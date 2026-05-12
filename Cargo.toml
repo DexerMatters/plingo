@@ -1,0 +1,21 @@
+[package]
+name = "plingo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+enum-display = "0.2.1"
+enum-iterator = "2.3.0"
+erased = "0.1.2"
+fluent-uri = "0.4.1"
+internment = "0.8.6"
+regex = "1.12.3"
+regex-syntax = "0.8.10"
+ropey = "1.6.1"
+sealed = "0.6.0"
+thiserror = "2.0.18"
+
+[dependencies.tokio]
+features = ["sync", "rt", "rt-multi-thread", "macros"]
+version = "1.52.3"

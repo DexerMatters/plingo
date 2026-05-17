@@ -10,29 +10,30 @@ use crate::scheme::*;
 pub(super) const DEFAULT_DEMAND_RETRY_BUDGET: u8 = 8;
 
 // ---------------------------------------------------------------------------
-// Wire types shared between mod.rs and this module
+// Wire types
 // ---------------------------------------------------------------------------
 
 pub(super) enum WorkerMessage {
     Demand(Demand),
     Delta(Box<dyn Any + Send + Sync>),
+    Barrier(AwaitBarrier),
 }
 
 pub(super) struct Demand {
-    pub getter: Arc<dyn Any + Send + Sync>,
-    pub getter_name: &'static str,
-    pub expected_output_type: TypeId,
-    pub expected_output_name: &'static str,
-    /// Layer where the demand originated (for retry after `Handled` delta propagation).
+    pub action: Arc<dyn Any + Send + Sync>,
+    pub action_name: &'static str,
     pub origin_layer_type: TypeId,
     pub remaining_retries: u8,
-    pub response_tx: oneshot::Sender<Result<ErasedOutput, GetterError>>,
+    pub response_tx: oneshot::Sender<Result<ErasedOutput, ActionError>>,
 }
 
 pub(crate) struct ErasedOutput {
     pub value: Box<dyn Any + Send + Sync>,
-    pub output_type: TypeId,
-    pub output_name: &'static str,
+}
+
+pub(super) struct AwaitBarrier {
+    destination_layer_type: TypeId,
+    response_tx: oneshot::Sender<()>,
 }
 
 type WorkerStarter =
@@ -44,14 +45,22 @@ pub(super) struct LayerSpec {
 
 enum PostDemand {
     Done,
-    Handled {
-        deltas: Box<dyn Any + Send + Sync>,
+    Continue {
+        continuation: Continuation,
+        demand: Demand,
+    },
+}
+
+enum ContinuationTransition {
+    Done,
+    Propagate {
+        payload: Box<dyn Any + Send + Sync>,
         demand: Demand,
     },
 }
 
 // ---------------------------------------------------------------------------
-// Top-layer worker: polls emit() for external signals, also handles demands
+// Top-layer worker
 // ---------------------------------------------------------------------------
 
 pub(super) fn spawn_top_worker<T>(
@@ -63,15 +72,13 @@ pub(super) fn spawn_top_worker<T>(
 ) -> tokio::task::JoinHandle<()>
 where
     T: TopLayer,
-    <<T::Lower as NonTopLayer>::Key as Getter<T::Lower>>::Output: Send + Sync + 'static,
 {
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                // External signal from the top layer's source.
                 maybe_delta = layer.emit(&context) => {
                     match maybe_delta {
-                        Ok(None) => break, // source exhausted
+                        Ok(None) => break,
                         Ok(Some(deltas)) => {
                             if let Err(err) = forward_delta_down(
                                 layer_type,
@@ -96,7 +103,6 @@ where
                         }
                     }
                 }
-                // Incoming demand or externally-injected delta.
                 msg = receiver.recv() => {
                     let Some(message) = msg else { break };
                     handle_any_message_top::<T>(
@@ -121,32 +127,72 @@ async fn handle_any_message_top<T>(
     message: WorkerMessage,
 ) where
     T: TopLayer,
-    <<T::Lower as NonTopLayer>::Key as Getter<T::Lower>>::Output: Send + Sync + 'static,
 {
     match message {
         WorkerMessage::Demand(demand) => {
-            match handle_any_demand::<T>(layer_type, layer_name, context, layer, demand).await {
+            let outcome = super::dispatch_registered_action(
+                layer,
+                context,
+                demand.action_name,
+                demand.action.as_ref(),
+            )
+            .await;
+            match finalize_demand_outcome(layer_name, demand, outcome).await {
                 PostDemand::Done => {}
-                PostDemand::Handled { deltas, demand } => {
-                    // Top layer produced side-effect deltas; forward the batch downward then retry.
-                    if let Err(err) =
-                        forward_delta_down(layer_type, layer_name, context, deltas).await
-                    {
-                        eprintln!("{err}");
+                PostDemand::Continue { continuation, demand } => {
+                    match transition_continuation(context, demand, continuation).await {
+                        ContinuationTransition::Done => {}
+                        ContinuationTransition::Propagate { payload, demand } => {
+                            if let Err(err) =
+                                forward_delta_down(layer_type, layer_name, context, payload).await
+                            {
+                                eprintln!("{err}");
+                                let _ = demand.response_tx.send(Err(ActionError::ErrorFromLayer {
+                                    action: demand.action_name.to_string(),
+                                    layer: layer_name.to_string(),
+                                    reason: err.to_string(),
+                                }));
+                                return;
+                            }
+                            retry_demand_at_origin(context, demand).await;
+                        }
                     }
-                    retry_demand_at_origin(context, demand).await;
                 }
             }
         }
-        // TopLayer receives no incoming deltas from above (it is the top).
         WorkerMessage::Delta(_) => {
-            debug_assert!(false, "TopLayer received a Delta message -- this is a bug");
+            eprintln!(
+                "{}",
+                DeltaFlowError::UnexpectedTopDelta { layer: layer_name.to_string() }
+            );
+        }
+        WorkerMessage::Barrier(_) => {
+            eprintln!("top layer {layer_name} received an unexpected barrier");
         }
     }
 }
 
+fn downcast_layer_deltas<L>(
+    layer_name: &'static str,
+    delta: Box<dyn Any + Send + Sync>,
+) -> LayerDeltas<L>
+where
+    L: NonTopLayer,
+{
+    delta
+        .downcast::<LayerDeltas<L>>()
+        .map(|typed| *typed)
+        .unwrap_or_else(|_| {
+            unreachable!(
+                "layer delta downcast must match pipeline wiring: layer={}, expected={}",
+                layer_name,
+                type_name::<LayerDeltas<L>>()
+            )
+        })
+}
+
 // ---------------------------------------------------------------------------
-// Middle-layer worker: receives Delta<M>, calls pass(), forwards Delta<M::Lower>
+// Middle-layer worker
 // ---------------------------------------------------------------------------
 
 pub(super) fn spawn_middle_worker<M>(
@@ -158,26 +204,42 @@ pub(super) fn spawn_middle_worker<M>(
 ) -> tokio::task::JoinHandle<()>
 where
     M: MiddleLayer,
-    <M::Key as Getter<M>>::Output: Send + Sync + 'static,
-    <<M::Lower as NonTopLayer>::Key as Getter<M::Lower>>::Output: Send + Sync + 'static,
 {
     tokio::spawn(async move {
         while let Some(message) = receiver.recv().await {
             match message {
                 WorkerMessage::Demand(demand) => {
-                    match handle_any_demand::<M>(layer_type, layer_name, &context, &layer, demand)
-                        .await
-                    {
+                    let outcome = super::dispatch_registered_action(
+                        &layer,
+                        &context,
+                        demand.action_name,
+                        demand.action.as_ref(),
+                    )
+                    .await;
+                    match finalize_demand_outcome(layer_name, demand, outcome).await {
                         PostDemand::Done => {}
-                        PostDemand::Handled { deltas, demand } => {
-                            if let Err(err) = apply_middle_delta::<M>(
-                                layer_type, layer_name, &context, &mut layer, deltas,
-                            )
-                            .await
-                            {
-                                eprintln!("{err}");
+                        PostDemand::Continue { continuation, demand } => {
+                            match transition_continuation(&context, demand, continuation).await {
+                                ContinuationTransition::Done => {}
+                                ContinuationTransition::Propagate { payload, demand } => {
+                                    if let Err(err) = apply_middle_delta::<M>(
+                                        layer_type, layer_name, &context, &mut layer, payload,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!("{err}");
+                                        let _ = demand.response_tx.send(Err(
+                                            ActionError::ErrorFromLayer {
+                                                action: demand.action_name.to_string(),
+                                                layer: layer_name.to_string(),
+                                                reason: err.to_string(),
+                                            },
+                                        ));
+                                        continue;
+                                    }
+                                    retry_demand_at_origin(&context, demand).await;
+                                }
                             }
-                            retry_demand_at_origin(&context, demand).await;
                         }
                     }
                 }
@@ -189,6 +251,9 @@ where
                     {
                         eprintln!("{err}");
                     }
+                }
+                WorkerMessage::Barrier(barrier) => {
+                    handle_barrier(layer_type, layer_name, &context, barrier).await;
                 }
             }
         }
@@ -204,93 +269,100 @@ async fn apply_middle_delta<M>(
 ) -> Result<(), DeltaFlowError>
 where
     M: MiddleLayer,
-    <M::Key as Getter<M>>::Output: Send + Sync + 'static,
-    <<M::Lower as NonTopLayer>::Key as Getter<M::Lower>>::Output: Send + Sync + 'static,
 {
-    let Ok(typed) = delta.downcast::<LayerDeltas<M>>() else {
-        debug_assert!(
-            false,
-            "delta cast mismatch in middle layer {layer_name}: expected {}",
-            type_name::<LayerDeltas<M>>()
-        );
-        return Ok(());
-    };
+    let typed = downcast_layer_deltas::<M>(layer_name, delta);
 
-    let out =
-        layer
-            .pass(context, *typed)
-            .await
-            .map_err(|err| DeltaFlowError::MiddlePassFailed {
-                layer: layer_name.to_string(),
-                reason: err.to_string(),
-            })?;
+    let out = layer
+        .pass(context, typed)
+        .await
+        .map_err(|err| DeltaFlowError::MiddlePassFailed {
+            layer: layer_name.to_string(),
+            reason: err.to_string(),
+        })?;
 
-    let lower_type = context.registry.lower_by_upper.get(&layer_type).copied();
+    let lower_type = context
+        .registry
+        .lower_by_upper
+        .get(&layer_type)
+        .copied()
+        .ok_or_else(|| DeltaFlowError::MissingLowerSender {
+            layer: layer_name.to_string(),
+        })?;
 
-    if let Some(lower_type) = lower_type {
-        forward_delta_down_to(lower_type, layer_name, context, Box::new(out)).await?;
-    }
+    forward_delta_down_to(lower_type, layer_name, context, Box::new(out)).await?;
 
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Bottom-layer worker: receives Delta<B>, calls consume(), nothing forwarded
+// Bottom-layer worker
 // ---------------------------------------------------------------------------
 
 pub(super) fn spawn_bottom_worker<B>(
     context: Context,
     mut receiver: mpsc::Receiver<WorkerMessage>,
-    layer_type: TypeId,
+    _layer_type: TypeId,
     layer_name: &'static str,
     mut layer: B,
 ) -> tokio::task::JoinHandle<()>
 where
     B: BottomLayer,
-    <B::Key as Getter<B>>::Output: Send + Sync + 'static,
 {
     tokio::spawn(async move {
         while let Some(message) = receiver.recv().await {
             match message {
                 WorkerMessage::Demand(demand) => {
-                    match handle_any_demand::<B>(layer_type, layer_name, &context, &layer, demand)
-                        .await
-                    {
+                    let outcome = super::dispatch_registered_action(
+                        &layer,
+                        &context,
+                        demand.action_name,
+                        demand.action.as_ref(),
+                    )
+                    .await;
+                    match finalize_demand_outcome(layer_name, demand, outcome).await {
                         PostDemand::Done => {}
-                        PostDemand::Handled { deltas, demand } => {
-                            if let Ok(typed) = deltas.downcast::<LayerDeltas<B>>() {
-                                if let Err(err) = layer.consume(&context, *typed).await {
-                                    eprintln!(
-                                        "{}",
-                                        DeltaFlowError::BottomConsumeFailed {
-                                            layer: layer_name.to_string(),
-                                            reason: err.to_string(),
-                                        }
-                                    );
+                        PostDemand::Continue { continuation, demand } => {
+                            match transition_continuation(&context, demand, continuation).await {
+                                ContinuationTransition::Done => {}
+                                ContinuationTransition::Propagate { payload, demand } => {
+                                    let typed = downcast_layer_deltas::<B>(layer_name, payload);
+                                    if let Err(err) = layer.consume(&context, typed).await {
+                                        eprintln!(
+                                            "{}",
+                                            DeltaFlowError::BottomConsumeFailed {
+                                                layer: layer_name.to_string(),
+                                                reason: err.to_string(),
+                                            }
+                                        );
+                                        let _ = demand.response_tx.send(Err(
+                                            ActionError::ErrorFromLayer {
+                                                action: demand.action_name.to_string(),
+                                                layer: layer_name.to_string(),
+                                                reason: err.to_string(),
+                                            },
+                                        ));
+                                        continue;
+                                    }
+                                    retry_demand_at_origin(&context, demand).await;
                                 }
                             }
-                            retry_demand_at_origin(&context, demand).await;
                         }
                     }
                 }
                 WorkerMessage::Delta(delta_box) => {
-                    if let Ok(typed) = delta_box.downcast::<LayerDeltas<B>>() {
-                        if let Err(err) = layer.consume(&context, *typed).await {
-                            eprintln!(
-                                "{}",
-                                DeltaFlowError::BottomConsumeFailed {
-                                    layer: layer_name.to_string(),
-                                    reason: err.to_string(),
-                                }
-                            );
-                        }
-                    } else {
-                        debug_assert!(
-                            false,
-                            "delta cast mismatch in bottom layer {layer_name}: expected {}",
-                            type_name::<LayerDeltas<B>>()
+                    let typed = downcast_layer_deltas::<B>(layer_name, delta_box);
+                    if let Err(err) = layer.consume(&context, typed).await {
+                        eprintln!(
+                            "{}",
+                            DeltaFlowError::BottomConsumeFailed {
+                                layer: layer_name.to_string(),
+                                reason: err.to_string(),
+                            }
                         );
                     }
+                }
+                WorkerMessage::Barrier(barrier) => {
+                    handle_barrier(TypeId::of::<B>(), layer_name, &context, barrier).await;
                 }
             }
         }
@@ -298,104 +370,221 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Shared demand handling (all three roles)
+// Shared demand handling
 // ---------------------------------------------------------------------------
 
-async fn handle_any_demand<L>(
-    layer_type: TypeId,
-    layer_name: &'static str,
-    context: &Context,
-    layer: &L,
+async fn finalize_demand_outcome<L>(
+    _layer_name: &'static str,
     demand: Demand,
+    outcome: ErasedOutcome<L>,
 ) -> PostDemand
 where
-    L: AnyLayer,
+    L: FallibleLayer,
 {
-    let outcome = layer
-        .resolve(context, AnyGetter::new(demand.getter.as_ref()))
-        .await;
-
-    let result = match outcome.into_kind() {
-        ErasedOutcomeKind::Resolved(output) => validate_output(layer_name, &demand, output),
-        ErasedOutcomeKind::Forwarded => {
-            forward_to_upper(layer_type, layer_name, context, &demand).await
+    let result = match outcome.inner {
+        ErasedOutcomeKind::Resolved(output) => Ok(output),
+        ErasedOutcomeKind::Continue(continuation) => {
+            return PostDemand::Continue { continuation, demand };
         }
-        ErasedOutcomeKind::Failed(err) => Err(GetterError::ErrorFromLayer {
-            getter: demand.getter_name.to_string(),
-            layer: layer_name.to_string(),
-            reason: err.to_string(),
-        }),
-        ErasedOutcomeKind::Updated(deltas) | ErasedOutcomeKind::Emitted(deltas) => {
-            return PostDemand::Handled { deltas, demand };
-        }
+        ErasedOutcomeKind::Failed(err) => Err(err),
     };
 
     let _ = demand.response_tx.send(result);
     PostDemand::Done
 }
 
+async fn transition_continuation(
+    context: &Context,
+    demand: Demand,
+    continuation: Continuation,
+) -> ContinuationTransition {
+    match continuation.effect {
+        ContinuationEffect::Propagate(payload) => {
+            ContinuationTransition::Propagate { payload, demand }
+        }
+        ContinuationEffect::Await(plan) => {
+            let context = context.clone();
+            tokio::spawn(async move {
+                match execute_await_plan(
+                    &context,
+                    demand.origin_layer_type,
+                    demand.remaining_retries,
+                    plan,
+                )
+                .await
+                {
+                    Ok(()) => retry_demand_at_origin(&context, demand).await,
+                    Err(err) => {
+                        let _ = demand.response_tx.send(Err(err));
+                    }
+                }
+            });
+            ContinuationTransition::Done
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Demand / delta routing helpers
 // ---------------------------------------------------------------------------
 
-async fn forward_to_upper(
-    current_layer_type: TypeId,
-    current_layer_name: &'static str,
+async fn execute_await_plan(
     context: &Context,
-    demand: &Demand,
-) -> Result<ErasedOutput, GetterError> {
-    let Some(upper_type) = context
-        .registry
-        .upper_by_lower
-        .get(&current_layer_type)
-        .copied()
-    else {
-        return Err(GetterError::MissingResource {
-            getter: demand.getter_name.to_string(),
-            layer: current_layer_name.to_string(),
-        });
-    };
-
-    let upper_name = context
+    origin_layer_type: TypeId,
+    remaining_retries: u8,
+    plan: AwaitPlan,
+) -> Result<(), ActionError> {
+    let AwaitPlan {
+        target_layer_type,
+        target_layer_name,
+        action,
+        action_name,
+    } = plan;
+    let target_name = context
         .registry
         .layer_names
-        .get(&upper_type)
+        .get(&target_layer_type)
         .copied()
-        .unwrap_or("unknown");
-    let upper_sender = context
+        .unwrap_or(target_layer_name);
+    let target_sender = context
         .registry
         .senders
-        .get(&upper_type)
+        .get(&target_layer_type)
         .cloned()
-        .ok_or_else(|| GetterError::MissingResource {
-            getter: demand.getter_name.to_string(),
-            layer: upper_name.to_string(),
+        .ok_or_else(|| ActionError::MissingResource {
+            action: action_name.to_string(),
+            layer: target_name.to_string(),
         })?;
 
     let (tx, rx) = oneshot::channel();
-    let forwarded = Demand {
-        getter: Arc::clone(&demand.getter),
-        getter_name: demand.getter_name,
-        expected_output_type: demand.expected_output_type,
-        expected_output_name: demand.expected_output_name,
-        origin_layer_type: demand.origin_layer_type,
-        remaining_retries: demand.remaining_retries,
+    let awaited_demand = Demand {
+        action,
+        action_name,
+        origin_layer_type: target_layer_type,
+        remaining_retries,
         response_tx: tx,
     };
 
-    upper_sender
-        .send(WorkerMessage::Demand(forwarded))
+    target_sender
+        .send(WorkerMessage::Demand(awaited_demand))
         .await
-        .map_err(|_| channel_closed(demand.getter_name, upper_name))?;
+        .map_err(|_| ActionError::ChannelClosed {
+            action: action_name.to_string(),
+            layer: target_name.to_string(),
+        })?;
 
-    let result = rx
-        .await
-        .map_err(|_| channel_closed(demand.getter_name, upper_name))?;
+    rx.await.map_err(|_| ActionError::ChannelClosed {
+        action: action_name.to_string(),
+        layer: target_name.to_string(),
+    })??;
 
-    result.and_then(|output| validate_output(upper_name, demand, output))
+    wait_for_downstream_drain(
+        context,
+        target_layer_type,
+        target_name,
+        origin_layer_type,
+        action_name,
+    )
+    .await?;
+
+    Ok(())
 }
 
-/// Forward a delta one step downward using the `lower_by_upper` map.
+async fn wait_for_downstream_drain(
+    context: &Context,
+    target_layer_type: TypeId,
+    target_layer_name: &'static str,
+    origin_layer_type: TypeId,
+    action_name: &'static str,
+) -> Result<(), ActionError> {
+    if target_layer_type == origin_layer_type {
+        return Ok(());
+    }
+
+    let origin_name = context
+        .registry
+        .layer_names
+        .get(&origin_layer_type)
+        .copied()
+        .unwrap_or("unknown");
+
+    let mut current = target_layer_type;
+    let mut first_hop = None;
+    loop {
+        let lower_type = context
+            .registry
+            .lower_by_upper
+            .get(&current)
+            .copied()
+            .ok_or_else(|| ActionError::AwaitPathMissing {
+                action: action_name.to_string(),
+                target: target_layer_name.to_string(),
+                layer: origin_name.to_string(),
+            })?;
+        first_hop.get_or_insert(lower_type);
+        if lower_type == origin_layer_type {
+            break;
+        }
+        current = lower_type;
+    }
+
+    let first_hop = first_hop.expect("await drain must have a first hop");
+    let sender = context
+        .registry
+        .senders
+        .get(&first_hop)
+        .cloned()
+        .ok_or_else(|| ActionError::ChannelClosed {
+            action: action_name.to_string(),
+            layer: origin_name.to_string(),
+        })?;
+
+    let (tx, rx) = oneshot::channel();
+    sender
+        .send(WorkerMessage::Barrier(AwaitBarrier {
+            destination_layer_type: origin_layer_type,
+            response_tx: tx,
+        }))
+        .await
+        .map_err(|_| ActionError::ChannelClosed {
+            action: action_name.to_string(),
+            layer: origin_name.to_string(),
+        })?;
+
+    rx.await.map_err(|_| ActionError::ChannelClosed {
+        action: action_name.to_string(),
+        layer: origin_name.to_string(),
+    })?;
+
+    Ok(())
+}
+
+async fn handle_barrier(
+    layer_type: TypeId,
+    layer_name: &'static str,
+    context: &Context,
+    barrier: AwaitBarrier,
+) {
+    if layer_type == barrier.destination_layer_type {
+        let _ = barrier.response_tx.send(());
+        return;
+    }
+
+    let lower_type = match context.registry.lower_by_upper.get(&layer_type).copied() {
+        Some(lower_type) => lower_type,
+        None => {
+            eprintln!(
+                "barrier could not continue downward from layer {layer_name}; await path is incomplete"
+            );
+            return;
+        }
+    };
+
+    if let Err(err) = forward_barrier_down_to(lower_type, layer_name, context, barrier).await {
+        eprintln!("{err}");
+    }
+}
+
 async fn forward_delta_down(
     upper_type: TypeId,
     upper_name: &str,
@@ -441,20 +630,32 @@ async fn forward_delta_down_to(
         })
 }
 
-fn validate_output(
-    layer_name: &'static str,
-    demand: &Demand,
-    output: ErasedOutput,
-) -> Result<ErasedOutput, GetterError> {
-    if output.output_type != demand.expected_output_type {
-        return Err(GetterError::OutputTypeMismatch {
-            getter: demand.getter_name.to_string(),
-            layer: layer_name.to_string(),
-            expected: demand.expected_output_name.to_string(),
-            actual: output.output_name.to_string(),
-        });
-    }
-    Ok(output)
+async fn forward_barrier_down_to(
+    lower_type: TypeId,
+    upper_name: &str,
+    context: &Context,
+    barrier: AwaitBarrier,
+) -> Result<(), DeltaFlowError> {
+    let lower_name = context
+        .registry
+        .layer_names
+        .get(&lower_type)
+        .copied()
+        .unwrap_or("unknown");
+    let lower_sender = context
+        .registry
+        .senders
+        .get(&lower_type)
+        .cloned()
+        .ok_or_else(|| DeltaFlowError::MissingLowerSender {
+            layer: upper_name.to_string(),
+        })?;
+    lower_sender
+        .send(WorkerMessage::Barrier(barrier))
+        .await
+        .map_err(|_| DeltaFlowError::LowerSenderClosed {
+            layer: lower_name.to_string(),
+        })
 }
 
 async fn retry_demand_at_origin(context: &Context, demand: Demand) {
@@ -465,8 +666,8 @@ async fn retry_demand_at_origin(context: &Context, demand: Demand) {
             .get(&demand.origin_layer_type)
             .copied()
             .unwrap_or("unknown");
-        let _ = demand.response_tx.send(Err(GetterError::RetryLimitReached {
-            getter: demand.getter_name.to_string(),
+        let _ = demand.response_tx.send(Err(ActionError::RetryLimitReached {
+            action: demand.action_name.to_string(),
             layer: origin_name.to_string(),
         }));
         return;
@@ -483,8 +684,8 @@ async fn retry_demand_at_origin(context: &Context, demand: Demand) {
     let remaining_retries = demand.remaining_retries - 1;
 
     let Some(sender) = context.registry.senders.get(&origin_type).cloned() else {
-        let _ = demand.response_tx.send(Err(GetterError::MissingResource {
-            getter: demand.getter_name.to_string(),
+        let _ = demand.response_tx.send(Err(ActionError::MissingResource {
+            action: demand.action_name.to_string(),
             layer: origin_name.to_string(),
         }));
         return;
@@ -492,10 +693,8 @@ async fn retry_demand_at_origin(context: &Context, demand: Demand) {
 
     let (retry_tx, retry_rx) = oneshot::channel();
     let retry_demand = Demand {
-        getter: Arc::clone(&demand.getter),
-        getter_name: demand.getter_name,
-        expected_output_type: demand.expected_output_type,
-        expected_output_name: demand.expected_output_name,
+        action: Arc::clone(&demand.action),
+        action_name: demand.action_name,
         origin_layer_type: origin_type,
         remaining_retries,
         response_tx: retry_tx,
@@ -506,8 +705,8 @@ async fn retry_demand_at_origin(context: &Context, demand: Demand) {
         .await
         .is_err()
     {
-        let _ = demand.response_tx.send(Err(GetterError::ChannelClosed {
-            getter: demand.getter_name.to_string(),
+        let _ = demand.response_tx.send(Err(ActionError::ChannelClosed {
+            action: demand.action_name.to_string(),
             layer: origin_name.to_string(),
         }));
         return;
@@ -518,42 +717,10 @@ async fn retry_demand_at_origin(context: &Context, demand: Demand) {
             let _ = demand.response_tx.send(result);
         }
         Err(_) => {
-            let _ = demand.response_tx.send(Err(GetterError::ChannelClosed {
-                getter: demand.getter_name.to_string(),
+            let _ = demand.response_tx.send(Err(ActionError::ChannelClosed {
+                action: demand.action_name.to_string(),
                 layer: origin_name.to_string(),
             }));
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Error helper constructors (used by mod.rs via pub(super))
-// ---------------------------------------------------------------------------
-
-pub(super) fn missing_getter_resource(getter: &str, layer: &str) -> GetterError {
-    GetterError::MissingResource {
-        getter: getter.to_string(),
-        layer: layer.to_string(),
-    }
-}
-
-pub(super) fn channel_closed(getter: &str, layer: &str) -> GetterError {
-    GetterError::ChannelClosed {
-        getter: getter.to_string(),
-        layer: layer.to_string(),
-    }
-}
-
-pub(super) fn output_type_mismatch(
-    getter: &str,
-    layer: &str,
-    expected: &str,
-    actual: &str,
-) -> GetterError {
-    GetterError::OutputTypeMismatch {
-        getter: getter.to_string(),
-        layer: layer.to_string(),
-        expected: expected.to_string(),
-        actual: actual.to_string(),
     }
 }

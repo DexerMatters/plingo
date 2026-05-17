@@ -15,5 +15,20 @@ pub struct Linked<Upper, Edge>(pub(super) PhantomData<fn() -> (Upper, Edge)>);
 /// The pipeline is complete: a BottomLayer has been registered. No further
 /// registrations are allowed.
 ///
-/// Only the `Runtime` in this state is complete and runnable.
+/// Only the [`sRuntime`] in this state is complete and runnable.
 pub struct Sealed;
+
+/// A trait for types that can receive types and produce an output type.
+pub trait Receiver<Input> {
+    type _Output: Send + Sync + 'static;
+}
+
+/// A trait for types that can receive a key and produce an output type.
+pub trait HasKey<K> {
+    type Key;
+}
+
+/// A trait for types that contain an error type.
+pub trait HasError<E> {
+    type Error;
+}

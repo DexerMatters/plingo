@@ -1,47 +1,38 @@
 use super::*;
-use std::any::{Any, TypeId};
+use std::any::Any;
 
 pub type DispatchFuture<'a> = Pin<Box<dyn Future<Output = RegisteredDispatchOutcome> + Send + 'a>>;
 
-pub struct ResolveActionEntry {
-    layer_type: TypeId,
-    action_type: TypeId,
-    dispatch: for<'a> fn(
-        &'a (dyn Any + Send + Sync),
-        &'a Context,
-        &'a (dyn Any + Send + Sync),
-    ) -> DispatchFuture<'a>,
-}
+pub type RegisteredDispatchFn = for<'a> fn(
+    &'a (dyn Any + Send + Sync),
+    &'a Context,
+    &'a (dyn Any + Send + Sync),
+) -> DispatchFuture<'a>;
 
-impl ResolveActionEntry {
-    pub const fn new(
-        layer_type: TypeId,
-        action_type: TypeId,
-        dispatch: for<'a> fn(
-            &'a (dyn Any + Send + Sync),
-            &'a Context,
-            &'a (dyn Any + Send + Sync),
-        ) -> DispatchFuture<'a>,
-    ) -> Self {
-        Self {
-            layer_type,
-            action_type,
-            dispatch,
-        }
-    }
-
-    pub(super) fn matches(&self, layer_type: TypeId, action_type: TypeId) -> bool {
-        self.layer_type == layer_type && self.action_type == action_type
-    }
-
-    pub(super) fn call<'a>(
-        &self,
-        layer: &'a (dyn Any + Send + Sync),
-        ctx: &'a Context,
-        action: &'a (dyn Any + Send + Sync),
-    ) -> DispatchFuture<'a> {
-        (self.dispatch)(layer, ctx, action)
-    }
+pub fn dispatch_resolve<'a, L, G>(
+    layer: &'a (dyn Any + Send + Sync),
+    ctx: &'a Context,
+    action: &'a (dyn Any + Send + Sync),
+) -> DispatchFuture<'a>
+where
+    L: Resolve<G> + 'static,
+    G: Send + Sync + 'static,
+{
+    let Some(layer) = layer.downcast_ref::<L>() else {
+        unreachable!(
+            "resolve action layer type mismatch: layer={}, action={}",
+            std::any::type_name::<L>(),
+            std::any::type_name::<G>(),
+        );
+    };
+    let Some(action) = action.downcast_ref::<G>() else {
+        unreachable!(
+            "resolve action registration type mismatch: layer={}, action={}",
+            std::any::type_name::<L>(),
+            std::any::type_name::<G>(),
+        );
+    };
+    Box::pin(async move { into_registered_dispatch_outcome(layer.resolve(ctx, action).await) })
 }
 
 pub struct RegisteredDispatchOutcome(pub(super) RegisteredDispatchOutcomeKind);

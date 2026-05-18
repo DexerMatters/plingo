@@ -1,10 +1,11 @@
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{
+    Data, DataEnum, DeriveInput, Expr, Fields, Meta,
     parse::{Parse, ParseStream},
     parse_macro_input,
     spanned::Spanned,
-    ItemImpl, Type,
+    Field, ItemImpl, Type,
 };
 
 // ---------------------------------------------------------------------------
@@ -111,18 +112,10 @@ pub fn layer(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     };
 
-    // Default (no-op) dynamic-dispatch — generic `#[resolve_action]`
-    // will provide a real implementation if one is needed.
-    let dyn_dispatch_impl = quote! {
-        impl #impl_generics ::plingo::scheme::__PlingoDynamicDispatch for #self_type #where_clause {}
-    };
-
     quote! {
         #item_impl
 
         #conduit_impls
-
-        #dyn_dispatch_impl
     }
     .into()
 }
@@ -138,8 +131,6 @@ pub fn resolve_action(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 fn expand_resolve_impl(item: TokenStream) -> TokenStream {
     let item_impl = parse_macro_input!(item as ItemImpl);
-
-    let is_generic = !item_impl.generics.params.is_empty();
 
     let (impl_generics, _ty_generics, where_clause) = item_impl.generics.split_for_impl();
 
@@ -177,107 +168,15 @@ fn expand_resolve_impl(item: TokenStream) -> TokenStream {
 
     let self_type = item_impl.self_ty.clone();
 
-    let call_resolve = quote! {
-        <#self_type as ::plingo::scheme::Resolve<#action_type>>::resolve(layer, ctx, action).await
-    };
-
     let receiver_output = quote!(<#self_type as ::plingo::scheme::Resolve<#action_type>>::Output);
+    quote! {
+        #item_impl
 
-    let map_outcome = quote! {
-        ::plingo::scheme::__macro_private::into_registered_dispatch_outcome(typed)
-    };
-
-    let dispatch_fn_name = quote::format_ident!("__plingo_dispatch");
-
-    let dispatch_body = quote! {
-        let Some(action) = action.downcast_ref::<#action_type>() else {
-            unreachable!(
-                "resolve action registration type mismatch: layer={}, action={}",
-                ::std::any::type_name::<#self_type>(),
-                ::std::any::type_name::<#action_type>(),
-            );
-        };
-        ::std::boxed::Box::pin(async move {
-            let typed = #call_resolve;
-            #map_outcome
-        })
-    };
-
-    if is_generic {
-        // Generic path: emit a specific `__PlingoDynamicDispatch` impl that
-        // overrides the default no-op provided by `#[layer]`.
-        quote! {
-            #item_impl
-
-            impl #impl_generics ::plingo::marker::Receiver<#action_type> for #self_type #where_clause {
-                type _Output = #receiver_output;
-            }
-
-            impl #impl_generics ::plingo::scheme::__PlingoDynamicDispatch for #self_type #where_clause {
-                fn __plingo_try_dispatch<'a>(
-                    &'a self,
-                    ctx: &'a ::plingo::scheme::Context,
-                    action: &'a (dyn ::std::any::Any + Send + Sync),
-                ) -> ::std::option::Option<
-                    ::plingo::scheme::__macro_private::DispatchFuture<'a>,
-                > {
-                    let Some(action) = action.downcast_ref::<#action_type>() else {
-                        return ::std::option::Option::None;
-                    };
-                    let fut = <#self_type as ::plingo::scheme::Resolve<#action_type>>::resolve(
-                        self, ctx, action,
-                    );
-                    ::std::option::Option::Some(::std::boxed::Box::pin(async move {
-                        ::plingo::scheme::__macro_private::into_registered_dispatch_outcome(fut.await)
-                    }))
-                }
-            }
+        impl #impl_generics ::plingo::marker::Receiver<#action_type> for #self_type #where_clause {
+            type _Output = #receiver_output;
         }
-        .into()
-    } else {
-        let entry_type = quote!(::plingo::scheme::__macro_private::ResolveActionEntry);
-
-        quote! {
-            #item_impl
-
-            impl ::plingo::marker::Receiver<#action_type> for #self_type {
-                type _Output = #receiver_output;
-            }
-
-            const _: () = {
-                fn #dispatch_fn_name<'a>(
-                    layer: &'a (dyn ::std::any::Any + Send + Sync),
-                    ctx: &'a ::plingo::scheme::Context,
-                    action: &'a (dyn ::std::any::Any + Send + Sync),
-                ) -> ::std::pin::Pin<
-                    ::std::boxed::Box<
-                        dyn ::std::future::Future<
-                            Output = ::plingo::scheme::__macro_private::RegisteredDispatchOutcome,
-                        > + Send + 'a,
-                    >,
-                > {
-                    let Some(layer) = layer.downcast_ref::<#self_type>() else {
-                        unreachable!(
-                            "resolve action layer type mismatch: layer={}, action={}",
-                            ::std::any::type_name::<#self_type>(),
-                            ::std::any::type_name::<#action_type>(),
-                        );
-                    };
-
-                    #dispatch_body
-                }
-
-                ::inventory::submit! {
-                    #entry_type::new(
-                        ::std::any::TypeId::of::<#self_type>(),
-                        ::std::any::TypeId::of::<#action_type>(),
-                        #dispatch_fn_name,
-                    )
-                }
-            };
-        }
-        .into()
     }
+    .into()
 }
 
 fn extract_action_type(segment: &syn::PathSegment) -> syn::Result<syn::Type> {
@@ -303,4 +202,291 @@ fn extract_action_type(segment: &syn::PathSegment) -> syn::Result<syn::Type> {
     };
 
     Ok(action_type.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Tokens derive: #[derive(Tokens)]
+// ---------------------------------------------------------------------------
+
+#[proc_macro_derive(Tokens, attributes(regex, enter, leave, skip, parse))]
+pub fn derive_tokens(item: TokenStream) -> TokenStream {
+    match expand_tokens_derive(parse_macro_input!(item as DeriveInput)) {
+        Ok(tokens) => tokens,
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+fn expand_tokens_derive(input: DeriveInput) -> syn::Result<TokenStream> {
+    let enum_ident = input.ident;
+    let rules_fn_ident = format_ident!("__plingo_rules_for_{}", enum_ident);
+
+    let data_enum = match input.data {
+        Data::Enum(data_enum) => data_enum,
+        _ => {
+            return Err(syn::Error::new(
+                enum_ident.span(),
+                "#[derive(Tokens)] can only be used on enums",
+            ));
+        }
+    };
+
+    let builders = build_token_builders(&enum_ident, &data_enum)?;
+    let specs = build_token_specs(&enum_ident, &data_enum)?;
+
+    Ok(quote! {
+        impl ::plingo::component::lex::TokenState for #enum_ident {
+            fn display_name() -> &'static str {
+                stringify!(#enum_ident)
+            }
+
+            fn state_key() -> &'static str {
+                concat!(module_path!(), "::", stringify!(#enum_ident))
+            }
+        }
+
+        #[allow(non_snake_case)]
+        fn #rules_fn_ident() -> ::std::vec::Vec<::plingo::component::lex::__macro_private::TokenSpec> {
+            #(#builders)*
+
+            ::std::vec![#(#specs),*]
+        }
+
+        ::plingo::inventory::submit! {
+            ::plingo::component::lex::__macro_private::StateRegistration::new(
+                stringify!(#enum_ident),
+                concat!(module_path!(), "::", stringify!(#enum_ident)),
+                #rules_fn_ident,
+            )
+        }
+    }
+    .into())
+}
+
+fn build_token_builders(
+    enum_ident: &syn::Ident,
+    data_enum: &DataEnum,
+) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    data_enum
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(index, variant)| build_token_builder(enum_ident, variant, index))
+        .collect()
+}
+
+fn build_token_builder(
+    enum_ident: &syn::Ident,
+    variant: &syn::Variant,
+    index: usize,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let builder_ident = format_ident!("__plingo_build_{}_{}", enum_ident, index);
+    let variant_ident = &variant.ident;
+    let token_name = format!("{}::{}", enum_ident, variant_ident);
+
+    let body = match &variant.fields {
+        Fields::Unit => {
+            ensure_no_field_parse_attrs(variant)?;
+            quote! {
+                ::std::result::Result::Ok(::plingo::component::lex::Token::new(
+                    stringify!(#variant_ident),
+                    #enum_ident::#variant_ident,
+                ))
+            }
+        }
+        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+            let field = fields.unnamed.first().unwrap();
+            let field_ty = &field.ty;
+            let parse_expr = field_parse_expr(field, &token_name)?;
+            quote! {
+                let value: #field_ty = #parse_expr;
+                ::std::result::Result::Ok(::plingo::component::lex::Token::new(
+                    stringify!(#variant_ident),
+                    #enum_ident::#variant_ident(value),
+                ))
+            }
+        }
+        Fields::Named(fields) if fields.named.len() == 1 => {
+            let field = fields.named.first().unwrap();
+            let field_ident = field.ident.as_ref().unwrap();
+            let field_ty = &field.ty;
+            let parse_expr = field_parse_expr(field, &token_name)?;
+            quote! {
+                let value: #field_ty = #parse_expr;
+                ::std::result::Result::Ok(::plingo::component::lex::Token::new(
+                    stringify!(#variant_ident),
+                    #enum_ident::#variant_ident { #field_ident: value },
+                ))
+            }
+        }
+        Fields::Unnamed(fields) => {
+            return Err(syn::Error::new(
+                fields.span(),
+                "token payload variants currently support exactly one field",
+            ));
+        }
+        Fields::Named(fields) => {
+            return Err(syn::Error::new(
+                fields.span(),
+                "token payload variants currently support exactly one field",
+            ));
+        }
+    };
+
+    Ok(quote! {
+        #[allow(non_snake_case)]
+        fn #builder_ident(
+            lexeme: &str,
+        ) -> ::std::result::Result<::plingo::component::lex::Token, ::plingo::component::lex::LexError> {
+            #body
+        }
+    })
+}
+
+fn build_token_specs(
+    enum_ident: &syn::Ident,
+    data_enum: &DataEnum,
+) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    data_enum
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(index, variant)| build_token_spec(enum_ident, variant, index))
+        .collect()
+}
+
+fn build_token_spec(
+    enum_ident: &syn::Ident,
+    variant: &syn::Variant,
+    index: usize,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let builder_ident = format_ident!("__plingo_build_{}_{}", enum_ident, index);
+    let config = parse_variant_config(variant)?;
+    let variant_ident = &variant.ident;
+    let display = format!("{}::{}", enum_ident, variant_ident);
+    let regex = config.regex;
+    let skip = config.skip;
+
+    let action = if let Some(target) = config.enter {
+        quote! { ::plingo::component::lex::__macro_private::StateDirective::Enter(<#target as ::plingo::component::lex::TokenState>::state_key()) }
+    } else if config.leave {
+        quote! { ::plingo::component::lex::__macro_private::StateDirective::Leave }
+    } else {
+        quote! { ::plingo::component::lex::__macro_private::StateDirective::None }
+    };
+
+    Ok(quote! {
+        ::plingo::component::lex::__macro_private::TokenSpec {
+            regex: #regex,
+            precedence: #index,
+            label: #display,
+            action: #action,
+            skip: #skip,
+            build: #builder_ident,
+        }
+    })
+}
+
+struct VariantConfig {
+    regex: syn::LitStr,
+    enter: Option<Type>,
+    leave: bool,
+    skip: bool,
+}
+
+fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig> {
+    let mut regex = None;
+    let mut enter = None;
+    let mut leave = false;
+    let mut skip = false;
+
+    for attr in &variant.attrs {
+        match &attr.meta {
+            Meta::List(meta) if meta.path.is_ident("regex") => {
+                if regex.is_some() {
+                    return Err(syn::Error::new(attr.span(), "duplicate #[regex(...)] attribute"));
+                }
+                regex = Some(attr.parse_args::<syn::LitStr>()?);
+            }
+            Meta::List(meta) if meta.path.is_ident("enter") => {
+                if enter.is_some() {
+                    return Err(syn::Error::new(attr.span(), "duplicate #[enter(...)] attribute"));
+                }
+                enter = Some(attr.parse_args::<Type>()?);
+            }
+            Meta::Path(path) if path.is_ident("leave") => {
+                if leave {
+                    return Err(syn::Error::new(attr.span(), "duplicate #[leave] attribute"));
+                }
+                leave = true;
+            }
+            Meta::Path(path) if path.is_ident("skip") => {
+                if skip {
+                    return Err(syn::Error::new(attr.span(), "duplicate #[skip] attribute"));
+                }
+                skip = true;
+            }
+            _ => {}
+        }
+    }
+
+    let Some(regex) = regex else {
+        return Err(syn::Error::new(
+            variant.span(),
+            "each token variant requires #[regex(...)]",
+        ));
+    };
+
+    if enter.is_some() && leave {
+        return Err(syn::Error::new(
+            variant.span(),
+            "#[enter(...)] and #[leave] cannot be used on the same variant",
+        ));
+    }
+
+    Ok(VariantConfig {
+        regex,
+        enter,
+        leave,
+        skip,
+    })
+}
+
+fn ensure_no_field_parse_attrs(variant: &syn::Variant) -> syn::Result<()> {
+    for field in variant.fields.iter() {
+        if field.attrs.iter().any(|attr| attr.path().is_ident("parse")) {
+            return Err(syn::Error::new(
+                field.span(),
+                "unit variants cannot use #[parse(...)]",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn field_parse_expr(field: &Field, token_name: &str) -> syn::Result<proc_macro2::TokenStream> {
+    let field_ty = &field.ty;
+    let mut parse_expr = None;
+
+    for attr in &field.attrs {
+        if !attr.path().is_ident("parse") {
+            continue;
+        }
+        if parse_expr.is_some() {
+            return Err(syn::Error::new(attr.span(), "duplicate #[parse(...)] attribute"));
+        }
+
+        let expr = attr.parse_args::<Expr>()?;
+        parse_expr = Some(quote! {
+            ::plingo::component::lex::__macro_private::IntoLexemeResult::into_lexeme_result((#expr)(lexeme))
+                .map_err(|source| ::plingo::component::lex::LexError::token_parse_failed(#token_name, lexeme, source))?
+        });
+    }
+
+    Ok(match parse_expr {
+        Some(expr) => expr,
+        None => quote! {
+            <#field_ty as ::plingo::component::lex::FromLexeme>::from_lexeme(lexeme)
+                .map_err(|source| ::plingo::component::lex::LexError::token_parse_failed(#token_name, lexeme, source))?
+        },
+    })
 }

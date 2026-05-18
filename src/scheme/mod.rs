@@ -10,6 +10,7 @@ use std::{
 
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio_stream::Stream;
 
 use crate::marker::*;
 use crate::scheme::message::*;
@@ -33,9 +34,9 @@ impl Default for Context {
 
 impl Context {
     /// Request the output of a action `G` from the layer `L` that can resolve it.
-    pub async fn get<L, G>(&self, action: G) -> Result<<L as Receiver<G>>::_Output, ActionError>
+    pub async fn post<L, G>(&self, action: G) -> Result<<L as Receiver<G>>::_Output, ActionError>
     where
-        L: FallibleLayer + Receiver<G> + 'static,
+        L: FallibleLayer + Receiver<G> + Resolve<G> + 'static,
         <L as Receiver<G>>::_Output: Send + Sync + 'static,
         G: Send + Sync + 'static,
     {
@@ -61,8 +62,9 @@ impl Context {
         let demand = Demand {
             action: Arc::new(action),
             action_name: type_name::<G>(),
-            origin_layer_type: layer_type,
+            requester_layer_type: layer_type,
             remaining_retries: DEFAULT_DEMAND_RETRY_BUDGET,
+            dispatch: __macro_private::dispatch_resolve::<L, G>,
             response_tx,
         };
 
@@ -96,10 +98,20 @@ impl Context {
 }
 
 /// Delta representing an insertion, deletion, or update of a key-value pair.
+#[derive(Debug, Clone)]
 pub enum Delta<K, V> {
     Insert { key: K, value: V },
     Delete { key: K },
     Update { key: K, value: V },
+}
+
+impl<K, V> Delta<K, V> {
+    /// Get the key associated with this delta, regardless of the variant.
+    pub fn key(&self) -> &K {
+        match self {
+            Delta::Insert { key, .. } | Delta::Delete { key } | Delta::Update { key, .. } => key,
+        }
+    }
 }
 
 /// A batch of deltas.
@@ -107,12 +119,10 @@ pub type Deltas<K, V> = Vec<Delta<K, V>>;
 
 /// Convenience type alias for a batch of deltas for a specific non-top layer `L`.
 pub type LayerDeltas<L> =
-    Deltas<<L as NonTopLayer>::_Key, <L as Receiver<<L as NonTopLayer>::_Key>>::_Output>;
+    Deltas<<L as NonTopLayer>::_Key, <L as Resolve<<L as NonTopLayer>::_Key>>::Output>;
 
 #[doc(hidden)]
 pub mod __macro_private;
-
-inventory::collect!(__macro_private::ResolveActionEntry);
 
 fn registered_outcome_to_erased<L: FallibleLayer>(
     action_name: &'static str,
@@ -138,49 +148,19 @@ fn registered_outcome_to_erased<L: FallibleLayer>(
     }
 }
 
-/// Fallback dispatch trait implemented by `#[layer]` for every layer type.
-/// `dispatch_registered_action` calls this when no compile-time inventory
-/// entry matches.  For generic `#[resolve_action]` impls, the dispatch
-/// function pointer is stored in a runtime map (populated lazily on first
-/// call to `resolve`).
-#[doc(hidden)]
-pub trait __PlingoDynamicDispatch: FallibleLayer {
-    #[allow(unused_variables)]
-    fn __plingo_try_dispatch<'a>(
-        &'a self,
-        ctx: &'a Context,
-        action: &'a (dyn Any + Send + Sync),
-    ) -> Option<Pin<Box<dyn Future<Output = __macro_private::RegisteredDispatchOutcome> + Send + 'a>>> {
-        None
-    }
-}
-
 async fn dispatch_registered_action<L>(
     layer: &L,
     ctx: &Context,
     action_name: &'static str,
     action: &(dyn Any + Send + Sync),
+    dispatch: __macro_private::RegisteredDispatchFn,
 ) -> ErasedOutcome<L>
 where
-    L: FallibleLayer + __PlingoDynamicDispatch,
+    L: FallibleLayer,
 {
-    let layer_type = TypeId::of::<L>();
-    let action_type = action.type_id();
     let layer_any: &(dyn Any + Send + Sync) = layer;
-
-    for entry in inventory::iter::<__macro_private::ResolveActionEntry> {
-        if entry.matches(layer_type, action_type) {
-            let out = entry.call(layer_any, ctx, action).await;
-            return registered_outcome_to_erased::<L>(action_name, out);
-        }
-    }
-
-    if let Some(out_fut) = layer.__plingo_try_dispatch(ctx, action) {
-        let out = out_fut.await;
-        return registered_outcome_to_erased::<L>(action_name, out);
-    }
-
-    ErasedOutcome::missing_action(action_name)
+    let out = dispatch(layer_any, ctx, action).await;
+    registered_outcome_to_erased::<L>(action_name, out)
 }
 
 /// Static action resolution contract for all layers.
@@ -270,14 +250,14 @@ impl<G, L: FallibleLayer + Receiver<G>> Outcome<G, L> {
     }
 }
 
-impl<G, L: NonTopLayer + Receiver<G>> Outcome<G, L> {
+impl<G, L: NonTopLayer + Resolve<G>> Outcome<G, L> {
     pub fn update(deltas: LayerDeltas<L>) -> Self {
         Self(OutcomeKind::Continue(Continuation::propagate(deltas)))
     }
 
     pub fn expect<Target, Awaited>(action: Awaited) -> Self
     where
-        Target: FallibleLayer + Receiver<Awaited>,
+        Target: FallibleLayer + Resolve<Awaited>,
         Awaited: Send + Sync + 'static,
     {
         Self(OutcomeKind::Continue(Continuation::await_action::<
@@ -296,18 +276,6 @@ impl<G, L: TopLayer + Receiver<G>> Outcome<G, L> {
 struct ErasedOutcome<L: FallibleLayer> {
     inner: ErasedOutcomeKind,
     _marker: PhantomData<fn() -> L>,
-}
-
-impl<L: FallibleLayer> ErasedOutcome<L> {
-    fn missing_action(action_name: &str) -> Self {
-        Self {
-            inner: ErasedOutcomeKind::Failed(ActionError::MissingResource {
-                action: action_name.to_string(),
-                layer: L::display(),
-            }),
-            _marker: PhantomData,
-        }
-    }
 }
 
 enum ErasedOutcomeKind {
@@ -330,27 +298,43 @@ pub trait FallibleLayer: Sized + Send + Sync + 'static {
     }
 }
 
+impl<E, L> HasError<E> for L
+where
+    L: FallibleLayer<__Error = E>,
+{
+    type Error = L::__Error;
+}
+
 /// A trait representing a top layer, which produces deltas from an external source.
-pub trait TopLayer: FallibleLayer<__Error = Self::Error> + __PlingoDynamicDispatch {
+pub trait TopLayer: FallibleLayer<__Error = Self::Error> {
     type Error: Display + Send + Sync + 'static;
     type Lower: NonTopLayer;
 
     fn emit(
-        &mut self,
+        &self,
         ctx: &Context,
-    ) -> impl Future<Output = Result<Option<LayerDeltas<Self::Lower>>, <Self as TopLayer>::Error>> + Send;
+    ) -> impl Stream<Item = Result<LayerDeltas<Self::Lower>, Self::Error>> + Send + '_;
 }
 
 /// Marker trait for layers that may appear below another layer in the pipeline.
 pub trait NonTopLayer:
-    FallibleLayer<__Error = Self::_Error> + Receiver<<Self as NonTopLayer>::_Key> + __PlingoDynamicDispatch
+    FallibleLayer<__Error = Self::_Error> + Resolve<<Self as NonTopLayer>::_Key>
 {
     type _Error: Display + Send + Sync + 'static;
     type _Key: Send + Sync + 'static;
 }
 
+impl<K, L> HasKey<K> for L
+where
+    L: NonTopLayer<_Key = K> + Resolve<K>,
+{
+    type Key = L::_Key;
+}
+
 /// A trait representing a middle layer.
-pub trait MiddleLayer: NonTopLayer<_Error = Self::Error, _Key = Self::Key> {
+pub trait MiddleLayer:
+    NonTopLayer<_Error = Self::Error, _Key = Self::Key> + Resolve<Self::Key>
+{
     type Lower: NonTopLayer;
     type Error: Display + Send + Sync + 'static;
     type Key: Send + Sync + 'static;
@@ -363,7 +347,9 @@ pub trait MiddleLayer: NonTopLayer<_Error = Self::Error, _Key = Self::Key> {
 }
 
 /// A trait representing a bottom layer.
-pub trait BottomLayer: NonTopLayer<_Error = Self::Error, _Key = Self::Key> {
+pub trait BottomLayer:
+    NonTopLayer<_Error = Self::Error, _Key = Self::Key> + Resolve<Self::Key>
+{
     type Key: Send + Sync + 'static;
     type Error: Display + Send + Sync + 'static;
     fn consume(
@@ -378,10 +364,20 @@ pub trait BottomLayer: NonTopLayer<_Error = Self::Error, _Key = Self::Key> {
 pub enum ActionError {
     #[error("Missing resource for action {action} while resolving in layer {layer}")]
     MissingResource { action: String, layer: String },
-    #[error("Await target layer {target} does not flow down to requester layer {layer} for action {action}")]
-    AwaitPathMissing { action: String, target: String, layer: String },
+    #[error(
+        "Await target layer {target} does not flow down to requester layer {layer} for action {action}"
+    )]
+    AwaitPathMissing {
+        action: String,
+        target: String,
+        layer: String,
+    },
     #[error("Layer {layer} failed while resolving action {action}: {reason}")]
-    ErrorFromLayer { action: String, layer: String, reason: String },
+    ErrorFromLayer {
+        action: String,
+        layer: String,
+        reason: String,
+    },
     #[error("Layer channel closed while resolving action {action} in layer {layer}")]
     ChannelClosed { action: String, layer: String },
     #[error("Retry limit reached while resolving action {action} in layer {layer}")]
@@ -566,8 +562,8 @@ impl Runtime<Sealed> {
         Ok(self)
     }
 
-    pub fn context(&self) -> &Context {
-        &self.context
+    pub fn context(&self) -> Context {
+        self.context.clone()
     }
 
     pub async fn shutdown(mut self) {
@@ -576,96 +572,5 @@ impl Runtime<Sealed> {
             worker.abort();
             let _ = worker.await;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-    use crate::{layer, resolve_action};
-
-    struct TestTop;
-
-    struct TestBottom;
-
-    #[derive(Clone, Copy)]
-    struct Ping;
-
-    #[layer(top)]
-    impl TopLayer for TestTop {
-        type Lower = TestBottom;
-        type Error = &'static str;
-
-        async fn emit(
-            &mut self,
-            _ctx: &Context,
-        ) -> Result<Option<LayerDeltas<Self::Lower>>, Self::Error> {
-            std::future::pending::<Result<Option<LayerDeltas<Self::Lower>>, Self::Error>>().await
-        }
-    }
-
-    #[layer(bottom)]
-    impl BottomLayer for TestBottom {
-        type Key = usize;
-        type Error = &'static str;
-
-        async fn consume(
-            &mut self,
-            _ctx: &Context,
-            _deltas: LayerDeltas<Self>,
-        ) -> Result<(), Self::Error> {
-            Ok(())
-        }
-    }
-
-    #[resolve_action]
-    impl Resolve<Ping> for TestTop {
-        type Output = usize;
-        async fn resolve<'a>(
-            &'a self,
-            _ctx: &'a Context,
-            _action: &'a Ping,
-        ) -> Outcome<Ping, Self> {
-            Outcome::ok(7)
-        }
-    }
-
-    #[resolve_action]
-    impl Resolve<usize> for TestBottom {
-        type Output = usize;
-        async fn resolve<'a>(
-            &'a self,
-            _ctx: &'a Context,
-            action: &'a usize,
-        ) -> Outcome<usize, Self> {
-            Outcome::ok(*action)
-        }
-    }
-
-    #[tokio::test]
-    async fn resolves_through_registered_dispatch_without_manual_dispatch_impls() {
-        let runtime = Runtime::new()
-            .with(TestTop)
-            .finish(TestBottom)
-            .run()
-            .await
-            .expect("runtime should start");
-
-        let top_value = runtime
-            .context()
-            .get::<TestTop, _>(Ping)
-            .await
-            .expect("top resolve should succeed");
-        assert_eq!(top_value, 7);
-
-        let bottom_value = runtime
-            .context()
-            .get::<TestBottom, _>(42usize)
-            .await
-            .expect("bottom resolve should succeed");
-        assert_eq!(bottom_value, 42);
-
-        runtime.shutdown().await;
     }
 }

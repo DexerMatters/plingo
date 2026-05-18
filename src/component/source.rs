@@ -1,19 +1,20 @@
-use std::{collections::HashMap, future, io, marker::PhantomData};
-
-use fluent_uri::Uri;
-use plingo_macros::{layer, resolve_action};
-use ropey::Rope;
-use thiserror::Error;
-use tokio::sync::mpsc::Receiver;
+use std::{collections::HashMap, io, marker::PhantomData};
 
 use crate::{
     scheme::{Context, Delta, LayerDeltas, NonTopLayer, Outcome, Resolve, TopLayer},
     utils::Span,
 };
+use async_stream::try_stream;
+use fluent_uri::Uri;
+use plingo_macros::{layer, resolve_action};
+use ropey::Rope;
+use thiserror::Error;
+use tokio::sync::{Mutex, mpsc::Receiver};
+use tokio_stream::Stream;
 
 pub struct Source<Lower: NonTopLayer> {
-    pub sources: HashMap<Uri<&'static str>, Rope>,
-    pub receiver: Receiver<Delta<Span, String>>,
+    pub sources: Mutex<HashMap<Uri<&'static str>, Rope>>,
+    pub receiver: Mutex<Receiver<Delta<Span, String>>>,
     _marker: PhantomData<Lower>,
 }
 
@@ -28,41 +29,124 @@ pub enum SourceError {
 impl<Lower: NonTopLayer> Source<Lower> {
     pub fn new(receiver: Receiver<Delta<Span, String>>) -> Self {
         Self {
-            sources: HashMap::new(),
-            receiver,
+            sources: Mutex::new(HashMap::new()),
+            receiver: Mutex::new(receiver),
             _marker: PhantomData,
+        }
+    }
+
+    async fn load(&self, uri: Uri<&'static str>) -> Result<(), SourceError> {
+        if self.sources.lock().await.contains_key(&uri) {
+            return Ok(());
+        }
+        let content = std::fs::read_to_string(uri.path().as_str())
+            .map_err(|e| SourceError::ReadError(uri, e))?;
+        self.sources
+            .lock()
+            .await
+            .insert(uri, Rope::from_str(&content));
+        Ok(())
+    }
+
+    pub async fn get(&self, span: Span) -> Result<String, SourceError> {
+        let uri = span.uri;
+        self.load(uri).await?;
+        let sources = self.sources.lock().await;
+        // SAFETY: We just loaded this source if it wasn't already present, so it must be present now.
+        let source = sources.get(&uri).unwrap();
+        let (start, end) = span.trim(&source).range.into();
+        Ok(source.slice(start..end).to_string())
+    }
+
+    async fn modify(&self, delta: &Delta<Span, String>) -> Result<(), SourceError> {
+        let uri = delta.key().uri;
+        self.load(uri).await?;
+        let mut sources = self.sources.lock().await;
+
+        // SAFETY: We just loaded this source if it wasn't already present, so
+        // it must be present now.
+        let source = sources.get_mut(&uri).unwrap();
+        match delta {
+            Delta::Delete { key } => {
+                let (start, end) = key.trim(&source).range.into();
+                source.remove(start..=end);
+            }
+            Delta::Insert { key, value } => {
+                let offset = key.trim(&source).range.start();
+                source.insert(offset, &value);
+            }
+            Delta::Update { key, value } => {
+                let (start, end) = key.trim(&source).range.into();
+                source.remove(start..=end);
+                source.insert(start, &value);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[layer(top)]
+impl<Lower> TopLayer for Source<Lower>
+where
+    Lower: NonTopLayer<_Key = Span> + Resolve<Span, Output = String>,
+{
+    type Error = SourceError;
+    type Lower = Lower;
+
+    fn emit(
+        &self,
+        _ctx: &Context,
+    ) -> impl Stream<Item = Result<LayerDeltas<Self::Lower>, Self::Error>> + Send + '_ {
+        try_stream! {
+            while let Some(delta) = self.receiver.lock().await.recv().await {
+                self.modify(&delta).await?;
+                yield vec![delta];
+            }
         }
     }
 }
 
-// NOTE: #[layer(top)] is intentionally omitted here — Source<Lower> is not
-// wired up as a layer in this example.  The Resolve impl below exists only to
-// demonstrate generic #[resolve_action] support.
+#[resolve_action]
+impl<Lower> Resolve<Span> for Source<Lower>
+where
+    Lower: NonTopLayer<_Key = Span> + Resolve<Span, Output = String>,
+{
+    type Output = String;
 
-#[layer(top)]
-impl<Lower: NonTopLayer> TopLayer for Source<Lower> {
-    type Error = SourceError;
-    type Lower = Lower;
-
-    async fn emit(
-        &mut self,
-        _ctx: &Context,
-    ) -> Result<Option<LayerDeltas<Self::Lower>>, Self::Error> {
-        future::pending().await
+    fn resolve<'a>(
+        &'a self,
+        _ctx: &'a Context,
+        action: &'a Span,
+    ) -> impl Future<Output = Outcome<Span, Self>> + Send + 'a {
+        async move {
+            match self.get(*action).await {
+                Ok(value) => Outcome::ok(value),
+                Err(err) => Outcome::fail(err),
+            }
+        }
     }
 }
 
-pub struct GetSource;
+#[derive(Debug, Clone)]
+pub struct Change(pub Delta<Span, String>);
 
 #[resolve_action]
-impl<Lower: NonTopLayer> Resolve<GetSource> for Source<Lower> {
-    type Output = String;
+impl<Lower> Resolve<Change> for Source<Lower>
+where
+    Lower: NonTopLayer<_Key = Span> + Resolve<Span, Output = String>,
+{
+    type Output = ();
 
-    async fn resolve<'a>(
+    fn resolve<'a>(
         &'a self,
         _ctx: &'a Context,
-        _action: &'a GetSource,
-    ) -> Outcome<GetSource, Self> {
-        future::pending().await
+        Change(action): &'a Change,
+    ) -> impl Future<Output = Outcome<Change, Self>> + Send + 'a {
+        async move {
+            match self.modify(&action).await {
+                Ok(()) => Outcome::emit(vec![action.clone()]),
+                Err(err) => Outcome::fail(err),
+            }
+        }
     }
 }

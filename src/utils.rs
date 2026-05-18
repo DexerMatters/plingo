@@ -1,5 +1,5 @@
 use core::fmt;
-use std::{error::Error, ffi::os_str::Display, fmt::Debug};
+use std::{error::Error, fmt::Debug};
 
 use fluent_uri::Uri;
 use ropey::Rope;
@@ -105,6 +105,33 @@ impl<T: Copy + PartialEq> RangeOrPoint<T> {
     }
 }
 
+impl<T: Copy + PartialEq> fmt::Display for RangeOrPoint<T>
+where
+    T: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RangeOrPoint::Range(start, end) => write!(f, "{}-{}", start, end),
+            RangeOrPoint::Point(offset) => write!(f, "{}", offset),
+        }
+    }
+}
+
+impl<T: Copy + PartialEq> From<(T, T)> for RangeOrPoint<T> {
+    fn from((start, end): (T, T)) -> Self {
+        RangeOrPoint::from_range(start, end)
+    }
+}
+
+impl<T: Copy + PartialEq> From<RangeOrPoint<T>> for (T, T) {
+    fn from(range_or_point: RangeOrPoint<T>) -> Self {
+        match range_or_point {
+            RangeOrPoint::Range(start, end) => (start, end),
+            RangeOrPoint::Point(offset) => (offset, offset),
+        }
+    }
+}
+
 /// A span in a source file, represented by a URI and a range of byte offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
@@ -123,11 +150,12 @@ impl fmt::Display for Span {
 
 impl Span {
     /// Creates a new `Span` with the given URI and byte offsets.
-    pub fn new(uri: String, start: usize, end: usize) -> Result<Self, SpanError> {
+    pub fn new(uri: impl ToString, start: usize, end: usize) -> Result<Self, SpanError> {
         if start > end {
             return Err(SpanError::IllegalSpan { start, end });
         }
-        let uri = Uri::parse(uri.leak() as &'static str).map_err(|e| SpanError::InvalidUri(e))?;
+        let uri = Uri::parse(uri.to_string().leak() as &'static str)
+            .map_err(|e| SpanError::InvalidUri(e))?;
         Ok(Span {
             uri,
             range: RangeOrPoint::Range(start, end),
@@ -210,24 +238,24 @@ impl Span {
         }
     }
 
-    /// Converts the byte offsets in this span to line and column numbers using the provided source text.
-    pub fn to_line_col(&self, source: &Rope) -> RangeOrPoint<(usize, usize)> {
-        let start_line = source.byte_to_line(self.range.start());
-        let start_col = self.range.start() - source.line_to_byte(start_line);
-        let end_line = source.byte_to_line(self.range.end());
-        let end_col = self.range.end() - source.line_to_byte(end_line);
-        RangeOrPoint::from_range((start_line, start_col), (end_line, end_col))
-    }
-}
-
-impl fmt::Display for RangeOrPoint<(usize, usize)> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RangeOrPoint::Range((start_line, start_col), (end_line, end_col)) => {
-                write!(f, "{}:{}-{}:{}", start_line, start_col, end_line, end_col)
-            }
-            RangeOrPoint::Point((line, col)) => write!(f, "{}:{}", line, col),
+    /// Trims the span to fit within the bounds of the given source text.
+    pub fn trim(&self, source: &Rope) -> Span {
+        let start = self.range.start();
+        let end = self.range.end();
+        let source_len = source.len_bytes();
+        Span {
+            uri: self.uri,
+            range: RangeOrPoint::from_range(start.min(source_len), end.min(source_len)),
         }
+    }
+
+    /// Converts the char offsets in this span to line and column numbers using the provided source text.
+    pub fn to_line_col(&self, source: &Rope) -> RangeOrPoint<(usize, usize)> {
+        let start_line = source.char_to_line(self.range.start());
+        let start_col = self.range.start() - source.line_to_char(start_line);
+        let end_line = source.char_to_line(self.range.end());
+        let end_col = self.range.end() - source.line_to_char(end_line);
+        RangeOrPoint::from_range((start_line, start_col), (end_line, end_col))
     }
 }
 

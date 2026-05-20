@@ -1,10 +1,12 @@
 use enum_iterator::Sequence;
 use tokio::sync::mpsc;
 
+use regex_automata::Input;
+
 use crate::{
     Tokens,
     component::{
-        lex::{Lexer, StateAction},
+        lex::{Interrupt, Lexer, StateAction},
         source::Source,
     },
     scheme::{Delta, Outcome, Runtime},
@@ -59,9 +61,6 @@ enum BestMatchTokens {
     #[regex(r"if")]
     KeywordIf,
 
-    #[regex(r"[a-z]{2}")]
-    TwoLetters,
-
     #[regex(r"abc")]
     LongerAbc,
 
@@ -99,6 +98,18 @@ fn test_multi_enum_token_schema() {
         Some(&RootTokens::Number(42))
     );
 }
+
+// #[test]
+// fn test_select_best_match_prefers_longest_then_precedence() {
+//     let lexer = Lexer::new::<BestMatchTokens>().unwrap();
+//     let state = lexer.states().first().unwrap();
+//     let mut input = Input::new("abcxix");
+
+//     let next = lexer.next(state.clone(), &mut input);
+//     println!("Next token: {:#?}", next);
+//     let next = lexer.next(next.0, &mut input);
+//     println!("Next token: {:#?}", next);
+// }
 
 #[tokio::test]
 async fn test_source_and_sink() -> anyhow::Result<()> {

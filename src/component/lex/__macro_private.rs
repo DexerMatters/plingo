@@ -1,4 +1,8 @@
-use std::{any::Any, error::Error};
+use std::{
+    any::Any,
+    error::Error,
+    hash::{Hash, Hasher},
+};
 
 use super::{LexError, Token};
 
@@ -39,11 +43,13 @@ where
 pub trait TokenValue: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync>;
+    fn eq_token_value(&self, other: &dyn TokenValue) -> bool;
+    fn hash_token_value(&self, state: &mut dyn Hasher);
 }
 
 impl<T> TokenValue for T
 where
-    T: Any + Send + Sync,
+    T: Any + Send + Sync + Eq + Hash,
 {
     fn as_any(&self) -> &dyn Any {
         self
@@ -52,6 +58,20 @@ where
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> {
         self
     }
+
+    fn eq_token_value(&self, other: &dyn TokenValue) -> bool {
+        other.as_any().downcast_ref::<T>() == Some(self)
+    }
+
+    fn hash_token_value(&self, state: &mut dyn Hasher) {
+        state.write_u64(calculate_hash(self));
+    }
+}
+
+fn calculate_hash<T: Hash>(value: &T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 pub struct TokenSpec {

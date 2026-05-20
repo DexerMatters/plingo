@@ -4,8 +4,16 @@ mod mode;
 #[doc(hidden)]
 pub mod __macro_private;
 
-use std::{any::Any, collections::HashMap, error::Error, fmt, str::FromStr};
+use std::{
+    any::Any,
+    collections::HashMap,
+    error::Error,
+    fmt,
+    hash::{Hash, Hasher},
+    str::FromStr,
+};
 
+use indexmap::IndexSet;
 use regex_automata::{
     MatchKind,
     dfa::{StartKind, dense::DFA},
@@ -28,17 +36,41 @@ pub trait FromLexeme: Sized {
     fn from_lexeme(lexeme: &str) -> Result<Self, Self::Error>;
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum Entry {
+    Token(usize, Token),
+    Error(usize, LexError),
+}
+
 pub struct Token {
     type_name: &'static str,
     variant_name: &'static str,
     value: Box<dyn __macro_private::TokenValue>,
 }
 
+impl PartialEq for Token {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_name == other.type_name
+            && self.variant_name == other.variant_name
+            && self.value.eq_token_value(other.value.as_ref())
+    }
+}
+
+impl Eq for Token {}
+
+impl Hash for Token {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.type_name.hash(state);
+        self.variant_name.hash(state);
+        self.value.hash_token_value(state);
+    }
+}
+
 impl Token {
     #[doc(hidden)]
     pub fn new<T>(variant_name: &'static str, value: T) -> Self
     where
-        T: Send + Sync + 'static,
+        T: Send + Sync + Eq + Hash + 'static,
     {
         Self {
             type_name: std::any::type_name::<T>(),
@@ -98,6 +130,41 @@ impl ResolvedToken {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BestMatch {
+    pub token_index: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interrupt {
+    ParseError,
+    NoCandidate,
+    MissingState,
+    UnsupportedSearch,
+    DeadState,
+    QuitState,
+    EndOfInput,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchReport {
+    pub best: Option<BestMatch>,
+    pub stop_offset: usize,
+    pub stop_reason: Interrupt,
+}
+
+impl MatchReport {
+    pub fn best_match(&self) -> Option<&BestMatch> {
+        self.best.as_ref()
+    }
+
+    pub fn has_match(&self) -> bool {
+        self.best.is_some()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StateMatcher {
     pub(crate) dfa: DFA<Vec<u32>>,
@@ -109,6 +176,7 @@ pub struct Lexer {
     root: StateId,
     state_info: Vec<StateInfo>,
     tokens: Vec<Vec<ResolvedToken>>,
+    arena: IndexSet<Entry>,
     state_matchers: Vec<StateMatcher>,
     states: Vec<LexerState>,
 }
@@ -153,8 +221,17 @@ impl Lexer {
             state_info: states,
             tokens,
             state_matchers,
+            arena: IndexSet::new(),
             states: vec![LexerState::new(root)],
         })
+    }
+
+    pub(crate) fn alloc(&mut self, entry: Entry) -> usize {
+        self.arena.insert_full(entry).0
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&Entry> {
+        self.arena.get_index(index)
     }
 
     pub fn root(&self) -> StateId {
@@ -208,7 +285,7 @@ pub enum LexerCreationError {
     UnknownState(String),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq, Hash)]
 pub enum LexError {
     #[error("Unexpected end of input while in state {state}")]
     UnexpectedEndOfInput { state: &'static str },
@@ -218,12 +295,11 @@ pub enum LexError {
     MissingToken { token: &'static str, offset: usize },
     #[error("Cannot leave root lexer state at offset {offset}")]
     CannotLeaveRootState { offset: usize },
-    #[error("Failed to parse token {token} from lexeme {lexeme:?}: {source}")]
+    #[error("Failed to parse token {token} from lexeme {lexeme:?}: {err}")]
     TokenParseError {
         token: &'static str,
         lexeme: String,
-        #[source]
-        source: Box<dyn Error + Send + Sync + 'static>,
+        err: String,
     },
 }
 
@@ -235,7 +311,7 @@ impl LexError {
         Self::TokenParseError {
             token,
             lexeme: lexeme.to_string(),
-            source: Box::new(source),
+            err: source.to_string(),
         }
     }
 }

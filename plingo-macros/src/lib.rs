@@ -217,8 +217,10 @@ pub fn derive_tokens(item: TokenStream) -> TokenStream {
 }
 
 fn expand_tokens_derive(input: DeriveInput) -> syn::Result<TokenStream> {
+    let existing_derives = collect_existing_derives(&input.attrs);
     let enum_ident = input.ident;
     let rules_fn_ident = format_ident!("__plingo_rules_for_{}", enum_ident);
+    let generics = input.generics;
 
     let data_enum = match input.data {
         Data::Enum(data_enum) => data_enum,
@@ -232,8 +234,16 @@ fn expand_tokens_derive(input: DeriveInput) -> syn::Result<TokenStream> {
 
     let builders = build_token_builders(&enum_ident, &data_enum)?;
     let specs = build_token_specs(&enum_ident, &data_enum)?;
+    let comparison_impls = build_comparison_impls(
+        &enum_ident,
+        &generics,
+        &data_enum,
+        &existing_derives,
+    );
 
     Ok(quote! {
+        #comparison_impls
+
         impl ::plingo::component::lex::TokenState for #enum_ident {
             fn display_name() -> &'static str {
                 stringify!(#enum_ident)
@@ -260,6 +270,91 @@ fn expand_tokens_derive(input: DeriveInput) -> syn::Result<TokenStream> {
         }
     }
     .into())
+}
+
+fn collect_existing_derives(attrs: &[syn::Attribute]) -> std::collections::HashSet<String> {
+    let mut derives = std::collections::HashSet::new();
+    for attr in attrs {
+        let Meta::List(meta) = &attr.meta else {
+            continue;
+        };
+        if !meta.path.is_ident("derive") {
+            continue;
+        }
+        let _ = attr.parse_nested_meta(|nested| {
+            if let Some(ident) = nested.path.get_ident() {
+                derives.insert(ident.to_string());
+            }
+            Ok(())
+        });
+    }
+    derives
+}
+
+fn build_comparison_impls(
+    enum_ident: &syn::Ident,
+    generics: &syn::Generics,
+    data_enum: &DataEnum,
+    existing_derives: &std::collections::HashSet<String>,
+) -> proc_macro2::TokenStream {
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let need_eq = !existing_derives.contains("Eq");
+    let need_hash = !existing_derives.contains("Hash");
+
+    let eq_impl = if need_eq {
+        quote! {
+            impl #impl_generics ::std::cmp::Eq for #enum_ident #ty_generics #where_clause {}
+        }
+    } else {
+        quote! {}
+    };
+
+    let hash_impl = if need_hash {
+        let hash_arms = data_enum.variants.iter().enumerate().map(|(index, variant)| {
+            let variant_ident = &variant.ident;
+            match &variant.fields {
+                Fields::Unit => quote! {
+                    Self::#variant_ident => {
+                        #index.hash(state);
+                    }
+                },
+                Fields::Unnamed(fields) if fields.unnamed.len() == 1 => quote! {
+                    Self::#variant_ident(value) => {
+                        #index.hash(state);
+                        value.hash(state);
+                    }
+                },
+                Fields::Named(fields) if fields.named.len() == 1 => {
+                    let field_ident = fields.named.first().unwrap().ident.as_ref().unwrap();
+                    quote! {
+                        Self::#variant_ident { #field_ident: value } => {
+                            #index.hash(state);
+                            value.hash(state);
+                        }
+                    }
+                }
+                _ => quote! {},
+            }
+        });
+
+        quote! {
+            impl #impl_generics ::std::hash::Hash for #enum_ident #ty_generics #where_clause {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    match self {
+                        #(#hash_arms),*
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    quote! {
+        #eq_impl
+        #hash_impl
+    }
 }
 
 fn build_token_builders(

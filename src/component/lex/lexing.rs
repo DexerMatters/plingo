@@ -1,70 +1,125 @@
 use regex_automata::{Anchored, Input, dfa::Automaton};
 
-use crate::component::lex::{LexError, Lexer, LexerState, ResolvedToken, Token};
-
-pub enum Interrupt {
-    ParseError,
-    NoCandidate,
-}
+use crate::component::lex::{
+    BestMatch, Interrupt, LexError, Lexer, LexerState, MatchReport, Token,
+};
 
 impl Lexer {
-    fn next(&self, mut state: LexerState, input: &str) -> (LexerState, Result<Token, Interrupt>) {
-        match self.select_best_match(&state, input) {
-            Some((resolved, match_end)) => {
-                state.offset += match_end;
-                state.apply_action(resolved.action);
-
-                (
-                    state,
-                    resolved
-                        .build(&input[..match_end])
-                        .map_err(|_| Interrupt::ParseError),
-                )
-            }
-            None => (state, Err(Interrupt::NoCandidate)),
-        }
+    pub(crate) fn next_wildcard(&self, mut state: LexerState) -> LexerState {
+        state.offset += 1;
+        state
     }
-    fn select_best_match(&self, state: &LexerState, input: &str) -> Option<(ResolvedToken, usize)> {
-        let current_state = state.current_state()?;
-        let matcher = self.state_matcher(current_state)?;
-        let tokens = self.tokens_in_state(current_state)?;
 
-        let input = Input::new(input).anchored(Anchored::Yes);
+    pub(crate) fn next_token(
+        &self,
+        mut state: LexerState,
+        BestMatch {
+            token_index,
+            start,
+            end,
+        }: BestMatch,
+        input: &mut Input,
+    ) -> (LexerState, Result<Token, Interrupt>) {
+        let Some(current_state) = state.current_state() else {
+            return (state, Err(Interrupt::NoCandidate));
+        };
+        let Some(token) = self
+            .tokens_in_state(current_state)
+            .and_then(|tokens| tokens.get(token_index))
+        else {
+            return (state, Err(Interrupt::NoCandidate));
+        };
+
+        state.offset = end;
+        state.apply_action(token.action);
+
+        let Ok(lexeme) = std::str::from_utf8(&input.haystack()[start..end]) else {
+            return (state, Err(Interrupt::ParseError));
+        };
+
+        (
+            state,
+            token.build(lexeme).map_err(|_| Interrupt::ParseError),
+        )
+    }
+
+    pub(crate) fn select_best_match(
+        &self,
+        last_state: &LexerState,
+        input: &mut Input,
+    ) -> MatchReport {
+        let Some(matcher) = last_state
+            .current_state()
+            .and_then(|state_id| self.state_matcher(state_id))
+        else {
+            return MatchReport {
+                best: None,
+                stop_offset: last_state.offset,
+                stop_reason: Interrupt::MissingState,
+            };
+        };
+
+        input.set_range(last_state.offset..input.end());
+        input.set_anchored(Anchored::Yes);
+
         let haystack = input.haystack();
-        let mut dfa_state = matcher.dfa.start_state_forward(&input).ok()?;
+        let search_start = input.start();
+        let search_end = input.end();
+        let Ok(mut dfa_state) = matcher.dfa.start_state_forward(input) else {
+            return MatchReport {
+                best: None,
+                stop_offset: last_state.offset,
+                stop_reason: Interrupt::UnsupportedSearch,
+            };
+        };
         let mut best: Option<(usize, usize)> = None;
-        let mut stopped_early = false;
+        let mut stop_offset = search_end;
+        let mut stop_reason = Interrupt::EndOfInput;
 
-        for (offset, &byte) in haystack.iter().enumerate() {
+        for (offset, &byte) in haystack[search_start..search_end].iter().enumerate() {
             dfa_state = matcher.dfa.next_state(dfa_state, byte);
             if matcher.dfa.is_special_state(dfa_state) {
+                let absolute_offset = search_start + offset;
                 record_best_match(
                     &matcher.dfa,
                     &matcher.token_index_by_pattern,
                     dfa_state,
-                    offset,
+                    absolute_offset,
                     &mut best,
                 );
-                if matcher.dfa.is_dead_state(dfa_state) || matcher.dfa.is_quit_state(dfa_state) {
-                    stopped_early = true;
+                if matcher.dfa.is_dead_state(dfa_state) {
+                    stop_offset = absolute_offset + 1;
+                    stop_reason = Interrupt::DeadState;
+                    break;
+                }
+                if matcher.dfa.is_quit_state(dfa_state) {
+                    stop_offset = absolute_offset + 1;
+                    stop_reason = Interrupt::QuitState;
                     break;
                 }
             }
         }
 
-        if !stopped_early {
+        if stop_reason == Interrupt::EndOfInput {
             dfa_state = matcher.dfa.next_eoi_state(dfa_state);
             record_best_match(
                 &matcher.dfa,
                 &matcher.token_index_by_pattern,
                 dfa_state,
-                haystack.len(),
+                search_end,
                 &mut best,
             );
         }
 
-        let (token_index, match_end) = best?;
-        Some((tokens[token_index].clone(), match_end))
+        MatchReport {
+            best: best.map(|(token_index, match_end)| BestMatch {
+                token_index,
+                start: last_state.offset,
+                end: match_end,
+            }),
+            stop_offset,
+            stop_reason,
+        }
     }
 }
 

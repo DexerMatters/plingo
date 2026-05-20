@@ -9,12 +9,12 @@ edition = "2024"
 enum-display = "0.2.1"
 enum-iterator = "2.3.0"
 fluent-uri = "0.4.1"
-inventory = "0.3"
 sealed = "0.6.0"
 
 # For efficient data structures
 smallvec = "1.15.1"
 ropey = "1.6.1"
+indexmap = "2.14.0"
 
 # For lexer
 regex-syntax = "0.8.10"
@@ -33,8 +33,8 @@ anyhow = "1.0.102"
 thiserror = "2.0.18"
 
 # For macro development
+inventory = "0.3"
 plingo-macros = { path = "plingo-macros" }
-
 
 
 [dependencies.tokio]

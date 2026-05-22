@@ -1,6 +1,7 @@
 use core::fmt;
 use std::{error::Error, fmt::Debug};
 
+use color_print::cwrite;
 use fluent_uri::Uri;
 use ropey::Rope;
 use thiserror::Error;
@@ -162,7 +163,8 @@ impl Span {
         })
     }
 
-    /// Creates a new `Span` with the given URI and byte offsets, using a pre-parsed URI.
+    /// Creates a new `Span` with the given URI and byte offsets, using a
+    /// pre-parsed URI.
     pub fn new_uri(uri: Uri<&'static str>, start: usize, end: usize) -> Result<Self, SpanError> {
         if start > end {
             return Err(SpanError::IllegalSpan { start, end });
@@ -173,18 +175,20 @@ impl Span {
         })
     }
 
-    /// Creates a `Span` that represents a single point (i.e., where start and end are the same).
+    /// Creates a `Span` that represents a single point (i.e., where start and
+    /// end are the same).
     pub fn point(uri: String, offset: usize) -> Result<Self, SpanError> {
         Self::new(uri, offset, offset)
     }
 
-    /// Creates a `Span` that represents a single point (i.e., where start and end are the same), using a pre-parsed URI.
+    /// Creates a `Span` that represents a single point (i.e., where start and
+    /// end are the same), using a pre-parsed URI.
     pub fn point_uri(uri: Uri<&'static str>, offset: usize) -> Result<Self, SpanError> {
         Self::new_uri(uri, offset, offset)
     }
 
-    /// Checks if this span covers another span
-    /// (i.e., if it starts before or at the same position and ends after or at the same position).
+    /// Checks if this span covers another span (i.e., if it starts before or at
+    /// the same position and ends after or at the same position).
     pub fn covers(&self, other: &Span) -> bool {
         self.uri == other.uri
             && self.range.start() <= other.range.start()
@@ -249,7 +253,8 @@ impl Span {
         }
     }
 
-    /// Converts the char offsets in this span to line and column numbers using the provided source text.
+    /// Converts the char offsets in this span to line and column numbers using
+    /// the provided source text.
     pub fn to_line_col(&self, source: &Rope) -> RangeOrPoint<(usize, usize)> {
         let start_line = source.char_to_line(self.range.start());
         let start_col = self.range.start() - source.line_to_char(start_line);
@@ -273,4 +278,53 @@ pub enum SpanError {
 pub struct Spanned<T> {
     pub span: Span,
     pub value: T,
+}
+
+/// A trait for types that can be pretty-printed with additional context
+pub trait PrettyDisplay<Ctx> {
+    /// Returns a wrapper that enables pretty-printing of this value with the
+    /// given context
+    fn pretty<'a>(&'a self, context: &'a Ctx) -> PrettyWrapper<'a, Self, Ctx>
+    where
+        Self: Sized,
+    {
+        PrettyWrapper {
+            value: self,
+            context,
+        }
+    }
+
+    /// Formats this value using the provided context, writing the result to the
+    /// given formatter
+    fn pretty_fmt(&self, f: &mut fmt::Formatter<'_>, context: &Ctx) -> fmt::Result;
+}
+
+impl<T: PrettyDisplay<Ctx>, Ctx> PrettyDisplay<Ctx> for &T {
+    fn pretty_fmt(&self, f: &mut fmt::Formatter<'_>, context: &Ctx) -> fmt::Result {
+        (*self).pretty_fmt(f, context)
+    }
+}
+
+impl<T: PrettyDisplay<Ctx>, Ctx> PrettyDisplay<Ctx> for Vec<T> {
+    fn pretty_fmt(&self, f: &mut fmt::Formatter<'_>, context: &Ctx) -> fmt::Result {
+        self.iter()
+            .map(|item| item.pretty(context))
+            .fold(Ok(()), |res, pretty_item| {
+                res.and_then(|_| cwrite!(f, "<dim>- </dim>{}\n", pretty_item))
+            })
+    }
+}
+
+/// A wrapper type that implements `Display` by delegating to the
+/// `PrettyDisplay` implementation of the inner value, using the provided
+/// context.
+pub struct PrettyWrapper<'a, T, Ctx> {
+    pub value: &'a T,
+    pub context: &'a Ctx,
+}
+
+impl<T: PrettyDisplay<Ctx>, Ctx> fmt::Display for PrettyWrapper<'_, T, Ctx> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.value.pretty_fmt(f, self.context)
+    }
 }

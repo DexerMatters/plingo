@@ -1,16 +1,16 @@
+use core::fmt;
+
 use enum_iterator::Sequence;
 use tokio::sync::mpsc;
 
-use regex_automata::Input;
-
 use crate::{
-    Tokens,
     component::{
-        lex::{Interrupt, Lexer, StateAction},
+        lex::{Entry, ErrorToken, Lexer, LexerState},
         source::Source,
     },
     scheme::{Delta, Outcome, Runtime},
-    utils::Span,
+    tokens,
+    utils::{PrettyDisplay, Span},
 };
 
 #[test]
@@ -36,80 +36,70 @@ fn parse_usize(text: &str) -> Result<usize, std::num::ParseIntError> {
     text.parse()
 }
 
-#[derive(Debug, PartialEq, Tokens)]
+#[tokens]
+#[derive(Debug, Clone)]
 enum RootTokens {
-    #[regex(r#"""#)]
+    #[regex(r##"#*""##)]
     #[enter(StringTokens)]
-    QuoteStart,
-
-    #[regex(r"[0-9]+")]
-    Number(#[parse(parse_usize)] usize),
+    QuoteStart(String),
 }
 
-#[derive(Debug, PartialEq, Tokens)]
-enum StringTokens {
-    #[regex(r#"[^"]+"#)]
-    Text(String),
+fn validate_content(text: &str, state: Option<&str>) -> bool {
+    if let Some(state) = state {
+        !text.contains(format!("\"{}", &state[0..state.len() - 2]).as_str())
+    } else {
+        false
+    }
+}
 
-    #[regex(r#"""#)]
+fn check_hash_count(lexeme: &str, parent_capture: Option<&str>) -> bool {
+    let hash_count = lexeme.chars().filter(|&c| c == '#').count();
+    let expected = parent_capture
+        .map(|s| s.chars().filter(|&c| c == '#').count())
+        .unwrap_or(0);
+    hash_count == expected
+}
+
+#[tokens]
+#[derive(Debug, Clone)]
+enum StringTokens {
+    #[regex(r#".*"#)]
+    #[validate(validate_content)]
+    Content(String),
+    #[regex(r##""#*"##)]
+    #[validate(check_hash_count)]
     #[leave]
     QuoteEnd,
 }
 
-#[derive(Debug, PartialEq, Tokens)]
-enum BestMatchTokens {
-    #[regex(r"if")]
-    KeywordIf,
+impl fmt::Display for RootTokens {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
 
-    #[regex(r"abc")]
-    LongerAbc,
-
-    #[regex(r"a")]
-    SingleA,
+impl fmt::Display for StringTokens {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 #[test]
 fn test_multi_enum_token_schema() {
-    let lexer = Lexer::new::<RootTokens>().unwrap();
-
-    assert!(lexer.state_info().len() >= 2);
-    assert!(lexer.tokens().len() >= 2);
-
-    let root_id = lexer.state_id_of::<RootTokens>().unwrap();
-    let string_id = lexer.state_id_of::<StringTokens>().unwrap();
-
-    let quote_start = lexer
-        .tokens_in_state(root_id)
-        .unwrap()
-        .iter()
-        .find(|token| token.label == "RootTokens::QuoteStart")
-        .unwrap();
-    assert_eq!(quote_start.action, StateAction::Enter(string_id));
-
-    let number = lexer
-        .tokens_in_state(root_id)
-        .unwrap()
-        .iter()
-        .find(|token| token.label == "RootTokens::Number")
-        .unwrap();
-    let built = number.build("42").unwrap();
-    assert_eq!(
-        built.downcast_ref::<RootTokens>(),
-        Some(&RootTokens::Number(42))
+    let mut lexer = Lexer::<RootTokens>::new().unwrap();
+    let input = r###"##"ssss"##"###;
+    let mut receiever = Vec::new();
+    let error = lexer.lex_cont(
+        LexerState::new(lexer.state_id_of::<RootTokens>().unwrap()),
+        input,
+        |token_id| {
+            receiever.push(token_id);
+            true
+        },
     );
+    error.map(|err| println!("Lexing error: {:?}", err));
+    println!("{}", receiever.pretty(&lexer));
 }
-
-// #[test]
-// fn test_select_best_match_prefers_longest_then_precedence() {
-//     let lexer = Lexer::new::<BestMatchTokens>().unwrap();
-//     let state = lexer.states().first().unwrap();
-//     let mut input = Input::new("abcxix");
-
-//     let next = lexer.next(state.clone(), &mut input);
-//     println!("Next token: {:#?}", next);
-//     let next = lexer.next(next.0, &mut input);
-//     println!("Next token: {:#?}", next);
-// }
 
 #[tokio::test]
 async fn test_source_and_sink() -> anyhow::Result<()> {

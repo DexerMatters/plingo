@@ -1,23 +1,36 @@
 use smallvec::SmallVec;
 
+use super::LexInterrupt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StateId(pub usize);
+pub enum State {
+    Id(usize),
+    IdWithCapture { id: usize, start: usize, end: usize },
+}
+
+impl State {
+    pub fn id(&self) -> usize {
+        match self {
+            Self::Id(id) | Self::IdWithCapture { id, .. } => *id,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateAction {
     None,
-    Enter(StateId),
+    Enter(State),
     Leave,
 }
 
 #[derive(Debug, Clone)]
 pub struct LexerState {
     pub offset: usize,
-    pub state_stack: SmallVec<[StateId; 4]>,
+    pub state_stack: SmallVec<[State; 4]>,
 }
 
 impl LexerState {
-    pub fn new(root: StateId) -> Self {
+    pub fn new(root: State) -> Self {
         let mut state_stack = SmallVec::new();
         state_stack.push(root);
         Self {
@@ -26,8 +39,19 @@ impl LexerState {
         }
     }
 
-    pub fn current_state(&self) -> Option<StateId> {
-        self.state_stack.last().copied()
+    pub fn current_state(&self) -> Result<State, LexInterrupt> {
+        self.state_stack
+            .last()
+            .copied()
+            .ok_or(LexInterrupt::MissingState)
+    }
+
+    pub fn current_capture(&self) -> Option<(usize, usize)> {
+        let s = *self.state_stack.last()?;
+        match s {
+            State::IdWithCapture { start, end, .. } => Some((start, end)),
+            State::Id(_) => None,
+        }
     }
 
     pub fn apply_action(&mut self, action: StateAction) {

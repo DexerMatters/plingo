@@ -1,8 +1,6 @@
 extern crate self as plingo;
 
-pub use plingo_macros::{Tokens, layer, resolve_action};
-
-pub use inventory;
+pub use plingo_macros::{layer, resolve_action, tokens};
 
 #[macro_export]
 macro_rules! debug_sink {

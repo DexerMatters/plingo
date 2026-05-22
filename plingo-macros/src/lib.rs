@@ -1,11 +1,11 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Data, DataEnum, DeriveInput, Expr, Fields, Meta,
+    Expr, Fields, ItemEnum, Meta,
     parse::{Parse, ParseStream},
     parse_macro_input,
     spanned::Spanned,
-    Field, ItemImpl, Type,
+    Field, Ident, ItemImpl, Type, Variant, parse_quote,
 };
 
 // ---------------------------------------------------------------------------
@@ -205,44 +205,33 @@ fn extract_action_type(segment: &syn::PathSegment) -> syn::Result<syn::Type> {
 }
 
 // ---------------------------------------------------------------------------
-// Tokens derive: #[derive(Tokens)]
+// Tokens attr/derive
 // ---------------------------------------------------------------------------
 
-#[proc_macro_derive(Tokens, attributes(regex, enter, leave, skip, parse))]
-pub fn derive_tokens(item: TokenStream) -> TokenStream {
-    match expand_tokens_derive(parse_macro_input!(item as DeriveInput)) {
+#[proc_macro_attribute]
+pub fn tokens(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    match expand_tokens_attr(parse_macro_input!(item as ItemEnum)) {
         Ok(tokens) => tokens,
         Err(err) => err.to_compile_error().into(),
     }
 }
 
-fn expand_tokens_derive(input: DeriveInput) -> syn::Result<TokenStream> {
-    let existing_derives = collect_existing_derives(&input.attrs);
-    let enum_ident = input.ident;
-    let rules_fn_ident = format_ident!("__plingo_rules_for_{}", enum_ident);
-    let generics = input.generics;
+fn expand_tokens_attr(mut item: ItemEnum) -> syn::Result<TokenStream> {
+    ensure_tokens_derives(&mut item)?;
+    let enum_ident = item.ident.clone();
+    let wrapper_variants = collect_wrapper_variants(&item)?;
+    let original_variants = item.variants.clone();
+    strip_token_attrs(&mut item);
+    item.variants.extend(wrapper_variants.clone());
 
-    let data_enum = match input.data {
-        Data::Enum(data_enum) => data_enum,
-        _ => {
-            return Err(syn::Error::new(
-                enum_ident.span(),
-                "#[derive(Tokens)] can only be used on enums",
-            ));
-        }
-    };
-
-    let builders = build_token_builders(&enum_ident, &data_enum)?;
-    let specs = build_token_specs(&enum_ident, &data_enum)?;
-    let comparison_impls = build_comparison_impls(
-        &enum_ident,
-        &generics,
-        &data_enum,
-        &existing_derives,
-    );
+    let state_specs_fn = format_ident!("__plingo_token_specs_for_{}", enum_ident);
+    let root_regs_fn = format_ident!("__plingo_state_regs_for_{}", enum_ident);
+    let builders = build_root_token_builders(&enum_ident, &original_variants)?;
+    let specs = build_root_token_specs(&enum_ident, &original_variants)?;
+    let lifted_regs = build_lifted_registrations(&enum_ident, &original_variants)?;
 
     Ok(quote! {
-        #comparison_impls
+        #item
 
         impl ::plingo::component::lex::TokenState for #enum_ident {
             fn display_name() -> &'static str {
@@ -254,139 +243,137 @@ fn expand_tokens_derive(input: DeriveInput) -> syn::Result<TokenStream> {
             }
         }
 
-        #[allow(non_snake_case)]
-        fn #rules_fn_ident() -> ::std::vec::Vec<::plingo::component::lex::__macro_private::TokenSpec> {
-            #(#builders)*
+        impl ::plingo::component::lex::StateTokens for #enum_ident {
+            fn token_specs() -> ::std::vec::Vec<::plingo::component::lex::__macro_private::TokenSpec<Self>> {
+                #state_specs_fn()
+            }
+        }
 
+        impl ::plingo::component::lex::LexerRoot for #enum_ident {
+            fn state_registrations() -> ::std::vec::Vec<::plingo::component::lex::__macro_private::StateRegistration<Self>> {
+                #root_regs_fn()
+            }
+        }
+
+        #(#builders)*
+
+        #[allow(non_snake_case)]
+        fn #state_specs_fn() -> ::std::vec::Vec<::plingo::component::lex::__macro_private::TokenSpec<#enum_ident>> {
             ::std::vec![#(#specs),*]
         }
 
-        ::plingo::inventory::submit! {
-            ::plingo::component::lex::__macro_private::StateRegistration::new(
-                stringify!(#enum_ident),
-                concat!(module_path!(), "::", stringify!(#enum_ident)),
-                #rules_fn_ident,
-            )
+        #[allow(non_snake_case)]
+        fn #root_regs_fn() -> ::std::vec::Vec<::plingo::component::lex::__macro_private::StateRegistration<#enum_ident>> {
+            let mut registrations = ::std::vec![<#enum_ident as ::plingo::component::lex::StateTokens>::state_registration()];
+            #(#lifted_regs)*
+            registrations
         }
     }
     .into())
 }
 
-fn collect_existing_derives(attrs: &[syn::Attribute]) -> std::collections::HashSet<String> {
-    let mut derives = std::collections::HashSet::new();
-    for attr in attrs {
+fn ensure_tokens_derives(item: &mut ItemEnum) -> syn::Result<()> {
+    let mut derive_index = None;
+    let mut seen = std::collections::HashSet::new();
+
+    for (index, attr) in item.attrs.iter().enumerate() {
         let Meta::List(meta) = &attr.meta else {
             continue;
         };
         if !meta.path.is_ident("derive") {
             continue;
         }
-        let _ = attr.parse_nested_meta(|nested| {
+        derive_index = Some(index);
+        attr.parse_nested_meta(|nested| {
             if let Some(ident) = nested.path.get_ident() {
-                derives.insert(ident.to_string());
+                seen.insert(ident.to_string());
             }
             Ok(())
-        });
+        })?;
     }
-    derives
+
+    if let Some(index) = derive_index {
+        let mut derives = Vec::<Ident>::new();
+        if let Meta::List(_) = &item.attrs[index].meta {
+            item.attrs[index].parse_nested_meta(|nested| {
+                if let Some(ident) = nested.path.get_ident() {
+                    derives.push(ident.clone());
+                }
+                Ok(())
+            })?;
+        }
+
+        for required in ["PartialEq", "Eq", "Hash"] {
+            if !derives.iter().any(|ident| ident == required) {
+                derives.push(format_ident!("{}", required));
+            }
+        }
+
+        item.attrs[index] = parse_quote!(#[derive(#(#derives),*)]);
+    } else {
+        item.attrs
+            .push(parse_quote!(#[derive(PartialEq, Eq, Hash)]));
+    }
+
+    Ok(())
 }
 
-fn build_comparison_impls(
-    enum_ident: &syn::Ident,
-    generics: &syn::Generics,
-    data_enum: &DataEnum,
-    existing_derives: &std::collections::HashSet<String>,
-) -> proc_macro2::TokenStream {
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-
-    let need_eq = !existing_derives.contains("Eq");
-    let need_hash = !existing_derives.contains("Hash");
-
-    let eq_impl = if need_eq {
-        quote! {
-            impl #impl_generics ::std::cmp::Eq for #enum_ident #ty_generics #where_clause {}
-        }
-    } else {
-        quote! {}
-    };
-
-    let hash_impl = if need_hash {
-        let hash_arms = data_enum.variants.iter().enumerate().map(|(index, variant)| {
-            let variant_ident = &variant.ident;
-            match &variant.fields {
-                Fields::Unit => quote! {
-                    Self::#variant_ident => {
-                        #index.hash(state);
-                    }
-                },
-                Fields::Unnamed(fields) if fields.unnamed.len() == 1 => quote! {
-                    Self::#variant_ident(value) => {
-                        #index.hash(state);
-                        value.hash(state);
-                    }
-                },
-                Fields::Named(fields) if fields.named.len() == 1 => {
-                    let field_ident = fields.named.first().unwrap().ident.as_ref().unwrap();
-                    quote! {
-                        Self::#variant_ident { #field_ident: value } => {
-                            #index.hash(state);
-                            value.hash(state);
-                        }
-                    }
-                }
-                _ => quote! {},
-            }
+fn strip_token_attrs(item: &mut ItemEnum) {
+    for variant in &mut item.variants {
+        variant.attrs.retain(|attr| {
+            let path = attr.path();
+            !(path.is_ident("regex")
+                || path.is_ident("enter")
+                || path.is_ident("leave")
+                || path.is_ident("skip")
+                || path.is_ident("validate"))
         });
 
-        quote! {
-            impl #impl_generics ::std::hash::Hash for #enum_ident #ty_generics #where_clause {
-                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
-                    match self {
-                        #(#hash_arms),*
-                    }
-                }
-            }
+        for field in &mut variant.fields {
+            field.attrs.retain(|attr| !attr.path().is_ident("parse"));
         }
-    } else {
-        quote! {}
-    };
-
-    quote! {
-        #eq_impl
-        #hash_impl
     }
 }
 
-fn build_token_builders(
-    enum_ident: &syn::Ident,
-    data_enum: &DataEnum,
+fn collect_wrapper_variants(item: &ItemEnum) -> syn::Result<Vec<Variant>> {
+    let mut wrappers = Vec::new();
+    for variant in &item.variants {
+        let config = parse_variant_config(variant)?;
+        let Some(target) = config.enter else {
+            continue;
+        };
+        let wrapper_ident = target_last_ident(&target)?;
+        wrappers.push(parse_quote! {
+            #wrapper_ident(#target)
+        });
+    }
+    Ok(wrappers)
+}
+
+fn build_root_token_builders(
+    root_ident: &Ident,
+    variants: &syn::punctuated::Punctuated<Variant, syn::token::Comma>,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
-    data_enum
-        .variants
+    variants
         .iter()
         .enumerate()
-        .map(|(index, variant)| build_token_builder(enum_ident, variant, index))
+        .map(|(index, variant)| build_root_token_builder(root_ident, variant, index))
         .collect()
 }
 
-fn build_token_builder(
-    enum_ident: &syn::Ident,
-    variant: &syn::Variant,
+fn build_root_token_builder(
+    root_ident: &Ident,
+    variant: &Variant,
     index: usize,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let builder_ident = format_ident!("__plingo_build_{}_{}", enum_ident, index);
+    let builder_ident = format_ident!("__plingo_build_{}_{}", root_ident, index);
     let variant_ident = &variant.ident;
-    let token_name = format!("{}::{}", enum_ident, variant_ident);
+    let token_name = format!("{}::{}", root_ident, variant_ident);
 
     let body = match &variant.fields {
         Fields::Unit => {
             ensure_no_field_parse_attrs(variant)?;
-            quote! {
-                ::std::result::Result::Ok(::plingo::component::lex::Token::new(
-                    stringify!(#variant_ident),
-                    #enum_ident::#variant_ident,
-                ))
-            }
+            quote! { ::std::result::Result::Ok(#root_ident::#variant_ident) }
         }
         Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
             let field = fields.unnamed.first().unwrap();
@@ -394,10 +381,7 @@ fn build_token_builder(
             let parse_expr = field_parse_expr(field, &token_name)?;
             quote! {
                 let value: #field_ty = #parse_expr;
-                ::std::result::Result::Ok(::plingo::component::lex::Token::new(
-                    stringify!(#variant_ident),
-                    #enum_ident::#variant_ident(value),
-                ))
+                ::std::result::Result::Ok(#root_ident::#variant_ident(value))
             }
         }
         Fields::Named(fields) if fields.named.len() == 1 => {
@@ -407,10 +391,7 @@ fn build_token_builder(
             let parse_expr = field_parse_expr(field, &token_name)?;
             quote! {
                 let value: #field_ty = #parse_expr;
-                ::std::result::Result::Ok(::plingo::component::lex::Token::new(
-                    stringify!(#variant_ident),
-                    #enum_ident::#variant_ident { #field_ident: value },
-                ))
+                ::std::result::Result::Ok(#root_ident::#variant_ident { #field_ident: value })
             }
         }
         Fields::Unnamed(fields) => {
@@ -431,35 +412,40 @@ fn build_token_builder(
         #[allow(non_snake_case)]
         fn #builder_ident(
             lexeme: &str,
-        ) -> ::std::result::Result<::plingo::component::lex::Token, ::plingo::component::lex::LexError> {
+        ) -> ::std::result::Result<#root_ident, ::plingo::component::lex::LexInterrupt> {
             #body
         }
     })
 }
 
-fn build_token_specs(
-    enum_ident: &syn::Ident,
-    data_enum: &DataEnum,
+fn build_root_token_specs(
+    root_ident: &Ident,
+    variants: &syn::punctuated::Punctuated<Variant, syn::token::Comma>,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
-    data_enum
-        .variants
+    variants
         .iter()
         .enumerate()
-        .map(|(index, variant)| build_token_spec(enum_ident, variant, index))
+        .map(|(index, variant)| build_root_token_spec(root_ident, variant, index))
         .collect()
 }
 
-fn build_token_spec(
-    enum_ident: &syn::Ident,
-    variant: &syn::Variant,
+fn build_root_token_spec(
+    root_ident: &Ident,
+    variant: &Variant,
     index: usize,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let builder_ident = format_ident!("__plingo_build_{}_{}", enum_ident, index);
+    let builder_ident = format_ident!("__plingo_build_{}_{}", root_ident, index);
     let config = parse_variant_config(variant)?;
     let variant_ident = &variant.ident;
-    let display = format!("{}::{}", enum_ident, variant_ident);
+    let display = format!("{}::{}", root_ident, variant_ident);
     let regex = config.regex;
     let skip = config.skip;
+    let has_payload = config.enter.is_some() && !variant.fields.is_empty();
+
+    let validate = match config.validate {
+        Some(v) => quote! { ::std::option::Option::Some(#v as fn(&str, ::std::option::Option<&str>) -> bool) },
+        None => quote! { ::std::option::Option::None },
+    };
 
     let action = if let Some(target) = config.enter {
         quote! { ::plingo::component::lex::__macro_private::StateDirective::Enter(<#target as ::plingo::component::lex::TokenState>::state_key()) }
@@ -476,9 +462,44 @@ fn build_token_spec(
             label: #display,
             action: #action,
             skip: #skip,
-            build: #builder_ident,
+            build: ::std::sync::Arc::new(#builder_ident),
+            has_payload: #has_payload,
+            validate: #validate,
         }
     })
+}
+
+fn build_lifted_registrations(
+    root_ident: &Ident,
+    variants: &syn::punctuated::Punctuated<Variant, syn::token::Comma>,
+) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    let mut lifted = Vec::new();
+    for variant in variants {
+        let config = parse_variant_config(variant)?;
+        let Some(target) = config.enter else {
+            continue;
+        };
+        let wrapper_ident = target_last_ident(&target)?;
+        lifted.push(quote! {
+            registrations.extend(::plingo::component::lex::lift_state_registrations::<#root_ident, #target>(#root_ident::#wrapper_ident));
+        });
+    }
+    Ok(lifted)
+}
+
+fn target_last_ident(target: &Type) -> syn::Result<Ident> {
+    let Type::Path(type_path) = target else {
+        return Err(syn::Error::new(
+            target.span(),
+            "enter target must be a concrete type path",
+        ));
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .map(|segment| segment.ident.clone())
+        .ok_or_else(|| syn::Error::new(target.span(), "enter target path cannot be empty"))
 }
 
 struct VariantConfig {
@@ -486,6 +507,7 @@ struct VariantConfig {
     enter: Option<Type>,
     leave: bool,
     skip: bool,
+    validate: Option<syn::Expr>,
 }
 
 fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig> {
@@ -493,20 +515,36 @@ fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig> {
     let mut enter = None;
     let mut leave = false;
     let mut skip = false;
+    let mut validate = None;
 
     for attr in &variant.attrs {
         match &attr.meta {
             Meta::List(meta) if meta.path.is_ident("regex") => {
                 if regex.is_some() {
-                    return Err(syn::Error::new(attr.span(), "duplicate #[regex(...)] attribute"));
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "duplicate #[regex(...)] attribute",
+                    ));
                 }
                 regex = Some(attr.parse_args::<syn::LitStr>()?);
             }
             Meta::List(meta) if meta.path.is_ident("enter") => {
                 if enter.is_some() {
-                    return Err(syn::Error::new(attr.span(), "duplicate #[enter(...)] attribute"));
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "duplicate #[enter(...)] attribute",
+                    ));
                 }
                 enter = Some(attr.parse_args::<Type>()?);
+            }
+            Meta::List(meta) if meta.path.is_ident("validate") => {
+                if validate.is_some() {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "duplicate #[validate(...)] attribute",
+                    ));
+                }
+                validate = Some(attr.parse_args::<syn::Expr>()?);
             }
             Meta::Path(path) if path.is_ident("leave") => {
                 if leave {
@@ -543,6 +581,7 @@ fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig> {
         enter,
         leave,
         skip,
+        validate,
     })
 }
 
@@ -567,13 +606,16 @@ fn field_parse_expr(field: &Field, token_name: &str) -> syn::Result<proc_macro2:
             continue;
         }
         if parse_expr.is_some() {
-            return Err(syn::Error::new(attr.span(), "duplicate #[parse(...)] attribute"));
+            return Err(syn::Error::new(
+                attr.span(),
+                "duplicate #[parse(...)] attribute",
+            ));
         }
 
         let expr = attr.parse_args::<Expr>()?;
         parse_expr = Some(quote! {
             ::plingo::component::lex::__macro_private::IntoLexemeResult::into_lexeme_result((#expr)(lexeme))
-                .map_err(|source| ::plingo::component::lex::LexError::token_parse_failed(#token_name, lexeme, source))?
+                .map_err(|source| ::plingo::component::lex::LexInterrupt::token_parse_failed(#token_name, lexeme, source))?
         });
     }
 
@@ -581,7 +623,7 @@ fn field_parse_expr(field: &Field, token_name: &str) -> syn::Result<proc_macro2:
         Some(expr) => expr,
         None => quote! {
             <#field_ty as ::plingo::component::lex::FromLexeme>::from_lexeme(lexeme)
-                .map_err(|source| ::plingo::component::lex::LexError::token_parse_failed(#token_name, lexeme, source))?
+                .map_err(|source| ::plingo::component::lex::LexInterrupt::token_parse_failed(#token_name, lexeme, source))?
         },
     })
 }

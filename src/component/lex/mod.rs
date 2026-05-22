@@ -5,14 +5,14 @@ mod mode;
 pub mod __macro_private;
 
 use std::{
-    any::Any,
     collections::HashMap,
     error::Error,
-    fmt,
-    hash::{Hash, Hasher},
+    fmt::{self},
+    hash::Hash,
     str::FromStr,
 };
 
+use color_print::cwrite;
 use indexmap::IndexSet;
 use regex_automata::{
     MatchKind,
@@ -21,7 +21,9 @@ use regex_automata::{
 use regex_syntax::hir::{Hir, HirKind, Look};
 use thiserror::Error;
 
-pub use mode::{LexerState, StateAction, StateId, StateInfo};
+pub use mode::{LexerState, State, StateAction, StateInfo};
+
+use crate::utils::PrettyDisplay;
 
 use self::__macro_private::{BuildToken, StateDirective, StateRegistration, TokenSpec};
 
@@ -30,93 +32,51 @@ pub trait TokenState: Send + Sync + 'static {
     fn state_key() -> &'static str;
 }
 
+pub trait StateTokens: TokenState + Sized {
+    fn token_specs() -> Vec<TokenSpec<Self>>;
+
+    fn state_registration() -> StateRegistration<Self> {
+        StateRegistration::new(Self::display_name(), Self::state_key(), Self::token_specs)
+    }
+}
+
+pub trait LexerRoot: TokenState + Hash + Eq + PartialEq + Sized + Send + Sync + 'static {
+    fn state_registrations() -> Vec<StateRegistration<Self>>;
+}
+
 pub trait FromLexeme: Sized {
     type Error: Error + Send + Sync + 'static;
 
     fn from_lexeme(lexeme: &str) -> Result<Self, Self::Error>;
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub enum Entry {
-    Token(usize, Token),
-    Error(usize, LexError),
-}
-
-pub struct Token {
-    type_name: &'static str,
-    variant_name: &'static str,
-    value: Box<dyn __macro_private::TokenValue>,
-}
-
-impl PartialEq for Token {
-    fn eq(&self, other: &Self) -> bool {
-        self.type_name == other.type_name
-            && self.variant_name == other.variant_name
-            && self.value.eq_token_value(other.value.as_ref())
-    }
-}
-
-impl Eq for Token {}
-
-impl Hash for Token {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.type_name.hash(state);
-        self.variant_name.hash(state);
-        self.value.hash_token_value(state);
-    }
-}
-
-impl Token {
-    #[doc(hidden)]
-    pub fn new<T>(variant_name: &'static str, value: T) -> Self
-    where
-        T: Send + Sync + Eq + Hash + 'static,
-    {
-        Self {
-            type_name: std::any::type_name::<T>(),
-            variant_name,
-            value: Box::new(value),
-        }
-    }
-
-    pub fn type_name(&self) -> &'static str {
-        self.type_name
-    }
-
-    pub fn variant_name(&self) -> &'static str {
-        self.variant_name
-    }
-
-    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        self.value.as_any().downcast_ref::<T>()
-    }
-
-    pub fn into_any(self) -> Box<dyn Any + Send + Sync> {
-        self.value.into_any()
-    }
-}
-
-impl fmt::Debug for Token {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Token")
-            .field("type_name", &self.type_name)
-            .field("variant_name", &self.variant_name)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ResolvedToken {
+#[derive(Clone)]
+pub struct ResolvedToken<Root> {
     pub precedence: usize,
     pub label: &'static str,
     pub action: StateAction,
     pub skip: bool,
-    pub(crate) build: BuildToken,
+    pub(crate) build: BuildToken<Root>,
     pub(crate) minimum_length: usize,
     pub(crate) maximum_length: usize,
+    pub(crate) has_payload: bool,
+    pub(crate) validate: Option<fn(&str, Option<&str>) -> bool>,
 }
 
-impl ResolvedToken {
+impl<Root> fmt::Debug for ResolvedToken<Root> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedToken")
+            .field("precedence", &self.precedence)
+            .field("label", &self.label)
+            .field("action", &self.action)
+            .field("skip", &self.skip)
+            .field("minimum_length", &self.minimum_length)
+            .field("maximum_length", &self.maximum_length)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Root> ResolvedToken<Root> {
     pub fn minimum_length(&self) -> usize {
         self.minimum_length
     }
@@ -125,7 +85,7 @@ impl ResolvedToken {
         self.maximum_length
     }
 
-    pub fn build(&self, lexeme: &str) -> Result<Token, LexError> {
+    pub fn build(&self, lexeme: &str) -> Result<Root, LexInterrupt> {
         (self.build)(lexeme)
     }
 }
@@ -137,22 +97,11 @@ pub struct BestMatch {
     pub end: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Interrupt {
-    ParseError,
-    NoCandidate,
-    MissingState,
-    UnsupportedSearch,
-    DeadState,
-    QuitState,
-    EndOfInput,
-}
-
 #[derive(Debug, Clone)]
 pub struct MatchReport {
     pub best: Option<BestMatch>,
     pub stop_offset: usize,
-    pub stop_reason: Interrupt,
+    pub stop_reason: LexInterrupt,
 }
 
 impl MatchReport {
@@ -165,29 +114,110 @@ impl MatchReport {
     }
 }
 
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum LexInterrupt {
+    #[error("Failed to parse token {token} from lexeme {lexeme:?}: {err}")]
+    TokenParseError {
+        token: &'static str,
+        lexeme: String,
+        err: String,
+    },
+    #[error("Parse error: {0}")]
+    ParseError(String, String),
+    #[error("Internal error: {0}")]
+    InternalError(String),
+    #[error("No candidate")]
+    NoCandidate,
+    #[error("Missing state")]
+    MissingState,
+    #[error("Unsupported search")]
+    UnsupportedSearch,
+    #[error("Dead state")]
+    DeadState,
+    #[error("Quit state")]
+    QuitState,
+    #[error("End of input")]
+    EndOfInput,
+}
+
+impl LexInterrupt {
+    pub fn token_parse_failed<E>(token: &'static str, lexeme: &str, source: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self::TokenParseError {
+            token,
+            lexeme: lexeme.to_string(),
+            err: source.to_string(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StateMatcher {
     pub(crate) dfa: DFA<Vec<u32>>,
     pub(crate) token_index_by_pattern: Vec<usize>,
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum Entry<Root>
+where
+    Root: LexerRoot,
+{
+    Token(usize, Root),
+    Error(usize, ErrorToken),
+}
+
+impl<Root: LexerRoot + fmt::Display> PrettyDisplay<Lexer<Root>> for usize {
+    fn pretty_fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+        context: &Lexer<Root>,
+    ) -> core::fmt::Result {
+        let entry = context.get(*self).ok_or_else(|| fmt::Error)?;
+        match entry {
+            Entry::Token(length, token) => {
+                cwrite!(
+                    f,
+                    "<dim>[{}]\t</dim><green>Token</green>: {}",
+                    length,
+                    token
+                )
+            }
+            Entry::Error(length, error) => {
+                cwrite!(
+                    f,
+                    "<dim>[{}]\t</dim><red>Error</red>: {}",
+                    length,
+                    error.pretty(context)
+                )
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
-pub struct Lexer {
-    root: StateId,
-    state_info: Vec<StateInfo>,
-    tokens: Vec<Vec<ResolvedToken>>,
-    arena: IndexSet<Entry>,
+pub struct Lexer<Root>
+where
+    Root: LexerRoot,
+{
+    root: State,
+
+    tokens: Vec<Vec<ResolvedToken<Root>>>,
+    arena: IndexSet<Entry<Root>>,
+
     state_matchers: Vec<StateMatcher>,
+    state_info: Vec<StateInfo>,
     states: Vec<LexerState>,
 }
 
-impl Lexer {
-    pub fn new<Root: TokenState>() -> Result<Self, LexerCreationError> {
-        let registrations = collect_state_registrations();
+impl<Root: LexerRoot> Lexer<Root> {
+    pub fn new() -> Result<Self, LexerCreationError> {
+        let registrations = Root::state_registrations();
         let state_ids = registrations
             .iter()
             .enumerate()
-            .map(|(index, registration)| (registration.type_name, StateId(index)))
+            .map(|(index, registration)| (registration.type_name, State::Id(index)))
             .collect::<HashMap<_, _>>();
 
         let root_type = Root::state_key();
@@ -220,21 +250,13 @@ impl Lexer {
             root,
             state_info: states,
             tokens,
-            state_matchers,
             arena: IndexSet::new(),
+            state_matchers,
             states: vec![LexerState::new(root)],
         })
     }
 
-    pub(crate) fn alloc(&mut self, entry: Entry) -> usize {
-        self.arena.insert_full(entry).0
-    }
-
-    pub(crate) fn get(&self, index: usize) -> Option<&Entry> {
-        self.arena.get_index(index)
-    }
-
-    pub fn root(&self) -> StateId {
+    pub fn root(&self) -> State {
         self.root
     }
 
@@ -242,29 +264,73 @@ impl Lexer {
         &self.state_info
     }
 
-    pub fn tokens(&self) -> &[Vec<ResolvedToken>] {
+    pub fn tokens(&self) -> &[Vec<ResolvedToken<Root>>] {
         &self.tokens
     }
 
-    pub fn tokens_in_state(&self, state: StateId) -> Option<&[ResolvedToken]> {
-        self.tokens.get(state.0).map(Vec::as_slice)
+    pub fn tokens_in_state(&self, state: State) -> Option<&[ResolvedToken<Root>]> {
+        self.tokens.get(state.id()).map(Vec::as_slice)
     }
 
-    pub(crate) fn state_matcher(&self, state: StateId) -> Option<&StateMatcher> {
-        self.state_matchers.get(state.0)
+    pub(crate) fn state_matcher(&self, state: State) -> Option<&StateMatcher> {
+        self.state_matchers.get(state.id())
     }
 
-    pub fn state_id_of<S: TokenState>(&self) -> Option<StateId> {
+    pub fn alloc(&mut self, entry: Entry<Root>) -> usize {
+        let index = self.arena.insert_full(entry).0;
+        index
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Entry<Root>> {
+        self.arena.get_index(index)
+    }
+
+    pub fn state_id_of<S: TokenState>(&self) -> Option<State> {
         let type_name = S::state_key();
         self.state_info
             .iter()
             .position(|state| state.type_name == type_name)
-            .map(StateId)
+            .map(|p| State::Id(p))
     }
 
     pub fn states(&self) -> &[LexerState] {
         &self.states
     }
+}
+
+pub fn lift_state_registrations<Root, Nested>(
+    wrap: fn(Nested) -> Root,
+) -> Vec<StateRegistration<Root>>
+where
+    Root: Send + Sync + 'static,
+    Nested: LexerRoot + 'static,
+{
+    Nested::state_registrations()
+        .into_iter()
+        .map(|registration| {
+            StateRegistration::new(
+                registration.display_name,
+                registration.type_name,
+                move || {
+                    (registration.rules)()
+                        .into_iter()
+                        .map(|spec| TokenSpec {
+                            regex: spec.regex,
+                            precedence: spec.precedence,
+                            label: spec.label,
+                            action: spec.action,
+                            skip: spec.skip,
+                            build: std::sync::Arc::new(move |lexeme| {
+                                (spec.build)(lexeme).map(wrap)
+                            }),
+                            has_payload: spec.has_payload,
+                            validate: spec.validate,
+                        })
+                        .collect()
+                },
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Error)]
@@ -285,33 +351,75 @@ pub enum LexerCreationError {
     UnknownState(String),
 }
 
-#[derive(Debug, Error, PartialEq, Eq, Hash)]
-pub enum LexError {
-    #[error("Unexpected end of input while in state {state}")]
-    UnexpectedEndOfInput { state: &'static str },
-    #[error("Unexpected token at offset {offset}")]
-    UnexpectedToken { offset: usize },
-    #[error("Missing token {token} at offset {offset}")]
-    MissingToken { token: &'static str, offset: usize },
-    #[error("Cannot leave root lexer state at offset {offset}")]
-    CannotLeaveRootState { offset: usize },
-    #[error("Failed to parse token {token} from lexeme {lexeme:?}: {err}")]
-    TokenParseError {
-        token: &'static str,
-        lexeme: String,
-        err: String,
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum ErrorToken {
+    UnexpectedEndOfInput {
+        state: usize,
+    },
+    UnexpectedToken {
+        start: usize,
+        end: usize,
+        expected_state: usize,
+    },
+    MissingToken {
+        state: usize,
+        token: usize,
+        offset: usize,
     },
 }
 
-impl LexError {
-    pub fn token_parse_failed<E>(token: &'static str, lexeme: &str, source: E) -> Self
-    where
-        E: Error + Send + Sync + 'static,
-    {
-        Self::TokenParseError {
-            token,
-            lexeme: lexeme.to_string(),
-            err: source.to_string(),
+impl<Root: LexerRoot> PrettyDisplay<Lexer<Root>> for ErrorToken {
+    fn pretty_fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+        context: &Lexer<Root>,
+    ) -> core::fmt::Result {
+        match self {
+            Self::UnexpectedEndOfInput { state } => {
+                let tokens = context
+                    .tokens_in_state(State::Id(*state))
+                    .ok_or_else(|| fmt::Error)?;
+                cwrite!(
+                    f,
+                    "Unexpected end of input, expected one of the following tokens: {}",
+                    tokens
+                        .iter()
+                        .map(|token| token.label)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+            Self::UnexpectedToken {
+                start,
+                end,
+                expected_state,
+            } => {
+                let tokens = context
+                    .tokens_in_state(State::Id(*expected_state))
+                    .ok_or_else(|| fmt::Error)?;
+                cwrite!(
+                    f,
+                    "Unexpected token from offset {} to {}, expected one of the following tokens: {}",
+                    start,
+                    end,
+                    tokens
+                        .iter()
+                        .map(|token| token.label)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+            Self::MissingToken {
+                state,
+                token,
+                offset,
+            } => {
+                let token = context
+                    .tokens_in_state(State::Id(*state))
+                    .and_then(|tokens| tokens.get(*token))
+                    .ok_or_else(|| fmt::Error)?;
+                cwrite!(f, "Missing token {} at offset {}", token.label, offset)
+            }
         }
     }
 }
@@ -375,18 +483,10 @@ impl_from_lexeme_via_parse!(
     bool, i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64,
 );
 
-fn collect_state_registrations() -> Vec<&'static StateRegistration> {
-    let mut registrations = ::inventory::iter::<StateRegistration>
-        .into_iter()
-        .collect::<Vec<_>>();
-    registrations.sort_by(|left, right| left.type_name.cmp(right.type_name));
-    registrations
-}
-
-fn resolve_token(
-    spec: TokenSpec,
-    state_ids: &HashMap<&'static str, StateId>,
-) -> Result<ResolvedToken, LexerCreationError> {
+fn resolve_token<Root>(
+    spec: TokenSpec<Root>,
+    state_ids: &HashMap<&'static str, State>,
+) -> Result<ResolvedToken<Root>, LexerCreationError> {
     let hir = regex_syntax::parse(spec.regex).map_err(|error| {
         LexerCreationError::RegexParsingError(spec.regex.to_string(), spec.label.to_string(), error)
     })?;
@@ -412,6 +512,8 @@ fn resolve_token(
         build: spec.build,
         minimum_length,
         maximum_length,
+        has_payload: spec.has_payload,
+        validate: spec.validate,
     })
 }
 
@@ -436,7 +538,7 @@ fn build_state_matcher(
 
 fn resolve_action(
     action: StateDirective,
-    state_ids: &HashMap<&'static str, StateId>,
+    state_ids: &HashMap<&'static str, State>,
 ) -> Result<StateAction, LexerCreationError> {
     match action {
         StateDirective::None => Ok(StateAction::None),

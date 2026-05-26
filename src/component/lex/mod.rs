@@ -3,17 +3,13 @@ mod mode;
 
 #[doc(hidden)]
 pub mod __macro_private;
+pub mod policy;
 
-use std::{
-    collections::HashMap,
-    error::Error,
-    fmt::{self},
-    hash::Hash,
-    str::FromStr,
-};
+use std::{collections::HashMap, error::Error, fmt, hash::Hash, marker::PhantomData, str::FromStr};
 
-use color_print::cwrite;
+use fluent_uri::Uri;
 use indexmap::IndexSet;
+use plingo_macros::layer;
 use regex_automata::{
     MatchKind,
     dfa::{StartKind, dense::DFA},
@@ -23,7 +19,12 @@ use thiserror::Error;
 
 pub use mode::{LexerState, State, StateAction, StateInfo};
 
-use crate::utils::PrettyDisplay;
+use crate::{
+    scheme::{
+        ActionError, Context, LayerDeltas, MiddleLayer, NonTopLayer, SnapshotId, SnapshotLayer,
+    },
+    utils::{PrettyDisplay, Span},
+};
 
 use self::__macro_private::{BuildToken, StateDirective, StateRegistration, TokenSpec};
 
@@ -59,7 +60,7 @@ pub struct ResolvedToken<Root> {
     pub(crate) build: BuildToken<Root>,
     pub(crate) minimum_length: usize,
     pub(crate) maximum_length: usize,
-    pub(crate) has_payload: bool,
+    pub(crate) captures_context: bool,
     pub(crate) validate: Option<fn(&str, Option<&str>) -> bool>,
 }
 
@@ -114,7 +115,7 @@ impl MatchReport {
     }
 }
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, Clone)]
 pub enum LexInterrupt {
     #[error("Failed to parse token {token} from lexeme {lexeme:?}: {err}")]
     TokenParseError {
@@ -138,6 +139,9 @@ pub enum LexInterrupt {
     QuitState,
     #[error("End of input")]
     EndOfInput,
+
+    #[error("Action error: {0}")]
+    ActionError(ActionError),
 }
 
 impl LexInterrupt {
@@ -159,7 +163,7 @@ pub(crate) struct StateMatcher {
     pub(crate) token_index_by_pattern: Vec<usize>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Entry<Root>
 where
     Root: LexerRoot,
@@ -168,14 +172,61 @@ where
     Error(usize, ErrorToken),
 }
 
-impl<Root: LexerRoot + fmt::Display> PrettyDisplay<Lexer<Root>> for usize {
+impl<Root> Entry<Root>
+where
+    Root: LexerRoot,
+{
+    pub fn is_token(&self) -> bool {
+        matches!(self, Self::Token(_, _))
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self, Self::Error(_, _))
+    }
+
+    pub fn length(&self) -> usize {
+        match self {
+            Self::Token(length, _) | Self::Error(length, _) => *length,
+        }
+    }
+}
+
+impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> for Entry<Root> {
     fn pretty_fmt(
         &self,
         f: &mut core::fmt::Formatter<'_>,
-        context: &Lexer<Root>,
+        context: &Lexer<Root, Lower>,
     ) -> core::fmt::Result {
-        let entry = context.get(*self).ok_or_else(|| fmt::Error)?;
-        match entry {
+        use color_print::cwrite;
+        match self {
+            Entry::Token(length, token) => {
+                cwrite!(
+                    f,
+                    "<dim>[{}]\t</dim><green>Token</green>: {}",
+                    length,
+                    token
+                )
+            }
+            Entry::Error(length, error) => {
+                cwrite!(
+                    f,
+                    "<dim>[{}]\t</dim><red>Error</red>: {}",
+                    length,
+                    error.pretty(context)
+                )
+            }
+        }
+    }
+}
+
+impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> for usize {
+    fn pretty_fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+        context: &Lexer<Root, Lower>,
+    ) -> core::fmt::Result {
+        use color_print::cwrite;
+        match context.get(*self) {
             Entry::Token(length, token) => {
                 cwrite!(
                     f,
@@ -197,34 +248,65 @@ impl<Root: LexerRoot + fmt::Display> PrettyDisplay<Lexer<Root>> for usize {
 }
 
 #[derive(Debug)]
-pub struct Lexer<Root>
+pub struct LexerSnapshotState<Root>
 where
     Root: LexerRoot,
 {
-    root: State,
-
-    tokens: Vec<Vec<ResolvedToken<Root>>>,
-    arena: IndexSet<Entry<Root>>,
-
-    state_matchers: Vec<StateMatcher>,
-    state_info: Vec<StateInfo>,
-    states: Vec<LexerState>,
+    state_instances: HashMap<Uri<&'static str>, Vec<LexerState>>,
+    token_instances: HashMap<Uri<&'static str>, Vec<usize>>,
+    _root: PhantomData<Root>,
 }
 
-impl<Root: LexerRoot> Lexer<Root> {
+impl<Root> Clone for LexerSnapshotState<Root>
+where
+    Root: LexerRoot,
+{
+    fn clone(&self) -> Self {
+        Self {
+            state_instances: self.state_instances.clone(),
+            token_instances: self.token_instances.clone(),
+            _root: PhantomData,
+        }
+    }
+}
+
+impl<Root> Default for LexerSnapshotState<Root>
+where
+    Root: LexerRoot,
+{
+    fn default() -> Self {
+        Self {
+            state_instances: HashMap::new(),
+            token_instances: HashMap::new(),
+            _root: PhantomData,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[layer]
+pub struct Lexer<Root, Lower = ()>
+where
+    Root: LexerRoot,
+{
+    tokens: Vec<Vec<ResolvedToken<Root>>>,
+    state_matchers: Vec<StateMatcher>,
+    state_info: Vec<StateInfo>,
+
+    #[snapshot]
+    latest: LexerSnapshotState<Root>,
+    arena: IndexSet<Entry<Root>>,
+    _lower: PhantomData<fn() -> Lower>,
+}
+
+impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
     pub fn new() -> Result<Self, LexerCreationError> {
         let registrations = Root::state_registrations();
         let state_ids = registrations
             .iter()
             .enumerate()
-            .map(|(index, registration)| (registration.type_name, State::Id(index)))
+            .map(|(index, registration)| (registration.type_name, State::new(index)))
             .collect::<HashMap<_, _>>();
-
-        let root_type = Root::state_key();
-        let Some(&root) = state_ids.get(root_type) else {
-            return Err(LexerCreationError::UnknownState(root_type.to_string()));
-        };
-
         let states = registrations
             .iter()
             .map(|registration| StateInfo {
@@ -247,17 +329,14 @@ impl<Root: LexerRoot> Lexer<Root> {
         }
 
         Ok(Self {
-            root,
             state_info: states,
             tokens,
             arena: IndexSet::new(),
             state_matchers,
-            states: vec![LexerState::new(root)],
+            latest: LexerSnapshotState::default(),
+            _lower: PhantomData,
+            _snapshot: HashMap::new(),
         })
-    }
-
-    pub fn root(&self) -> State {
-        self.root
     }
 
     pub fn state_info(&self) -> &[StateInfo] {
@@ -269,11 +348,11 @@ impl<Root: LexerRoot> Lexer<Root> {
     }
 
     pub fn tokens_in_state(&self, state: State) -> Option<&[ResolvedToken<Root>]> {
-        self.tokens.get(state.id()).map(Vec::as_slice)
+        self.tokens.get(state.id).map(Vec::as_slice)
     }
 
     pub(crate) fn state_matcher(&self, state: State) -> Option<&StateMatcher> {
-        self.state_matchers.get(state.id())
+        self.state_matchers.get(state.id)
     }
 
     pub fn alloc(&mut self, entry: Entry<Root>) -> usize {
@@ -281,8 +360,36 @@ impl<Root: LexerRoot> Lexer<Root> {
         index
     }
 
-    pub fn get(&self, index: usize) -> Option<&Entry<Root>> {
-        self.arena.get_index(index)
+    pub fn get(&self, index: usize) -> &Entry<Root> {
+        // SAFETY: The index is guaranteed to be valid because it's only
+        // produced by `alloc`, which inserts into the arena and returns the
+        // index.
+        self.arena.get_index(index).unwrap()
+    }
+
+    pub(crate) fn snapshot_state(&self, snapshot: Option<SnapshotId>) -> &LexerSnapshotState<Root> {
+        self.state(snapshot).unwrap_or_else(|| self.latest_state())
+    }
+
+    pub(crate) fn entries_in_span(
+        &self,
+        snapshot: Option<SnapshotId>,
+        span: Span,
+    ) -> Vec<Entry<Root>>
+    where
+        Root: Clone,
+    {
+        let state = self.snapshot_state(snapshot);
+        let Some(token_ids) = state.token_instances.get(&span.uri) else {
+            return Vec::new();
+        };
+
+        let start = span.range.start().min(token_ids.len());
+        let end = span.range.end().min(token_ids.len());
+        token_ids[start..end]
+            .iter()
+            .map(|&token_id| self.get(token_id).clone())
+            .collect()
     }
 
     pub fn state_id_of<S: TokenState>(&self) -> Option<State> {
@@ -290,11 +397,41 @@ impl<Root: LexerRoot> Lexer<Root> {
         self.state_info
             .iter()
             .position(|state| state.type_name == type_name)
-            .map(|p| State::Id(p))
+            .map(|p| State::new(p))
     }
+}
 
-    pub fn states(&self) -> &[LexerState] {
-        &self.states
+#[layer(middle)]
+impl<Root, Lower> MiddleLayer for Lexer<Root, Lower>
+where
+    Root: LexerRoot,
+    Lower: NonTopLayer<_Key = Span, _Value = usize> + Send + Sync + 'static,
+{
+    type Lower = Lower;
+    type Key = Span;
+    type Error = LexInterrupt;
+    type Value = usize;
+
+    fn pass(
+        &mut self,
+        ctx: &Context,
+        deltas: LayerDeltas<Self>,
+    ) -> impl Future<Output = Result<LayerDeltas<Self::Lower>, Self::Error>> + Send {
+        async move {
+            let mut working = self.latest.clone();
+            let mut lower_deltas = Vec::new();
+            for delta in deltas {
+                match self.lex_delta(ctx, &mut working, delta).await {
+                    Ok(deltas) => lower_deltas.extend(deltas),
+                    Err(err) => return Err(err),
+                }
+            }
+            self.latest = working.clone();
+            if let Some(snapshot) = ctx.snapshot() {
+                self.push_state(snapshot);
+            }
+            Ok(lower_deltas)
+        }
     }
 }
 
@@ -323,7 +460,7 @@ where
                             build: std::sync::Arc::new(move |lexeme| {
                                 (spec.build)(lexeme).map(wrap)
                             }),
-                            has_payload: spec.has_payload,
+                            captures_context: spec.captures_context,
                             validate: spec.validate,
                         })
                         .collect()
@@ -351,7 +488,7 @@ pub enum LexerCreationError {
     UnknownState(String),
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ErrorToken {
     UnexpectedEndOfInput {
         state: usize,
@@ -368,16 +505,18 @@ pub enum ErrorToken {
     },
 }
 
-impl<Root: LexerRoot> PrettyDisplay<Lexer<Root>> for ErrorToken {
+impl<Root: LexerRoot, Lower> PrettyDisplay<Lexer<Root, Lower>> for ErrorToken {
     fn pretty_fmt(
         &self,
         f: &mut core::fmt::Formatter<'_>,
-        context: &Lexer<Root>,
+        context: &Lexer<Root, Lower>,
     ) -> core::fmt::Result {
+        use color_print::cwrite;
+
         match self {
             Self::UnexpectedEndOfInput { state } => {
                 let tokens = context
-                    .tokens_in_state(State::Id(*state))
+                    .tokens_in_state(State::new(*state))
                     .ok_or_else(|| fmt::Error)?;
                 cwrite!(
                     f,
@@ -395,7 +534,7 @@ impl<Root: LexerRoot> PrettyDisplay<Lexer<Root>> for ErrorToken {
                 expected_state,
             } => {
                 let tokens = context
-                    .tokens_in_state(State::Id(*expected_state))
+                    .tokens_in_state(State::new(*expected_state))
                     .ok_or_else(|| fmt::Error)?;
                 cwrite!(
                     f,
@@ -415,7 +554,7 @@ impl<Root: LexerRoot> PrettyDisplay<Lexer<Root>> for ErrorToken {
                 offset,
             } => {
                 let token = context
-                    .tokens_in_state(State::Id(*state))
+                    .tokens_in_state(State::new(*state))
                     .and_then(|tokens| tokens.get(*token))
                     .ok_or_else(|| fmt::Error)?;
                 cwrite!(f, "Missing token {} at offset {}", token.label, offset)
@@ -512,7 +651,7 @@ fn resolve_token<Root>(
         build: spec.build,
         minimum_length,
         maximum_length,
-        has_payload: spec.has_payload,
+        captures_context: spec.captures_context,
         validate: spec.validate,
     })
 }
@@ -544,7 +683,7 @@ fn resolve_action(
         StateDirective::None => Ok(StateAction::None),
         StateDirective::Enter(target) => state_ids
             .get(target)
-            .copied()
+            .cloned()
             .map(StateAction::Enter)
             .ok_or_else(|| LexerCreationError::UnknownState(target.to_string())),
         StateDirective::Leave => Ok(StateAction::Leave),

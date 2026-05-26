@@ -4,7 +4,6 @@ use std::{
 };
 
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::StreamExt;
 
 use crate::scheme::*;
 
@@ -16,14 +15,20 @@ pub(super) const DEFAULT_DEMAND_RETRY_BUDGET: u8 = 8;
 
 pub(super) enum WorkerMessage {
     Demand(Demand),
-    Delta(Box<dyn Any + Send + Sync>),
+    Delta(DeltaEnvelope),
     Barrier(AwaitBarrier),
+}
+
+pub(super) struct DeltaEnvelope {
+    pub snapshot: SnapshotId,
+    pub payload: Box<dyn Any + Send + Sync>,
 }
 
 pub(super) struct Demand {
     pub action: Arc<dyn Any + Send + Sync>,
     pub action_name: &'static str,
     pub requester_layer_type: TypeId,
+    pub snapshot: Option<SnapshotId>,
     pub remaining_retries: u8,
     pub dispatch: __macro_private::RegisteredDispatchFn,
     pub response_tx: oneshot::Sender<Result<ErasedOutput, ActionError>>,
@@ -56,7 +61,7 @@ enum PostDemand {
 enum ContinuationTransition {
     Done,
     Propagate {
-        payload: Box<dyn Any + Send + Sync>,
+        envelope: DeltaEnvelope,
         demand: Demand,
     },
 }
@@ -70,57 +75,61 @@ pub(super) fn spawn_top_worker<T>(
     mut receiver: mpsc::Receiver<WorkerMessage>,
     layer_type: TypeId,
     layer_name: &'static str,
-    layer: T,
+    mut layer: T,
 ) -> tokio::task::JoinHandle<()>
 where
     T: TopLayer,
 {
     tokio::spawn(async move {
-        let emits = layer.emit(&context);
-        let mut emits = std::pin::pin!(emits);
+        enum TopEvent<TLower: NonTopLayer, TError> {
+            Emit(Result<Option<EmittedDeltas<TLower>>, TError>),
+            Message(Option<WorkerMessage>),
+        }
+
         loop {
-            let mut emits_ref = emits.as_mut();
-            let next_emit = emits_ref.next();
-            tokio::pin!(next_emit);
-            tokio::select! {
-                maybe_delta = &mut next_emit => {
-                    match maybe_delta {
-                        Some(Ok(deltas)) => {
-                            if let Err(err) = forward_delta_down(
-                                layer_type,
-                                layer_name,
-                                &context,
-                                Box::new(deltas),
-                            )
-                            .await
-                            {
-                                eprintln!("{err}");
-                            }
-                        }
-                        Some(Err(err)) => {
-                            eprintln!(
-                                "{}",
-                                DeltaFlowError::TopEmitFailed {
-                                    layer: layer_name.to_string(),
-                                    reason: err.to_string(),
-                                }
-                            );
-                            break;
-                        }
-                        None => break,
-                    }
+            let event = {
+                let next_emit = layer.emit(&context);
+                tokio::pin!(next_emit);
+                tokio::select! {
+                    maybe_delta = &mut next_emit => TopEvent::Emit(maybe_delta),
+                    msg = receiver.recv() => TopEvent::Message(msg),
                 }
-                msg = receiver.recv() => {
-                    let Some(message) = msg else { break };
-                    handle_any_message_top::<T>(
+            };
+
+            match event {
+                TopEvent::Emit(Ok(Some(emitted))) => {
+                    if let Err(err) = forward_delta_down(
                         layer_type,
                         layer_name,
                         &context,
-                        &layer,
-                        message,
+                        DeltaEnvelope {
+                            snapshot: emitted.snapshot,
+                            payload: Box::new(emitted.deltas),
+                        },
+                    )
+                    .await
+                    {
+                        eprintln!("{err}");
+                    }
+                }
+                TopEvent::Emit(Err(err)) => {
+                    eprintln!(
+                        "{}",
+                        DeltaFlowError::TopEmitFailed {
+                            layer: layer_name.to_string(),
+                            reason: err.to_string(),
+                        }
+                    );
+                    break;
+                }
+                TopEvent::Emit(Ok(None)) => break,
+                TopEvent::Message(Some(message)) => {
+                    handle_any_message_top::<T>(
+                        layer_type, layer_name, &context, &mut layer, message,
                     )
                     .await;
                 }
+                TopEvent::Message(None) => break,
             }
         }
     })
@@ -130,16 +139,17 @@ async fn handle_any_message_top<T>(
     layer_type: TypeId,
     layer_name: &'static str,
     context: &Context,
-    layer: &T,
+    layer: &mut T,
     message: WorkerMessage,
 ) where
     T: TopLayer,
 {
     match message {
         WorkerMessage::Demand(demand) => {
+            let resolve_ctx = context.with_snapshot(demand.snapshot);
             let outcome = super::dispatch_registered_action(
                 layer,
-                context,
+                &resolve_ctx,
                 demand.action_name,
                 demand.action.as_ref(),
                 demand.dispatch,
@@ -152,9 +162,9 @@ async fn handle_any_message_top<T>(
                     demand,
                 } => match transition_continuation(context, demand, continuation).await {
                     ContinuationTransition::Done => {}
-                    ContinuationTransition::Propagate { payload, demand } => {
+                    ContinuationTransition::Propagate { envelope, demand } => {
                         if let Err(err) =
-                            forward_delta_down(layer_type, layer_name, context, payload).await
+                            forward_delta_down(layer_type, layer_name, context, envelope).await
                         {
                             eprintln!("{err}");
                             let _ = demand.response_tx.send(Err(ActionError::ErrorFromLayer {
@@ -183,14 +193,12 @@ async fn handle_any_message_top<T>(
     }
 }
 
-fn downcast_layer_deltas<L>(
-    layer_name: &'static str,
-    delta: Box<dyn Any + Send + Sync>,
-) -> LayerDeltas<L>
+fn downcast_layer_deltas<L>(layer_name: &'static str, delta: DeltaEnvelope) -> LayerDeltas<L>
 where
     L: NonTopLayer,
 {
     delta
+        .payload
         .downcast::<LayerDeltas<L>>()
         .map(|typed| *typed)
         .unwrap_or_else(|_| {
@@ -220,9 +228,10 @@ where
         while let Some(message) = receiver.recv().await {
             match message {
                 WorkerMessage::Demand(demand) => {
+                    let resolve_ctx = context.with_snapshot(demand.snapshot);
                     let outcome = super::dispatch_registered_action(
-                        &layer,
-                        &context,
+                        &mut layer,
+                        &resolve_ctx,
                         demand.action_name,
                         demand.action.as_ref(),
                         demand.dispatch,
@@ -235,9 +244,9 @@ where
                             demand,
                         } => match transition_continuation(&context, demand, continuation).await {
                             ContinuationTransition::Done => {}
-                            ContinuationTransition::Propagate { payload, demand } => {
+                            ContinuationTransition::Propagate { envelope, demand } => {
                                 if let Err(err) = apply_middle_delta::<M>(
-                                    layer_type, layer_name, &context, &mut layer, payload,
+                                    layer_type, layer_name, &context, &mut layer, envelope,
                                 )
                                 .await
                                 {
@@ -277,20 +286,23 @@ async fn apply_middle_delta<M>(
     layer_name: &'static str,
     context: &Context,
     layer: &mut M,
-    delta: Box<dyn Any + Send + Sync>,
+    delta: DeltaEnvelope,
 ) -> Result<(), DeltaFlowError>
 where
     M: MiddleLayer,
 {
+    let snapshot = delta.snapshot;
     let typed = downcast_layer_deltas::<M>(layer_name, delta);
+    let delta_ctx = context.with_snapshot(Some(snapshot));
 
-    let out = layer
-        .pass(context, typed)
-        .await
-        .map_err(|err| DeltaFlowError::MiddlePassFailed {
-            layer: layer_name.to_string(),
-            reason: err.to_string(),
-        })?;
+    let out =
+        layer
+            .pass(&delta_ctx, typed)
+            .await
+            .map_err(|err| DeltaFlowError::MiddlePassFailed {
+                layer: layer_name.to_string(),
+                reason: err.to_string(),
+            })?;
 
     let lower_type = context
         .registry
@@ -301,7 +313,16 @@ where
             layer: layer_name.to_string(),
         })?;
 
-    forward_delta_down_to(lower_type, layer_name, context, Box::new(out)).await?;
+    forward_delta_down_to(
+        lower_type,
+        layer_name,
+        context,
+        DeltaEnvelope {
+            snapshot,
+            payload: Box::new(out),
+        },
+    )
+    .await?;
 
     Ok(())
 }
@@ -324,9 +345,10 @@ where
         while let Some(message) = receiver.recv().await {
             match message {
                 WorkerMessage::Demand(demand) => {
+                    let resolve_ctx = context.with_snapshot(demand.snapshot);
                     let outcome = super::dispatch_registered_action(
-                        &layer,
-                        &context,
+                        &mut layer,
+                        &resolve_ctx,
                         demand.action_name,
                         demand.action.as_ref(),
                         demand.dispatch,
@@ -339,9 +361,11 @@ where
                             demand,
                         } => match transition_continuation(&context, demand, continuation).await {
                             ContinuationTransition::Done => {}
-                            ContinuationTransition::Propagate { payload, demand } => {
-                                let typed = downcast_layer_deltas::<B>(layer_name, payload);
-                                if let Err(err) = layer.consume(&context, typed).await {
+                            ContinuationTransition::Propagate { envelope, demand } => {
+                                let snapshot = envelope.snapshot;
+                                let typed = downcast_layer_deltas::<B>(layer_name, envelope);
+                                let delta_ctx = context.with_snapshot(Some(snapshot));
+                                if let Err(err) = layer.consume(&delta_ctx, typed).await {
                                     eprintln!(
                                         "{}",
                                         DeltaFlowError::BottomConsumeFailed {
@@ -363,8 +387,10 @@ where
                     }
                 }
                 WorkerMessage::Delta(delta_box) => {
+                    let snapshot = delta_box.snapshot;
                     let typed = downcast_layer_deltas::<B>(layer_name, delta_box);
-                    if let Err(err) = layer.consume(&context, typed).await {
+                    let delta_ctx = context.with_snapshot(Some(snapshot));
+                    if let Err(err) = layer.consume(&delta_ctx, typed).await {
                         eprintln!(
                             "{}",
                             DeltaFlowError::BottomConsumeFailed {
@@ -416,7 +442,17 @@ async fn transition_continuation(
 ) -> ContinuationTransition {
     match continuation.effect {
         ContinuationEffect::Propagate(payload) => {
-            ContinuationTransition::Propagate { payload, demand }
+            let snapshot = demand
+                .snapshot
+                .unwrap_or_else(|| context.allocate_snapshot());
+            let demand = Demand {
+                snapshot: Some(snapshot),
+                ..demand
+            };
+            ContinuationTransition::Propagate {
+                envelope: DeltaEnvelope { snapshot, payload },
+                demand,
+            }
         }
         ContinuationEffect::Await(plan) => {
             let context = context.clone();
@@ -424,6 +460,7 @@ async fn transition_continuation(
                 match execute_await_plan(
                     &context,
                     demand.requester_layer_type,
+                    demand.snapshot,
                     demand.remaining_retries,
                     plan,
                     demand.dispatch,
@@ -448,6 +485,7 @@ async fn transition_continuation(
 async fn execute_await_plan(
     context: &Context,
     requester_layer_type: TypeId,
+    snapshot: Option<SnapshotId>,
     remaining_retries: u8,
     plan: AwaitPlan,
     dispatch: __macro_private::RegisteredDispatchFn,
@@ -479,6 +517,7 @@ async fn execute_await_plan(
         action,
         action_name,
         requester_layer_type,
+        snapshot,
         remaining_retries,
         dispatch,
         response_tx: tx,
@@ -608,7 +647,7 @@ async fn forward_delta_down(
     upper_type: TypeId,
     upper_name: &str,
     context: &Context,
-    delta: Box<dyn Any + Send + Sync>,
+    delta: DeltaEnvelope,
 ) -> Result<(), DeltaFlowError> {
     let lower_type = context
         .registry
@@ -625,7 +664,7 @@ async fn forward_delta_down_to(
     lower_type: TypeId,
     upper_name: &str,
     context: &Context,
-    delta: Box<dyn Any + Send + Sync>,
+    delta: DeltaEnvelope,
 ) -> Result<(), DeltaFlowError> {
     let lower_name = context
         .registry
@@ -715,6 +754,7 @@ async fn retry_demand_at_origin(context: &Context, demand: Demand) {
         action: Arc::clone(&demand.action),
         action_name: demand.action_name,
         requester_layer_type: origin_type,
+        snapshot: demand.snapshot,
         remaining_retries,
         dispatch: demand.dispatch,
         response_tx: retry_tx,

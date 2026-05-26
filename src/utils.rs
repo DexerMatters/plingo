@@ -1,9 +1,9 @@
 use core::fmt;
-use std::{error::Error, fmt::Debug};
+use std::{error::Error, fmt::Debug, sync::Arc};
 
 use color_print::cwrite;
 use fluent_uri::Uri;
-use ropey::Rope;
+use ropey::{Rope, RopeSlice};
 use thiserror::Error;
 
 /// A value with associated warnings
@@ -133,6 +133,113 @@ impl<T: Copy + PartialEq> From<RangeOrPoint<T>> for (T, T) {
     }
 }
 
+pub trait RangeExt: Sized {
+    type Unit: Copy + Ord;
+
+    fn covers(&self, other: &Self) -> bool;
+    fn inside(&self, other: &Self) -> bool;
+    fn overlaps(&self, other: &Self) -> bool;
+    fn union(&self, other: &Self) -> Self;
+    fn intersection(&self, other: &Self) -> Option<Self>;
+    fn trim_to(&self, max: Self::Unit) -> Self;
+}
+
+impl<T: Copy + Ord> RangeExt for RangeOrPoint<T> {
+    type Unit = T;
+
+    fn covers(&self, other: &Self) -> bool {
+        self.start() <= other.start() && self.end() >= other.end()
+    }
+
+    fn inside(&self, other: &Self) -> bool {
+        self.start() >= other.start() && self.end() <= other.end()
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        self.start() < other.end() && self.end() > other.start()
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        RangeOrPoint::from_range(self.start().min(other.start()), self.end().max(other.end()))
+    }
+
+    fn intersection(&self, other: &Self) -> Option<Self> {
+        let start = self.start().max(other.start());
+        let end = self.end().min(other.end());
+        if start < end {
+            Some(RangeOrPoint::from_range(start, end))
+        } else {
+            None
+        }
+    }
+
+    fn trim_to(&self, max: Self::Unit) -> Self {
+        RangeOrPoint::from_range(self.start().min(max), self.end().min(max))
+    }
+}
+
+/// An owned, `'static` slice of a [`Rope`]. Cheap to clone and keeps the
+/// underlying rope alive via `Arc`.
+#[derive(Clone)]
+pub struct OwnedRopeSlice {
+    rope: Arc<Rope>,
+    start: usize,
+    end: usize,
+}
+
+impl OwnedRopeSlice {
+    pub fn new(rope: Arc<Rope>, start: usize, end: usize) -> Self {
+        Self { rope, start, end }
+    }
+
+    /// Borrow the underlying [`RopeSlice`] with a closure — zero allocation.
+    pub fn with_slice<R>(&self, f: impl FnOnce(RopeSlice<'_>) -> R) -> R {
+        let start = self.rope.byte_to_char(self.start);
+        let end = self.rope.byte_to_char(self.end);
+        f(self.rope.slice(start..end))
+    }
+
+    pub fn to_string(&self) -> String {
+        self.with_slice(|s| s.to_string())
+    }
+
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+}
+
+impl fmt::Debug for OwnedRopeSlice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedRopeSlice")
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .finish()
+    }
+}
+
+impl fmt::Display for OwnedRopeSlice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.with_slice(|s| {
+            for chunk in s.chunks() {
+                f.write_str(chunk)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl PartialEq for OwnedRopeSlice {
+    fn eq(&self, other: &Self) -> bool {
+        self.with_slice(|a| other.with_slice(|b| a == b))
+    }
+}
+
+impl Eq for OwnedRopeSlice {}
+
 /// A span in a source file, represented by a URI and a range of byte offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
@@ -190,25 +297,19 @@ impl Span {
     /// Checks if this span covers another span (i.e., if it starts before or at
     /// the same position and ends after or at the same position).
     pub fn covers(&self, other: &Span) -> bool {
-        self.uri == other.uri
-            && self.range.start() <= other.range.start()
-            && self.range.end() >= other.range.end()
+        self.uri == other.uri && self.range.covers(&other.range)
     }
 
     /// Checks if this span is inside another span
     /// (i.e., if it starts after or at the same position and ends before or at the same position).
     pub fn inside(&self, other: &Span) -> bool {
-        self.uri == other.uri
-            && self.range.start() >= other.range.start()
-            && self.range.end() <= other.range.end()
+        self.uri == other.uri && self.range.inside(&other.range)
     }
 
     /// Checks if this span overlaps with another span
     /// (i.e., if they share any common byte positions).
     pub fn overlaps(&self, other: &Span) -> bool {
-        self.uri == other.uri
-            && self.range.start() < other.range.end()
-            && self.range.end() > other.range.start()
+        self.uri == other.uri && self.range.overlaps(&other.range)
     }
 
     /// Computes the union of this span with another span, if they overlap or are adjacent.
@@ -218,10 +319,7 @@ impl Span {
         }
         Some(Span {
             uri: self.uri,
-            range: RangeOrPoint::from_range(
-                self.range.start().min(other.range.start()),
-                self.range.end().max(other.range.end()),
-            ),
+            range: self.range.union(&other.range),
         })
     }
 
@@ -230,26 +328,17 @@ impl Span {
         if self.uri != other.uri {
             return None;
         }
-        let start = self.range.start().max(other.range.start());
-        let end = self.range.end().min(other.range.end());
-        if start < end {
-            Some(Span {
-                uri: self.uri,
-                range: RangeOrPoint::from_range(start, end),
-            })
-        } else {
-            None
-        }
+        self.range.intersection(&other.range).map(|range| Span {
+            uri: self.uri,
+            range,
+        })
     }
 
     /// Trims the span to fit within the bounds of the given source text.
     pub fn trim(&self, source: &Rope) -> Span {
-        let start = self.range.start();
-        let end = self.range.end();
-        let source_len = source.len_bytes();
         Span {
             uri: self.uri,
-            range: RangeOrPoint::from_range(start.min(source_len), end.min(source_len)),
+            range: self.range.trim_to(source.len_bytes()),
         }
     }
 
@@ -261,6 +350,39 @@ impl Span {
         let end_line = source.char_to_line(self.range.end());
         let end_col = self.range.end() - source.line_to_char(end_line);
         RangeOrPoint::from_range((start_line, start_col), (end_line, end_col))
+    }
+
+    pub fn map_range(&self, f: impl FnOnce(RangeOrPoint<usize>) -> RangeOrPoint<usize>) -> Self {
+        Span {
+            uri: self.uri,
+            range: f(self.range),
+        }
+    }
+
+    pub fn free_right(&self) -> Self {
+        self.map_range(|range| match range {
+            RangeOrPoint::Range(start, _) => RangeOrPoint::Range(start, usize::MAX),
+            RangeOrPoint::Point(offset) => RangeOrPoint::Range(offset, usize::MAX),
+        })
+    }
+
+    pub fn free_left(&self) -> Self {
+        self.map_range(|range| match range {
+            RangeOrPoint::Range(_, end) => RangeOrPoint::Range(0, end),
+            RangeOrPoint::Point(offset) if offset != 0 => RangeOrPoint::Range(0, offset),
+            x => x,
+        })
+    }
+
+    pub fn extend_right(&self, amount: usize) -> Self {
+        self.map_range(|range| match range {
+            RangeOrPoint::Range(start, end) => {
+                RangeOrPoint::Range(start, end.saturating_add(amount))
+            }
+            RangeOrPoint::Point(offset) => {
+                RangeOrPoint::Range(offset, offset.saturating_add(amount))
+            }
+        })
     }
 }
 
@@ -281,7 +403,7 @@ pub struct Spanned<T> {
 }
 
 /// A trait for types that can be pretty-printed with additional context
-pub trait PrettyDisplay<Ctx> {
+pub trait PrettyDisplay<Ctx = ()> {
     /// Returns a wrapper that enables pretty-printing of this value with the
     /// given context
     fn pretty<'a>(&'a self, context: &'a Ctx) -> PrettyWrapper<'a, Self, Ctx>

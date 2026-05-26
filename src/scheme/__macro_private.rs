@@ -4,13 +4,13 @@ use std::any::Any;
 pub type DispatchFuture<'a> = Pin<Box<dyn Future<Output = RegisteredDispatchOutcome> + Send + 'a>>;
 
 pub type RegisteredDispatchFn = for<'a> fn(
-    &'a (dyn Any + Send + Sync),
+    &'a mut (dyn Any + Send + Sync),
     &'a Context,
     &'a (dyn Any + Send + Sync),
 ) -> DispatchFuture<'a>;
 
 pub fn dispatch_resolve<'a, L, G>(
-    layer: &'a (dyn Any + Send + Sync),
+    layer: &'a mut (dyn Any + Send + Sync),
     ctx: &'a Context,
     action: &'a (dyn Any + Send + Sync),
 ) -> DispatchFuture<'a>
@@ -18,7 +18,7 @@ where
     L: Resolve<G> + 'static,
     G: Send + Sync + 'static,
 {
-    let Some(layer) = layer.downcast_ref::<L>() else {
+    let Some(layer) = layer.downcast_mut::<L>() else {
         unreachable!(
             "resolve action layer type mismatch: layer={}, action={}",
             std::any::type_name::<L>(),

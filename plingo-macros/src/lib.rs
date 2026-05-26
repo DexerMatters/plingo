@@ -1,15 +1,16 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Expr, Fields, ItemEnum, Meta,
+    Expr, Field, Fields, Ident, ItemEnum, ItemImpl, ItemStruct, Meta, Type, Variant,
     parse::{Parse, ParseStream},
-    parse_macro_input,
+    parse_macro_input, parse_quote,
     spanned::Spanned,
-    Field, Ident, ItemImpl, Type, Variant, parse_quote,
 };
 
 // ---------------------------------------------------------------------------
-// Layer attribute: #[layer(top)] | #[layer(middle)] | #[layer(bottom)]
+// Layer attribute — two forms:
+//   #[layer]             on struct  → snapshot machinery only
+//   #[layer(top|middle|bottom)]  on impl  → conduit impls only
 // ---------------------------------------------------------------------------
 
 enum LayerRole {
@@ -35,6 +36,119 @@ impl Parse for LayerRole {
 
 #[proc_macro_attribute]
 pub fn layer(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if attr.is_empty() {
+        expand_layer_struct(item)
+    } else {
+        expand_layer_impl(attr, item)
+    }
+}
+
+// ---- #[layer] on struct: snapshot machinery ----
+
+fn expand_layer_struct(item: TokenStream) -> TokenStream {
+    let mut item_struct = parse_macro_input!(item as ItemStruct);
+    let self_ident = item_struct.ident.clone();
+    let generics = item_struct.generics.clone();
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let fields = match &mut item_struct.fields {
+        Fields::Named(fields) => &mut fields.named,
+        _ => {
+            return syn::Error::new(
+                item_struct.span(),
+                "#[layer] on structs currently requires named fields",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    let mut snapshot_ty = None;
+    let mut snapshot_field_ident = None;
+    for field in fields.iter_mut() {
+        let field_span = field.span();
+        let mut keep_attrs = Vec::new();
+        for attr in field.attrs.drain(..) {
+            if attr.path().is_ident("snapshot") {
+                if snapshot_ty.is_some() {
+                    return syn::Error::new(attr.span(), "only one #[snapshot] field is supported")
+                        .to_compile_error()
+                        .into();
+                }
+                let Some(field_ident) = field.ident.clone() else {
+                    return syn::Error::new(field_span, "#[snapshot] requires a named field")
+                        .to_compile_error()
+                        .into();
+                };
+                snapshot_ty = Some(field.ty.clone());
+                snapshot_field_ident = Some(field_ident);
+            } else {
+                keep_attrs.push(attr);
+            }
+        }
+        field.attrs = keep_attrs;
+    }
+
+    let has_reserved_name = fields.iter().any(|field| {
+        field.ident.as_ref().is_some_and(|ident| ident == "_snapshot")
+    });
+    if has_reserved_name {
+        return syn::Error::new(
+            item_struct.span(),
+            "layer structs cannot define a field named _snapshot",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    if let Some(ref snapshot_ty) = snapshot_ty {
+        fields.push(parse_quote! {
+            _snapshot: ::std::collections::HashMap<::plingo::scheme::SnapshotId, #snapshot_ty>
+        });
+    }
+
+    let snapshot_impl = match (snapshot_field_ident, snapshot_ty.as_ref()) {
+        (Some(field_ident), Some(snapshot_ty)) => quote! {
+            impl #impl_generics ::plingo::scheme::SnapshotLayer for #self_ident #ty_generics #where_clause {
+                type State = #snapshot_ty;
+
+                fn push_state(&mut self, snapshot: ::plingo::scheme::SnapshotId) {
+                    self._snapshot.insert(snapshot, self.#field_ident.clone());
+                }
+
+                fn state(
+                    &self,
+                    snapshot: ::std::option::Option<::plingo::scheme::SnapshotId>,
+                ) -> ::std::option::Option<&Self::State> {
+                    match snapshot {
+                        Some(snapshot) => self._snapshot.get(&snapshot),
+                        None => Some(&self.#field_ident),
+                    }
+                }
+
+                fn latest_state(&self) -> &Self::State {
+                    &self.#field_ident
+                }
+
+                fn latest_state_mut(&mut self) -> &mut Self::State {
+                    &mut self.#field_ident
+                }
+            }
+        },
+        _ => quote! {},
+    };
+
+    quote! {
+        #item_struct
+
+        #snapshot_impl
+    }
+    .into()
+}
+
+// ---- #[layer(top|middle|bottom)] on impl: conduit impls ----
+
+fn expand_layer_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let role = parse_macro_input!(attr as LayerRole);
     let item_impl = parse_macro_input!(item as ItemImpl);
 
@@ -43,7 +157,7 @@ pub fn layer(attr: TokenStream, item: TokenStream) -> TokenStream {
         _ => {
             return syn::Error::new(
                 item_impl.self_ty.span(),
-                "#[layer] requires a struct or type name as the impl target",
+                "#[layer(role)] requires a struct or type name as the impl target",
             )
             .to_compile_error()
             .into();
@@ -52,7 +166,6 @@ pub fn layer(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let (impl_generics, _ty_generics, where_clause) = item_impl.generics.split_for_impl();
 
-    // Validate that the trait matches the role.
     if let Some((_, trait_path, _)) = &item_impl.trait_ {
         let expected_trait = match role {
             LayerRole::Top => "TopLayer",
@@ -78,7 +191,7 @@ pub fn layer(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         return syn::Error::new(
             item_impl.self_ty.span(),
-            "#[layer] can only be used on trait impl blocks",
+            "#[layer(role)] can only be used on trait impl blocks",
         )
         .to_compile_error()
         .into();
@@ -98,6 +211,7 @@ pub fn layer(attr: TokenStream, item: TokenStream) -> TokenStream {
             impl #impl_generics ::plingo::scheme::NonTopLayer for #self_type #where_clause {
                 type _Key = <Self as ::plingo::scheme::MiddleLayer>::Key;
                 type _Error = <Self as ::plingo::scheme::MiddleLayer>::Error;
+                type _Value = <Self as ::plingo::scheme::MiddleLayer>::Value;
             }
         },
         LayerRole::Bottom => quote! {
@@ -108,6 +222,7 @@ pub fn layer(attr: TokenStream, item: TokenStream) -> TokenStream {
             impl #impl_generics ::plingo::scheme::NonTopLayer for #self_type #where_clause {
                 type _Key = <Self as ::plingo::scheme::BottomLayer>::Key;
                 type _Error = <Self as ::plingo::scheme::BottomLayer>::Error;
+                type _Value = <Self as ::plingo::scheme::BottomLayer>::Value;
             }
         },
     };
@@ -205,7 +320,7 @@ fn extract_action_type(segment: &syn::PathSegment) -> syn::Result<syn::Type> {
 }
 
 // ---------------------------------------------------------------------------
-// Tokens attr/derive
+// Tokens attribute: #[tokens]
 // ---------------------------------------------------------------------------
 
 #[proc_macro_attribute]
@@ -294,14 +409,12 @@ fn ensure_tokens_derives(item: &mut ItemEnum) -> syn::Result<()> {
 
     if let Some(index) = derive_index {
         let mut derives = Vec::<Ident>::new();
-        if let Meta::List(_) = &item.attrs[index].meta {
-            item.attrs[index].parse_nested_meta(|nested| {
-                if let Some(ident) = nested.path.get_ident() {
-                    derives.push(ident.clone());
-                }
-                Ok(())
-            })?;
-        }
+        item.attrs[index].parse_nested_meta(|nested| {
+            if let Some(ident) = nested.path.get_ident() {
+                derives.push(ident.clone());
+            }
+            Ok(())
+        })?;
 
         for required in ["PartialEq", "Eq", "Hash"] {
             if !derives.iter().any(|ident| ident == required) {
@@ -440,10 +553,13 @@ fn build_root_token_spec(
     let display = format!("{}::{}", root_ident, variant_ident);
     let regex = config.regex;
     let skip = config.skip;
-    let has_payload = config.enter.is_some() && !variant.fields.is_empty();
+    let has_fields = !variant.fields.is_empty();
+    let captures_context = config.enter.is_some() && has_fields;
 
     let validate = match config.validate {
-        Some(v) => quote! { ::std::option::Option::Some(#v as fn(&str, ::std::option::Option<&str>) -> bool) },
+        Some(v) => {
+            quote! { ::std::option::Option::Some(#v as fn(&str, ::std::option::Option<&str>) -> bool) }
+        }
         None => quote! { ::std::option::Option::None },
     };
 
@@ -463,7 +579,7 @@ fn build_root_token_spec(
             action: #action,
             skip: #skip,
             build: ::std::sync::Arc::new(#builder_ident),
-            has_payload: #has_payload,
+            captures_context: #captures_context,
             validate: #validate,
         }
     })
@@ -502,6 +618,10 @@ fn target_last_ident(target: &Type) -> syn::Result<Ident> {
         .ok_or_else(|| syn::Error::new(target.span(), "enter target path cannot be empty"))
 }
 
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
 struct VariantConfig {
     regex: syn::LitStr,
     enter: Option<Type>,
@@ -537,6 +657,12 @@ fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig> {
                 }
                 enter = Some(attr.parse_args::<Type>()?);
             }
+            Meta::Path(path) if path.is_ident("leave") => {
+                if leave {
+                    return Err(syn::Error::new(attr.span(), "duplicate #[leave] attribute"));
+                }
+                leave = true;
+            }
             Meta::List(meta) if meta.path.is_ident("validate") => {
                 if validate.is_some() {
                     return Err(syn::Error::new(
@@ -545,12 +671,6 @@ fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig> {
                     ));
                 }
                 validate = Some(attr.parse_args::<syn::Expr>()?);
-            }
-            Meta::Path(path) if path.is_ident("leave") => {
-                if leave {
-                    return Err(syn::Error::new(attr.span(), "duplicate #[leave] attribute"));
-                }
-                leave = true;
             }
             Meta::Path(path) if path.is_ident("skip") => {
                 if skip {

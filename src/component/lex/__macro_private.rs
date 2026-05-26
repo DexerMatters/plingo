@@ -46,7 +46,7 @@ pub struct TokenSpec<Root> {
     pub action: StateDirective,
     pub skip: bool,
     pub build: BuildToken<Root>,
-    pub has_payload: bool,
+    pub captures_context: bool,
     pub validate: Option<fn(&str, Option<&str>) -> bool>,
 }
 

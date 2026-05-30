@@ -612,7 +612,7 @@ impl<Upper: FallibleLayer, Edge: FallibleLayer> Runtime<Linked<Upper, Edge>> {
 }
 
 impl Runtime<Sealed> {
-    pub async fn run(mut self) -> Result<Self, RuntimeBuildError> {
+    pub async fn run(&mut self) -> Result<(), RuntimeBuildError> {
         if !self.inner.workers.is_empty() {
             return Err(RuntimeBuildError::AlreadyRunning);
         }
@@ -645,7 +645,7 @@ impl Runtime<Sealed> {
             self.inner.workers.push(worker);
         }
 
-        Ok(self)
+        Ok(())
     }
 
     pub fn context(&self) -> Context {

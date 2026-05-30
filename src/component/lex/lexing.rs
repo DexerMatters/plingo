@@ -3,8 +3,8 @@ use regex_automata::{Anchored, Input, dfa::Automaton};
 use crate::{
     component::{
         lex::{
-            BestMatch, Entry, ErrorToken, LexInterrupt, Lexer, LexerRoot, LexerSnapshotState,
-            LexerState, MatchReport, State, StateAction,
+            BestMatch, Entry, ErrorToken, LexInterrupt, LexedToken, Lexer, LexerRoot,
+            LexerSnapshotState, LexerState, MatchReport, State, StateAction,
         },
         source::Source,
     },
@@ -207,7 +207,11 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                     match self.next_token(&mut state, &best_match, &mut input) {
                         Ok(token) => {
                             let length = best_match.end - best_match.start;
-                            let token_id = self.alloc(Entry::Token(length, token));
+                            let token_id = self.alloc(Entry::Token {
+                                length,
+                                terminal: token.terminal,
+                                value: token.value,
+                            });
                             if !cont(token_id, &state) {
                                 return Ok(());
                             }
@@ -238,6 +242,22 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             }
         }
 
+        if !unexpected_input.is_empty() {
+            let taken = std::mem::take(&mut unexpected_input);
+            let error = ErrorToken::UnexpectedToken {
+                start: state.offset - taken.chars().count(),
+                end: state.offset,
+                expected_state: state.current_state().unwrap().id,
+            };
+            let token_id = self.alloc(Entry::Error(taken.chars().count(), error));
+            if !cont(token_id, &state) {
+                return Ok(());
+            }
+        }
+
+        let eof = self.alloc(Entry::EOF);
+        cont(eof, &state);
+
         Ok(())
     }
 
@@ -250,7 +270,7 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             end,
         }: &BestMatch,
         input: &mut Input,
-    ) -> Result<Root, LexInterrupt> {
+    ) -> Result<LexedToken<Root>, LexInterrupt> {
         let current = state.current_state()?;
         let Some(token) = self
             .tokens_in_state(current)
@@ -277,6 +297,10 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
 
         token
             .build(lexeme)
+            .map(|value| LexedToken {
+                terminal: token.terminal,
+                value,
+            })
             .map_err(|e| LexInterrupt::ParseError(e.to_string(), lexeme.to_string()))
     }
 

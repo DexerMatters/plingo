@@ -20,6 +20,7 @@ use thiserror::Error;
 pub use mode::{LexerState, State, StateAction, StateInfo};
 
 use crate::{
+    component::parse::grammar::TerminalId,
     scheme::{
         ActionError, Context, LayerDeltas, MiddleLayer, NonTopLayer, SnapshotId, SnapshotLayer,
     },
@@ -53,6 +54,7 @@ pub trait FromLexeme: Sized {
 
 #[derive(Clone)]
 pub struct ResolvedToken<Root> {
+    pub terminal: TerminalId,
     pub precedence: usize,
     pub label: &'static str,
     pub action: StateAction,
@@ -89,6 +91,12 @@ impl<Root> ResolvedToken<Root> {
     pub fn build(&self, lexeme: &str) -> Result<Root, LexInterrupt> {
         (self.build)(lexeme)
     }
+}
+
+#[derive(Clone)]
+pub struct LexedToken<Root> {
+    pub terminal: TerminalId,
+    pub value: Root,
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +176,12 @@ pub enum Entry<Root>
 where
     Root: LexerRoot,
 {
-    Token(usize, Root),
+    Token {
+        length: usize,
+        terminal: TerminalId,
+        value: Root,
+    },
+    EOF,
     Error(usize, ErrorToken),
 }
 
@@ -177,7 +190,7 @@ where
     Root: LexerRoot,
 {
     pub fn is_token(&self) -> bool {
-        matches!(self, Self::Token(_, _))
+        matches!(self, Self::Token { .. })
     }
 
     pub fn is_error(&self) -> bool {
@@ -186,7 +199,8 @@ where
 
     pub fn length(&self) -> usize {
         match self {
-            Self::Token(length, _) | Self::Error(length, _) => *length,
+            Self::Token { length, .. } | Self::Error(length, _) => *length,
+            Self::EOF => 0,
         }
     }
 }
@@ -199,12 +213,12 @@ impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> fo
     ) -> core::fmt::Result {
         use color_print::cwrite;
         match self {
-            Entry::Token(length, token) => {
+            Entry::Token { length, value, .. } => {
                 cwrite!(
                     f,
                     "<dim>[{}]\t</dim><green>Token</green>: {}",
                     length,
-                    token
+                    value
                 )
             }
             Entry::Error(length, error) => {
@@ -215,6 +229,7 @@ impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> fo
                     error.pretty(context)
                 )
             }
+            Entry::EOF => cwrite!(f, "<dim>[0]\t</dim><green>EOF</green>"),
         }
     }
 }
@@ -227,12 +242,12 @@ impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> fo
     ) -> core::fmt::Result {
         use color_print::cwrite;
         match context.get(*self) {
-            Entry::Token(length, token) => {
+            Entry::Token { length, value, .. } => {
                 cwrite!(
                     f,
                     "<dim>[{}]\t</dim><green>Token</green>: {}",
                     length,
-                    token
+                    value
                 )
             }
             Entry::Error(length, error) => {
@@ -243,6 +258,7 @@ impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> fo
                     error.pretty(context)
                 )
             }
+            Entry::EOF => cwrite!(f, "<dim>[0]\t</dim><green>EOF</green>"),
         }
     }
 }
@@ -367,6 +383,13 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         self.arena.get_index(index).unwrap()
     }
 
+    pub fn terminal_of(&self, index: usize) -> Option<TerminalId> {
+        match self.get(index) {
+            Entry::Token { terminal, .. } => Some(*terminal),
+            Entry::EOF | Entry::Error(_, _) => None,
+        }
+    }
+
     pub(crate) fn snapshot_state(&self, snapshot: Option<SnapshotId>) -> &LexerSnapshotState<Root> {
         self.state(snapshot).unwrap_or_else(|| self.latest_state())
     }
@@ -389,6 +412,42 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         token_ids[start..end]
             .iter()
             .map(|&token_id| self.get(token_id).clone())
+            .collect()
+    }
+
+    pub(crate) fn token_data_in_span(
+        &self,
+        snapshot: Option<SnapshotId>,
+        span: Span,
+    ) -> Vec<crate::component::parse::TokenData> {
+        let state = self.snapshot_state(snapshot);
+        let Some(token_ids) = state.token_instances.get(&span.uri) else {
+            return Vec::new();
+        };
+
+        let start = span.range.start().min(token_ids.len());
+        let end = span.range.end().min(token_ids.len());
+        token_ids[start..end]
+            .iter()
+            .map(|&id| match self.get(id) {
+                Entry::Token {
+                    length, terminal, ..
+                } => crate::component::parse::TokenData {
+                    id,
+                    terminal: Some(*terminal),
+                    length: *length,
+                },
+                Entry::EOF => crate::component::parse::TokenData {
+                    id,
+                    terminal: None,
+                    length: 0,
+                },
+                Entry::Error(length, _) => crate::component::parse::TokenData {
+                    id,
+                    terminal: None,
+                    length: *length,
+                },
+            })
             .collect()
     }
 
@@ -453,6 +512,7 @@ where
                         .into_iter()
                         .map(|spec| TokenSpec {
                             regex: spec.regex,
+                            terminal: spec.terminal,
                             precedence: spec.precedence,
                             label: spec.label,
                             action: spec.action,
@@ -644,6 +704,7 @@ fn resolve_token<Root>(
     let maximum_length = hir.properties().maximum_len().unwrap_or(usize::MAX);
 
     Ok(ResolvedToken {
+        terminal: spec.terminal,
         precedence: spec.precedence,
         label: spec.label,
         action: resolve_action(spec.action, state_ids)?,

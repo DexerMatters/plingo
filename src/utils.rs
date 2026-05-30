@@ -6,6 +6,12 @@ use fluent_uri::Uri;
 use ropey::{Rope, RopeSlice};
 use thiserror::Error;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Either<L, R> {
+    Left(L),
+    Right(R),
+}
+
 /// A value with associated warnings
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct Warned<T, W: Error> {

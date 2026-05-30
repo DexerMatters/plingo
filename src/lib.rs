@@ -1,14 +1,23 @@
 extern crate self as plingo;
 
-pub use plingo_macros::{layer, resolve_action, tokens};
+pub use plingo_macros::{NonTerminal, layer, resolve_action, tokens};
+
+#[macro_export]
+macro_rules! debug_relay {
+    (
+        |$ctx:pat_param, $deltas:pat_param| $body:expr $(,)?
+    ) => {
+        $crate::component::debug::DebugRelay::new(move |$ctx, $deltas| $body)
+    };
+}
 
 #[macro_export]
 macro_rules! debug_sink {
     (
-        |$consume_ctx:pat_param, $consume_deltas:pat_param| $consume_body:expr $(,)?
+        |$ctx:pat_param, $deltas:pat_param| $body:expr $(,)?
     ) => {
-        $crate::component::sink::DebugSink::new(move |$consume_ctx, $consume_deltas| {
-            ::std::boxed::Box::pin($consume_body) as $crate::component::sink::BoxFuture<'_, _>
+        $crate::component::debug::DebugSink::new(move |$ctx, $deltas| {
+            ::std::boxed::Box::pin($body) as $crate::component::debug::BoxFuture<'_, _>
         })
     };
 }

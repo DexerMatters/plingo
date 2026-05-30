@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::component::parse::grammar::TerminalId;
+
 use super::LexInterrupt;
 
 pub type BuildToken<Root> = Arc<dyn Fn(&str) -> Result<Root, LexInterrupt> + Send + Sync>;
@@ -41,6 +43,7 @@ where
 #[derive(Clone)]
 pub struct TokenSpec<Root> {
     pub regex: &'static str,
+    pub terminal: TerminalId,
     pub precedence: usize,
     pub label: &'static str,
     pub action: StateDirective,

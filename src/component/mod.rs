@@ -1,4 +1,5 @@
+pub mod common;
+pub mod debug;
 pub mod lex;
 pub mod parse;
-pub mod sink;
 pub mod source;

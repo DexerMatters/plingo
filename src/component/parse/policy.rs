@@ -1,0 +1,188 @@
+use std::{any::TypeId, marker::PhantomData};
+
+use fluent_uri::Uri;
+use plingo_macros::resolve_action;
+
+use crate::{
+    component::{
+        lex::{Lexer, LexerRoot, policy::GetTokenById},
+        parse::{AstToken, ParsePath, Parser, data::AstBox, data::ProductData, data::ProductId},
+    },
+    scheme::{Context, NonTopLayer, Outcome, Resolve, SnapshotLayer},
+};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GetNode(pub ParsePath);
+
+#[resolve_action]
+impl<Root, Lower> Resolve<GetNode> for Parser<Root, Lower>
+where
+    Root: LexerRoot + Clone + 'static,
+    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+{
+    type Output = Vec<ProductId>;
+
+    fn resolve<'a>(
+        &'a mut self,
+        ctx: &'a Context,
+        action: &'a GetNode,
+    ) -> impl Future<Output = Outcome<GetNode, Self>> + Send + 'a {
+        async move {
+            let state = self.state(ctx.snapshot()).unwrap_or(self.latest_state());
+            Outcome::ok(self.products_at_path(state, &action.0))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DerefAstBox<T>(pub AstBox<T>);
+
+#[resolve_action]
+impl<Root, Lower, T> Resolve<DerefAstBox<T>> for Parser<Root, Lower>
+where
+    Root: LexerRoot + Clone + 'static,
+    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    T: Clone + Send + Sync + 'static,
+{
+    type Output = T;
+
+    fn resolve<'a>(
+        &'a mut self,
+        _ctx: &'a Context,
+        action: &'a DerefAstBox<T>,
+    ) -> impl Future<Output = Outcome<DerefAstBox<T>, Self>> + Send + 'a {
+        async move {
+            let Some(arenas) = self.session_arenas.get(&action.0.uri) else {
+                return Outcome::fail(super::ParseError::Build(
+                    super::grammar::BuildError::MissingProduct(0),
+                ));
+            };
+            match arenas.ast.cloned::<T>(action.0.id) {
+                Some(v) => Outcome::ok(v),
+                None => Outcome::fail(super::ParseError::Build(
+                    super::grammar::BuildError::TypeMismatch { product: 0 },
+                )),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DerefAstToken<T>(pub AstToken<T>);
+
+#[resolve_action]
+impl<Root, Lower, T> Resolve<DerefAstToken<T>> for Parser<Root, Lower>
+where
+    Root: LexerRoot + Clone + 'static,
+    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    T: Clone + Send + Sync + 'static,
+{
+    type Output = T;
+
+    fn resolve<'a>(
+        &'a mut self,
+        ctx: &'a Context,
+        action: &'a DerefAstToken<T>,
+    ) -> impl Future<Output = Outcome<DerefAstToken<T>, Self>> + Send + 'a {
+        async move {
+            match ctx
+                .post::<Lexer<Root, Self>, GetTokenById<T>>(GetTokenById(action.0.id, PhantomData))
+                .await
+            {
+                Ok(value) => Outcome::ok(value),
+                Err(_) => Outcome::fail(super::ParseError::Build(
+                    super::grammar::BuildError::TypeMismatch { product: 0 },
+                )),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GetAstTree<T>(pub ParsePath, pub PhantomData<T>);
+
+#[resolve_action]
+impl<Root, Lower, T> Resolve<GetAstTree<T>> for Parser<Root, Lower>
+where
+    Root: LexerRoot + Clone + 'static,
+    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    type Output = Vec<AstBox<T>>;
+
+    fn resolve<'a>(
+        &'a mut self,
+        ctx: &'a Context,
+        action: &'a GetAstTree<T>,
+    ) -> impl Future<Output = Outcome<GetAstTree<T>, Self>> + Send + 'a {
+        async move {
+            let state = self.state(ctx.snapshot()).unwrap_or(self.latest_state());
+            Outcome::ok(self.ast_boxes_at_path::<T>(state, &action.0))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GetAstToken<T>(pub ParsePath, pub PhantomData<T>);
+
+#[resolve_action]
+impl<Root, Lower, T> Resolve<GetAstToken<T>> for Parser<Root, Lower>
+where
+    Root: LexerRoot + Clone + 'static,
+    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    type Output = Vec<AstToken<T>>;
+
+    fn resolve<'a>(
+        &'a mut self,
+        ctx: &'a Context,
+        action: &'a GetAstToken<T>,
+    ) -> impl Future<Output = Outcome<GetAstToken<T>, Self>> + Send + 'a {
+        async move {
+            let state = self.state(ctx.snapshot()).unwrap_or(self.latest_state());
+            Outcome::ok(self.ast_tokens_at_path::<T>(state, &action.0))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GetRootAstBox<T>(pub Uri<&'static str>, pub PhantomData<T>);
+
+#[resolve_action]
+impl<Root, Lower, T> Resolve<GetRootAstBox<T>> for Parser<Root, Lower>
+where
+    Root: LexerRoot + Clone + 'static,
+    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    type Output = Vec<AstBox<T>>;
+
+    fn resolve<'a>(
+        &'a mut self,
+        ctx: &'a Context,
+        action: &'a GetRootAstBox<T>,
+    ) -> impl Future<Output = Outcome<GetRootAstBox<T>, Self>> + Send + 'a {
+        async move {
+            let state = self.state(ctx.snapshot()).unwrap_or(self.latest_state());
+            let Some(roots) = state.roots.get(&action.0) else {
+                return Outcome::ok(Vec::new());
+            };
+            let Some(arenas) = self.session_arenas.get(&action.0) else {
+                return Outcome::ok(Vec::new());
+            };
+            let target = TypeId::of::<T>();
+            Outcome::ok(
+                roots
+                    .iter()
+                    .filter_map(|&pid| match &arenas.products.get(pid)?.data {
+                        ProductData::Node { ast, ty } if *ty == target => {
+                            Some(AstBox::new(*ast, action.0))
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        }
+    }
+}

@@ -212,17 +212,20 @@ enum NullableExprAst {
 
 #[derive(NonTerminal, Debug)]
 enum EbnfExprAst {
-    #[rule([ExprAst])]
-    Maybe(#[from(0)] Option<AstBox<ExprAst>>),
+    #[rule([$x(ExprAst)])]
+    Maybe(#[from(x)] Option<AstBox<ExprAst>>),
 
-    #[rule({ExprAst})]
-    Many(#[from(0)] Vec<AstBox<ExprAst>>),
+    #[rule({$x(ExprAst)})]
+    Many(#[from(x)] Vec<AstBox<ExprAst>>),
 
-    #[rule(ExprAst)]
-    Alt(#[from(0)] AstBox<ExprAst>),
+    #[rule($x(ExprAst))]
+    Alt(#[from(x)] AstBox<ExprAst>),
 
-    #[rule({ExprAst}[1..2])]
-    Bounded(#[from(0)] Vec<AstBox<ExprAst>>),
+    #[rule({$x(ExprAst)}[1..2])]
+    Bounded(#[from(x)] Vec<AstBox<ExprAst>>),
+
+    #[rule({$x(ExprAst)}{RootTokens::Number}[1..3])]
+    SeparatorBounded(#[from(x)] Vec<AstBox<ExprAst>>),
 }
 
 #[test]

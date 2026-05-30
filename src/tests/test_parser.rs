@@ -16,11 +16,7 @@ use crate::{
     utils::{RangeOrPoint, Span},
 };
 use color_print::cprintln;
-use std::{
-    marker::PhantomData,
-    sync::{Arc, atomic::AtomicUsize},
-    time::Duration,
-};
+use std::{marker::PhantomData, time::Duration};
 use tokio::sync::mpsc;
 
 #[tokens]
@@ -71,48 +67,41 @@ enum JsonValue {
     False,
     #[rule(JsonToken::Null)]
     Null,
-    #[rule(JsonObject)]
-    Object(#[from(0)] AstBox<JsonObject>),
-    #[rule(JsonArray)]
-    Array(#[from(0)] AstBox<JsonArray>),
+    #[rule($obj(JsonObject))]
+    Object(#[from(obj)] AstBox<JsonObject>),
+    #[rule($arr(JsonArray))]
+    Array(#[from(arr)] AstBox<JsonArray>),
 }
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonObject {
     #[rule(JsonToken::LBrace, JsonToken::RBrace)]
     Empty,
-    #[rule(JsonToken::LBrace, JsonMembers, JsonToken::RBrace)]
-    Members(#[from(1)] AstBox<JsonMembers>),
+    #[rule(JsonToken::LBrace, $members(JsonMembers), JsonToken::RBrace)]
+    Members(#[from(members)] AstBox<JsonMembers>),
 }
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonMembers {
-    #[rule(JsonMember)]
-    One(#[from(0)] AstBox<JsonMember>),
-    #[rule(JsonMembers, JsonToken::Comma, JsonMember)]
-    More(
-        #[from(0)] AstBox<JsonMembers>,
-        #[from(2)] AstBox<JsonMember>,
-    ),
+    #[rule({$m(JsonMember)}{JsonToken::Comma})]
+    Many(#[from(m)] Vec<AstBox<JsonMember>>),
 }
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonMember {
-    #[rule(JsonToken::String, JsonToken::Colon, JsonValue)]
-    Pair(#[from(0)] AstToken<JsonToken>, #[from(2)] AstBox<JsonValue>),
+    #[rule($key(JsonToken::String), JsonToken::Colon, $val(JsonValue))]
+    Pair(#[from(key)] AstToken<JsonToken>, #[from(val)] AstBox<JsonValue>),
 }
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonArray {
     #[rule(JsonToken::LBracket, JsonToken::RBracket)]
     Empty,
-    #[rule(JsonToken::LBracket, JsonElements, JsonToken::RBracket)]
-    Elements(#[from(1)] AstBox<JsonElements>),
+    #[rule(JsonToken::LBracket, $els(JsonElements), JsonToken::RBracket)]
+    Elements(#[from(els)] AstBox<JsonElements>),
 }
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonElements {
-    #[rule(JsonValue)]
-    One(#[from(0)] AstBox<JsonValue>),
-    #[rule(JsonElements, JsonToken::Comma, JsonValue)]
-    More(
-        #[from(0)] AstBox<JsonElements>,
-        #[from(2)] AstBox<JsonValue>,
+    #[rule($head(JsonValue), {$tail(JsonToken::Comma, JsonValue)})]
+    Many(
+        #[from(head)] AstBox<JsonValue>,
+        #[from(tail)] Vec<(AstToken<JsonToken>, AstBox<JsonValue>)>,
     ),
 }
 
@@ -223,19 +212,10 @@ async fn walk_array(ctx: &Context, arr: &JsonArray, indent: usize) {
 
 async fn walk_members(ctx: &Context, mems: &JsonMembers, indent: usize) {
     match mems {
-        JsonMembers::One(m) => walk_member(ctx, m, indent).await,
-        JsonMembers::More(more, m) => {
-            let more: Option<JsonMembers> = deref!(
-                ctx,
-                DerefAstBox<JsonMembers>,
-                DerefAstBox(*more),
-                "Members::More inner",
-                indent
-            );
-            if let Some(more) = more {
-                Box::pin(walk_members(ctx, &more, indent)).await;
+        JsonMembers::Many(items) => {
+            for m in items {
+                walk_member(ctx, m, indent).await;
             }
-            walk_member(ctx, m, indent).await;
         }
     }
 }
@@ -280,49 +260,35 @@ async fn walk_member(ctx: &Context, member: &AstBox<JsonMember>, indent: usize) 
 
 async fn walk_elements(ctx: &Context, els: &JsonElements, indent: usize) {
     match els {
-        JsonElements::One(val) => {
+        JsonElements::Many(head, tail) => {
             if let Some(v) = deref!(
                 ctx,
                 DerefAstBox<JsonValue>,
-                DerefAstBox(*val),
-                "Elements::One",
+                DerefAstBox(*head),
+                "Elements::Many head",
                 indent
             ) {
                 walk_value(ctx, &v, indent).await;
             }
-        }
-        JsonElements::More(more, val) => {
-            let more: Option<JsonElements> = deref!(
-                ctx,
-                DerefAstBox<JsonElements>,
-                DerefAstBox(*more),
-                "Elements::More inner",
-                indent
-            );
-            if let Some(more) = more {
-                Box::pin(walk_elements(ctx, &more, indent)).await;
-            }
-            if let Some(v) = deref!(
-                ctx,
-                DerefAstBox<JsonValue>,
-                DerefAstBox(*val),
-                "Elements::More val",
-                indent
-            ) {
-                walk_value(ctx, &v, indent).await;
+            for (_, val) in tail {
+                if let Some(v) = deref!(
+                    ctx,
+                    DerefAstBox<JsonValue>,
+                    DerefAstBox(*val),
+                    "Elements::Many val",
+                    indent
+                ) {
+                    walk_value(ctx, &v, indent).await;
+                }
             }
         }
     }
 }
-const JSON_SAMPLE: &str =
-    r#"{"name":"plingo","features":["lexer","parser"],"ok":true,"count":2,"meta":null}"#;
 
 #[tokio::test]
 async fn json_runtime_parse_output() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let uri = Span::new("file:///json-runtime.json", 0, 0)?.uri;
-    let counter = Arc::new(AtomicUsize::new(0));
-
     let debug_sink = debug_sink!(|ctx, deltas| async move {
         cprintln!("<dim>---------Received---------</dim>");
         let _: &Vec<Delta<ParsePath, ParseForest>> = &deltas;
@@ -393,7 +359,7 @@ async fn json_runtime_parse_output() -> anyhow::Result<()> {
                 uri,
                 range: RangeOrPoint::Point(0),
             },
-            value: r#"{"hello":{"world":22}}"#.into(),
+            value: r#"{"hello":{"world":22},"foo":"bar"}"#.into(),
         })
         .await?;
 

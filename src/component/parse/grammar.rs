@@ -205,10 +205,18 @@ impl<'a> BuildCx<'a> {
         T: Clone + 'static,
     {
         match self.product(product)?.data {
-            ProductData::Node { ast, .. } => self
-                .ast
-                .cloned(ast)
-                .ok_or(BuildError::TypeMismatch { product }),
+            ProductData::Node { ast, .. } => {
+                let result = self
+                    .ast
+                    .cloned(ast);
+                if result.is_none() {
+                    eprintln!(
+                        "BuildCx::expect_value TypeMismatch for product {product:?}: expecting {}",
+                        std::any::type_name::<T>(),
+                    );
+                }
+                result.ok_or(BuildError::TypeMismatch { product })
+            }
             ProductData::Token { ast: Some(ast), .. } => self
                 .ast
                 .cloned(ast)

@@ -85,7 +85,14 @@ impl<'a> LowerCtx<'a> {
         let mut registrations = Vec::new();
         let lowered = self.lower_expr(&rule, &mut builders, &mut registrations)?;
         let rhs_exprs = lowered.symbol_exprs;
-        let field_exprs = build_variant_field_exprs(&variant.fields, &rhs_exprs)?;
+        let mut named_captures = Vec::new();
+        if let Some(name) = &lowered.name {
+            named_captures.push((name.clone(), 0usize));
+        }
+        for (name, index, _kind) in &lowered.captures {
+            named_captures.push((name.clone(), *index));
+        }
+        let field_exprs = build_variant_field_exprs(&variant.fields, &rhs_exprs, &named_captures)?;
         let ctor = match &variant.fields {
             Fields::Unit => quote! { #enum_ident::#variant_ident },
             Fields::Unnamed(_) => quote! { #enum_ident::#variant_ident(#(#field_exprs),*) },
@@ -159,8 +166,14 @@ impl<'a> LowerCtx<'a> {
             RuleExpr::Seq(items) => {
                 let mut symbol_exprs = Vec::new();
                 let mut value_types = Vec::new();
+                let mut captures = Vec::new();
                 for item in items {
                     let lowered = self.lower_expr(item, builders, registrations)?;
+                    let symbol_offset = symbol_exprs.len();
+                    if let Some(name) = lowered.name {
+                        captures.push((name, symbol_offset, lowered.value_kind.clone()));
+                    }
+                    captures.extend(lowered.captures);
                     symbol_exprs.extend(lowered.symbol_exprs);
                     value_types.push(lowered.value_kind);
                 }
@@ -171,10 +184,22 @@ impl<'a> LowerCtx<'a> {
                 } else {
                     ValueKind::Tuple(value_types)
                 };
-                Ok(LoweredExpr::new(symbol_exprs, value_type))
+                Ok(LoweredExpr {
+                    symbol_exprs,
+                    value_kind: value_type,
+                    name: None,
+                    captures,
+                })
+            }
+            RuleExpr::Named(name, inner) => {
+                let mut lowered = self.lower_expr(inner, builders, registrations)?;
+                lowered.name = Some(name.clone());
+                Ok(lowered)
             }
             RuleExpr::Optional(inner) => {
                 let lowered = self.lower_expr(inner, builders, registrations)?;
+                let capture_name = lowered.name.clone();
+                let captures = lowered.captures;
                 let synthetic = self.synthetic_name("opt");
                 let builder_none = self.synthetic_builder("opt_none");
                 let builder_some = self.synthetic_builder("opt_some");
@@ -241,19 +266,32 @@ impl<'a> LowerCtx<'a> {
                     grammar.rule(#synthetic, lhs, ::std::vec![#(#inner_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_some));
                 });
 
-                Ok(LoweredExpr::new(
-                    vec![quote! { grammar.begin_internal_non_terminal(#synthetic) }],
-                    ValueKind::Option(Box::new(inner_kind)),
-                ))
+                Ok(LoweredExpr {
+                    symbol_exprs: vec![quote! { grammar.begin_internal_non_terminal(#synthetic) }],
+                    value_kind: ValueKind::Option(Box::new(inner_kind)),
+                    name: capture_name,
+                    captures,
+                })
             }
-            RuleExpr::Repeat(inner, bounds) => {
+            RuleExpr::Repeat(inner, separator, bounds) => {
                 let lowered = self.lower_expr(inner, builders, registrations)?;
+                let capture_name = lowered.name.clone();
+                let captures = lowered.captures;
                 let synthetic = self.synthetic_name("rep");
                 let item_kind = lowered.value_kind.clone();
                 let item_type = item_kind.ty_tokens();
                 let inner_symbols = lowered.symbol_exprs.clone();
+                let item_stride = inner_symbols.len();
                 let (min, max) = bounds.unwrap_or((0, None));
                 let upper = max.unwrap_or(min + 3);
+
+                let (sep_lowered, sep_stride) = if let Some(sep) = separator {
+                    let sep_lowered = self.lower_expr(sep, builders, registrations)?;
+                    let stride = sep_lowered.symbol_exprs.len();
+                    (Some(sep_lowered), stride)
+                } else {
+                    (None, 0)
+                };
 
                 if min == 0 {
                     let builder_empty = self.synthetic_builder("rep_empty");
@@ -283,9 +321,20 @@ impl<'a> LowerCtx<'a> {
 
                 for count in min.max(1)..=upper {
                     let builder = self.synthetic_builder(&format!("rep_{}", count));
-                    let seq = (0..count)
-                        .flat_map(|_| inner_symbols.clone())
-                        .collect::<Vec<_>>();
+                    let seq: Vec<_> = match &sep_lowered {
+                        None => (0..count)
+                            .flat_map(|_| inner_symbols.clone())
+                            .collect(),
+                        Some(sep) => {
+                            let mut s = Vec::new();
+                            s.extend(inner_symbols.clone());
+                            for _ in 1..count {
+                                s.extend(sep.symbol_exprs.clone());
+                                s.extend(inner_symbols.clone());
+                            }
+                            s
+                        }
+                    };
                     let seq_bindings = seq
                         .iter()
                         .enumerate()
@@ -311,15 +360,32 @@ impl<'a> LowerCtx<'a> {
                             )
                         })
                         .collect::<Vec<_>>();
+                    let stride = if separator.is_some() {
+                        item_stride + sep_stride
+                    } else {
+                        item_stride
+                    };
                     let indexes = (0..count).collect::<Vec<_>>();
                     let pushes = indexes
                         .iter()
                         .map(|index| {
-                            let extract = item_kind.extract_expr(quote! {
-                                ::plingo::component::parse::__macro_private::production_child(children, #index)?
-                            });
-                            quote! {
-                                value.push(#extract);
+                            let base = index * stride;
+                            match &item_kind {
+                                ValueKind::Tuple(kinds) => {
+                                    let parts: Vec<_> = kinds.iter().enumerate().map(|(i, k)| {
+                                        let offset = base + i;
+                                        k.extract_expr(quote! {
+                                            ::plingo::component::parse::__macro_private::production_child(children, #offset)?
+                                        })
+                                    }).collect();
+                                    quote! { value.push((#(#parts),*)); }
+                                }
+                                _ => {
+                                    let extract = item_kind.extract_expr(quote! {
+                                        ::plingo::component::parse::__macro_private::production_child(children, #base)?
+                                    });
+                                    quote! { value.push(#extract); }
+                                }
                             }
                         })
                         .collect::<Vec<_>>();
@@ -340,10 +406,12 @@ impl<'a> LowerCtx<'a> {
                     });
                 }
 
-                Ok(LoweredExpr::new(
-                    vec![quote! { grammar.begin_internal_non_terminal(#synthetic) }],
-                    ValueKind::Vec(Box::new(item_kind)),
-                ))
+                Ok(LoweredExpr {
+                    symbol_exprs: vec![quote! { grammar.begin_internal_non_terminal(#synthetic) }],
+                    value_kind: ValueKind::Vec(Box::new(item_kind)),
+                    name: capture_name,
+                    captures,
+                })
             }
             RuleExpr::Alt(items) => {
                 if items.len() != 2 {
@@ -492,6 +560,8 @@ impl<'a> LowerCtx<'a> {
 struct LoweredExpr {
     symbol_exprs: Vec<proc_macro2::TokenStream>,
     value_kind: ValueKind,
+    name: Option<String>,
+    captures: Vec<(String, usize, ValueKind)>,
 }
 
 impl LoweredExpr {
@@ -499,6 +569,8 @@ impl LoweredExpr {
         Self {
             symbol_exprs,
             value_kind,
+            name: None,
+            captures: Vec::new(),
         }
     }
 }
@@ -519,7 +591,7 @@ impl ValueKind {
         match self {
             Self::Unit => quote! { () },
             Self::Node(ty) => quote! { ::plingo::component::parse::data::AstBox<#ty> },
-            Self::Token(ty) => quote! { #ty },
+            Self::Token(ty) => quote! { ::plingo::component::parse::data::AstToken<#ty> },
             Self::Option(inner) => {
                 let inner = inner.ty_tokens();
                 quote! { ::std::option::Option<#inner> }
@@ -551,13 +623,20 @@ impl ValueKind {
             }
             Self::Token(ty) => {
                 quote! {
-                    <#ty as ::plingo::component::parse::__macro_private::TokenField>::from_token_entry(
+                    <::plingo::component::parse::data::AstToken<#ty> as ::plingo::component::parse::__macro_private::TokenField>::from_token_entry(
                         cx,
                         ::plingo::component::parse::__macro_private::BuildField::from_product(cx, #child)?,
                     )?
                 }
             }
-            Self::Tuple(_) => unreachable!(),
+            Self::Tuple(kinds) => {
+                let fields = kinds.iter().enumerate().map(|(i, k)| {
+                    k.extract_expr(quote! {
+                        ::plingo::component::parse::__macro_private::production_child(children, #i)?
+                    })
+                });
+                quote! { (#(#fields),*) }
+            }
         }
     }
 }
@@ -569,7 +648,8 @@ enum RuleExpr {
     Seq(Vec<RuleExpr>),
     Alt(Vec<RuleExpr>),
     Optional(Box<RuleExpr>),
-    Repeat(Box<RuleExpr>, Option<(usize, Option<usize>)>),
+    Repeat(Box<RuleExpr>, Option<Box<RuleExpr>>, Option<(usize, Option<usize>)>),
+    Named(String, Box<RuleExpr>),
 }
 
 #[derive(Clone)]
@@ -639,6 +719,14 @@ fn parse_seq(input: ParseStream) -> syn::Result<RuleExpr> {
 }
 
 fn parse_postfix(input: ParseStream) -> syn::Result<RuleExpr> {
+    if input.peek(syn::Token![$]) {
+        let _: syn::Token![$] = input.parse()?;
+        let name: Ident = input.parse()?;
+        let content;
+        syn::parenthesized!(content in input);
+        let inner = parse_alt(&content)?;
+        return Ok(RuleExpr::Named(name.to_string(), Box::new(inner)));
+    }
     if input.peek(syn::token::Bracket) {
         let content;
         syn::bracketed!(content in input);
@@ -649,6 +737,13 @@ fn parse_postfix(input: ParseStream) -> syn::Result<RuleExpr> {
         let content;
         syn::braced!(content in input);
         let inner = parse_alt(&content)?;
+        let separator = if input.peek(syn::token::Brace) {
+            let sep_content;
+            syn::braced!(sep_content in input);
+            Some(Box::new(parse_alt(&sep_content)?))
+        } else {
+            None
+        };
         let bounds = if input.peek(syn::token::Bracket) {
             let bound_content;
             syn::bracketed!(bound_content in input);
@@ -663,7 +758,7 @@ fn parse_postfix(input: ParseStream) -> syn::Result<RuleExpr> {
         } else {
             None
         };
-        return Ok(RuleExpr::Repeat(Box::new(inner), bounds));
+        return Ok(RuleExpr::Repeat(Box::new(inner), separator, bounds));
     }
     parse_atom(input)
 }
@@ -727,22 +822,47 @@ fn atom_value_type(atom: &Atom) -> syn::Result<ValueKind> {
     }
 }
 
+enum FromSpec {
+    Positional(usize),
+    Named(String),
+}
+
 fn build_variant_field_exprs(
     fields: &Fields,
     rhs_exprs: &[proc_macro2::TokenStream],
+    named_captures: &[(String, usize)],
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     fields
         .iter()
-        .map(|field| build_variant_field_expr(field, rhs_exprs))
+        .map(|field| build_variant_field_expr(field, rhs_exprs, named_captures))
         .collect()
 }
 
 fn build_variant_field_expr(
     field: &Field,
     rhs_exprs: &[proc_macro2::TokenStream],
+    named_captures: &[(String, usize)],
 ) -> syn::Result<proc_macro2::TokenStream> {
     let field_ty = &field.ty;
-    let index = parse_from_index(field)?;
+    let from_spec = parse_from_spec(field)?;
+    let index = match from_spec {
+        FromSpec::Positional(i) => i,
+        FromSpec::Named(ref name) => {
+            named_captures
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, i)| *i)
+                .ok_or_else(|| {
+                    syn::Error::new(
+                        field.ty.span(),
+                        format!(
+                            "named capture '{name}' not found in rule; available: {:?}",
+                            named_captures
+                        ),
+                    )
+                })?
+        }
+    };
     if index >= rhs_exprs.len() {
         return Err(syn::Error::new(
             field.ty.span(),
@@ -773,25 +893,31 @@ fn build_variant_field_expr(
     )
 }
 
-fn parse_from_index(field: &Field) -> syn::Result<usize> {
-    let mut index = None;
+fn parse_from_spec(field: &Field) -> syn::Result<FromSpec> {
+    let mut spec = None;
     for attr in &field.attrs {
         if !attr.path().is_ident("from") {
             continue;
         }
-        if index.is_some() {
+        if spec.is_some() {
             return Err(syn::Error::new(
                 attr.span(),
                 "duplicate #[from(...)] attribute",
             ));
         }
-        let lit = attr.parse_args::<LitInt>()?;
-        index = Some(lit.base10_parse::<usize>()?);
+        let tokens = &attr.meta.require_list()?.tokens;
+        let arg = syn::parse2::<syn::LitInt>(tokens.clone()).ok();
+        if let Some(lit) = arg {
+            spec = Some(FromSpec::Positional(lit.base10_parse::<usize>()?));
+        } else {
+            let ident = syn::parse2::<Ident>(tokens.clone())?;
+            spec = Some(FromSpec::Named(ident.to_string()));
+        }
     }
-    index.ok_or_else(|| {
+    spec.ok_or_else(|| {
         syn::Error::new(
             field.span(),
-            "each nonterminal field requires #[from(index)]",
+            "each nonterminal field requires #[from(index)] or #[from(name)]",
         )
     })
 }

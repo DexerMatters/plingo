@@ -313,7 +313,17 @@ impl AstArena {
     where
         T: Clone + 'static,
     {
-        self.values.get(id)?.downcast_ref::<T>().cloned()
+        let entry = self.values.get(id)?;
+        let result = entry.downcast_ref::<T>().cloned();
+        if result.is_none() {
+            eprintln!(
+                "AstArena::cloned TypeMismatch: requested {:?} ({}), stored {:?}",
+                std::any::TypeId::of::<T>(),
+                std::any::type_name::<T>(),
+                entry.as_ref().type_id(),
+            );
+        }
+        result
     }
 }
 

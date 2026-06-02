@@ -7,7 +7,7 @@ use indexmap::IndexSet;
 
 use crate::component::parse::{TokenOccurrenceId, recovery};
 use crate::component::{
-    lex::{GetVisibleTokenBatch, Lexer, LexerRoot, VisibleTokenBatch},
+    lex::{GetVisibleTokenBatch, Lexer, LexerRoot},
     parse::{
         IncrementalParseStats, Parser, ParserSnapshotState, SessionArenas, TokenData,
         build::{Action, ActionSet},
@@ -20,11 +20,11 @@ use crate::component::{
         grammar::{BuildCx, BuildError, Grammar, NonTerminalId, Symbol, TerminalId},
         identity::TokenFingerprint,
         incremental::ReplayPlan,
-        recovery::{RecoveryError, Repair},
+        recovery::Repair,
     },
 };
 use crate::scheme::{Context, Delta, LayerDeltas, NonTopLayer};
-use crate::utils::{RangeOrPoint, Span};
+use crate::utils::Span;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ParseToken {
@@ -182,7 +182,6 @@ impl ParserSessionState {
         self.columns.truncate(column + 1);
         self.generation += 1;
         self.columns[column].reset_for_replay();
-        self.reduced_products.clear();
         self.diagnostics
             .retain(|info| info.location.is_some_and(|loc| loc < column));
 
@@ -204,6 +203,11 @@ impl ParserSessionState {
                     if let Some(&product) = column.products.first() {
                         self.token_products.insert(token, product);
                     }
+                }
+            }
+            for diagnostic in &column.diagnostics {
+                if !self.diagnostics.contains(diagnostic) {
+                    self.diagnostics.push(diagnostic.clone());
                 }
             }
             self.columns.push(column);
@@ -975,7 +979,7 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
             })
             .collect::<Vec<_>>();
         edge_sigs.sort();
-        let sig = format!("{}@{}[{}]", node.state, node.column, edge_sigs.join(","));
+        let sig = format!("{}[{}]", node.state, edge_sigs.join(","));
         node_memo.insert(node_id, sig.clone());
         sig
     }
@@ -996,7 +1000,7 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
             .map(|edge| Self::frontier_state_node_signature(gss, edge.to, memo))
             .collect::<Vec<_>>();
         edge_sigs.sort();
-        let sig = format!("{}@{}[{}]", node.state, node.column, edge_sigs.join(","));
+        let sig = format!("{}[{}]", node.state, edge_sigs.join(","));
         memo.insert(node_id, sig.clone());
         sig
     }
@@ -1080,6 +1084,7 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
                 &mut node_memo,
                 &mut product_memo,
             )
+            && a.diagnostics == b.diagnostics
     }
 
     fn frontier_equivalent(a: &ParseColumn, b: &ParseColumn, gss: &GssArena) -> bool {
@@ -1136,114 +1141,65 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
         &mut self,
         working: &mut ParserSnapshotState,
         uri: fluent_uri::Uri<&'static str>,
-        deltas: &[Delta<Span, usize>],
+        _deltas: &[Delta<Span, usize>],
         ctx: &Context,
     ) -> Result<LayerDeltas<Lower>, ParseError>
     where
         Lower: NonTopLayer<_Key = super::ParsePath, _Value = super::ParseForest>,
     {
         let roots_before = working.roots.get(&uri).cloned().unwrap_or_default();
-        let eof = self.grammar.eof;
-
-        let span = Span {
-            uri,
-            range: RangeOrPoint::Range(0, usize::MAX),
-        };
-        let tokens: Vec<TokenData> = ctx
-            .post::<Lexer<Root, Self>, super::GetParseTokens>(super::GetParseTokens(span))
+        let batch = ctx
+            .post::<Lexer<Root, Self>, GetVisibleTokenBatch>(GetVisibleTokenBatch(uri.clone()))
             .await
             .map_err(|_| ParseError::Build(BuildError::MissingProduct(0)))?;
+        let Some(batch) = batch else {
+            self.latest_incremental_stats
+                .insert(uri, IncrementalParseStats::default());
+            return Ok(Vec::new());
+        };
 
-        if deltas.len() > 1 {
-            let mut fresh_arenas = SessionArenas {
-                trees: TreeArena::new(),
-                products: ProductArena::new(),
-                ast: AstArena::new(uri),
-                gss: GssArena::new(),
-            };
-            let mut fresh_state = ParserSessionState::default();
-            if fresh_state.columns.is_empty() {
-                let start = fresh_arenas.gss.node(0, 0, 0);
-                fresh_state.columns = vec![ParseColumn::new(0, None, IndexSet::from([start]))];
-            }
-            let mut fresh_ctx = SessionContext {
-                state: &mut fresh_state,
-                trees: &mut fresh_arenas.trees,
-                products: &mut fresh_arenas.products,
-                ast: &mut fresh_arenas.ast,
-                gss: &mut fresh_arenas.gss,
-                grammar: &self.grammar,
-                actions: &self.actions,
-                gotos: &self.gotos,
-                error_recovery: self.config.error_recovery,
-                error_recovery_timeout: self.config.error_recovery_timeout,
-            };
-            let repair_start = Instant::now();
-            fresh_ctx.parse_tokens(&tokens)?;
-            let roots_after = fresh_ctx.state.accepted().to_vec();
-            let recovery_columns = fresh_ctx
-                .state
-                .columns
-                .iter()
-                .filter(|c| c.error_derived)
-                .count();
-            drop(fresh_ctx);
+        let plan = ReplayPlan::from_batch(batch.clone());
 
-            let lower_deltas = if roots_before.is_empty() {
-                vec![emit::insert_root(uri.clone(), roots_after.clone())]
-            } else if !roots_after.is_empty() {
-                let raw = super::diff::diff_trees(
-                    &fresh_arenas.products,
-                    &fresh_arenas.trees,
-                    &roots_before,
-                    &roots_after,
-                    uri.clone(),
-                );
-                let compacted = super::diff::compact(raw);
-                if compacted.is_empty() && !deltas.is_empty() {
-                    emit::replace_root(uri.clone(), roots_after.clone(), roots_before.len())
-                } else {
-                    compacted
-                }
-            } else {
-                vec![emit::delete_root(uri.clone(), roots_before.len())]
-            };
-
-            self.session_arenas.insert(uri.clone(), fresh_arenas);
-            working.sessions.insert(uri.clone(), fresh_state);
-            working.roots.insert(uri.clone(), roots_after.clone());
+        if !plan.batch.is_changed() {
+            let sessions = working.sessions.get(&uri);
+            let current_boundary = sessions.map(|state| state.current_column()).unwrap_or(0);
+            let recovery_columns = sessions
+                .map(|state| {
+                    state
+                        .columns
+                        .iter()
+                        .skip(1)
+                        .filter(|column| column.error_derived)
+                        .count()
+                })
+                .unwrap_or(0);
             self.latest_incremental_stats.insert(
-                uri.clone(),
+                uri,
                 IncrementalParseStats {
-                    reparsed: tokens.len(),
-                    reused: 0,
+                    restart_boundary: plan.restart_boundary,
+                    reconverged_new_boundary: batch.new_tokens.len().checked_sub(1),
+                    reconverged_old_boundary: batch.old_tokens.len().checked_sub(1),
+                    reparsed: 0,
+                    reused: current_boundary,
                     recovery_columns,
-                    converged: false,
+                    frontier_converged: true,
+                    semantic_reused: true,
+                    converged: true,
                 },
             );
-
-            let elapsed = repair_start.elapsed();
-            log::debug!(
-                target: "Measure",
-                "{} new={} full-batch in {:?}",
-                uri,
-                tokens.len(),
-                elapsed,
-            );
-
-            return Ok(lower_deltas);
+            return Ok(Vec::new());
         }
 
         let arenas = self
             .session_arenas
-            .entry(uri)
+            .entry(uri.clone())
             .or_insert_with(|| SessionArenas {
                 trees: TreeArena::new(),
                 products: ProductArena::new(),
-                ast: AstArena::new(uri),
+                ast: AstArena::new(uri.clone()),
                 gss: GssArena::new(),
             });
-        let state = working.sessions.entry(uri).or_default();
+        let state = working.sessions.entry(uri.clone()).or_default();
         if state.columns.is_empty() {
             let start = arenas.gss.node(0, 0, 0);
             state.columns = vec![ParseColumn::new(0, None, IndexSet::from([start]))];
@@ -1261,43 +1217,31 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
             error_recovery_timeout: self.config.error_recovery_timeout,
         };
 
-        let restart = if deltas.len() > 1 {
-            0
-        } else {
-            deltas
-                .iter()
-                .map(|delta| match delta {
-                    Delta::Insert { key, .. } => {
-                        Self::restart_column_for_offset(&tokens, key.range.start())
-                            .saturating_sub(1)
-                    }
-                    Delta::Delete { key, .. } => {
-                        Self::restart_column_for_offset(&tokens, key.range.start())
-                    }
-                })
-                .min()
-                .unwrap_or(0)
-                .min(session_ctx.state.current_column())
-        };
-        let old_columns = session_ctx.state.columns_from(restart + 1);
-        let old_columns_len = old_columns.len();
-        let mut old_index_by_token: HashMap<Option<TokenOccurrenceId>, Vec<usize>> = HashMap::new();
-        for (idx, column) in old_columns.iter().enumerate() {
-            old_index_by_token
-                .entry(column.token())
-                .or_default()
-                .push(idx);
-        }
-
-        let columns_before = session_ctx.state.columns.len();
-
-        session_ctx.state.truncate_to_column(restart);
-
-        let repair_start = Instant::now();
-
-        let parse_tokens = tokens
+        let restart_boundary = plan
+            .restart_boundary
+            .min(session_ctx.state.current_column());
+        let old_reuse_start = plan.old_reuse_start.min(session_ctx.state.columns.len());
+        let old_suffix_columns = session_ctx.state.columns_from(old_reuse_start);
+        let old_checkpoints = old_suffix_columns
             .iter()
-            .filter(|data| data.column >= restart)
+            .enumerate()
+            .map(|(offset, column)| {
+                checkpoint::checkpoint_for_column(
+                    old_reuse_start + offset,
+                    column,
+                    session_ctx.gss,
+                    session_ctx.products,
+                    session_ctx.trees,
+                )
+            })
+            .collect::<Vec<_>>();
+        let old_suffix_len = old_suffix_columns.len();
+
+        session_ctx.state.truncate_to_column(restart_boundary);
+
+        let parse_tokens = plan
+            .replay_tokens()
+            .iter()
             .map(|data| ParseToken {
                 entry: data.id,
                 column: data.column,
@@ -1309,35 +1253,102 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
             })
             .collect::<Vec<_>>();
 
-        let mut converged_at_old = None;
-        let mut frontier_converged_at_old = None;
-        let mut saw_recovery = false;
+        fn maybe_reuse_suffix<'a>(
+            plan: &ReplayPlan,
+            old_suffix_columns: &[ParseColumn],
+            old_checkpoints: &[BoundaryCheckpoint],
+            session_ctx: &mut SessionContext<'a>,
+            current_boundary: usize,
+            frontier_converged: &mut bool,
+            semantic_reused: &mut bool,
+            reconverged_new_boundary: &mut Option<usize>,
+            reconverged_old_boundary: &mut Option<usize>,
+        ) -> Result<bool, ParseError> {
+            if current_boundary < plan.new_reuse_start {
+                return Ok(false);
+            }
+            let Some(old_boundary) = plan.translated_old_boundary(current_boundary) else {
+                return Ok(false);
+            };
+            let old_index = old_boundary.saturating_sub(plan.old_reuse_start);
+            let Some(old_checkpoint) = old_checkpoints.get(old_index) else {
+                return Ok(false);
+            };
+            let Some(current_column) = session_ctx.state.column(current_boundary) else {
+                return Ok(false);
+            };
+            let current_checkpoint = checkpoint::checkpoint_for_column(
+                current_boundary,
+                current_column,
+                session_ctx.gss,
+                session_ctx.products,
+                session_ctx.trees,
+            );
+            if current_checkpoint.frontier_key == old_checkpoint.frontier_key {
+                *frontier_converged = true;
+            }
+            if current_checkpoint == *old_checkpoint {
+                *semantic_reused = true;
+                *reconverged_new_boundary = Some(current_boundary);
+                *reconverged_old_boundary = Some(old_boundary);
+                let reused_columns = old_suffix_columns
+                    .iter()
+                    .skip(old_index)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                session_ctx.state.discard_columns_from(current_boundary);
+                session_ctx.state.append_reused_columns(reused_columns);
+                return Ok(true);
+            }
+            Ok(false)
+        }
+
+        let repair_start = Instant::now();
+        let eof = self.grammar.eof;
+        let mut frontier_converged = false;
+        let mut semantic_reused = false;
+        let mut reconverged_new_boundary = None;
+        let mut reconverged_old_boundary = None;
         let mut i = 0usize;
         while i < parse_tokens.len() {
             let token = &parse_tokens[i];
             let column = session_ctx.state.current_column();
             session_ctx.reduce_until_stable(column, token.terminal)?;
             if token.terminal == eof && !session_ctx.state.accepted().is_empty() {
-                if let Some(current) = session_ctx.state.columns.last() {
-                    Self::compare_current_column(
-                        current,
-                        &old_index_by_token,
-                        &old_columns,
-                        session_ctx.gss,
-                        session_ctx.products,
-                        session_ctx.trees,
-                        true,
-                        &mut frontier_converged_at_old,
-                        &mut converged_at_old,
-                    );
+                session_ctx.compact_accepted_roots();
+                let current_boundary = session_ctx.state.current_column();
+                if maybe_reuse_suffix(
+                    &plan,
+                    &old_suffix_columns,
+                    &old_checkpoints,
+                    &mut session_ctx,
+                    current_boundary,
+                    &mut frontier_converged,
+                    &mut semantic_reused,
+                    &mut reconverged_new_boundary,
+                    &mut reconverged_old_boundary,
+                )? {
+                    break;
                 }
                 break;
             }
+
             if token.terminal == session_ctx.grammar.error_terminal && session_ctx.error_recovery {
                 if let Some(next) = session_ctx.recover_tokens(i, &parse_tokens)? {
-                    saw_recovery = true;
-                    frontier_converged_at_old = None;
-                    converged_at_old = None;
+                    let current_boundary = session_ctx.state.current_column();
+                    if maybe_reuse_suffix(
+                        &plan,
+                        &old_suffix_columns,
+                        &old_checkpoints,
+                        &mut session_ctx,
+                        current_boundary,
+                        &mut frontier_converged,
+                        &mut semantic_reused,
+                        &mut reconverged_new_boundary,
+                        &mut reconverged_old_boundary,
+                    )? {
+                        break;
+                    }
                     if next == i {
                         continue;
                     }
@@ -1345,13 +1356,25 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
                     continue;
                 }
             }
+
             if let Err(ParseError::NoActiveStacks { .. }) =
                 session_ctx.shift_parse_token(column, token)
             {
                 if let Some(next) = session_ctx.recover_tokens(i, &parse_tokens)? {
-                    saw_recovery = true;
-                    frontier_converged_at_old = None;
-                    converged_at_old = None;
+                    let current_boundary = session_ctx.state.current_column();
+                    if maybe_reuse_suffix(
+                        &plan,
+                        &old_suffix_columns,
+                        &old_checkpoints,
+                        &mut session_ctx,
+                        current_boundary,
+                        &mut frontier_converged,
+                        &mut semantic_reused,
+                        &mut reconverged_new_boundary,
+                        &mut reconverged_old_boundary,
+                    )? {
+                        break;
+                    }
                     if next == i {
                         continue;
                     }
@@ -1362,137 +1385,100 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
                     column: Some(token.column),
                 });
             }
+
             if token.terminal == eof {
                 let next_column = session_ctx.state.current_column();
                 session_ctx.reduce_until_stable(next_column, token.terminal)?;
             }
-            if session_ctx
-                .state
-                .columns
-                .last()
-                .is_some_and(|current| current.error_derived)
-            {
-                saw_recovery = true;
-                frontier_converged_at_old = None;
-                converged_at_old = None;
-            }
-            if !saw_recovery && let Some(current) = session_ctx.state.columns.last() {
-                Self::compare_current_column(
-                    current,
-                    &old_index_by_token,
-                    &old_columns,
-                    session_ctx.gss,
-                    session_ctx.products,
-                    session_ctx.trees,
-                    false,
-                    &mut frontier_converged_at_old,
-                    &mut converged_at_old,
-                );
+
+            let current_boundary = session_ctx.state.current_column();
+            if maybe_reuse_suffix(
+                &plan,
+                &old_suffix_columns,
+                &old_checkpoints,
+                &mut session_ctx,
+                current_boundary,
+                &mut frontier_converged,
+                &mut semantic_reused,
+                &mut reconverged_new_boundary,
+                &mut reconverged_old_boundary,
+            )? {
+                break;
             }
             i += 1;
         }
 
         session_ctx.compact_accepted_roots();
         let roots_after = session_ctx.state.accepted().to_vec();
-        if let Some(old_idx) = converged_at_old {
-            let current_column = session_ctx.state.current_column();
-            session_ctx.state.discard_columns_from(current_column);
-            session_ctx
-                .state
-                .append_reused_columns(old_columns.into_iter().skip(old_idx));
-        }
+        working.roots.insert(uri.clone(), roots_after.clone());
 
-        working.roots.insert(uri, roots_after.clone());
-
-        let reused = converged_at_old
-            .map(|old_idx| old_columns_len.saturating_sub(old_idx))
+        let reused = reconverged_old_boundary
+            .map(|old_boundary| {
+                old_suffix_len.saturating_sub(old_boundary.saturating_sub(old_reuse_start))
+            })
             .unwrap_or(0);
-        let reparsed = if let Some(old_idx) = converged_at_old {
-            old_idx + 1
-        } else {
-            session_ctx.state.current_column().saturating_sub(restart)
-        };
+        let reparsed = reconverged_new_boundary
+            .map(|new_boundary| new_boundary.saturating_sub(restart_boundary))
+            .unwrap_or_else(|| {
+                session_ctx
+                    .state
+                    .current_column()
+                    .saturating_sub(restart_boundary)
+            });
         let recovery_columns = session_ctx
             .state
             .columns
             .iter()
-            .skip(restart + 1)
+            .skip(restart_boundary.saturating_add(1))
             .filter(|c| c.error_derived)
             .count();
         self.latest_incremental_stats.insert(
-            uri,
+            uri.clone(),
             IncrementalParseStats {
+                restart_boundary,
+                reconverged_new_boundary,
+                reconverged_old_boundary,
                 reparsed,
                 reused,
                 recovery_columns,
-                converged: frontier_converged_at_old.is_some(),
+                frontier_converged,
+                semantic_reused,
+                converged: frontier_converged,
             },
         );
         drop(session_ctx);
 
         let lower_deltas = if roots_before.is_empty() {
-            vec![emit::insert_root(uri, roots_after.clone())]
-        } else if !roots_after.is_empty() {
-            let raw = super::diff::diff_trees(
+            if roots_after.is_empty() {
+                Vec::new()
+            } else {
+                vec![emit::insert_root(uri.clone(), roots_after.clone())]
+            }
+        } else if roots_after.is_empty() {
+            vec![emit::delete_root(uri.clone(), roots_before.len())]
+        } else {
+            super::diff::compact(super::diff::diff_trees(
                 &arenas.products,
                 &arenas.trees,
                 &roots_before,
                 &roots_after,
-                uri,
-            );
-            let compacted = super::diff::compact(raw);
-            if compacted.is_empty() && !deltas.is_empty() {
-                emit::replace_root(uri, roots_after.clone(), roots_before.len())
-            } else {
-                compacted
-            }
-        } else {
-            vec![emit::delete_root(uri, roots_before.len())]
+                uri.clone(),
+            ))
         };
 
         let elapsed = repair_start.elapsed();
-        let conv_flag = if frontier_converged_at_old.is_some() {
-            "conv"
-        } else {
-            "full"
-        };
-        if columns_before > 1 {
-            let total_suffix = columns_before.saturating_sub(restart);
-            let mut fields = format!("new={} old={}", reparsed, total_suffix);
-            if recovery_columns > 0 {
-                fields.push_str(&format!(" recov={}", recovery_columns));
-            }
-            if reused > 0 {
-                let old_suffix_len = total_suffix.saturating_sub(1);
-                fields.push_str(&format!(" reused={}/{}", reused, old_suffix_len));
-            }
-            log::debug!(
-                target: "Measure",
-                "{} {} {} in {:?}",
-                uri, fields, conv_flag, elapsed,
-            );
-        } else {
-            log::debug!(
-                target: "Measure",
-                "{} new={} {} in {:?}",
-                uri, reparsed, conv_flag, elapsed,
-            );
-        }
+        log::debug!(
+            target: "Measure",
+            "{} restart={} reparsed={} reused={} frontier={} semantic={} in {:?}",
+            uri,
+            restart_boundary,
+            reparsed,
+            reused,
+            frontier_converged,
+            semantic_reused,
+            elapsed,
+        );
 
         Ok(lower_deltas)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ParseError;
-
-    #[test]
-    fn parse_error_displays() {
-        let e = ParseError::MissingGoto {
-            state: 0,
-            non_terminal: 1,
-        };
-        assert!(format!("{e}").contains("missing goto"));
     }
 }

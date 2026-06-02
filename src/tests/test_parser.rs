@@ -775,6 +775,27 @@ async fn json_runtime_whitespace_only_edit_is_ignored() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn json_runtime_whitespace_delete_is_ignored() -> anyhow::Result<()> {
+    let source = r#"{"a":1, "b":2, "c":3}"#;
+    let delete_at = source.find(", ").unwrap() + 1;
+    let uri = Span::new("test://json-incremental", 0, 0)?.uri;
+
+    let (batches, _stats) = run_json_incremental_case(
+        source,
+        vec![Delta::Delete {
+            key: Span::new_uri(uri, delete_at, delete_at + 1)?,
+        }],
+    )
+    .await?;
+
+    assert!(
+        batches[1].is_empty(),
+        "whitespace-delete edit should not emit parse deltas"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn json_runtime_batched_replace_pair_emits_output() -> anyhow::Result<()> {
     let source = r#"{"a":1,"b":2}"#;
     let replace_at = source.find("a").unwrap();

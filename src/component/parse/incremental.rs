@@ -10,7 +10,7 @@ pub(crate) struct ReplayPlan {
 
 impl ReplayPlan {
     pub(crate) fn from_batch(batch: VisibleTokenBatch) -> Self {
-        let restart_boundary = batch.prefix_len.saturating_sub(1);
+        let restart_boundary = batch.prefix_len;
         let old_reuse_start = batch.old_tokens.len().saturating_sub(batch.suffix_len);
         let new_reuse_start = batch.new_tokens.len().saturating_sub(batch.suffix_len);
         Self {

@@ -357,7 +357,7 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         token_ranges: &[(usize, usize)],
     ) -> Vec<TokenData> {
         let mut out = Vec::new();
-        for (column, (&id, &(start, end))) in token_ids.iter().zip(token_ranges.iter()).enumerate() {
+        for (column, (&id, &(start, _end))) in token_ids.iter().zip(token_ranges.iter()).enumerate() {
             let Some(entry) = self.arena.get(id) else {
                 continue;
             };

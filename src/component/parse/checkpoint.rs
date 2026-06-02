@@ -12,7 +12,7 @@ use super::{
     parsing::ParseColumn,
 };
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct BoundaryCheckpoint {
     pub column_index: usize,
     pub frontier_key: u64,
@@ -20,6 +20,17 @@ pub(crate) struct BoundaryCheckpoint {
     pub accepted_key: u64,
     pub diagnostics_key: u64,
 }
+
+impl PartialEq for BoundaryCheckpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.frontier_key == other.frontier_key
+            && self.semantic_key == other.semantic_key
+            && self.accepted_key == other.accepted_key
+            && self.diagnostics_key == other.diagnostics_key
+    }
+}
+
+impl Eq for BoundaryCheckpoint {}
 
 pub(crate) fn checkpoint_for_column(
     column_index: usize,
@@ -32,12 +43,14 @@ pub(crate) fn checkpoint_for_column(
     let accepted_key = product_list_hash(column.accepted(), products, trees);
     let diagnostics_key = hash_value(&column.diagnostics);
     let products_key = product_list_hash(&column.products, products, trees);
+    let frontier_semantic_key = frontier_semantic_hash(column, gss, products, trees);
 
     BoundaryCheckpoint {
         column_index,
         frontier_key,
         semantic_key: hash_value(&(
             frontier_key,
+            frontier_semantic_key,
             products_key,
             accepted_key,
             diagnostics_key,
@@ -49,19 +62,46 @@ pub(crate) fn checkpoint_for_column(
 }
 
 fn frontier_hash(column: &ParseColumn, gss: &GssArena) -> u64 {
-    let mut memo = HashMap::new();
-    let base = frontier_set_hash(column.base_active_nodes(), gss, &mut memo);
-    let active = frontier_set_hash(column.active_nodes(), gss, &mut memo);
+    let mut node_memo = HashMap::new();
+    let base = frontier_set_hash(column.base_active_nodes(), gss, &mut node_memo);
+    let active = frontier_set_hash(column.active_nodes(), gss, &mut node_memo);
+    hash_value(&(base, active, column.error_derived))
+}
+
+fn frontier_semantic_hash(
+    column: &ParseColumn,
+    gss: &GssArena,
+    products: &ProductArena,
+    trees: &TreeArena,
+) -> u64 {
+    let mut node_memo = HashMap::new();
+    let mut product_memo = HashMap::new();
+    let base = frontier_semantic_set_hash(
+        column.base_active_nodes(),
+        gss,
+        products,
+        trees,
+        &mut node_memo,
+        &mut product_memo,
+    );
+    let active = frontier_semantic_set_hash(
+        column.active_nodes(),
+        gss,
+        products,
+        trees,
+        &mut node_memo,
+        &mut product_memo,
+    );
     hash_value(&(base, active, column.error_derived))
 }
 
 fn frontier_set_hash(
     nodes: impl Iterator<Item = GssNodeId>,
     gss: &GssArena,
-    memo: &mut HashMap<GssNodeId, u64>,
+    node_memo: &mut HashMap<GssNodeId, u64>,
 ) -> u64 {
     let mut hashes = nodes
-        .map(|node_id| frontier_node_hash(node_id, gss, memo))
+        .map(|node_id| frontier_node_hash(node_id, gss, node_memo))
         .collect::<Vec<_>>();
     hashes.sort_unstable();
     hash_value(&hashes)
@@ -70,9 +110,9 @@ fn frontier_set_hash(
 fn frontier_node_hash(
     node_id: GssNodeId,
     gss: &GssArena,
-    memo: &mut HashMap<GssNodeId, u64>,
+    node_memo: &mut HashMap<GssNodeId, u64>,
 ) -> u64 {
-    if let Some(&hash) = memo.get(&node_id) {
+    if let Some(&hash) = node_memo.get(&node_id) {
         return hash;
     }
 
@@ -80,15 +120,79 @@ fn frontier_node_hash(
         Some(node) => {
             let mut parents = gss
                 .outgoing_edges(node_id)
-                .map(|edge| (edge.product, frontier_node_hash(edge.to, gss, memo)))
+                .map(|edge| frontier_node_hash(edge.to, gss, node_memo))
                 .collect::<Vec<_>>();
             parents.sort_unstable();
-            hash_value(&(node.state, node.column, node.generation, parents))
+            hash_value(&(node.state, parents))
         }
         None => hash_value(&("missing-gss-node", node_id)),
     };
 
-    memo.insert(node_id, hash);
+    node_memo.insert(node_id, hash);
+    hash
+}
+
+fn frontier_semantic_set_hash(
+    nodes: impl Iterator<Item = GssNodeId>,
+    gss: &GssArena,
+    products: &ProductArena,
+    trees: &TreeArena,
+    node_memo: &mut HashMap<GssNodeId, u64>,
+    product_memo: &mut HashMap<ProductId, u64>,
+) -> u64 {
+    let mut hashes = nodes
+        .map(|node_id| {
+            frontier_semantic_node_hash(
+                node_id,
+                gss,
+                products,
+                trees,
+                node_memo,
+                product_memo,
+            )
+        })
+        .collect::<Vec<_>>();
+    hashes.sort_unstable();
+    hash_value(&hashes)
+}
+
+fn frontier_semantic_node_hash(
+    node_id: GssNodeId,
+    gss: &GssArena,
+    products: &ProductArena,
+    trees: &TreeArena,
+    node_memo: &mut HashMap<GssNodeId, u64>,
+    product_memo: &mut HashMap<ProductId, u64>,
+) -> u64 {
+    if let Some(&hash) = node_memo.get(&node_id) {
+        return hash;
+    }
+
+    let hash = match gss.get_node(node_id) {
+        Some(node) => {
+            let mut parents = gss
+                .outgoing_edges(node_id)
+                .map(|edge| {
+                    (
+                        product_hash(edge.product, products, trees, product_memo),
+                        frontier_semantic_node_hash(
+                            edge.to,
+                            gss,
+                            products,
+                            trees,
+                            node_memo,
+                            product_memo,
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            parents.sort_unstable();
+            hash_value(&(node.state, parents))
+        }
+        None => hash_value(&("missing-gss-node", node_id)),
+    };
+
+    node_memo.insert(node_id, hash);
     hash
 }
 

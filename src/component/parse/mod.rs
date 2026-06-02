@@ -98,9 +98,14 @@ pub type TokenOccurrenceId = usize;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IncrementalParseStats {
+    pub restart_boundary: usize,
+    pub reconverged_new_boundary: Option<usize>,
+    pub reconverged_old_boundary: Option<usize>,
     pub reparsed: usize,
     pub reused: usize,
     pub recovery_columns: usize,
+    pub frontier_converged: bool,
+    pub semantic_reused: bool,
     pub converged: bool,
 }
 

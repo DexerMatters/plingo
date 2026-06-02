@@ -201,6 +201,7 @@ struct EditCase {
     expected_keys: &'static [&'static str],
     min_errors: usize,
     requires_convergence: bool,
+    expect_reparse: bool,
 }
 
 fn json_edit_cases() -> Vec<EditCase> {
@@ -221,6 +222,7 @@ fn json_edit_cases() -> Vec<EditCase> {
             expected_keys: &["a", "b", "c"],
             min_errors: 0,
             requires_convergence: true,
+            expect_reparse: true,
         },
         EditCase {
             name: "valid_nested_object_and_array_append",
@@ -238,6 +240,7 @@ fn json_edit_cases() -> Vec<EditCase> {
             expected_keys: &["user", "flags"],
             min_errors: 0,
             requires_convergence: true,
+            expect_reparse: true,
         },
         EditCase {
             name: "valid_deep_append_and_nested_member_add",
@@ -255,6 +258,7 @@ fn json_edit_cases() -> Vec<EditCase> {
             expected_keys: &["arr", "ok"],
             min_errors: 0,
             requires_convergence: true,
+            expect_reparse: true,
         },
         EditCase {
             name: "valid_large_member_append",
@@ -280,6 +284,7 @@ fn json_edit_cases() -> Vec<EditCase> {
             expected_keys: &["a", "j", "k", "l", "m"],
             min_errors: 0,
             requires_convergence: true,
+            expect_reparse: true,
         },
         EditCase {
             name: "invalid_large_member_append_after_root",
@@ -291,6 +296,7 @@ fn json_edit_cases() -> Vec<EditCase> {
             expected_keys: &["a"],
             min_errors: 1,
             requires_convergence: false,
+            expect_reparse: true,
         },
         EditCase {
             name: "invalid_null_suffix_keeps_tail",
@@ -302,6 +308,7 @@ fn json_edit_cases() -> Vec<EditCase> {
             expected_keys: &["xddd", "he", "well"],
             min_errors: 1,
             requires_convergence: false,
+            expect_reparse: true,
         },
         EditCase {
             name: "invalid_null_suffix_keeps_tail_w",
@@ -313,6 +320,7 @@ fn json_edit_cases() -> Vec<EditCase> {
             expected_keys: &["xddd", "he", "well"],
             min_errors: 1,
             requires_convergence: false,
+            expect_reparse: true,
         },
         EditCase {
             name: "invalid_missing_colon_recovers",
@@ -327,6 +335,7 @@ fn json_edit_cases() -> Vec<EditCase> {
             expected_keys: &["a", "b", "c"],
             min_errors: 1,
             requires_convergence: false,
+            expect_reparse: true,
         },
         EditCase {
             name: "invalid_extra_comma_recovers",
@@ -338,6 +347,7 @@ fn json_edit_cases() -> Vec<EditCase> {
             expected_keys: &["a", "b", "c"],
             min_errors: 1,
             requires_convergence: false,
+            expect_reparse: true,
         },
         EditCase {
             name: "invalid_lexer_garbage_keeps_following_member",
@@ -349,6 +359,7 @@ fn json_edit_cases() -> Vec<EditCase> {
             expected_keys: &["a", "b", "c"],
             min_errors: 1,
             requires_convergence: false,
+            expect_reparse: true,
         },
     ]
 }
@@ -365,6 +376,7 @@ fn json_runtime_cases() -> Vec<EditCase> {
             expected_keys: &["he"],
             min_errors: 0,
             requires_convergence: true,
+            expect_reparse: true,
         },
         EditCase {
             name: "runtime_string_shorten",
@@ -376,6 +388,19 @@ fn json_runtime_cases() -> Vec<EditCase> {
             expected_keys: &["he"],
             min_errors: 0,
             requires_convergence: true,
+            expect_reparse: true,
+        },
+        EditCase {
+            name: "runtime_whitespace_delete_is_ignored",
+            initial: r#"{"a":1, "b":2, "c":3}"#,
+            ops: &[EditOp::Delete {
+                locate: Locate::First(" "),
+                len: 1,
+            }],
+            expected_keys: &["a", "b", "c"],
+            min_errors: 0,
+            requires_convergence: false,
+            expect_reparse: false,
         },
         EditCase {
             name: "runtime_repeated_child_rewrite",
@@ -399,6 +424,7 @@ fn json_runtime_cases() -> Vec<EditCase> {
             expected_keys: &[],
             min_errors: 0,
             requires_convergence: false,
+            expect_reparse: true,
         },
         EditCase {
             name: "runtime_large_member_append",
@@ -424,6 +450,7 @@ fn json_runtime_cases() -> Vec<EditCase> {
             expected_keys: &["a", "j", "k", "l", "m"],
             min_errors: 0,
             requires_convergence: false,
+            expect_reparse: true,
         },
         EditCase {
             name: "runtime_large_member_append_after_root",
@@ -435,6 +462,7 @@ fn json_runtime_cases() -> Vec<EditCase> {
             expected_keys: &["a"],
             min_errors: 1,
             requires_convergence: false,
+            expect_reparse: true,
         },
     ]
 }
@@ -1154,6 +1182,7 @@ fn json_syntax_null_suffix_preserves_tail_w() -> anyhow::Result<()> {
         expected_keys: &["xddd", "he", "well"],
         min_errors: 1,
         requires_convergence: false,
+        expect_reparse: true,
     };
 
     let (mut parser, _lexer, uri, token_data, final_source) =
@@ -1220,6 +1249,7 @@ async fn json_runtime_batched_large_append_matrix() -> anyhow::Result<()> {
         expected_keys: &["a", "j", "k", "l", "m"],
         min_errors: 0,
         requires_convergence: true,
+        expect_reparse: true,
     };
 
     let (summary, batches, stats, final_source, token_count, first_eof) =
@@ -1246,7 +1276,11 @@ async fn json_runtime_batched_large_append_matrix() -> anyhow::Result<()> {
         "case {} emitted an empty batch",
         case.name
     );
-    assert!(stats.iter().all(|stat| stat.reparsed > 0));
+    assert!(
+        !case.expect_reparse || stats.iter().all(|stat| stat.reparsed > 0),
+        "case {} expected parser activity but got a skip-only edit",
+        case.name
+    );
     assert_eq!(final_source, r#"{"a":1,"j":true,"k":[1,2,3],"l":{"a":1,"b":2},"m":null}"#);
     Ok(())
 }
@@ -1263,6 +1297,7 @@ async fn json_runtime_invalid_edits_recover() -> anyhow::Result<()> {
         expected_keys: &["a", "b", "c"],
         min_errors: 1,
         requires_convergence: false,
+        expect_reparse: true,
     };
 
     let (summary, _, _, _) = run_runtime_case(case.name, case.initial, case.ops).await?;
@@ -1282,6 +1317,7 @@ async fn json_runtime_null_suffix_preserves_tail() -> anyhow::Result<()> {
         expected_keys: &["xddd", "he", "well"],
         min_errors: 1,
         requires_convergence: false,
+        expect_reparse: true,
     };
 
     let (summary, final_source) =
@@ -1305,6 +1341,7 @@ async fn json_runtime_null_suffix_preserves_tail_w() -> anyhow::Result<()> {
         expected_keys: &["xddd", "he", "well"],
         min_errors: 1,
         requires_convergence: false,
+        expect_reparse: true,
     };
 
     let (summary, final_source) =

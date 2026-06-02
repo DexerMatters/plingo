@@ -210,9 +210,10 @@ where
             debug_assert_eq!(states.len(), tokens.len() + 1);
             debug_assert_eq!(tokens.len(), ranges.len());
             let new_visible_tokens = self.token_data_for_uri(snapshot_state, uri);
-            snapshot_state
-                .visible_batches
-                .insert(uri, Self::build_visible_batch(old_visible_tokens, new_visible_tokens));
+            snapshot_state.visible_batches.insert(
+                uri,
+                Self::build_visible_batch(old_visible_tokens, new_visible_tokens),
+            );
             return Ok(Vec::new());
         }
 
@@ -245,11 +246,15 @@ where
         }
 
         let new_visible_tokens = self.token_data_for_uri(snapshot_state, uri);
-        snapshot_state
-            .visible_batches
-            .insert(uri, Self::build_visible_batch(old_visible_tokens, new_visible_tokens));
+        let visible_batch = Self::build_visible_batch(old_visible_tokens, new_visible_tokens);
+        let changed = visible_batch.is_changed();
+        snapshot_state.visible_batches.insert(uri, visible_batch);
 
-        Ok(deltas.to_vec())
+        if changed {
+            Ok(deltas.to_vec())
+        } else {
+            Ok(Vec::new())
+        }
     }
 }
 

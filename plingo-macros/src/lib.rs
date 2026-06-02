@@ -29,7 +29,7 @@ pub fn tokens(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-#[proc_macro_derive(NonTerminal, attributes(rule, from))]
+#[proc_macro_derive(NonTerminal, attributes(rule, from, parse_err))]
 pub fn derive_non_terminal(item: TokenStream) -> TokenStream {
     match non_terminal::expand_non_terminal_derive(parse_macro_input!(item as ItemEnum)) {
         Ok(tokens) => tokens,

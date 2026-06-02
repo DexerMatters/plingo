@@ -47,7 +47,9 @@ pub fn expand_non_terminal_derive(mut item: ItemEnum) -> syn::Result<proc_macro:
 
 fn strip_non_terminal_attrs(item: &mut ItemEnum) {
     for variant in &mut item.variants {
-        variant.attrs.retain(|attr| !attr.path().is_ident("rule"));
+        variant
+            .attrs
+            .retain(|attr| !attr.path().is_ident("rule") && !attr.path().is_ident("parse_err"));
         for field in &mut variant.fields {
             field.attrs.retain(|attr| !attr.path().is_ident("from"));
         }
@@ -260,10 +262,10 @@ impl<'a> LowerCtx<'a> {
                 });
 
                 registrations.push(quote! {
-                    let lhs = grammar.begin_internal_non_terminal(#synthetic);
+                    let opt_lhs = grammar.begin_internal_non_terminal(#synthetic);
                     #(#inner_bindings)*
-                    grammar.rule(#synthetic, lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_none));
-                    grammar.rule(#synthetic, lhs, ::std::vec![#(#inner_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_some));
+                    grammar.rule(#synthetic, opt_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_none));
+                    grammar.rule(#synthetic, opt_lhs, ::std::vec![#(#inner_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_some));
                 });
 
                 Ok(LoweredExpr {
@@ -283,15 +285,190 @@ impl<'a> LowerCtx<'a> {
                 let inner_symbols = lowered.symbol_exprs.clone();
                 let item_stride = inner_symbols.len();
                 let (min, max) = bounds.unwrap_or((0, None));
-                let upper = max.unwrap_or(min + 3);
-
-                let (sep_lowered, sep_stride) = if let Some(sep) = separator {
+                let sep_symbols: Vec<_> = if let Some(sep) = separator.as_ref() {
                     let sep_lowered = self.lower_expr(sep, builders, registrations)?;
-                    let stride = sep_lowered.symbol_exprs.len();
-                    (Some(sep_lowered), stride)
+                    sep_lowered.symbol_exprs.clone()
                 } else {
-                    (None, 0)
+                    Vec::new()
                 };
+                let has_sep = !sep_symbols.is_empty();
+
+                if max.is_none() && min == 0 {
+                    let builder_empty = self.synthetic_builder("rep_empty");
+                    builders.push(quote! {
+                        fn #builder_empty(
+                            cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
+                            production: ::plingo::component::parse::grammar::ProductionId,
+                            children: &[::plingo::component::parse::data::ProductId],
+                        ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
+                            ::plingo::component::parse::__macro_private::production_node(
+                                cx,
+                                production,
+                                children,
+                                ::std::vec::Vec::<#item_type>::new(),
+                            )
+                        }
+                    });
+
+                    if has_sep {
+                        let tail_synthetic = self.synthetic_name("rep_tail");
+                        let builder_item = self.synthetic_builder("rep_item");
+                        let builder_tail = self.synthetic_builder("rep_tail_more");
+                        let item_bindings = inner_symbols
+                            .iter()
+                            .enumerate()
+                            .map(|(rule_index, expr)| {
+                                let ident = format_ident!(
+                                    "__plingo_rep_item_symbol_{}_{}_{}",
+                                    self.variant_index,
+                                    0usize,
+                                    rule_index
+                                );
+                                quote! { let #ident = #expr; }
+                            })
+                            .collect::<Vec<_>>();
+                        let item_idents = (0..inner_symbols.len())
+                            .map(|rule_index| {
+                                format_ident!(
+                                    "__plingo_rep_item_symbol_{}_{}_{}",
+                                    self.variant_index,
+                                0usize,
+                                    rule_index
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let tail_seq: Vec<_> = sep_symbols
+                            .iter()
+                            .cloned()
+                            .chain(inner_symbols.iter().cloned())
+                            .chain(::std::iter::once(quote! { tail_lhs }))
+                            .collect();
+                        let tail_bindings = tail_seq
+                            .iter()
+                            .enumerate()
+                            .map(|(rule_index, expr)| {
+                                let ident = format_ident!(
+                                    "__plingo_rep_tail_symbol_{}_{}_{}",
+                                    self.variant_index,
+                                        0usize,
+                                    rule_index
+                                );
+                                quote! { let #ident = #expr; }
+                            })
+                            .collect::<Vec<_>>();
+                        let tail_idents = (0..tail_seq.len())
+                            .map(|rule_index| {
+                                format_ident!(
+                                    "__plingo_rep_tail_symbol_{}_{}_{}",
+                                    self.variant_index,
+                                    0usize,
+                                    rule_index
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let item_extract = self.repeat_item_extract_expr(&item_kind, 0);
+                        let tail_extract = self.repeat_item_extract_expr(&item_kind, sep_symbols.len());
+                        let tail_len = sep_symbols.len() + item_stride;
+                        builders.push(quote! {
+                            fn #builder_item(
+                                cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
+                                production: ::plingo::component::parse::grammar::ProductionId,
+                                children: &[::plingo::component::parse::data::ProductId],
+                            ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
+                                let item: #item_type = #item_extract;
+                                let tail: ::std::vec::Vec<#item_type> = cx.expect_value(
+                                    ::plingo::component::parse::__macro_private::production_child(children, #item_stride)?,
+                                )?;
+                                let mut value = ::std::vec::Vec::with_capacity(1 + tail.len());
+                                value.push(item);
+                                value.extend(tail);
+                                ::plingo::component::parse::__macro_private::production_node(cx, production, children, value)
+                            }
+                        });
+                        builders.push(quote! {
+                            fn #builder_tail(
+                                cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
+                                production: ::plingo::component::parse::grammar::ProductionId,
+                                children: &[::plingo::component::parse::data::ProductId],
+                            ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
+                                let item: #item_type = #tail_extract;
+                                let tail: ::std::vec::Vec<#item_type> = cx.expect_value(
+                                    ::plingo::component::parse::__macro_private::production_child(children, #tail_len)?,
+                                )?;
+                                let mut value = ::std::vec::Vec::with_capacity(1 + tail.len());
+                                value.push(item);
+                                value.extend(tail);
+                                ::plingo::component::parse::__macro_private::production_node(cx, production, children, value)
+                            }
+                        });
+                        registrations.push(quote! {
+                            let rep_lhs = grammar.begin_internal_non_terminal(#synthetic);
+                            let tail_lhs = grammar.begin_internal_non_terminal(#tail_synthetic);
+                            #(#item_bindings)*
+                            grammar.rule(#synthetic, rep_lhs, ::std::vec![#(#item_idents),*, tail_lhs], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
+                            #(#tail_bindings)*
+                            grammar.rule(#synthetic, tail_lhs, ::std::vec![#(#tail_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_tail));
+                            grammar.rule(#synthetic, tail_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
+                        });
+                    } else {
+                        let item_bindings = inner_symbols
+                            .iter()
+                            .enumerate()
+                            .map(|(rule_index, expr)| {
+                                let ident = format_ident!(
+                                    "__plingo_rep_item_symbol_{}_{}_{}",
+                                    self.variant_index,
+                                0usize,
+                                    rule_index
+                                );
+                                quote! { let #ident = #expr; }
+                            })
+                            .collect::<Vec<_>>();
+                        let item_idents = (0..inner_symbols.len())
+                            .map(|rule_index| {
+                                format_ident!(
+                                    "__plingo_rep_item_symbol_{}_{}_{}",
+                                    self.variant_index,
+                                    0usize,
+                                    rule_index
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let item_extract = self.repeat_item_extract_expr(&item_kind, 0);
+                        let builder_item = self.synthetic_builder("rep_item");
+                        builders.push(quote! {
+                            fn #builder_item(
+                                cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
+                                production: ::plingo::component::parse::grammar::ProductionId,
+                                children: &[::plingo::component::parse::data::ProductId],
+                            ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
+                                let item: #item_type = #item_extract;
+                                let tail: ::std::vec::Vec<#item_type> = cx.expect_value(
+                                    ::plingo::component::parse::__macro_private::production_child(children, #item_stride)?,
+                                )?;
+                                let mut value = ::std::vec::Vec::with_capacity(1 + tail.len());
+                                value.push(item);
+                                value.extend(tail);
+                                ::plingo::component::parse::__macro_private::production_node(cx, production, children, value)
+                            }
+                        });
+                        registrations.push(quote! {
+                            let rep_lhs = grammar.begin_internal_non_terminal(#synthetic);
+                            #(#item_bindings)*
+                            grammar.rule(#synthetic, rep_lhs, ::std::vec![#(#item_idents),*, rep_lhs], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
+                            grammar.rule(#synthetic, rep_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
+                        });
+                    }
+
+                    return Ok(LoweredExpr {
+                        symbol_exprs: vec![quote! { grammar.begin_internal_non_terminal(#synthetic) }],
+                        value_kind: ValueKind::Vec(Box::new(item_kind)),
+                        name: capture_name,
+                        captures,
+                    });
+                }
+
+                let sep_stride = sep_symbols.len();
 
                 if min == 0 {
                     let builder_empty = self.synthetic_builder("rep_empty");
@@ -310,30 +487,28 @@ impl<'a> LowerCtx<'a> {
                         }
                     });
                     registrations.push(quote! {
-                        let lhs = grammar.begin_internal_non_terminal(#synthetic);
-                        grammar.rule(#synthetic, lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
+                        let rep_lhs = grammar.begin_internal_non_terminal(#synthetic);
+                        grammar.rule(#synthetic, rep_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
                     });
                 } else {
                     registrations.push(quote! {
-                        let lhs = grammar.begin_internal_non_terminal(#synthetic);
+                        let rep_lhs = grammar.begin_internal_non_terminal(#synthetic);
                     });
                 }
 
+                let upper = max.unwrap_or(min + 3);
                 for count in min.max(1)..=upper {
                     let builder = self.synthetic_builder(&format!("rep_{}", count));
-                    let seq: Vec<_> = match &sep_lowered {
-                        None => (0..count)
-                            .flat_map(|_| inner_symbols.clone())
-                            .collect(),
-                        Some(sep) => {
-                            let mut s = Vec::new();
+                    let seq: Vec<_> = if has_sep {
+                        let mut s = Vec::new();
+                        s.extend(inner_symbols.clone());
+                        for _ in 1..count {
+                            s.extend(sep_symbols.clone());
                             s.extend(inner_symbols.clone());
-                            for _ in 1..count {
-                                s.extend(sep.symbol_exprs.clone());
-                                s.extend(inner_symbols.clone());
-                            }
-                            s
                         }
+                        s
+                    } else {
+                        (0..count).flat_map(|_| inner_symbols.clone()).collect()
                     };
                     let seq_bindings = seq
                         .iter()
@@ -345,9 +520,7 @@ impl<'a> LowerCtx<'a> {
                                 count,
                                 rule_index
                             );
-                            quote! {
-                                let #ident = #expr;
-                            }
+                            quote! { let #ident = #expr; }
                         })
                         .collect::<Vec<_>>();
                     let seq_idents = (0..seq.len())
@@ -360,7 +533,7 @@ impl<'a> LowerCtx<'a> {
                             )
                         })
                         .collect::<Vec<_>>();
-                    let stride = if separator.is_some() {
+                    let stride = if has_sep {
                         item_stride + sep_stride
                     } else {
                         item_stride
@@ -402,7 +575,7 @@ impl<'a> LowerCtx<'a> {
                     });
                     registrations.push(quote! {
                         #(#seq_bindings)*
-                        grammar.rule(#synthetic, lhs, ::std::vec![#(#seq_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder));
+                        grammar.rule(#synthetic, rep_lhs, ::std::vec![#(#seq_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder));
                     });
                 }
 
@@ -516,11 +689,11 @@ impl<'a> LowerCtx<'a> {
                 });
 
                 registrations.push(quote! {
-                    let lhs = grammar.begin_internal_non_terminal(#synthetic);
+                    let alt_lhs = grammar.begin_internal_non_terminal(#synthetic);
                     #(#left_bindings)*
-                    grammar.rule(#synthetic, lhs, ::std::vec![#(#left_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#left_builder));
+                    grammar.rule(#synthetic, alt_lhs, ::std::vec![#(#left_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#left_builder));
                     #(#right_bindings)*
-                    grammar.rule(#synthetic, lhs, ::std::vec![#(#right_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#right_builder));
+                    grammar.rule(#synthetic, alt_lhs, ::std::vec![#(#right_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#right_builder));
                 });
 
                 Ok(LoweredExpr::new(
@@ -554,6 +727,31 @@ impl<'a> LowerCtx<'a> {
             index
         )
     }
+
+    fn repeat_item_extract_expr(
+        &self,
+        item_kind: &ValueKind,
+        base: usize,
+    ) -> proc_macro2::TokenStream {
+        match item_kind {
+            ValueKind::Tuple(kinds) => {
+                let parts: Vec<_> = kinds
+                    .iter()
+                    .enumerate()
+                    .map(|(index, kind)| {
+                        let offset = base + index;
+                        kind.extract_expr(quote! {
+                            ::plingo::component::parse::__macro_private::production_child(children, #offset)?
+                        })
+                    })
+                    .collect();
+                quote! { (#(#parts),*) }
+            }
+            _ => item_kind.extract_expr(quote! {
+                ::plingo::component::parse::__macro_private::production_child(children, #base)?
+            }),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -584,6 +782,7 @@ enum ValueKind {
     Vec(Box<ValueKind>),
     Either(Box<ValueKind>, Box<ValueKind>),
     Tuple(Vec<ValueKind>),
+    Error,
 }
 
 impl ValueKind {
@@ -609,13 +808,14 @@ impl ValueKind {
                 let items = items.iter().map(Self::ty_tokens);
                 quote! { (#(#items),*) }
             }
+            Self::Error => quote! { () },
         }
     }
 
     fn extract_expr(&self, child: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
         match self {
             Self::Unit => quote! { () },
-            Self::Node(_) | Self::Option(_) | Self::Vec(_) | Self::Either(_, _) => {
+            Self::Node(_) | Self::Option(_) | Self::Vec(_) | Self::Either(_, _) | Self::Error => {
                 let ty = self.ty_tokens();
                 quote! {
                     <#ty as ::plingo::component::parse::__macro_private::BuildField>::from_product(cx, #child)?
@@ -648,7 +848,11 @@ enum RuleExpr {
     Seq(Vec<RuleExpr>),
     Alt(Vec<RuleExpr>),
     Optional(Box<RuleExpr>),
-    Repeat(Box<RuleExpr>, Option<Box<RuleExpr>>, Option<(usize, Option<usize>)>),
+    Repeat(
+        Box<RuleExpr>,
+        Option<Box<RuleExpr>>,
+        Option<(usize, Option<usize>)>,
+    ),
     Named(String, Box<RuleExpr>),
 }
 
@@ -656,32 +860,56 @@ enum RuleExpr {
 enum Atom {
     Token { root: Type, variant: Ident },
     NonTerminal(Type),
+    Error,
 }
 
 fn parse_rule_expr(variant: &Variant) -> syn::Result<RuleExpr> {
     let mut expr = None;
+    let mut is_error = false;
     for attr in &variant.attrs {
-        if !attr.path().is_ident("rule") {
+        if attr.path().is_ident("parse_err") {
+            if is_error {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "duplicate #[parse_err] attribute",
+                ));
+            }
+            if expr.is_some() {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "#[parse_err] and #[rule] cannot be used on the same variant",
+                ));
+            }
+            is_error = true;
+            expr = Some(RuleExpr::Atom(Atom::Error));
             continue;
         }
-        if expr.is_some() {
-            return Err(syn::Error::new(
-                attr.span(),
-                "duplicate #[rule(...)] attribute",
-            ));
+        if attr.path().is_ident("rule") {
+            if expr.is_some() {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "duplicate #[rule(...)] attribute",
+                ));
+            }
+            if is_error {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "#[parse_err] and #[rule] cannot be used on the same variant",
+                ));
+            }
+            expr = Some(
+                if matches!(&attr.meta, syn::Meta::List(meta) if meta.tokens.is_empty()) {
+                    RuleExpr::Empty
+                } else {
+                    attr.parse_args::<RuleExpr>()?
+                },
+            );
         }
-        expr = Some(
-            if matches!(&attr.meta, syn::Meta::List(meta) if meta.tokens.is_empty()) {
-                RuleExpr::Empty
-            } else {
-                attr.parse_args::<RuleExpr>()?
-            },
-        );
     }
     expr.ok_or_else(|| {
         syn::Error::new(
             variant.span(),
-            "each nonterminal variant requires #[rule(...)]",
+            "each nonterminal variant requires #[rule(...)] or #[parse_err]",
         )
     })
 }
@@ -812,6 +1040,13 @@ fn atom_symbol_expr(atom: &Atom) -> proc_macro2::TokenStream {
                 )
             }
         }
+        Atom::Error => {
+            quote! {
+                ::plingo::component::parse::grammar::Symbol::T(
+                    ::plingo::component::parse::grammar::ERROR_TERMINAL,
+                )
+            }
+        }
     }
 }
 
@@ -819,6 +1054,7 @@ fn atom_value_type(atom: &Atom) -> syn::Result<ValueKind> {
     match atom {
         Atom::NonTerminal(ty) => Ok(ValueKind::Node(ty.clone())),
         Atom::Token { root, .. } => Ok(ValueKind::Token(root.clone())),
+        Atom::Error => Ok(ValueKind::Error),
     }
 }
 
@@ -847,21 +1083,19 @@ fn build_variant_field_expr(
     let from_spec = parse_from_spec(field)?;
     let index = match from_spec {
         FromSpec::Positional(i) => i,
-        FromSpec::Named(ref name) => {
-            named_captures
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, i)| *i)
-                .ok_or_else(|| {
-                    syn::Error::new(
-                        field.ty.span(),
-                        format!(
-                            "named capture '{name}' not found in rule; available: {:?}",
-                            named_captures
-                        ),
-                    )
-                })?
-        }
+        FromSpec::Named(ref name) => named_captures
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, i)| *i)
+            .ok_or_else(|| {
+                syn::Error::new(
+                    field.ty.span(),
+                    format!(
+                        "named capture '{name}' not found in rule; available: {:?}",
+                        named_captures
+                    ),
+                )
+            })?,
     };
     if index >= rhs_exprs.len() {
         return Err(syn::Error::new(
@@ -872,7 +1106,12 @@ fn build_variant_field_expr(
     let child =
         quote! { ::plingo::component::parse::__macro_private::production_child(children, #index)? };
     Ok(
-        if is_ast_box(field_ty) || is_option(field_ty) || is_vec(field_ty) || is_either(field_ty) {
+        if is_ast_box(field_ty)
+            || is_option(field_ty)
+            || is_vec(field_ty)
+            || is_either(field_ty)
+            || is_parse_error_info(field_ty)
+        {
             quote! {
                 <#field_ty as ::plingo::component::parse::__macro_private::BuildField>::from_product(
                     cx,
@@ -936,6 +1175,10 @@ fn is_vec(ty: &Type) -> bool {
 
 fn is_either(ty: &Type) -> bool {
     path_head(ty).as_deref() == Some("Either")
+}
+
+fn is_parse_error_info(ty: &Type) -> bool {
+    path_head(ty).as_deref() == Some("ParseErrorInfo")
 }
 
 fn path_head(ty: &Type) -> Option<String> {

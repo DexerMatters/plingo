@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
 use crate::component::parse::{
-    data::{AstBox, AstToken, ProductData, ProductId, TokenEntryId},
+    data::{AstBox, AstToken, ParseErrorInfo, ProductData, ProductId, TokenEntryId, TreeData},
     grammar::{BuildCx, BuildError, GrammarBuilder, ProductionId, Symbol},
 };
 use crate::utils::Either;
@@ -63,6 +63,44 @@ impl<T: 'static> TokenField for AstToken<T> {
                 entry: tok_entry, ..
             } => Ok(AstToken::new(*tok_entry)),
             _ => Err(BuildError::ExpectedToken { product: entry }),
+        }
+    }
+}
+
+impl BuildField for ParseErrorInfo {
+    fn from_product(cx: &BuildCx<'_>, product: ProductId) -> Result<Self, BuildError> {
+        let p = cx
+            .products
+            .get(product)
+            .ok_or(BuildError::MissingProduct(product))?;
+        if !matches!(p.data, ProductData::Error) {
+            return Err(BuildError::TypeMismatch { product });
+        }
+        let tree = cx
+            .trees
+            .get(p.green)
+            .ok_or(BuildError::MissingProduct(product))?;
+        match &tree.data {
+            TreeData::Error {
+                kind,
+                node,
+                unexpected,
+                expected,
+                recovered,
+                location,
+                ..
+            } => {
+                Ok(ParseErrorInfo {
+                    kind: kind.clone(),
+                    node: *node,
+                    length: tree.length,
+                    unexpected: *unexpected,
+                    expected: *expected,
+                    recovered: *recovered,
+                    location: *location,
+                })
+            }
+            _ => Err(BuildError::TypeMismatch { product }),
         }
     }
 }

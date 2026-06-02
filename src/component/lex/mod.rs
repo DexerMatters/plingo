@@ -5,10 +5,17 @@ mod mode;
 pub mod __macro_private;
 pub mod policy;
 
-use std::{collections::HashMap, error::Error, fmt, hash::Hash, marker::PhantomData, str::FromStr};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    hash::Hash,
+    marker::PhantomData,
+    ops::Range,
+    str::FromStr,
+};
 
 use fluent_uri::Uri;
-use indexmap::IndexSet;
 use plingo_macros::layer;
 use regex_automata::{
     MatchKind,
@@ -20,9 +27,11 @@ use thiserror::Error;
 pub use mode::{LexerState, State, StateAction, StateInfo};
 
 use crate::{
-    component::parse::grammar::TerminalId,
+    component::parse::{TokenData, grammar::TerminalId},
+    component::parse::identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
     scheme::{
-        ActionError, Context, LayerDeltas, MiddleLayer, NonTopLayer, SnapshotId, SnapshotLayer,
+        ActionError, Context, Delta, LayerDeltas, MiddleLayer, NonTopLayer, SnapshotId,
+        SnapshotLayer,
     },
     utils::{PrettyDisplay, Span},
 };
@@ -185,6 +194,26 @@ where
     Error(usize, ErrorToken),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleTokenBatch {
+    pub old_tokens: Vec<TokenData>,
+    pub new_tokens: Vec<TokenData>,
+    pub prefix_len: usize,
+    pub suffix_len: usize,
+    pub old_changed_range: Range<usize>,
+    pub new_changed_range: Range<usize>,
+}
+
+impl VisibleTokenBatch {
+    pub fn is_changed(&self) -> bool {
+        self.old_changed_range.start != self.old_changed_range.end
+            || self.new_changed_range.start != self.new_changed_range.end
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GetVisibleTokenBatch(pub Uri<&'static str>);
+
 impl<Root> Entry<Root>
 where
     Root: LexerRoot,
@@ -270,6 +299,8 @@ where
 {
     state_instances: HashMap<Uri<&'static str>, Vec<LexerState>>,
     token_instances: HashMap<Uri<&'static str>, Vec<usize>>,
+    token_ranges: HashMap<Uri<&'static str>, Vec<(usize, usize)>>,
+    visible_batches: HashMap<Uri<&'static str>, VisibleTokenBatch>,
     _root: PhantomData<Root>,
 }
 
@@ -281,6 +312,8 @@ where
         Self {
             state_instances: self.state_instances.clone(),
             token_instances: self.token_instances.clone(),
+            token_ranges: self.token_ranges.clone(),
+            visible_batches: self.visible_batches.clone(),
             _root: PhantomData,
         }
     }
@@ -294,6 +327,8 @@ where
         Self {
             state_instances: HashMap::new(),
             token_instances: HashMap::new(),
+            token_ranges: HashMap::new(),
+            visible_batches: HashMap::new(),
             _root: PhantomData,
         }
     }
@@ -311,11 +346,108 @@ where
 
     #[snapshot]
     latest: LexerSnapshotState<Root>,
-    arena: IndexSet<Entry<Root>>,
+    arena: Vec<Entry<Root>>,
     _lower: PhantomData<fn() -> Lower>,
 }
 
 impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
+    fn token_data_from_instances(
+        &self,
+        token_ids: &[usize],
+        token_ranges: &[(usize, usize)],
+    ) -> Vec<TokenData> {
+        let mut out = Vec::new();
+        for (column, (&id, &(start, end))) in token_ids.iter().zip(token_ranges.iter()).enumerate() {
+            let Some(entry) = self.arena.get(id) else {
+                continue;
+            };
+            let data = match entry {
+                Entry::Token {
+                    length,
+                    terminal,
+                    value,
+                } if !self.is_skip_terminal(*terminal) => Some(TokenData {
+                    id,
+                    terminal: Some(*terminal),
+                    start,
+                    length: *length,
+                    column,
+                    fingerprint: token_fingerprint(Some(*terminal), value, *length),
+                }),
+                Entry::EOF => Some(TokenData {
+                    id,
+                    terminal: None,
+                    start,
+                    length: 0,
+                    column,
+                    fingerprint: eof_fingerprint(),
+                }),
+                Entry::Error(length, error) => Some(TokenData {
+                    id,
+                    terminal: None,
+                    start,
+                    length: *length,
+                    column,
+                    fingerprint: error_fingerprint(error, *length),
+                }),
+                _ => None,
+            };
+            if let Some(data) = data {
+                out.push(data);
+            }
+        }
+        out
+    }
+
+    fn token_data_for_uri(
+        &self,
+        state: &LexerSnapshotState<Root>,
+        uri: Uri<&'static str>,
+    ) -> Vec<TokenData> {
+        let Some(token_ids) = state.token_instances.get(&uri) else {
+            return Vec::new();
+        };
+        let Some(token_ranges) = state.token_ranges.get(&uri) else {
+            return Vec::new();
+        };
+        self.token_data_from_instances(token_ids, token_ranges)
+    }
+
+    fn token_data_semantically_equal(a: &TokenData, b: &TokenData) -> bool {
+        a.terminal == b.terminal && a.length == b.length && a.fingerprint == b.fingerprint
+    }
+
+    fn build_visible_batch(old_tokens: Vec<TokenData>, new_tokens: Vec<TokenData>) -> VisibleTokenBatch {
+        let mut prefix_len = 0usize;
+        while prefix_len < old_tokens.len()
+            && prefix_len < new_tokens.len()
+            && Self::token_data_semantically_equal(&old_tokens[prefix_len], &new_tokens[prefix_len])
+        {
+            prefix_len += 1;
+        }
+
+        let mut suffix_len = 0usize;
+        while suffix_len < old_tokens.len().saturating_sub(prefix_len)
+            && suffix_len < new_tokens.len().saturating_sub(prefix_len)
+        {
+            let old_idx = old_tokens.len() - suffix_len - 1;
+            let new_idx = new_tokens.len() - suffix_len - 1;
+            if !Self::token_data_semantically_equal(&old_tokens[old_idx], &new_tokens[new_idx]) {
+                break;
+            }
+            suffix_len += 1;
+        }
+
+        VisibleTokenBatch {
+            old_changed_range: prefix_len..old_tokens.len().saturating_sub(suffix_len),
+            new_changed_range: prefix_len..new_tokens.len().saturating_sub(suffix_len),
+            old_tokens,
+            new_tokens,
+            prefix_len,
+            suffix_len,
+        }
+    }
+
     pub fn new() -> Result<Self, LexerCreationError> {
         let registrations = Root::state_registrations();
         let state_ids = registrations
@@ -347,7 +479,7 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         Ok(Self {
             state_info: states,
             tokens,
-            arena: IndexSet::new(),
+            arena: Vec::new(),
             state_matchers,
             latest: LexerSnapshotState::default(),
             _lower: PhantomData,
@@ -372,15 +504,13 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
     }
 
     pub fn alloc(&mut self, entry: Entry<Root>) -> usize {
-        let index = self.arena.insert_full(entry).0;
+        let index = self.arena.len();
+        self.arena.push(entry);
         index
     }
 
     pub fn get(&self, index: usize) -> &Entry<Root> {
-        // SAFETY: The index is guaranteed to be valid because it's only
-        // produced by `alloc`, which inserts into the arena and returns the
-        // index.
-        self.arena.get_index(index).unwrap()
+        self.arena.get(index).unwrap()
     }
 
     pub fn terminal_of(&self, index: usize) -> Option<TerminalId> {
@@ -406,12 +536,20 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         let Some(token_ids) = state.token_instances.get(&span.uri) else {
             return Vec::new();
         };
+        let Some(token_ranges) = state.token_ranges.get(&span.uri) else {
+            return Vec::new();
+        };
 
-        let start = span.range.start().min(token_ids.len());
-        let end = span.range.end().min(token_ids.len());
-        token_ids[start..end]
+        token_ids
             .iter()
-            .map(|&token_id| self.get(token_id).clone())
+            .zip(token_ranges.iter())
+            .filter_map(|(&token_id, &(start, end))| {
+                if start < span.range.end() && end > span.range.start() {
+                    self.arena.get(token_id).cloned()
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
@@ -424,31 +562,78 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         let Some(token_ids) = state.token_instances.get(&span.uri) else {
             return Vec::new();
         };
+        let Some(token_ranges) = state.token_ranges.get(&span.uri) else {
+            return Vec::new();
+        };
 
-        let start = span.range.start().min(token_ids.len());
-        let end = span.range.end().min(token_ids.len());
-        token_ids[start..end]
+        let mut out = Vec::new();
+        for (column, (&id, &(start, end))) in token_ids.iter().zip(token_ranges.iter()).enumerate() {
+            let Some(entry) = self.arena.get(id) else {
+                continue;
+            };
+            let include = match entry {
+                Entry::Token { terminal, .. } => {
+                    !self.is_skip_terminal(*terminal)
+                        && start < span.range.end()
+                        && end > span.range.start()
+                }
+                Entry::Error(_, _) => start < span.range.end() && end > span.range.start(),
+                Entry::EOF => start >= span.range.start() && start <= span.range.end(),
+            };
+
+            if include {
+                match entry {
+                    Entry::Token {
+                        length, terminal, value,
+                    } => {
+                        out.push(TokenData {
+                            id,
+                            terminal: Some(*terminal),
+                            start,
+                            length: *length,
+                            column,
+                            fingerprint: token_fingerprint(Some(*terminal), value, *length),
+                        });
+                    }
+                    Entry::EOF => {
+                        out.push(TokenData {
+                            id,
+                            terminal: None,
+                            start,
+                            length: 0,
+                            column,
+                            fingerprint: eof_fingerprint(),
+                        });
+                    }
+                    Entry::Error(length, error) => {
+                        out.push(TokenData {
+                            id,
+                            terminal: None,
+                            start,
+                            length: *length,
+                            column,
+                            fingerprint: error_fingerprint(error, *length),
+                        });
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    pub(crate) fn visible_batch(
+        &self,
+        snapshot: Option<SnapshotId>,
+        uri: Uri<&'static str>,
+    ) -> Option<VisibleTokenBatch> {
+        self.snapshot_state(snapshot).visible_batches.get(&uri).cloned()
+    }
+
+    fn is_skip_terminal(&self, terminal: TerminalId) -> bool {
+        self.tokens
             .iter()
-            .map(|&id| match self.get(id) {
-                Entry::Token {
-                    length, terminal, ..
-                } => crate::component::parse::TokenData {
-                    id,
-                    terminal: Some(*terminal),
-                    length: *length,
-                },
-                Entry::EOF => crate::component::parse::TokenData {
-                    id,
-                    terminal: None,
-                    length: 0,
-                },
-                Entry::Error(length, _) => crate::component::parse::TokenData {
-                    id,
-                    terminal: None,
-                    length: *length,
-                },
-            })
-            .collect()
+            .any(|state_tokens| state_tokens.iter().any(|t| t.terminal == terminal && t.skip))
     }
 
     pub fn state_id_of<S: TokenState>(&self) -> Option<State> {
@@ -479,12 +664,27 @@ where
         async move {
             let mut working = self.latest.clone();
             let mut lower_deltas = Vec::new();
+
+            let mut grouped: Vec<(Uri<&'static str>, Vec<Delta<Span, usize>>)> = Vec::new();
             for delta in deltas {
-                match self.lex_delta(ctx, &mut working, delta).await {
-                    Ok(deltas) => lower_deltas.extend(deltas),
-                    Err(err) => return Err(err),
+                let uri = delta.key().uri;
+                if let Some((_, batch)) = grouped
+                    .iter_mut()
+                    .find(|(group_uri, _)| *group_uri == uri)
+                {
+                    batch.push(delta);
+                } else {
+                    grouped.push((uri, vec![delta]));
                 }
             }
+
+            for (_, batch) in grouped {
+                let uri_lower_deltas = self
+                    .lex_deltas(ctx, &mut working, &batch)
+                    .await?;
+                lower_deltas.extend(uri_lower_deltas);
+            }
+
             self.latest = working.clone();
             if let Some(snapshot) = ctx.snapshot() {
                 self.push_state(snapshot);
@@ -544,6 +744,8 @@ pub enum LexerCreationError {
     UnsupportedRegexFeature(String, String, HirKind),
     #[error("Token {0} with pattern {1} cannot be matched by any input string")]
     ImpossibleToken(String, String),
+    #[error("Token {0} with pattern {1} can match the empty string, which is unsupported")]
+    EmptyMatchToken(String, String),
     #[error("State {0} is referenced but not registered")]
     UnknownState(String),
 }
@@ -701,6 +903,12 @@ fn resolve_token<Root>(
     let minimum_length = hir.properties().minimum_len().ok_or_else(|| {
         LexerCreationError::ImpossibleToken(spec.label.to_string(), spec.regex.to_string())
     })?;
+    if minimum_length == 0 {
+        return Err(LexerCreationError::EmptyMatchToken(
+            spec.label.to_string(),
+            spec.regex.to_string(),
+        ));
+    }
     let maximum_length = hir.properties().maximum_len().unwrap_or(usize::MAX);
 
     Ok(ResolvedToken {

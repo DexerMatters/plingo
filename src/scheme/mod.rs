@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -495,6 +495,7 @@ pub(crate) struct LayerRegistry {
     lower_by_upper: HashMap<TypeId, TypeId>,
     layer_names: HashMap<TypeId, &'static str>,
     next_snapshot: AtomicU64,
+    pub(crate) panicked: AtomicBool,
 }
 
 struct RuntimeInner {
@@ -630,6 +631,7 @@ impl Runtime<Sealed> {
             lower_by_upper: self.inner.lower_by_upper.clone(),
             layer_names: self.inner.layer_names.clone(),
             next_snapshot: AtomicU64::new(1),
+            panicked: AtomicBool::new(false),
         });
         self.context = Context {
             registry,
@@ -652,11 +654,24 @@ impl Runtime<Sealed> {
         self.context.clone()
     }
 
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(&mut self) {
+        let registry = Arc::clone(&self.context.registry);
         self.context = Context::default();
         for worker in self.inner.workers.drain(..) {
-            worker.abort();
-            let _ = worker.await;
+            if worker.is_finished() {
+                if let Err(e) = worker.await {
+                    if e.is_panic() {
+                        registry.panicked.store(true, Ordering::SeqCst);
+                    }
+                }
+            } else {
+                worker.abort();
+                let _ = worker.await;
+            }
         }
+    }
+
+    pub fn workers_panicked(&self) -> bool {
+        self.context.registry.panicked.load(Ordering::SeqCst)
     }
 }

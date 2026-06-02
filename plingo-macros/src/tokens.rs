@@ -247,22 +247,18 @@ fn build_parser_terminal_impl(
 ) -> syn::Result<proc_macro2::TokenStream> {
     let mut arms = Vec::new();
     for (index, variant) in variants.iter().enumerate() {
-        match &variant.fields {
-            Fields::Unit | Fields::Unnamed(_) | Fields::Named(_) => {
-                let variant_ident = &variant.ident;
-                let label = format!("{}::{}", root_ident, variant_ident);
-                arms.push(quote! {
-                    stringify!(#variant_ident) => grammar.terminal_symbol(
-                        #label,
-                        ::plingo::component::parse::grammar::TerminalId {
-                            state_key: <#root_ident as ::plingo::component::lex::TokenState>::state_key(),
-                            token_id: #index as u32,
-                        },
-                        ::std::option::Option::None,
-                    )
-                });
-            }
-        }
+        let variant_ident = &variant.ident;
+        let label = format!("{}::{}", root_ident, variant_ident);
+        arms.push(quote! {
+            stringify!(#variant_ident) => grammar.terminal_symbol(
+                #label,
+                ::plingo::component::parse::grammar::TerminalId {
+                    state_key: <#root_ident as ::plingo::component::lex::TokenState>::state_key(),
+                    token_id: #index as u32,
+                },
+                ::std::option::Option::None,
+            )
+        });
     }
 
     Ok(quote! {

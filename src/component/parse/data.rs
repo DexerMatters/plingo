@@ -10,6 +10,7 @@ use indexmap::IndexSet;
 use crate::component::parse::{
     build::LRStateId,
     grammar::{NonTerminalId, Symbol, TerminalId},
+    identity::TokenFingerprint,
 };
 
 pub type GreenId = usize;
@@ -45,34 +46,69 @@ impl GreenTree {
     pub fn new_error(
         length: usize,
         kind: ErrorKind,
+        node: NonTerminalId,
+        children: Vec<GreenId>,
         unexpected: Option<Symbol>,
         expected: Symbol,
+        recovered: bool,
+        location: Option<usize>,
     ) -> GreenTree {
         GreenTree {
             length,
             data: TreeData::Error {
                 kind,
+                node,
+                children,
                 unexpected,
                 expected,
+                recovered,
+                location,
             },
         }
     }
 
-    pub fn new_unexpected_error(length: usize, unexpected: Symbol, expected: Symbol) -> GreenTree {
+    pub fn new_unexpected_error(
+        length: usize,
+        node: NonTerminalId,
+        unexpected: Symbol,
+        expected: Symbol,
+    ) -> GreenTree {
         Self::new_error(
             length,
             ErrorKind::UnexpectedToken,
+            node,
+            Vec::new(),
             Some(unexpected),
             expected,
+            false,
+            None,
         )
     }
 
-    pub fn new_missing_error(length: usize, expected: Symbol) -> GreenTree {
-        Self::new_error(length, ErrorKind::MissingToken, None, expected)
+    pub fn new_missing_error(length: usize, node: NonTerminalId, expected: Symbol) -> GreenTree {
+        Self::new_error(
+            length,
+            ErrorKind::MissingToken,
+            node,
+            Vec::new(),
+            None,
+            expected,
+            false,
+            None,
+        )
     }
 
-    pub fn new_eoi_error(expected: Symbol) -> GreenTree {
-        Self::new_error(0, ErrorKind::UnexpectedEndOfInput, None, expected)
+    pub fn new_eoi_error(node: NonTerminalId, expected: Symbol) -> GreenTree {
+        Self::new_error(
+            0,
+            ErrorKind::UnexpectedEndOfInput,
+            node,
+            Vec::new(),
+            None,
+            expected,
+            false,
+            None,
+        )
     }
 }
 
@@ -87,8 +123,12 @@ pub enum TreeData {
     },
     Error {
         kind: ErrorKind,
+        node: NonTerminalId,
+        children: Vec<GreenId>,
         unexpected: Option<Symbol>,
         expected: Symbol,
+        recovered: bool,
+        location: Option<usize>,
     },
 }
 
@@ -97,6 +137,18 @@ pub enum ErrorKind {
     MissingToken,
     UnexpectedToken,
     UnexpectedEndOfInput,
+    Recovered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParseErrorInfo {
+    pub kind: ErrorKind,
+    pub node: NonTerminalId,
+    pub length: usize,
+    pub unexpected: Option<Symbol>,
+    pub expected: Symbol,
+    pub recovered: bool,
+    pub location: Option<usize>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -160,51 +212,70 @@ impl Product {
         Self::new(green, ProductData::Error)
     }
 
-    pub fn token(green: GreenId, entry: TokenEntryId) -> Self {
+    pub fn token(green: GreenId, entry: TokenEntryId, fingerprint: TokenFingerprint) -> Self {
         Self::new(
             green,
             ProductData::Token {
                 entry,
+                fingerprint,
                 ast: None,
                 ty: TypeId::of::<()>(),
             },
         )
     }
 
-    pub fn typed_token<T: 'static>(green: GreenId, entry: TokenEntryId, ast: AstBox<T>) -> Self {
+    pub fn typed_token<T: 'static>(
+        green: GreenId,
+        entry: TokenEntryId,
+        fingerprint: TokenFingerprint,
+        ast: AstBox<T>,
+    ) -> Self {
         Self::new(
             green,
             ProductData::Token {
                 entry,
+                fingerprint,
                 ast: Some(ast.id),
                 ty: TypeId::of::<T>(),
             },
         )
     }
 
-    pub fn node<T: 'static>(green: GreenId, ast: AstBox<T>) -> Self {
+    pub fn node<T: 'static>(green: GreenId, ast: AstBox<T>, children: Vec<ProductId>) -> Self {
         Self::new(
             green,
             ProductData::Node {
                 ast: ast.id,
                 ty: TypeId::of::<T>(),
+                children,
             },
         )
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum ProductData {
     Error,
     Token {
         entry: TokenEntryId,
+        fingerprint: TokenFingerprint,
         ast: Option<AstId>,
         ty: TypeId,
     },
     Node {
         ast: AstId,
         ty: TypeId,
+        children: Vec<ProductId>,
     },
+}
+
+impl ProductData {
+    pub fn token_fingerprint(&self) -> Option<TokenFingerprint> {
+        match self {
+            Self::Token { fingerprint, .. } => Some(*fingerprint),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -240,10 +311,16 @@ impl TreeArena {
         &mut self,
         length: usize,
         kind: ErrorKind,
+        node: NonTerminalId,
+        children: Vec<GreenId>,
         unexpected: Option<Symbol>,
         expected: Symbol,
+        recovered: bool,
+        location: Option<usize>,
     ) -> GreenId {
-        self.insert(GreenTree::new_error(length, kind, unexpected, expected))
+        self.insert(GreenTree::new_error(
+            length, kind, node, children, unexpected, expected, recovered, location,
+        ))
     }
 
     fn total_len(&self, children: &[GreenId]) -> usize {
@@ -313,17 +390,7 @@ impl AstArena {
     where
         T: Clone + 'static,
     {
-        let entry = self.values.get(id)?;
-        let result = entry.downcast_ref::<T>().cloned();
-        if result.is_none() {
-            eprintln!(
-                "AstArena::cloned TypeMismatch: requested {:?} ({}), stored {:?}",
-                std::any::TypeId::of::<T>(),
-                std::any::type_name::<T>(),
-                entry.as_ref().type_id(),
-            );
-        }
-        result
+        self.values.get(id)?.downcast_ref::<T>().cloned()
     }
 }
 
@@ -333,12 +400,12 @@ pub(crate) type GssEdgeId = usize;
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct GssNode {
     pub state: LRStateId,
-    pub column: u16,
+    pub column: usize,
     pub generation: u32,
 }
 
 impl GssNode {
-    fn new(state: LRStateId, column: u16, generation: u32) -> GssNode {
+    fn new(state: LRStateId, column: usize, generation: u32) -> GssNode {
         GssNode {
             state,
             column,
@@ -382,7 +449,7 @@ impl GssArena {
         }
     }
 
-    pub fn node(&mut self, state: LRStateId, column: u16, generation: u32) -> GssNodeId {
+    pub fn node(&mut self, state: LRStateId, column: usize, generation: u32) -> GssNodeId {
         let node = GssNode::new(state, column, generation);
         let (id, inserted) = self.nodes.insert_full(node);
 

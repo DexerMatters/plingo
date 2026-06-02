@@ -79,29 +79,35 @@ async fn process_file_change(tx: &mpsc::Sender<Delta<Span, String>>, path: &Path
 
     let ops = capture_diff_slices(Algorithm::Patience, old_content.as_bytes(), new.as_bytes());
 
+    let mut shift: isize = 0;
     for op in &ops {
         match op {
             DiffOp::Delete {
                 old_index, old_len, ..
             } => {
+                let start = (*old_index as isize + shift).max(0) as usize;
+                let end = start + old_len;
                 let _ = tx
                     .send(Delta::Delete {
-                        key: Span::new_uri(uri, *old_index, old_index + old_len).unwrap(),
+                        key: Span::new_uri(uri, start, end).unwrap(),
                     })
                     .await;
+                shift -= *old_len as isize;
             }
             DiffOp::Insert {
                 old_index,
                 new_index,
                 new_len,
             } => {
+                let start = (*old_index as isize + shift).max(0) as usize;
                 let text = new[*new_index..*new_index + *new_len].to_string();
                 let _ = tx
                     .send(Delta::Insert {
-                        key: Span::new_uri(uri, *old_index, *old_index).unwrap(),
+                        key: Span::new_uri(uri, start, start).unwrap(),
                         value: text,
                     })
                     .await;
+                shift += *new_len as isize;
             }
             DiffOp::Replace {
                 old_index,
@@ -109,18 +115,20 @@ async fn process_file_change(tx: &mpsc::Sender<Delta<Span, String>>, path: &Path
                 new_index,
                 new_len,
             } => {
+                let start = (*old_index as isize + shift).max(0) as usize;
                 let _ = tx
                     .send(Delta::Delete {
-                        key: Span::new_uri(uri, *old_index, old_index + old_len).unwrap(),
+                        key: Span::new_uri(uri, start, start + old_len).unwrap(),
                     })
                     .await;
                 let text = new[*new_index..*new_index + *new_len].to_string();
                 let _ = tx
                     .send(Delta::Insert {
-                        key: Span::new_uri(uri, *old_index, *old_index).unwrap(),
+                        key: Span::new_uri(uri, start, start).unwrap(),
                         value: text,
                     })
                     .await;
+                shift += *new_len as isize - *old_len as isize;
             }
             DiffOp::Equal { .. } => {}
         }

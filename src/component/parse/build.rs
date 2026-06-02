@@ -5,7 +5,7 @@ use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 
 use crate::component::parse::{
-    Parser, ParserSnapshotState,
+    Parser, ParserConfig, ParserSnapshotState,
     grammar::{Grammar, NonTerminalId, ProductionId, Symbol, TerminalId},
 };
 
@@ -70,10 +70,18 @@ impl ActionSet {
             self.inner.push(action);
         }
     }
+
+    pub fn has_shift(&self) -> bool {
+        self.inner.iter().any(|a| matches!(a, Action::Shift(_)))
+    }
 }
 
 impl Grammar {
     pub fn build_lr1<Root, Lower>(&self) -> Parser<Root, Lower> {
+        self.build_lr1_with_config::<Root, Lower>(ParserConfig::default())
+    }
+
+    pub fn build_lr1_with_config<Root, Lower>(&self, config: ParserConfig) -> Parser<Root, Lower> {
         let mut states = Vec::new();
         let mut state_keys = IndexSet::new();
         let mut queue = VecDeque::new();
@@ -110,7 +118,9 @@ impl Grammar {
             transitions,
             states,
             session_arenas: HashMap::new(),
+            config,
             latest: ParserSnapshotState::default(),
+            latest_incremental_stats: HashMap::new(),
             _lower: PhantomData,
             _snapshot: Default::default(),
         };
@@ -228,6 +238,19 @@ impl<Root, Lower> Parser<Root, Lower> {
 
     pub fn goto_state(&self, state: LRStateId, non_terminal: NonTerminalId) -> Option<LRStateId> {
         self.gotos[self.grammar.goto_index(state, non_terminal)]
+    }
+
+    pub fn shift_terminals_for_state(&self, state: LRStateId) -> Vec<TerminalId> {
+        let count = self.grammar.terminal_count();
+        let mut result = Vec::new();
+        for ti in 0..count {
+            let terminal = self.grammar.terminal_at(ti);
+            let actions = &self.actions[self.grammar.action_index(state, terminal)];
+            if actions.has_shift() {
+                result.push(terminal);
+            }
+        }
+        result
     }
 
     fn action_set_mut(&mut self, state: LRStateId, terminal: TerminalId) -> &mut ActionSet {

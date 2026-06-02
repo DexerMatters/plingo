@@ -5,7 +5,15 @@ use enum_iterator::Sequence;
 use crate::{
     NonTerminal,
     component::lex::{Entry, Lexer, LexerState},
-    component::parse::{AstToken, TokenData, build::Action, data::AstBox, grammar::Grammar},
+    component::parse::{
+        AstToken, ErrorKind, ParseErrorInfo, ParserConfig, TokenData,
+        build::Action,
+        data::{AstArena, AstBox, Product, ProductArena, ProductData, TreeArena},
+        identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
+        diff,
+        grammar::{ERROR_TERMINAL, Grammar, Symbol},
+    },
+    scheme::Delta,
     tokens,
     utils::{PrettyDisplay, Span},
 };
@@ -13,44 +21,61 @@ use crate::{
 //mod test_runtime;
 
 mod test_parser;
+mod test_parser_comprehensive;
 
 #[cfg(test)]
 mod fs_watch;
 
-fn token_data_from_entries(entries: &[(usize, Entry<RootTokens>)]) -> Vec<TokenData> {
+fn token_data_from_entries(entries: &[(usize, Entry<RootTokens>, usize, usize)]) -> Vec<TokenData> {
     entries
         .iter()
-        .map(|(id, entry)| match entry {
-            Entry::Token {
-                length, terminal, ..
-            } => TokenData {
-                id: *id,
-                terminal: Some(*terminal),
-                length: *length,
-            },
-            Entry::EOF => TokenData {
-                id: *id,
-                terminal: None,
-                length: 0,
-            },
-            Entry::Error(length, _) => TokenData {
-                id: *id,
-                terminal: None,
-                length: *length,
-            },
+        .enumerate()
+        .map(|(column, (id, entry, start, _end))| {
+            let data = match entry {
+                Entry::Token {
+                    length, terminal, value,
+                } => TokenData {
+                    id: *id,
+                    terminal: Some(*terminal),
+                    start: *start,
+                    length: *length,
+                    column,
+                    fingerprint: token_fingerprint(Some(*terminal), value, *length),
+                },
+                Entry::EOF => TokenData {
+                    id: *id,
+                    terminal: None,
+                    start: *start,
+                    length: 0,
+                    column,
+                    fingerprint: eof_fingerprint(),
+                },
+                Entry::Error(length, error) => TokenData {
+                    id: *id,
+                    terminal: None,
+                    start: *start,
+                    length: *length,
+                    column,
+                    fingerprint: error_fingerprint(error, *length),
+                },
+            };
+            data
         })
         .collect()
 }
 
-fn collect_entries(lexer: &mut Lexer<RootTokens>, input: &str) -> Vec<(usize, Entry<RootTokens>)> {
-    let token_ids: Vec<usize> = {
+fn collect_entries(
+    lexer: &mut Lexer<RootTokens>,
+    input: &str,
+) -> Vec<(usize, Entry<RootTokens>, usize, usize)> {
+    let token_ids: Vec<(usize, usize, usize)> = {
         let mut ids = Vec::new();
         lexer
             .lex_cont(
                 LexerState::new(lexer.state_id_of::<RootTokens>().unwrap()),
                 input.to_string(),
-                |token_id, _| {
-                    ids.push(token_id);
+                |token_id, _, start, end| {
+                    ids.push((token_id, start, end));
                     true
                 },
             )
@@ -59,7 +84,7 @@ fn collect_entries(lexer: &mut Lexer<RootTokens>, input: &str) -> Vec<(usize, En
     };
     token_ids
         .into_iter()
-        .map(|id| (id, lexer.get(id).clone()))
+        .map(|(id, start, end)| (id, lexer.get(id).clone(), start, end))
         .collect()
 }
 
@@ -208,6 +233,32 @@ enum NullableExprAst {
 
     #[rule(RootTokens::Number)]
     Number(#[from(0)] AstToken<RootTokens>),
+
+    #[parse_err]
+    Error(#[from(0)] ParseErrorInfo),
+}
+
+#[derive(NonTerminal, Debug)]
+enum TokenClassAst {
+    #[rule(RootTokens::Number)]
+    Number(#[from(0)] AstToken<RootTokens>),
+
+    #[rule(RootTokens::QuoteStart)]
+    QuoteStart(#[from(0)] AstToken<RootTokens>),
+}
+
+#[derive(NonTerminal, Debug, Clone)]
+enum ErrorOnlyAst {
+    #[rule(
+        RootTokens::QuoteStart,
+        RootTokens::QuoteStart,
+        RootTokens::QuoteStart,
+        RootTokens::Number
+    )]
+    Pair,
+
+    #[parse_err]
+    Error(#[from(0)] ParseErrorInfo),
 }
 
 #[derive(NonTerminal, Debug)]
@@ -224,8 +275,11 @@ enum EbnfExprAst {
     #[rule({$x(ExprAst)}[1..2])]
     Bounded(#[from(x)] Vec<AstBox<ExprAst>>),
 
-    #[rule({$x(ExprAst)}{RootTokens::Number}[1..3])]
-    SeparatorBounded(#[from(x)] Vec<AstBox<ExprAst>>),
+    #[rule({$x(ExprAst)}{RootTokens::Number})]
+    Separated(#[from(x)] Vec<AstBox<ExprAst>>),
+
+    #[parse_err]
+    Error,
 }
 
 #[test]
@@ -236,7 +290,7 @@ fn test_multi_enum_token_schema() {
     let error = lexer.lex_cont(
         LexerState::new(lexer.state_id_of::<RootTokens>().unwrap()),
         input.to_string(),
-        |token_id, _state| {
+        |token_id, _state, _, _| {
             receiver.push(token_id);
             true
         },
@@ -254,7 +308,7 @@ fn test_raw_string_simple() {
     let error = lexer.lex_cont(
         LexerState::new(lexer.state_id_of::<RawRoot>().unwrap()),
         input.to_string(),
-        |token_id, _state| {
+        |token_id, _state, _, _| {
             received.push(token_id);
             true
         },
@@ -270,7 +324,7 @@ fn test_raw_string_nonmatching_delimiter_rejected() {
     let error = lexer.lex_cont(
         LexerState::new(lexer.state_id_of::<RawRoot>().unwrap()),
         input.to_string(),
-        |token_id, _state| {
+        |token_id, _state, _, _| {
             received.push(token_id);
             true
         },
@@ -368,7 +422,10 @@ fn test_parse_session_rejects_lexer_error_entry() {
     let error_data = vec![TokenData {
         id: 0,
         terminal: None,
+        start: 0,
         length: 0,
+        column: 0,
+        fingerprint: 0,
     }];
     let result = parser.parse_tokens_at(uri, &error_data);
     assert!(result.is_err());
@@ -383,7 +440,10 @@ fn test_parse_session_accepts_nullable_grammar_on_eof() {
     let eof_data = vec![TokenData {
         id: 0,
         terminal: None,
+        start: 0,
         length: 0,
+        column: 0,
+        fingerprint: 0,
     }];
     parser.parse_tokens_at(uri, &eof_data).unwrap();
 
@@ -398,6 +458,122 @@ fn test_parse_session_accepts_nullable_grammar_on_eof() {
 }
 
 #[test]
+fn test_error_recovery_deletes_unexpected_token() {
+    let grammar = Grammar::from_spec::<NullableExprAst>();
+    let mut parser = grammar.build_lr1_with_config::<RootTokens, ()>(ParserConfig {
+        error_recovery: true,
+        ..ParserConfig::default()
+    });
+    let uri = Span::new("test://recover-delete", 0, 0).unwrap().uri;
+
+    let mut lexer = Lexer::<RootTokens>::new().unwrap();
+    let entries = collect_entries(&mut lexer, "123");
+    let data = token_data_from_entries(&entries);
+    let number = data
+        .iter()
+        .find(|token| token.terminal.is_some())
+        .copied()
+        .unwrap();
+    let eof = data
+        .iter()
+        .find(|token| token.terminal.is_none())
+        .copied()
+        .unwrap();
+    let duplicated = TokenData {
+        id: number.id + 100,
+        fingerprint: number.fingerprint,
+        ..number
+    };
+    let eof = TokenData {
+        id: number.id + 101,
+        fingerprint: eof.fingerprint,
+        ..eof
+    };
+
+    parser
+        .parse_tokens_at(uri, &[number, duplicated, eof])
+        .unwrap();
+    assert_eq!(parser.session_state(uri).unwrap().accepted().len(), 1);
+}
+
+#[test]
+fn test_error_recovery_can_be_disabled() {
+    let grammar = Grammar::from_spec::<NullableExprAst>();
+    let mut parser = grammar.build_lr1_with_config::<RootTokens, ()>(ParserConfig {
+        error_recovery: false,
+        ..ParserConfig::default()
+    });
+    let uri = Span::new("test://recover-disabled", 0, 0).unwrap().uri;
+
+    let mut lexer = Lexer::<RootTokens>::new().unwrap();
+    let entries = collect_entries(&mut lexer, "123");
+    let data = token_data_from_entries(&entries);
+    let number = data
+        .iter()
+        .find(|token| token.terminal.is_some())
+        .copied()
+        .unwrap();
+    let eof = data
+        .iter()
+        .find(|token| token.terminal.is_none())
+        .copied()
+        .unwrap();
+    let duplicated = TokenData {
+        id: number.id + 100,
+        fingerprint: number.fingerprint,
+        ..number
+    };
+    let eof = TokenData {
+        id: number.id + 101,
+        fingerprint: eof.fingerprint,
+        ..eof
+    };
+
+    assert!(
+        parser
+            .parse_tokens_at(uri, &[number, duplicated, eof])
+            .is_err()
+    );
+}
+
+#[test]
+fn test_parse_error_variant_receives_error_info() {
+    let grammar = Grammar::from_spec::<ErrorOnlyAst>();
+    let mut parser = grammar.build_lr1_with_config::<RootTokens, ()>(ParserConfig {
+        error_recovery: true,
+        ..ParserConfig::default()
+    });
+    let uri = Span::new("test://recover-info", 0, 0).unwrap().uri;
+
+    let mut lexer = Lexer::<RootTokens>::new().unwrap();
+    let entries = collect_entries(&mut lexer, "123");
+    let data = token_data_from_entries(&entries);
+    parser.parse_tokens_at(uri, &data).unwrap();
+
+    let accepted = parser.session_state(uri).unwrap().accepted().to_vec();
+    assert_eq!(accepted.len(), 1);
+    let product = parser.session_product(uri, accepted[0]).unwrap();
+    let ProductData::Node { ast, .. } = product.data else {
+        panic!("expected accepted parse node");
+    };
+    let value = parser
+        .session_arenas
+        .get(&uri)
+        .unwrap()
+        .ast
+        .cloned::<ErrorOnlyAst>(ast)
+        .unwrap();
+
+    let ErrorOnlyAst::Error(info) = value else {
+        panic!("expected parse error AST variant");
+    };
+    assert_eq!(info.kind, ErrorKind::UnexpectedToken);
+    assert!(info.unexpected.is_some());
+    assert_eq!(info.expected, Symbol::T(ERROR_TERMINAL));
+    assert!(info.recovered);
+}
+
+#[test]
 fn test_parse_session_can_truncate_to_middle_column_and_reparse() {
     let grammar = Grammar::from_spec::<ExprAst>();
     let mut parser = grammar.build_lr1::<RootTokens, ()>();
@@ -406,7 +582,6 @@ fn test_parse_session_can_truncate_to_middle_column_and_reparse() {
 
     let first_entries = collect_entries(&mut lexer, "123");
     let first_data = token_data_from_entries(&first_entries);
-    let first_token = first_data[0].id;
 
     parser.parse_tokens_at(uri, &first_data).unwrap();
     assert_eq!(parser.session_state(uri).unwrap().accepted().len(), 1);
@@ -414,7 +589,7 @@ fn test_parse_session_can_truncate_to_middle_column_and_reparse() {
     let resume_column = parser
         .session_state(uri)
         .unwrap()
-        .column_before_token(first_token)
+        .column_before_token(first_data[0].column)
         .unwrap();
     assert_eq!(resume_column, 0);
 
@@ -425,4 +600,238 @@ fn test_parse_session_can_truncate_to_middle_column_and_reparse() {
     parser.parse_tokens_at(uri, &repl_data).unwrap();
 
     assert_eq!(parser.session_state(uri).unwrap().accepted().len(), 1);
+}
+
+#[test]
+fn test_incremental_reparse_keeps_valid_frontier_for_token_class_change() {
+    let grammar = Grammar::from_spec::<TokenClassAst>();
+    let mut parser = grammar.build_lr1::<RootTokens, ()>();
+    let uri = Span::new("test://incremental-token-class", 0, 0)
+        .unwrap()
+        .uri;
+    let mut lexer = Lexer::<RootTokens>::new().unwrap();
+
+    let first_entries = collect_entries(&mut lexer, "123");
+    let first_data = token_data_from_entries(&first_entries);
+    parser.parse_tokens_at(uri, &first_data).unwrap();
+
+    parser.truncate_session(uri, 0);
+
+    let second_entries = collect_entries(&mut lexer, "\"");
+    let second_data = token_data_from_entries(&second_entries);
+    parser.parse_tokens_at(uri, &second_data).unwrap();
+
+    assert_eq!(parser.session_state(uri).unwrap().accepted().len(), 1);
+}
+
+#[test]
+fn test_incremental_reparse_keeps_valid_frontier_for_token_length_change() {
+    let grammar = Grammar::from_spec::<ExprAst>();
+    let mut parser = grammar.build_lr1::<RootTokens, ()>();
+    let uri = Span::new("test://incremental-token-length", 0, 0)
+        .unwrap()
+        .uri;
+    let mut lexer = Lexer::<RootTokens>::new().unwrap();
+
+    let first_entries = collect_entries(&mut lexer, "123");
+    let first_data = token_data_from_entries(&first_entries);
+    parser.parse_tokens_at(uri, &first_data).unwrap();
+
+    let resume_column = parser
+        .session_state(uri)
+        .unwrap()
+        .column_before_token(first_data[0].column)
+        .unwrap();
+    parser.truncate_session(uri, resume_column);
+
+    let second_entries = collect_entries(&mut lexer, "4567");
+    let second_data = token_data_from_entries(&second_entries);
+    parser.parse_tokens_at(uri, &second_data).unwrap();
+
+    assert_eq!(parser.session_state(uri).unwrap().accepted().len(), 1);
+}
+
+#[test]
+fn test_diff_compact_keeps_replacement_deltas() {
+    let uri = Span::new("test://diff-compact", 0, 0).unwrap().uri;
+    let path = vec![0, 1];
+    let deltas = vec![
+        Delta::Delete {
+            key: crate::component::parse::ParsePath {
+                uri,
+                path: path.clone(),
+                range: crate::utils::RangeOrPoint::Point(0),
+            },
+        },
+        Delta::Insert {
+            key: crate::component::parse::ParsePath {
+                uri,
+                path,
+                range: crate::utils::RangeOrPoint::Point(0),
+            },
+            value: crate::component::parse::ParseForest { roots: vec![1] },
+        },
+    ];
+
+    let compacted = diff::compact(deltas);
+    assert_eq!(compacted.len(), 2);
+    assert!(matches!(compacted[0], Delta::Delete { .. }));
+    assert!(matches!(compacted[1], Delta::Insert { .. }));
+}
+
+#[test]
+fn test_diff_trees_replaces_same_green_different_product() {
+    let uri = Span::new("test://diff-same-green", 0, 0).unwrap().uri;
+    let mut trees = TreeArena::new();
+    let mut products = ProductArena::new();
+
+    let leaf = trees.leaf(3, ERROR_TERMINAL);
+    let old = products.insert(Product::token(leaf, 1, 11));
+    let new = products.insert(Product::token(leaf, 2, 22));
+
+    let deltas = diff::diff_trees(&products, &trees, &[old], &[new], uri);
+
+    assert_eq!(deltas.len(), 2);
+    assert!(matches!(deltas[0], Delta::Delete { .. }));
+    assert!(matches!(deltas[1], Delta::Insert { .. }));
+}
+
+#[test]
+fn test_diff_trees_handles_repeated_identical_children_exactly() {
+    let uri = Span::new("test://diff-duplicate-children", 0, 0)
+        .unwrap()
+        .uri;
+    let mut trees = TreeArena::new();
+    let mut products = ProductArena::new();
+    let mut ast = AstArena::new(uri);
+
+    let leaf_same = trees.leaf(3, ERROR_TERMINAL);
+    let leaf_other = trees.leaf(4, ERROR_TERMINAL);
+    let child_a = products.insert(Product::token(leaf_same, 10, 101));
+    let child_b = products.insert(Product::token(leaf_same, 11, 101));
+    let child_c = products.insert(Product::token(leaf_other, 12, 202));
+
+    let old_green = trees.node(0, vec![leaf_same, leaf_same]);
+    let new_green = trees.node(0, vec![leaf_same, leaf_other]);
+    let old_root = products.insert(Product::node(
+        old_green,
+        ast.insert(()),
+        vec![child_a, child_b],
+    ));
+    let new_root = products.insert(Product::node(
+        new_green,
+        ast.insert(()),
+        vec![child_a, child_c],
+    ));
+
+    let deltas = diff::diff_trees(&products, &trees, &[old_root], &[new_root], uri);
+
+    assert_eq!(deltas.len(), 2);
+    assert!(matches!(&deltas[0], Delta::Delete { key } if key.path == vec![0, 1]));
+    assert!(
+        matches!(&deltas[1], Delta::Insert { key, value } if key.path == vec![0, 1] && value.roots == vec![child_c])
+    );
+}
+
+#[test]
+fn test_diff_trees_aligns_middle_insert_without_cascade() {
+    let uri = Span::new("test://diff-middle-insert", 0, 0).unwrap().uri;
+    let mut trees = TreeArena::new();
+    let mut products = ProductArena::new();
+    let mut ast = AstArena::new(uri);
+
+    let leaf_a = trees.leaf(1, ERROR_TERMINAL);
+    let leaf_b = trees.leaf(2, ERROR_TERMINAL);
+    let leaf_c = trees.leaf(3, ERROR_TERMINAL);
+    let child_a = products.insert(Product::token(leaf_a, 10, 301));
+    let child_b = products.insert(Product::token(leaf_b, 11, 302));
+    let child_c = products.insert(Product::token(leaf_c, 12, 303));
+
+    let old_green = trees.node(0, vec![leaf_a, leaf_c]);
+    let new_green = trees.node(0, vec![leaf_a, leaf_b, leaf_c]);
+    let old_root = products.insert(Product::node(
+        old_green,
+        ast.insert(()),
+        vec![child_a, child_c],
+    ));
+    let new_root = products.insert(Product::node(
+        new_green,
+        ast.insert(()),
+        vec![child_a, child_b, child_c],
+    ));
+
+    let deltas = diff::diff_trees(&products, &trees, &[old_root], &[new_root], uri);
+
+    assert_eq!(deltas.len(), 1);
+    assert!(
+        matches!(&deltas[0], Delta::Insert { key, value } if key.path == vec![0, 1] && value.roots == vec![child_b])
+    );
+}
+
+#[test]
+fn test_diff_trees_aligns_middle_delete_without_cascade() {
+    let uri = Span::new("test://diff-middle-delete", 0, 0).unwrap().uri;
+    let mut trees = TreeArena::new();
+    let mut products = ProductArena::new();
+    let mut ast = AstArena::new(uri);
+
+    let leaf_a = trees.leaf(1, ERROR_TERMINAL);
+    let leaf_b = trees.leaf(2, ERROR_TERMINAL);
+    let leaf_c = trees.leaf(3, ERROR_TERMINAL);
+    let child_a = products.insert(Product::token(leaf_a, 20, 401));
+    let child_b = products.insert(Product::token(leaf_b, 21, 402));
+    let child_c = products.insert(Product::token(leaf_c, 22, 403));
+
+    let old_green = trees.node(0, vec![leaf_a, leaf_b, leaf_c]);
+    let new_green = trees.node(0, vec![leaf_a, leaf_c]);
+    let old_root = products.insert(Product::node(
+        old_green,
+        ast.insert(()),
+        vec![child_a, child_b, child_c],
+    ));
+    let new_root = products.insert(Product::node(
+        new_green,
+        ast.insert(()),
+        vec![child_a, child_c],
+    ));
+
+    let deltas = diff::diff_trees(&products, &trees, &[old_root], &[new_root], uri);
+
+    assert_eq!(deltas.len(), 1);
+    assert!(
+        matches!(&deltas[0], Delta::Delete { key } if key.path == vec![0, 1])
+    );
+}
+
+#[test]
+fn test_diff_trees_keeps_equivalent_error_nodes() {
+    let uri = Span::new("test://diff-error-equivalent", 0, 0).unwrap().uri;
+    let mut trees = TreeArena::new();
+    let mut products = ProductArena::new();
+
+    let first_green = trees.error(
+        3,
+        ErrorKind::UnexpectedToken,
+        0,
+        Vec::new(),
+        Some(Symbol::T(ERROR_TERMINAL)),
+        Symbol::T(ERROR_TERMINAL),
+        true,
+        Some(1),
+    );
+    let second_green = trees.error(
+        3,
+        ErrorKind::UnexpectedToken,
+        0,
+        Vec::new(),
+        Some(Symbol::T(ERROR_TERMINAL)),
+        Symbol::T(ERROR_TERMINAL),
+        true,
+        Some(1),
+    );
+    let old = products.insert(Product::error(first_green));
+    let new = products.insert(Product::error(second_green));
+
+    let deltas = diff::diff_trees(&products, &trees, &[old], &[new], uri);
+    assert!(deltas.is_empty());
 }

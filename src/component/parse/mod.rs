@@ -1,4 +1,4 @@
-use std::{any::TypeId, collections::HashMap, fmt, marker::PhantomData};
+use std::{any::TypeId, collections::HashMap, fmt, marker::PhantomData, time::Duration};
 
 use fluent_uri::Uri;
 use indexmap::{IndexMap, IndexSet};
@@ -8,8 +8,8 @@ use crate::component::{
     parse::{
         build::{ActionSet, Conflict, LR1State, LRStateId},
         data::{
-            AstArena, AstBox, GreenId, GreenTree, GssArena, Product, ProductArena, ProductData,
-            ProductId, TokenEntryId, TreeArena,
+            AstArena, AstBox, GreenTree, GssArena, Product, ProductArena, ProductData, ProductId,
+            TokenEntryId, TreeArena,
         },
         grammar::{Grammar, Symbol, TerminalId},
         parsing::{ParserSessionState, SessionContext},
@@ -21,17 +21,56 @@ use crate::utils::{RangeOrPoint, Span};
 
 pub(crate) mod analyze;
 pub(crate) mod build;
+pub(crate) mod checkpoint;
 pub mod data;
 pub(crate) mod diff;
+pub(crate) mod emit;
 pub mod grammar;
+pub(crate) mod identity;
+pub(crate) mod incremental;
 pub(crate) mod parsing;
 pub mod policy;
+pub(crate) mod recovery;
 
-pub use data::AstToken;
+pub use data::{AstToken, ErrorKind, ParseErrorInfo};
+pub use identity::TokenFingerprint;
 pub use parsing::ParseError;
 
 #[doc(hidden)]
 pub mod __macro_private;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergenceLevel {
+    /// Compare only LR state sets at each column.
+    LRState,
+    /// Also require matching accepted product counts.
+    AcceptedProducts,
+    /// Deep: compare GreenId of accepted products (most robust).
+    GreenIds,
+}
+
+impl Default for ConvergenceLevel {
+    fn default() -> Self {
+        Self::GreenIds
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParserConfig {
+    pub convergence_level: ConvergenceLevel,
+    pub error_recovery: bool,
+    pub error_recovery_timeout: Duration,
+}
+
+impl Default for ParserConfig {
+    fn default() -> Self {
+        Self {
+            convergence_level: ConvergenceLevel::default(),
+            error_recovery: true,
+            error_recovery_timeout: Duration::from_millis(100),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ParsePath {
@@ -55,6 +94,16 @@ pub struct ParseForest {
     pub roots: Vec<ProductId>,
 }
 
+pub type TokenOccurrenceId = usize;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IncrementalParseStats {
+    pub reparsed: usize,
+    pub reused: usize,
+    pub recovery_columns: usize,
+    pub converged: bool,
+}
+
 impl fmt::Display for ParseForest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} parse roots", self.roots.len())
@@ -65,7 +114,10 @@ impl fmt::Display for ParseForest {
 pub struct TokenData {
     pub id: TokenEntryId,
     pub terminal: Option<TerminalId>,
+    pub start: usize,
     pub length: usize,
+    pub column: TokenOccurrenceId,
+    pub fingerprint: TokenFingerprint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -93,9 +145,11 @@ pub struct Parser<Root = (), Lower = ()> {
     pub actions: Vec<ActionSet>,
     pub gotos: Vec<Option<LRStateId>>,
     pub(crate) session_arenas: HashMap<Uri<&'static str>, SessionArenas>,
+    pub config: ParserConfig,
 
     #[snapshot]
     pub latest: ParserSnapshotState,
+    pub(crate) latest_incremental_stats: HashMap<Uri<&'static str>, IncrementalParseStats>,
     pub(crate) _lower: PhantomData<(Root, Lower)>,
 }
 
@@ -128,6 +182,8 @@ impl<Root, Lower> Parser<Root, Lower> {
             grammar: &self.grammar,
             actions: &self.actions,
             gotos: &self.gotos,
+            error_recovery: self.config.error_recovery,
+            error_recovery_timeout: self.config.error_recovery_timeout,
         };
         ctx.parse_tokens(tokens)
     }
@@ -140,6 +196,26 @@ impl<Root, Lower> Parser<Root, Lower> {
 
     pub fn session_state(&self, uri: fluent_uri::Uri<&'static str>) -> Option<&ParserSessionState> {
         self.latest.sessions.get(&uri)
+    }
+
+    pub fn incremental_stats(
+        &self,
+        uri: fluent_uri::Uri<&'static str>,
+    ) -> Option<IncrementalParseStats> {
+        self.latest_incremental_stats.get(&uri).copied()
+    }
+
+    pub fn parse_diagnostics(&self, uri: fluent_uri::Uri<&'static str>) -> Vec<ParseErrorInfo> {
+        let Some(state) = self.latest.sessions.get(&uri) else {
+            return Vec::new();
+        };
+        let roots = self
+            .latest
+            .roots
+            .get(&uri)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        policy::collect_parse_diagnostics(state, self.session_arenas.get(&uri), roots)
     }
 
     pub fn session_product(
@@ -172,21 +248,16 @@ impl<Root, Lower> Parser<Root, Lower> {
         let Some(arenas) = self.session_arenas.get(&path.uri) else {
             return Vec::new();
         };
-        let products = &arenas.products.products;
-        let trees = &arenas.trees;
 
-        let mut current: Vec<GreenId> = roots
-            .iter()
-            .filter_map(|&pid| products.get(pid).map(|p| p.green))
-            .collect();
+        let mut current = roots.clone();
 
         for &child_idx in &path.path {
             let mut next = Vec::new();
-            for gid in current {
-                if let Some(GreenTree {
-                    data: data::TreeData::Node { children, .. },
+            for pid in current {
+                if let Some(Product {
+                    data: ProductData::Node { children, .. },
                     ..
-                }) = trees.get(gid)
+                }) = arenas.products.get(pid)
                 {
                     if let Some(&child) = children.get(child_idx) {
                         next.push(child);
@@ -195,14 +266,7 @@ impl<Root, Lower> Parser<Root, Lower> {
             }
             current = next;
         }
-
-        let mut result = Vec::new();
-        for (pid, product) in products.iter().enumerate() {
-            if current.contains(&product.green) && !result.contains(&pid) {
-                result.push(pid);
-            }
-        }
-        result
+        current
     }
 
     pub(crate) fn ast_boxes_at_path<T: 'static>(
@@ -218,7 +282,9 @@ impl<Root, Lower> Parser<Root, Lower> {
         products
             .iter()
             .filter_map(|&pid| match arenas.products.get(pid)?.data {
-                ProductData::Node { ast, ty } if ty == target => Some(AstBox::new(ast, path.uri)),
+                ProductData::Node { ast, ty, .. } if ty == target => {
+                    Some(AstBox::new(ast, path.uri))
+                }
                 _ => None,
             })
             .collect()
@@ -263,24 +329,24 @@ where
         async move {
             let mut working = self.latest.clone();
             let mut lower_deltas = Vec::new();
-            let mut deltas = deltas;
+            let mut grouped: Vec<(Uri<&'static str>, Vec<Delta<Span, usize>>)> = Vec::new();
 
-            while !deltas.is_empty() {
-                let d = deltas.remove(0);
-                if matches!(&d, Delta::Delete { .. })
-                    && deltas.first().is_some_and(|next| {
-                        matches!(next, Delta::Insert { .. })
-                            && d.key().uri == next.key().uri
-                            && d.key().range.start() == next.key().range.start()
-                    })
+            for delta in deltas {
+                let uri = delta.key().uri;
+                if let Some((_, batch)) =
+                    grouped.iter_mut().find(|(group_uri, _)| *group_uri == uri)
                 {
-                    let ins = deltas.remove(0);
-                    lower_deltas
-                        .extend(self.parse_delta(&mut working, ins, ctx).await?);
+                    batch.push(delta);
                 } else {
-                    lower_deltas
-                        .extend(self.parse_delta(&mut working, d, ctx).await?);
+                    grouped.push((uri, vec![delta]));
                 }
+            }
+
+            for (uri, batch) in grouped {
+                lower_deltas.extend(
+                    self.parse_delta_batch(&mut working, uri, &batch, ctx)
+                        .await?,
+                );
             }
 
             self.latest = working;

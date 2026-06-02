@@ -8,6 +8,7 @@ use crate::component::parse::{
         AstArena, AstBox, ErrorKind, GreenId, Product, ProductArena, ProductData, ProductId,
         TokenEntryId, TreeArena,
     },
+    identity::TokenFingerprint,
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -72,6 +73,11 @@ pub const EOF_TERMINAL: TerminalId = TerminalId {
     token_id: u32::MAX,
 };
 
+pub const ERROR_TERMINAL: TerminalId = TerminalId {
+    state_key: "",
+    token_id: u32::MAX - 1,
+};
+
 #[allow(dead_code)]
 pub struct Grammar {
     pub(crate) terminals: Vec<Terminal>,
@@ -82,6 +88,8 @@ pub struct Grammar {
     pub(crate) productions_for_lhs: Vec<std::ops::Range<u32>>,
     pub(crate) production_ids_by_lhs: Vec<ProductionId>,
     pub(crate) eof: TerminalId,
+    pub error_terminal: TerminalId,
+    pub error_non_terminal: NonTerminalId,
     pub(crate) terminal_indices: HashMap<TerminalId, usize>,
     pub(crate) is_nullable: BitVec,
     pub(crate) is_at_first: Vec<BitVec>,
@@ -98,6 +106,8 @@ impl Clone for Grammar {
             productions_for_lhs: self.productions_for_lhs.clone(),
             production_ids_by_lhs: self.production_ids_by_lhs.clone(),
             eof: self.eof,
+            error_terminal: self.error_terminal,
+            error_non_terminal: self.error_non_terminal,
             terminal_indices: self.terminal_indices.clone(),
             is_nullable: self.is_nullable.clone(),
             is_at_first: self.is_at_first.clone(),
@@ -205,18 +215,10 @@ impl<'a> BuildCx<'a> {
         T: Clone + 'static,
     {
         match self.product(product)?.data {
-            ProductData::Node { ast, .. } => {
-                let result = self
-                    .ast
-                    .cloned(ast);
-                if result.is_none() {
-                    eprintln!(
-                        "BuildCx::expect_value TypeMismatch for product {product:?}: expecting {}",
-                        std::any::type_name::<T>(),
-                    );
-                }
-                result.ok_or(BuildError::TypeMismatch { product })
-            }
+            ProductData::Node { ast, .. } => self
+                .ast
+                .cloned(ast)
+                .ok_or(BuildError::TypeMismatch { product }),
             ProductData::Token { ast: Some(ast), .. } => self
                 .ast
                 .cloned(ast)
@@ -241,7 +243,9 @@ impl<'a> BuildCx<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let green = self.trees.node(self.lhs(production)?, greens);
         let ast = self.ast.insert(value);
-        Ok(self.products.insert(Product::node(green, ast)))
+        Ok(self
+            .products
+            .insert(Product::node(green, ast, children.to_vec())))
     }
 
     pub fn lhs(&self, production: ProductionId) -> Result<NonTerminalId, BuildError> {
@@ -253,9 +257,10 @@ impl<'a> BuildCx<'a> {
         length: usize,
         terminal: TerminalId,
         entry: TokenEntryId,
+        fingerprint: TokenFingerprint,
     ) -> ProductId {
         let green = self.trees.leaf(length, terminal);
-        self.products.insert(Product::token(green, entry))
+        self.products.insert(Product::token(green, entry, fingerprint))
     }
 
     pub fn alloc_typed_token<T>(
@@ -263,6 +268,7 @@ impl<'a> BuildCx<'a> {
         length: usize,
         terminal: TerminalId,
         entry: TokenEntryId,
+        fingerprint: TokenFingerprint,
         value: T,
     ) -> ProductId
     where
@@ -271,18 +277,50 @@ impl<'a> BuildCx<'a> {
         let green = self.trees.leaf(length, terminal);
         let ast = self.ast.insert(value);
         self.products
-            .insert(Product::typed_token(green, entry, ast))
+            .insert(Product::typed_token(green, entry, fingerprint, ast))
     }
 
     pub fn alloc_error(
         &mut self,
         length: usize,
         kind: ErrorKind,
+        node: NonTerminalId,
+        children: Vec<GreenId>,
         unexpected: Option<Symbol>,
         expected: Symbol,
+        recovered: bool,
     ) -> ProductId {
-        let green = self.trees.error(length, kind, unexpected, expected);
+        let green = self.trees.error(
+            length,
+            kind,
+            node,
+            children,
+            unexpected,
+            expected,
+            recovered,
+            None,
+        );
         self.products.insert(Product::error(green))
+    }
+
+    pub fn alloc_error_with_children(
+        &mut self,
+        kind: ErrorKind,
+        node: NonTerminalId,
+        children: &[ProductId],
+        unexpected: Option<Symbol>,
+        expected: Symbol,
+        recovered: bool,
+    ) -> Result<ProductId, BuildError> {
+        let greens = children
+            .iter()
+            .map(|&child| self.green_of(child))
+            .collect::<Result<Vec<_>, _>>()?;
+        let length = greens
+            .iter()
+            .map(|g| self.trees.get(*g).map_or(0, |t| t.length))
+            .sum();
+        Ok(self.alloc_error(length, kind, node, greens, unexpected, expected, recovered))
     }
 
     pub fn is_error(&self, product: ProductId) -> Result<bool, BuildError> {
@@ -326,29 +364,45 @@ fn augmented_build(
 impl GrammarBuilder {
     pub(crate) fn new() -> Self {
         Self {
-            terminals: vec![Terminal {
-                id: TerminalId {
-                    state_key: "",
-                    token_id: u32::MAX,
+            terminals: vec![
+                Terminal {
+                    id: TerminalId {
+                        state_key: "",
+                        token_id: u32::MAX,
+                    },
+                    label: "EOF",
+                    precedence: None,
                 },
-                label: "EOF",
-                precedence: None,
-            }],
-            terminal_indices: HashMap::from([(
-                TerminalId {
-                    state_key: "",
-                    token_id: u32::MAX,
+                Terminal {
+                    id: ERROR_TERMINAL,
+                    label: "error",
+                    precedence: None,
                 },
-                TerminalId {
-                    state_key: "",
-                    token_id: u32::MAX,
+            ],
+            terminal_indices: HashMap::from([
+                (
+                    TerminalId {
+                        state_key: "",
+                        token_id: u32::MAX,
+                    },
+                    TerminalId {
+                        state_key: "",
+                        token_id: u32::MAX,
+                    },
+                ),
+                (ERROR_TERMINAL, ERROR_TERMINAL),
+            ]),
+            non_terminals: vec![
+                NonTerminal {
+                    label: "S'",
+                    named: false,
                 },
-            )]),
-            non_terminals: vec![NonTerminal {
-                label: "S'",
-                named: false,
-            }],
-            non_terminal_open: vec![false],
+                NonTerminal {
+                    label: "Err",
+                    named: false,
+                },
+            ],
+            non_terminal_open: vec![false, false],
             productions: vec![PendingProduction {
                 id: 0,
                 label: "S'",
@@ -445,6 +499,27 @@ impl GrammarBuilder {
         });
     }
 
+    pub(crate) fn error_rule(
+        &mut self,
+        label: &'static str,
+        lhs: NonTerminalId,
+        builder: Option<BuildFn>,
+    ) {
+        let rhs_start = self.rhs_symbols.len() as u32;
+        self.rhs_symbols.push(Symbol::T(ERROR_TERMINAL));
+        let rhs_len = 1u16;
+        let id = self.productions.len() as ProductionId;
+        self.productions.push(PendingProduction {
+            id,
+            label,
+            lhs,
+            rhs_start,
+            rhs_len,
+            precedence: None,
+            build: builder.unwrap_or(default_build),
+        });
+    }
+
     fn finish(mut self, start: NonTerminalId) -> Grammar {
         self.productions[0].rhs_start = self.rhs_symbols.len() as u32;
         self.rhs_symbols.push(Symbol::N(start));
@@ -472,6 +547,8 @@ impl GrammarBuilder {
             productions_for_lhs: Vec::new(),
             production_ids_by_lhs: Vec::new(),
             eof: EOF_TERMINAL,
+            error_terminal: ERROR_TERMINAL,
+            error_non_terminal: 1,
             terminal_indices: HashMap::new(),
             is_nullable: BitVec::new(),
             is_at_first: Vec::new(),

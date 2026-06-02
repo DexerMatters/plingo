@@ -93,6 +93,23 @@ impl<Lower> Source<Lower> {
         Ok(())
     }
 
+    fn lower_delta(&self, delta: &Delta<Span, String>) -> Delta<Span, usize> {
+        let start = delta.key().range.start();
+        match delta {
+            Delta::Insert { key, value } => {
+                let end = start + value.len();
+                Delta::Insert {
+                    key: Span {
+                        uri: key.uri,
+                        range: RangeOrPoint::from_range(start, end),
+                    },
+                    value: value.len(),
+                }
+            }
+            Delta::Delete { key, .. } => Delta::Delete { key: *key },
+        }
+    }
+
     fn capture_snapshot(&mut self, snapshot: SnapshotId) {
         self.push_state(snapshot);
     }
@@ -115,25 +132,17 @@ where
             let Some(delta) = self.receiver.recv().await else {
                 return Ok(None);
             };
-            let start = delta.key().range.start();
-            self.modify(&delta)?;
+            let mut batch = vec![delta];
+            while let Ok(next) = self.receiver.try_recv() {
+                batch.push(next);
+            }
+
+            for delta in &batch {
+                self.modify(delta)?;
+            }
             let snapshot_id = ctx.allocate_snapshot();
             self.capture_snapshot(snapshot_id);
-            let deltas = match &delta {
-                Delta::Insert { key, value } => {
-                    let end = start + value.len();
-                    vec![Delta::Insert {
-                        key: Span {
-                            uri: key.uri,
-                            range: RangeOrPoint::from_range(start, end),
-                        },
-                        value: value.len(),
-                    }]
-                }
-                Delta::Delete { key, .. } => {
-                    vec![Delta::Delete { key: *key }]
-                }
-            };
+            let deltas = batch.iter().map(|delta| self.lower_delta(delta)).collect();
             Ok(Some(EmittedDeltas::new(snapshot_id, deltas)))
         }
     }

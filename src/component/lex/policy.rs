@@ -5,7 +5,7 @@ use plingo_macros::resolve_action;
 use crate::{
     component::{
         common::Pretty,
-        lex::{Entry, LexInterrupt, Lexer, LexerRoot},
+        lex::{Entry, GetVisibleTokenBatch, LexInterrupt, Lexer, LexerRoot, VisibleTokenBatch},
         parse::{GetParseTokens, TokenData},
     },
     scheme::{Context, NonTopLayer, Outcome, Resolve},
@@ -67,6 +67,23 @@ where
     }
 }
 
+#[resolve_action]
+impl<Root, Lower> Resolve<GetVisibleTokenBatch> for Lexer<Root, Lower>
+where
+    Root: LexerRoot + Clone,
+    Lower: NonTopLayer<_Key = Span, _Value = usize>,
+{
+    type Output = Option<VisibleTokenBatch>;
+
+    fn resolve<'a>(
+        &'a mut self,
+        ctx: &'a Context,
+        action: &'a GetVisibleTokenBatch,
+    ) -> impl Future<Output = Outcome<GetVisibleTokenBatch, Self>> + Send + 'a {
+        async move { Outcome::ok(self.visible_batch(ctx.snapshot(), action.0)) }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GetTokenById<T>(pub usize, pub PhantomData<T>);
 
@@ -85,7 +102,7 @@ where
         action: &'a GetTokenById<T>,
     ) -> impl Future<Output = Outcome<GetTokenById<T>, Self>> + Send + 'a {
         let id = action.0;
-        let entry = self.arena.get_index(id).cloned();
+        let entry = self.arena.get(id).cloned();
         async move {
             match entry {
                 Some(Entry::Token { value, .. }) => {

@@ -6,7 +6,8 @@ use crate::{
     NonTerminal,
     component::lex::{Entry, Lexer, LexerState},
     component::parse::{
-        AstToken, ErrorKind, ParseErrorInfo, ParserConfig, TokenData,
+        AstToken, ErrorKind, ParseAddress, ParseChange, ParseErrorInfo, ParseUnit, ParserConfig,
+        TokenData,
         build::Action,
         data::{
             ast::{AstArena, AstBox},
@@ -17,7 +18,7 @@ use crate::{
         grammar::{ERROR_TERMINAL, Grammar, Symbol},
         identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
     },
-    scheme::Delta,
+    scheme::ReplacementBatch,
     tokens,
     utils::{PrettyDisplay, Span},
 };
@@ -662,27 +663,40 @@ fn test_diff_compact_keeps_replacement_deltas() {
     let uri = Span::new("test://diff-compact", 0, 0).unwrap().uri;
     let path = vec![0, 1];
     let deltas = vec![
-        Delta::Delete {
-            key: crate::component::parse::ParsePath {
+        ParseChange::new(
+            ParseAddress {
                 uri,
-                path: path.clone(),
-                range: crate::utils::RangeOrPoint::Point(0),
+                parent_path: path.clone(),
             },
-        },
-        Delta::Insert {
-            key: crate::component::parse::ParsePath {
+            ReplacementBatch {
+                old_units: vec![ParseUnit { product: 0 }],
+                new_units: Vec::new(),
+                prefix_len: 0,
+                suffix_len: 0,
+                old_changed_range: 0..1,
+                new_changed_range: 0..0,
+            },
+        ),
+        ParseChange::new(
+            ParseAddress {
                 uri,
-                path,
-                range: crate::utils::RangeOrPoint::Point(0),
+                parent_path: path,
             },
-            value: crate::component::parse::ParseForest { roots: vec![1] },
-        },
+            ReplacementBatch {
+                old_units: Vec::new(),
+                new_units: vec![ParseUnit { product: 1 }],
+                prefix_len: 0,
+                suffix_len: 0,
+                old_changed_range: 0..0,
+                new_changed_range: 0..1,
+            },
+        ),
     ];
 
     let compacted = diff::compact(deltas);
     assert_eq!(compacted.len(), 2);
-    assert!(matches!(compacted[0], Delta::Delete { .. }));
-    assert!(matches!(compacted[1], Delta::Insert { .. }));
+    assert_eq!(compacted[0].batch.old_units[0].product, 0);
+    assert_eq!(compacted[1].batch.new_units[0].product, 1);
 }
 
 #[test]
@@ -697,9 +711,13 @@ fn test_diff_trees_replaces_same_green_different_product() {
 
     let deltas = diff::diff_trees(&products, &trees, &[old], &[new], uri);
 
-    assert_eq!(deltas.len(), 2);
-    assert!(matches!(deltas[0], Delta::Delete { .. }));
-    assert!(matches!(deltas[1], Delta::Insert { .. }));
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].address.uri, uri);
+    assert_eq!(deltas[0].address.parent_path, Vec::<usize>::new());
+    assert_eq!(deltas[0].batch.old_changed_range, 0..1);
+    assert_eq!(deltas[0].batch.new_changed_range, 0..1);
+    assert_eq!(deltas[0].batch.old_units.len(), 1);
+    assert_eq!(deltas[0].batch.new_units[0].product, new);
 }
 
 #[test]
@@ -732,11 +750,12 @@ fn test_diff_trees_handles_repeated_identical_children_exactly() {
 
     let deltas = diff::diff_trees(&products, &trees, &[old_root], &[new_root], uri);
 
-    assert_eq!(deltas.len(), 2);
-    assert!(matches!(&deltas[0], Delta::Delete { key } if key.path == vec![0, 1]));
-    assert!(
-        matches!(&deltas[1], Delta::Insert { key, value } if key.path == vec![0, 1] && value.roots == vec![child_c])
-    );
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].address.parent_path, vec![0]);
+    assert_eq!(deltas[0].batch.old_changed_range, 1..2);
+    assert_eq!(deltas[0].batch.new_changed_range, 1..2);
+    assert_eq!(deltas[0].batch.old_units[0].product, child_b);
+    assert_eq!(deltas[0].batch.new_units[0].product, child_c);
 }
 
 #[test]
@@ -769,9 +788,11 @@ fn test_diff_trees_aligns_middle_insert_without_cascade() {
     let deltas = diff::diff_trees(&products, &trees, &[old_root], &[new_root], uri);
 
     assert_eq!(deltas.len(), 1);
-    assert!(
-        matches!(&deltas[0], Delta::Insert { key, value } if key.path == vec![0, 1] && value.roots == vec![child_b])
-    );
+    assert_eq!(deltas[0].address.parent_path, vec![0]);
+    assert_eq!(deltas[0].batch.old_changed_range, 1..1);
+    assert_eq!(deltas[0].batch.new_changed_range, 1..2);
+    assert!(deltas[0].batch.old_units.is_empty());
+    assert_eq!(deltas[0].batch.new_units[0].product, child_b);
 }
 
 #[test]
@@ -804,7 +825,11 @@ fn test_diff_trees_aligns_middle_delete_without_cascade() {
     let deltas = diff::diff_trees(&products, &trees, &[old_root], &[new_root], uri);
 
     assert_eq!(deltas.len(), 1);
-    assert!(matches!(&deltas[0], Delta::Delete { key } if key.path == vec![0, 1]));
+    assert_eq!(deltas[0].address.parent_path, vec![0]);
+    assert_eq!(deltas[0].batch.old_changed_range, 1..2);
+    assert_eq!(deltas[0].batch.new_changed_range, 1..1);
+    assert_eq!(deltas[0].batch.old_units[0].product, child_b);
+    assert!(deltas[0].batch.new_units.is_empty());
 }
 
 #[test]

@@ -1,4 +1,3 @@
-use core::fmt;
 use std::{
     any::{Any, TypeId, type_name},
     collections::HashMap,
@@ -6,9 +5,10 @@ use std::{
     fmt::Display,
     future::Future,
     marker::PhantomData,
+    ops::Range,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -125,62 +125,98 @@ impl Context {
     }
 }
 
-/// Delta representing an insertion or deletion of a key-value pair.
-#[derive(Debug, Clone)]
-pub enum Delta<K, V> {
-    Insert { key: K, value: V },
-    Delete { key: K },
+pub trait LayerChange: Send + Sync + 'static {
+    type Address: Send + Sync + 'static;
+    type Unit: Send + Sync + 'static;
+
+    fn address(&self) -> &Self::Address;
+
+    fn batch(&self) -> &ReplacementBatch<Self::Unit>;
+
+    fn is_changed(&self) -> bool {
+        self.batch().is_changed()
+    }
 }
 
-impl<K, V> fmt::Display for Delta<K, V>
+impl LayerChange for () {
+    type Address = ();
+    type Unit = ();
+
+    fn address(&self) -> &Self::Address {
+        self
+    }
+
+    fn batch(&self) -> &ReplacementBatch<Self::Unit> {
+        static BATCH: OnceLock<ReplacementBatch<()>> = OnceLock::new();
+        BATCH.get_or_init(|| ReplacementBatch {
+            old_units: Vec::new(),
+            new_units: Vec::new(),
+            prefix_len: 0,
+            suffix_len: 0,
+            old_changed_range: 0..0,
+            new_changed_range: 0..0,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacementBatch<Unit> {
+    pub old_units: Vec<Unit>,
+    pub new_units: Vec<Unit>,
+    pub prefix_len: usize,
+    pub suffix_len: usize,
+    pub old_changed_range: Range<usize>,
+    pub new_changed_range: Range<usize>,
+}
+
+impl<Unit> ReplacementBatch<Unit> {
+    pub fn is_changed(&self) -> bool {
+        self.old_changed_range.start != self.old_changed_range.end
+            || self.new_changed_range.start != self.new_changed_range.end
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacementChange<Address, Unit> {
+    pub address: Address,
+    pub batch: ReplacementBatch<Unit>,
+}
+
+impl<Address, Unit> ReplacementChange<Address, Unit> {
+    pub fn new(address: Address, batch: ReplacementBatch<Unit>) -> Self {
+        Self { address, batch }
+    }
+}
+
+impl<Address, Unit> LayerChange for ReplacementChange<Address, Unit>
 where
-    K: fmt::Display,
-    V: fmt::Display,
+    Address: Send + Sync + 'static,
+    Unit: Send + Sync + 'static,
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Delta::Insert { key, value } => {
-                write!(f, "Insert {{ key: {}, value: {} }}", key, value)
-            }
-            Delta::Delete { key } => {
-                write!(f, "Delete {{ key: {} }}", key)
-            }
-        }
+    type Address = Address;
+    type Unit = Unit;
+
+    fn address(&self) -> &Self::Address {
+        &self.address
+    }
+
+    fn batch(&self) -> &ReplacementBatch<Self::Unit> {
+        &self.batch
     }
 }
 
-impl<K, V> Delta<K, V> {
-    /// Get the key associated with this delta, regardless of the variant.
-    pub fn key(&self) -> &K {
-        match self {
-            Delta::Insert { key, .. } | Delta::Delete { key, .. } => key,
-        }
-    }
+pub type LayerChanges<L> = Vec<<L as NonTopLayer>::Change>;
 
-    pub fn map_value<U, F: FnOnce(&V) -> U>(&self, f: F) -> Option<U> {
-        match self {
-            Delta::Insert { value, .. } => Some(f(value)),
-            Delta::Delete { .. } => None,
-        }
-    }
-}
-
-/// A batch of deltas.
-pub type Deltas<K, V> = Vec<Delta<K, V>>;
-
-pub struct EmittedDeltas<L: NonTopLayer> {
+pub struct EmittedChanges<L: NonTopLayer> {
     pub snapshot: SnapshotId,
-    pub deltas: LayerDeltas<L>,
+    pub changes: LayerChanges<L>,
 }
 
-impl<L: NonTopLayer> EmittedDeltas<L> {
-    pub fn new(snapshot: SnapshotId, deltas: LayerDeltas<L>) -> Self {
-        Self { snapshot, deltas }
+impl<L: NonTopLayer> EmittedChanges<L> {
+    pub fn new(snapshot: SnapshotId, changes: LayerChanges<L>) -> Self {
+        Self { snapshot, changes }
     }
 }
-
-/// Convenience type alias for a batch of deltas for a specific non-top layer `L`.
-pub type LayerDeltas<L> = Deltas<<L as NonTopLayer>::_Key, <L as NonTopLayer>::_Value>;
 
 #[doc(hidden)]
 pub mod __macro_private;
@@ -312,8 +348,8 @@ impl<G, L: FallibleLayer + Receiver<G>> Outcome<G, L> {
 }
 
 impl<G, L: NonTopLayer + Receiver<G>> Outcome<G, L> {
-    pub fn update(deltas: LayerDeltas<L>) -> Self {
-        Self(OutcomeKind::Continue(Continuation::propagate(deltas)))
+    pub fn update(changes: LayerChanges<L>) -> Self {
+        Self(OutcomeKind::Continue(Continuation::propagate(changes)))
     }
 
     pub fn expect<Target, Awaited>(action: Awaited) -> Self
@@ -329,8 +365,8 @@ impl<G, L: NonTopLayer + Receiver<G>> Outcome<G, L> {
 }
 
 impl<G, L: TopLayer + Receiver<G>> Outcome<G, L> {
-    pub fn emit(deltas: LayerDeltas<L::Lower>) -> Self {
-        Self(OutcomeKind::Continue(Continuation::propagate(deltas)))
+    pub fn emit(changes: LayerChanges<L::Lower>) -> Self {
+        Self(OutcomeKind::Continue(Continuation::propagate(changes)))
     }
 }
 
@@ -374,14 +410,13 @@ pub trait TopLayer: FallibleLayer<__Error = Self::Error> {
     fn emit<'a>(
         &'a mut self,
         ctx: &'a Context,
-    ) -> impl Future<Output = Result<Option<EmittedDeltas<Self::Lower>>, Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<Option<EmittedChanges<Self::Lower>>, Self::Error>> + Send + 'a;
 }
 
 /// Marker trait for layers that may appear below another layer in the pipeline.
 pub trait NonTopLayer: FallibleLayer<__Error = Self::_Error> {
     type _Error: Display + Send + Sync + 'static;
-    type _Key: Send + Sync + 'static;
-    type _Value: Send + Sync + 'static;
+    type Change: LayerChange;
 }
 
 impl FallibleLayer for () {
@@ -390,15 +425,15 @@ impl FallibleLayer for () {
 
 impl NonTopLayer for () {
     type _Error = Infallible;
-    type _Key = crate::utils::Span;
-    type _Value = usize;
+    type Change = ();
 }
 
-impl<K, L> HasKey<K> for L
+impl<A, L> HasAddress<A> for L
 where
-    L: NonTopLayer<_Key = K>,
+    L: NonTopLayer,
+    L::Change: LayerChange<Address = A>,
 {
-    type Key = L::_Key;
+    type Address = A;
 }
 
 pub trait SnapshotLayer {
@@ -411,32 +446,26 @@ pub trait SnapshotLayer {
 }
 
 /// A trait representing a middle layer.
-pub trait MiddleLayer:
-    NonTopLayer<_Error = Self::Error, _Key = Self::Key, _Value = Self::Value>
-{
+pub trait MiddleLayer: NonTopLayer<_Error = Self::Error> {
     type Lower: NonTopLayer;
     type Error: Display + Send + Sync + 'static;
-    type Key: Send + Sync + 'static;
-    type Value: Send + Sync + 'static;
+    type Change: LayerChange;
 
     fn pass(
         &mut self,
         ctx: &Context,
-        deltas: LayerDeltas<Self>,
-    ) -> impl Future<Output = Result<LayerDeltas<Self::Lower>, Self::Error>> + Send;
+        changes: LayerChanges<Self>,
+    ) -> impl Future<Output = Result<LayerChanges<Self::Lower>, Self::Error>> + Send;
 }
 
 /// A trait representing a bottom layer.
-pub trait BottomLayer:
-    NonTopLayer<_Error = Self::Error, _Key = Self::Key, _Value = Self::Value>
-{
-    type Key: Send + Sync + 'static;
+pub trait BottomLayer: NonTopLayer<_Error = Self::Error> {
     type Error: Display + Send + Sync + 'static;
-    type Value: Send + Sync + 'static;
+    type Change: LayerChange;
     fn consume(
         &mut self,
         ctx: &Context,
-        deltas: LayerDeltas<Self>,
+        changes: LayerChanges<Self>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -463,6 +492,76 @@ pub enum ActionError {
     ChannelClosed { action: String, layer: String },
     #[error("Retry limit reached while resolving action {action} in layer {layer}")]
     RetryLimitReached { action: String, layer: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LayerChange, ReplacementBatch, ReplacementChange};
+
+    #[test]
+    fn replacement_batch_reports_unchanged_when_ranges_are_empty() {
+        let batch = ReplacementBatch {
+            old_units: vec![1, 2, 3],
+            new_units: vec![1, 2, 3],
+            prefix_len: 3,
+            suffix_len: 0,
+            old_changed_range: 3..3,
+            new_changed_range: 3..3,
+        };
+
+        assert!(!batch.is_changed());
+    }
+
+    #[test]
+    fn replacement_batch_reports_changed_for_insert_delete_and_replace() {
+        let insert = ReplacementBatch {
+            old_units: vec![1, 3],
+            new_units: vec![1, 2, 3],
+            prefix_len: 1,
+            suffix_len: 1,
+            old_changed_range: 1..1,
+            new_changed_range: 1..2,
+        };
+        let delete = ReplacementBatch {
+            old_units: vec![1, 2, 3],
+            new_units: vec![1, 3],
+            prefix_len: 1,
+            suffix_len: 1,
+            old_changed_range: 1..2,
+            new_changed_range: 1..1,
+        };
+        let replace = ReplacementBatch {
+            old_units: vec![1, 2, 3],
+            new_units: vec![1, 4, 3],
+            prefix_len: 1,
+            suffix_len: 1,
+            old_changed_range: 1..2,
+            new_changed_range: 1..2,
+        };
+
+        assert!(insert.is_changed());
+        assert!(delete.is_changed());
+        assert!(replace.is_changed());
+    }
+
+    #[test]
+    fn replacement_change_uses_address_and_batch_change_state() {
+        let change = ReplacementChange {
+            address: "file:///test.json",
+            batch: ReplacementBatch {
+                old_units: vec!['a'],
+                new_units: vec!['b'],
+                prefix_len: 0,
+                suffix_len: 0,
+                old_changed_range: 0..1,
+                new_changed_range: 0..1,
+            },
+        };
+
+        assert_eq!(change.address(), &"file:///test.json");
+        assert_eq!(change.batch().new_units, vec!['b']);
+        assert!(change.is_changed());
+    }
 }
 
 /// Errors that can occur while building the runtime.

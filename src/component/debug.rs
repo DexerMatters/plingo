@@ -2,21 +2,20 @@ use std::{convert::Infallible, marker::PhantomData, pin::Pin};
 
 use plingo_macros::layer;
 
-use crate::scheme::{BottomLayer, Context, LayerDeltas, MiddleLayer, NonTopLayer};
+use crate::scheme::{BottomLayer, Context, LayerChange, LayerChanges, MiddleLayer, NonTopLayer};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[layer]
-pub struct DebugSink<K, V>
+pub struct DebugSink<C>
 where
-    K: Send + Sync + 'static,
-    V: Send + Sync + 'static,
+    C: LayerChange,
 {
-    _marker: PhantomData<fn() -> (K, V)>,
+    _marker: PhantomData<fn() -> C>,
     consume_fn: Box<
         dyn for<'a> Fn(
                 &'a Context,
-                LayerDeltas<Self>,
+                LayerChanges<Self>,
             )
                 -> Pin<Box<dyn Future<Output = Result<(), Infallible>> + Send + 'a>>
             + Send
@@ -24,14 +23,13 @@ where
     >,
 }
 
-impl<K, V> DebugSink<K, V>
+impl<C> DebugSink<C>
 where
-    K: Send + Sync + 'static,
-    V: Send + Sync + 'static,
+    C: LayerChange,
 {
     pub fn new<ConsumeFn>(consume_fn: ConsumeFn) -> Self
     where
-        ConsumeFn: for<'a> Fn(&'a Context, LayerDeltas<Self>) -> BoxFuture<'a, Result<(), Infallible>>
+        ConsumeFn: for<'a> Fn(&'a Context, LayerChanges<Self>) -> BoxFuture<'a, Result<(), Infallible>>
             + Send
             + Sync
             + 'static,
@@ -44,44 +42,40 @@ where
 }
 
 #[layer(bottom)]
-impl<K, V> BottomLayer for DebugSink<K, V>
+impl<C> BottomLayer for DebugSink<C>
 where
-    K: Send + Sync + 'static,
-    V: Send + Sync + 'static,
+    C: LayerChange,
 {
     type Error = Infallible;
-    type Key = K;
-    type Value = V;
+    type Change = C;
 
     fn consume(
         &mut self,
         ctx: &Context,
-        deltas: LayerDeltas<Self>,
+        changes: LayerChanges<Self>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        (self.consume_fn)(ctx, deltas)
+        (self.consume_fn)(ctx, changes)
     }
 }
 
 #[layer]
-pub struct DebugRelay<K, V, Lower>
+pub struct DebugRelay<C, Lower>
 where
-    K: Send + Sync + 'static,
-    V: Send + Sync + 'static,
-    Lower: NonTopLayer<_Key = K, _Value = V> + Send + Sync + 'static,
+    C: LayerChange,
+    Lower: NonTopLayer<Change = C> + Send + Sync + 'static,
 {
-    _marker: PhantomData<fn() -> (K, V, Lower)>,
-    investigate_fn: Box<dyn for<'a> Fn(&'a Context, &'a LayerDeltas<Self>) + Send + Sync>,
+    _marker: PhantomData<fn() -> (C, Lower)>,
+    investigate_fn: Box<dyn for<'a> Fn(&'a Context, &'a LayerChanges<Self>) + Send + Sync>,
 }
 
-impl<K, V, Lower> DebugRelay<K, V, Lower>
+impl<C, Lower> DebugRelay<C, Lower>
 where
-    K: Send + Sync + 'static,
-    V: Send + Sync + 'static,
-    Lower: NonTopLayer<_Key = K, _Value = V> + Send + Sync + 'static,
+    C: LayerChange,
+    Lower: NonTopLayer<Change = C> + Send + Sync + 'static,
 {
     pub fn new<InvestigateFn>(investigate_fn: InvestigateFn) -> Self
     where
-        InvestigateFn: for<'a> Fn(&'a Context, &'a LayerDeltas<Self>) + Send + Sync + 'static,
+        InvestigateFn: for<'a> Fn(&'a Context, &'a LayerChanges<Self>) + Send + Sync + 'static,
     {
         Self {
             _marker: PhantomData,
@@ -91,23 +85,21 @@ where
 }
 
 #[layer(middle)]
-impl<K, V, Lower> MiddleLayer for DebugRelay<K, V, Lower>
+impl<C, Lower> MiddleLayer for DebugRelay<C, Lower>
 where
-    K: Send + Sync + 'static,
-    V: Send + Sync + 'static,
-    Lower: NonTopLayer<_Key = K, _Value = V> + Send + Sync + 'static,
+    C: LayerChange,
+    Lower: NonTopLayer<Change = C> + Send + Sync + 'static,
 {
     type Lower = Lower;
-    type Key = K;
     type Error = Infallible;
-    type Value = V;
+    type Change = C;
 
     async fn pass(
         &mut self,
         ctx: &Context,
-        deltas: LayerDeltas<Self>,
-    ) -> Result<LayerDeltas<Self::Lower>, Self::Error> {
-        (self.investigate_fn)(ctx, &deltas);
-        Ok(deltas)
+        changes: LayerChanges<Self>,
+    ) -> Result<LayerChanges<Self::Lower>, Self::Error> {
+        (self.investigate_fn)(ctx, &changes);
+        Ok(changes)
     }
 }

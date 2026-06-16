@@ -8,14 +8,14 @@ use fluent_uri::Uri;
 use notify::Watcher;
 use tokio::sync::mpsc;
 
-use crate::{scheme::Delta, utils::Span};
+use crate::{component::source::SourceEdit, utils::Span};
 
 thread_local! {
     static FILE_CONTENT: Mutex<HashMap<Uri<&'static str>, String>> = Mutex::new(HashMap::new());
 }
 
 pub async fn watch_directory(
-    tx: mpsc::Sender<Delta<Span, String>>,
+    tx: mpsc::Sender<SourceEdit>,
     dir: impl AsRef<Path>,
 ) -> notify::Result<()> {
     let dir = std::fs::canonicalize(dir.as_ref()).unwrap_or_else(|_| dir.as_ref().to_path_buf());
@@ -59,7 +59,7 @@ pub async fn watch_directory(
     Ok(())
 }
 
-async fn process_file_change(tx: &mpsc::Sender<Delta<Span, String>>, path: &Path) {
+async fn process_file_change(tx: &mpsc::Sender<SourceEdit>, path: &Path) {
     use similar::{Algorithm, DiffOp, capture_diff_slices};
 
     let Ok(new) = std::fs::read_to_string(path) else {
@@ -88,7 +88,7 @@ async fn process_file_change(tx: &mpsc::Sender<Delta<Span, String>>, path: &Path
                 let start = (*old_index as isize + shift).max(0) as usize;
                 let end = start + old_len;
                 let _ = tx
-                    .send(Delta::Delete {
+                    .send(SourceEdit::Delete {
                         key: Span::new_uri(uri, start, end).unwrap(),
                     })
                     .await;
@@ -102,7 +102,7 @@ async fn process_file_change(tx: &mpsc::Sender<Delta<Span, String>>, path: &Path
                 let start = (*old_index as isize + shift).max(0) as usize;
                 let text = new[*new_index..*new_index + *new_len].to_string();
                 let _ = tx
-                    .send(Delta::Insert {
+                    .send(SourceEdit::Insert {
                         key: Span::new_uri(uri, start, start).unwrap(),
                         value: text,
                     })
@@ -117,13 +117,13 @@ async fn process_file_change(tx: &mpsc::Sender<Delta<Span, String>>, path: &Path
             } => {
                 let start = (*old_index as isize + shift).max(0) as usize;
                 let _ = tx
-                    .send(Delta::Delete {
+                    .send(SourceEdit::Delete {
                         key: Span::new_uri(uri, start, start + old_len).unwrap(),
                     })
                     .await;
                 let text = new[*new_index..*new_index + *new_len].to_string();
                 let _ = tx
-                    .send(Delta::Insert {
+                    .send(SourceEdit::Insert {
                         key: Span::new_uri(uri, start, start).unwrap(),
                         value: text,
                     })
@@ -139,7 +139,7 @@ async fn process_file_change(tx: &mpsc::Sender<Delta<Span, String>>, path: &Path
     });
 }
 
-async fn scan_and_send_directory(tx: &mpsc::Sender<Delta<Span, String>>, dir: &Path) {
+async fn scan_and_send_directory(tx: &mpsc::Sender<SourceEdit>, dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

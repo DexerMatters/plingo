@@ -4,17 +4,15 @@ use indexmap::IndexSet;
 
 use super::{ParseColumn, ParseError, ParseToken, SessionContext};
 use crate::component::{
-    lex::{GetVisibleTokenBatch, Lexer, LexerRoot},
+    lex::{LexerRoot, TokenChange},
     parse::{
-        IncrementalParseStats, Parser, ParserSnapshotState, SessionArenas, checkpoint,
+        IncrementalParseStats, ParseChange, Parser, ParserSnapshotState, SessionArenas, checkpoint,
         data::{ast::AstArena, green::TreeArena, gss::GssArena, product::ProductArena},
         emit,
-        grammar::BuildError,
         incremental::ReplayPlan,
     },
 };
-use crate::scheme::{Context, Delta, LayerDeltas, NonTopLayer};
-use crate::utils::Span;
+use crate::scheme::{LayerChange, LayerChanges, NonTopLayer};
 
 fn maybe_reuse_suffix(
     plan: &ReplayPlan,
@@ -92,33 +90,15 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
     pub(crate) async fn parse_delta_batch(
         &mut self,
         working: &mut ParserSnapshotState,
-        uri: fluent_uri::Uri<&'static str>,
-        _deltas: &[Delta<Span, usize>],
-        ctx: &Context,
-    ) -> Result<LayerDeltas<Lower>, ParseError>
+        change: TokenChange,
+    ) -> Result<LayerChanges<Lower>, ParseError>
     where
-        Lower: NonTopLayer<_Key = super::super::ParsePath, _Value = super::super::ParseForest>,
+        Lower: NonTopLayer<Change = ParseChange>,
     {
         let total_start = Instant::now();
+        let uri = *change.address();
         let roots_before = working.roots.get(&uri).cloned().unwrap_or_default();
-        let fetch_batch_start = Instant::now();
-        let batch = ctx
-            .post::<Lexer<Root, Self>, GetVisibleTokenBatch>(GetVisibleTokenBatch(uri.clone()))
-            .await
-            .map_err(|_| ParseError::Build(BuildError::MissingProduct(0)))?;
-        let fetch_batch_elapsed = fetch_batch_start.elapsed();
-        let Some(batch) = batch else {
-            self.latest_incremental_stats
-                .insert(uri.clone(), IncrementalParseStats::default());
-            log::debug!(
-                target: "Measure",
-                "parse {} total={:?} fetch_batch={:?} batch=none",
-                uri,
-                total_start.elapsed(),
-                fetch_batch_elapsed,
-            );
-            return Ok(Vec::new());
-        };
+        let batch = change.batch;
 
         let plan_start = Instant::now();
         let plan = ReplayPlan::from_batch(batch.clone());
@@ -141,8 +121,8 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
                 uri,
                 IncrementalParseStats {
                     restart_boundary: plan.restart_boundary,
-                    reconverged_new_boundary: batch.new_tokens.len().checked_sub(1),
-                    reconverged_old_boundary: batch.old_tokens.len().checked_sub(1),
+                    reconverged_new_boundary: batch.new_units.len().checked_sub(1),
+                    reconverged_old_boundary: batch.old_units.len().checked_sub(1),
                     reparsed: 0,
                     reused: current_boundary,
                     recovery_columns,
@@ -153,16 +133,15 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
             );
             log::debug!(
                 target: "Measure",
-                "parse {} total={:?} fetch_batch={:?} plan={:?} changed=false restart={} reused={} recovery_columns={} old_tokens={} new_tokens={} prefix={} suffix={}",
+                "parse {} total={:?} plan={:?} changed=false restart={} reused={} recovery_columns={} old_tokens={} new_tokens={} prefix={} suffix={}",
                 uri,
                 total_start.elapsed(),
-                fetch_batch_elapsed,
                 plan_elapsed,
                 plan.restart_boundary,
                 current_boundary,
                 recovery_columns,
-                batch.old_tokens.len(),
-                batch.new_tokens.len(),
+                batch.old_units.len(),
+                batch.new_units.len(),
                 batch.prefix_len,
                 batch.suffix_len,
             );
@@ -412,7 +391,7 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
                 vec![emit::insert_root(uri.clone(), roots_after.clone())]
             }
         } else if roots_after.is_empty() {
-            vec![emit::delete_root(uri.clone(), roots_before.len())]
+            vec![emit::delete_root(uri.clone(), roots_before.clone())]
         } else {
             super::super::diff::compact(super::super::diff::diff_trees(
                 &arenas.products,
@@ -427,10 +406,9 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
         let total_elapsed = total_start.elapsed();
         log::debug!(
             target: "Measure",
-            "parse {} total={:?} fetch_batch={:?} plan={:?} session={:?} checkpoints={:?} truncate={:?} tokens={:?} replay={:?} reduce={:?} shift={:?} recover={:?} converge={:?} replay_misc={:?} compact={:?} stats={:?} diff={:?} restart={} reparsed={} reused={} old_suffix={} replay_tokens={} frontier={} semantic={} old_tokens={} new_tokens={} prefix={} suffix={}",
+            "parse {} total={:?} plan={:?} session={:?} checkpoints={:?} truncate={:?} tokens={:?} replay={:?} reduce={:?} shift={:?} recover={:?} converge={:?} replay_misc={:?} compact={:?} stats={:?} diff={:?} restart={} reparsed={} reused={} old_suffix={} replay_tokens={} frontier={} semantic={} old_tokens={} new_tokens={} prefix={} suffix={}",
             uri,
             total_elapsed,
-            fetch_batch_elapsed,
             plan_elapsed,
             session_setup_elapsed,
             checkpoint_elapsed,
@@ -452,8 +430,8 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
             parse_tokens.len(),
             frontier_converged,
             semantic_reused,
-            batch.old_tokens.len(),
-            batch.new_tokens.len(),
+            batch.old_units.len(),
+            batch.new_units.len(),
             batch.prefix_len,
             batch.suffix_len,
         );

@@ -4,7 +4,7 @@ use crate::{
         debug::DebugSink,
         lex::Lexer,
         parse::{
-            AstToken, ParseErrorInfo, ParseForest, ParsePath, Parser,
+            AstToken, ParseChange, ParseErrorInfo, ParsePath, Parser,
             data::ast::AstBox,
             grammar::Grammar,
             policy::{
@@ -12,9 +12,9 @@ use crate::{
                 GetNode, GetParseDiagnostics,
             },
         },
-        source::Source,
+        source::{Source, SourceEdit},
     },
-    scheme::{Context, Delta, Runtime},
+    scheme::{Context, Runtime},
     tests::fs_watch,
     tokens,
     utils::{RangeOrPoint, Span},
@@ -128,7 +128,7 @@ enum JsonElements {
     Error(#[from(0)] ParseErrorInfo),
 }
 
-type JsonSink = DebugSink<ParsePath, ParseForest>;
+type JsonSink = DebugSink<ParseChange>;
 type Jp = Parser<JsonToken, JsonSink>;
 
 macro_rules! deref {
@@ -385,13 +385,13 @@ async fn json_runtime_parse_output() -> anyhow::Result<()> {
     let (sender, receiver) = mpsc::channel(256);
 
     let debug_sink = debug_sink!(|ctx, deltas| async move {
-        let _: &Vec<Delta<ParsePath, ParseForest>> = &deltas;
+        let _: &Vec<ParseChange> = &deltas;
         cprintln!("<dim>---------Received---------</dim>");
 
         let Some(first) = deltas.first() else {
             return Ok(());
         };
-        let uri = first.key().uri;
+        let uri = first.address.uri;
         let root_path = ParsePath {
             uri: uri,
             path: Vec::new(),
@@ -418,54 +418,60 @@ async fn json_runtime_parse_output() -> anyhow::Result<()> {
                 print_parse_error("", &info);
             }
         }
-        for delta in &deltas {
-            match delta {
-                Delta::Insert { key, value } => {
-                    cprintln!(
-                        "<green>Inserted: +{} root(s) at {key}</green>",
-                        value.roots.len()
-                    );
-                    let mut names = Vec::new();
-                    for &pid in &value.roots {
-                        if let Ok(desc) = ctx
+        for change in &deltas {
+            let key = ParsePath {
+                uri: change.address.uri,
+                path: change.address.parent_path.clone(),
+                range: RangeOrPoint::from_range(
+                    change.batch.old_changed_range.start,
+                    change.batch.old_changed_range.end,
+                ),
+            };
+            if !change.batch.old_units.is_empty() {
+                let prev = ctx.last_snapshot();
+                let mut names = Vec::new();
+                if let Ok(pids) = prev.post::<Jp, GetNode>(GetNode(key.clone())).await {
+                    for &pid in &pids {
+                        if let Ok(desc) = prev
                             .post::<Jp, DescribeProduct>(DescribeProduct(key.uri, pid))
                             .await
                         {
                             names.push(desc);
+                        } else {
+                            names.push("?".to_string());
                         }
                     }
-                    let desc = if names.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", names.join(", "))
-                    };
-                    cprintln!(
-                        "<green>  + {} subtree(s) at {key}{desc}</green>",
-                        value.roots.len(),
-                    );
                 }
-                Delta::Delete { key } => {
-                    let prev = ctx.last_snapshot();
-                    let mut names = Vec::new();
-                    if let Ok(pids) = prev.post::<Jp, GetNode>(GetNode(key.clone())).await {
-                        for &pid in &pids {
-                            if let Ok(desc) = prev
-                                .post::<Jp, DescribeProduct>(DescribeProduct(key.uri, pid))
-                                .await
-                            {
-                                names.push(desc);
-                            } else {
-                                names.push("?".to_string());
-                            }
-                        }
+                let desc = if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", names.join(", "))
+                };
+                cprintln!("<red>Deleted {key}{desc}</red>");
+            }
+            if !change.batch.new_units.is_empty() {
+                cprintln!(
+                    "<green>Inserted: +{} root(s) at {key}</green>",
+                    change.batch.new_units.len()
+                );
+                let mut names = Vec::new();
+                for unit in &change.batch.new_units {
+                    if let Ok(desc) = ctx
+                        .post::<Jp, DescribeProduct>(DescribeProduct(key.uri, unit.product))
+                        .await
+                    {
+                        names.push(desc);
                     }
-                    let desc = if names.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", names.join(", "))
-                    };
-                    cprintln!("<red>Deleted {key}{desc}</red>");
                 }
+                let desc = if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", names.join(", "))
+                };
+                cprintln!(
+                    "<green>  + {} subtree(s) at {key}{desc}</green>",
+                    change.batch.new_units.len(),
+                );
             }
         }
         Ok(())
@@ -497,8 +503,8 @@ async fn json_runtime_four_member_object_is_accepted() -> anyhow::Result<()> {
 }
 
 async fn recv_non_empty_parse_batch(
-    rx: &mut mpsc::Receiver<Vec<Delta<ParsePath, ParseForest>>>,
-) -> anyhow::Result<Vec<Delta<ParsePath, ParseForest>>> {
+    rx: &mut mpsc::Receiver<Vec<ParseChange>>,
+) -> anyhow::Result<Vec<ParseChange>> {
     let batch = timeout(Duration::from_secs(2), rx.recv())
         .await?
         .ok_or_else(|| anyhow::anyhow!("parse sink channel closed"))?;
@@ -506,8 +512,8 @@ async fn recv_non_empty_parse_batch(
 }
 
 async fn recv_parse_batches_until_quiet(
-    rx: &mut mpsc::Receiver<Vec<Delta<ParsePath, ParseForest>>>,
-) -> anyhow::Result<Vec<Vec<Delta<ParsePath, ParseForest>>>> {
+    rx: &mut mpsc::Receiver<Vec<ParseChange>>,
+) -> anyhow::Result<Vec<Vec<ParseChange>>> {
     let mut batches = vec![recv_non_empty_parse_batch(rx).await?];
     loop {
         match timeout(Duration::from_millis(500), rx.recv()).await {
@@ -520,9 +526,9 @@ async fn recv_parse_batches_until_quiet(
 
 async fn run_json_incremental_case(
     initial: &str,
-    changes: Vec<Delta<Span, String>>,
+    changes: Vec<SourceEdit>,
 ) -> anyhow::Result<(
-    Vec<Vec<Delta<ParsePath, ParseForest>>>,
+    Vec<Vec<ParseChange>>,
     Vec<crate::component::parse::IncrementalParseStats>,
 )> {
     let (source_tx, source_rx) = mpsc::channel(32);
@@ -546,7 +552,7 @@ async fn run_json_incremental_case(
 
     let uri = Span::new("test://json-incremental", 0, 0)?.uri;
     source_tx
-        .send(Delta::Insert {
+        .send(SourceEdit::Insert {
             key: Span::new_uri(uri, 0, 0)?,
             value: initial.to_string(),
         })
@@ -571,7 +577,7 @@ async fn run_json_incremental_case(
 
 async fn run_json_incremental_case_member_keys(
     initial: &str,
-    changes: Vec<Delta<Span, String>>,
+    changes: Vec<SourceEdit>,
 ) -> anyhow::Result<Vec<String>> {
     let (source_tx, source_rx) = mpsc::channel(32);
     let (sink_tx, mut sink_rx) = mpsc::channel(32);
@@ -594,7 +600,7 @@ async fn run_json_incremental_case_member_keys(
 
     let uri = Span::new("test://json-incremental", 0, 0)?.uri;
     source_tx
-        .send(Delta::Insert {
+        .send(SourceEdit::Insert {
             key: Span::new_uri(uri, 0, 0)?,
             value: initial.to_string(),
         })
@@ -628,8 +634,8 @@ async fn run_json_incremental_case_member_keys(
 
 async fn run_json_incremental_batched_case_member_keys(
     initial: &str,
-    changes: Vec<Delta<Span, String>>,
-) -> anyhow::Result<(Vec<Delta<ParsePath, ParseForest>>, Vec<String>)> {
+    changes: Vec<SourceEdit>,
+) -> anyhow::Result<(Vec<ParseChange>, Vec<String>)> {
     let (source_tx, source_rx) = mpsc::channel(32);
     let (sink_tx, mut sink_rx) = mpsc::channel(32);
 
@@ -650,7 +656,7 @@ async fn run_json_incremental_batched_case_member_keys(
     runtime.run().await?;
 
     let uri = Span::new("test://json-incremental-batch", 0, 0)?.uri;
-    source_tx.try_send(Delta::Insert {
+    source_tx.try_send(SourceEdit::Insert {
         key: Span::new_uri(uri, 0, 0)?,
         value: initial.to_string(),
     })?;
@@ -693,32 +699,36 @@ async fn json_incremental_runtime_emits_deltas_for_conv_cases() -> anyhow::Resul
 
     let (string_len, string_len_stats) = run_json_incremental_case(
         r#"{"he":"101"}"#,
-        vec![Delta::Insert {
+        vec![SourceEdit::Insert {
             key: Span::new_uri(uri, 10, 10)?,
             value: "3".to_string(),
         }],
     )
     .await?;
-    assert_eq!(string_len[1].len(), 2);
+    assert_eq!(string_len[1].len(), 1);
+    assert_eq!(string_len[1][0].batch.old_units.len(), 1);
+    assert_eq!(string_len[1][0].batch.new_units.len(), 1);
     assert!(string_len_stats[0].converged);
 
     let (string_shorten, string_shorten_stats) = run_json_incremental_case(
         r#"{"he":"101"}"#,
-        vec![Delta::Delete {
+        vec![SourceEdit::Delete {
             key: Span::new_uri(uri, 9, 10)?,
         }],
     )
     .await?;
-    assert_eq!(string_shorten[1].len(), 2);
+    assert_eq!(string_shorten[1].len(), 1);
+    assert_eq!(string_shorten[1][0].batch.old_units.len(), 1);
+    assert_eq!(string_shorten[1][0].batch.new_units.len(), 1);
     assert!(string_shorten_stats[0].converged);
 
     let (repeated_child, repeated_child_stats) = run_json_incremental_case(
         r#"[1,1,1]"#,
         vec![
-            Delta::Delete {
+            SourceEdit::Delete {
                 key: Span::new_uri(uri, 5, 6)?,
             },
-            Delta::Insert {
+            SourceEdit::Insert {
                 key: Span::new_uri(uri, 5, 5)?,
                 value: "2".to_string(),
             },
@@ -733,21 +743,23 @@ async fn json_incremental_runtime_emits_deltas_for_conv_cases() -> anyhow::Resul
 }
 
 #[tokio::test]
-async fn json_runtime_name_change_emits_one_replace_pair() -> anyhow::Result<()> {
+async fn json_runtime_name_change_emits_one_replacement_batch() -> anyhow::Result<()> {
     let source = r#"{"he":"101","well":{}}"#;
     let insert_at = source.find("he").unwrap() + "he".len();
     let uri = Span::new("test://json-incremental", 0, 0)?.uri;
 
     let (batches, stats) = run_json_incremental_case(
         source,
-        vec![Delta::Insert {
+        vec![SourceEdit::Insert {
             key: Span::new_uri(uri, insert_at, insert_at)?,
             value: "llo".to_string(),
         }],
     )
     .await?;
 
-    assert_eq!(batches[1].len(), 2);
+    assert_eq!(batches[1].len(), 1);
+    assert_eq!(batches[1][0].batch.old_units.len(), 1);
+    assert_eq!(batches[1][0].batch.new_units.len(), 1);
     assert!(stats[0].converged);
     Ok(())
 }
@@ -760,7 +772,7 @@ async fn json_runtime_whitespace_only_edit_is_ignored() -> anyhow::Result<()> {
 
     let (batches, _stats) = run_json_incremental_case(
         source,
-        vec![Delta::Insert {
+        vec![SourceEdit::Insert {
             key: Span::new_uri(uri, insert_at, insert_at)?,
             value: " ".to_string(),
         }],
@@ -782,7 +794,7 @@ async fn json_runtime_whitespace_delete_is_ignored() -> anyhow::Result<()> {
 
     let (batches, _stats) = run_json_incremental_case(
         source,
-        vec![Delta::Delete {
+        vec![SourceEdit::Delete {
             key: Span::new_uri(uri, delete_at, delete_at + 1)?,
         }],
     )
@@ -804,10 +816,10 @@ async fn json_runtime_batched_replace_pair_emits_output() -> anyhow::Result<()> 
     let (batch, member_keys) = run_json_incremental_batched_case_member_keys(
         source,
         vec![
-            Delta::Delete {
+            SourceEdit::Delete {
                 key: Span::new_uri(uri, replace_at, replace_at + 1)?,
             },
-            Delta::Insert {
+            SourceEdit::Insert {
                 key: Span::new_uri(uri, replace_at, replace_at)?,
                 value: "c".to_string(),
             },
@@ -832,7 +844,7 @@ async fn json_error_recovery_preserves_following_member_after_null_suffix() -> a
 
     let member_keys = run_json_incremental_case_member_keys(
         source,
-        vec![Delta::Insert {
+        vec![SourceEdit::Insert {
             key: Span::new_uri(uri, insert_at, insert_at)?,
             value: "s".to_string(),
         }],

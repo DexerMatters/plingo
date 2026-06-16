@@ -5,7 +5,7 @@ use plingo_macros::resolve_action;
 use crate::{
     component::{
         common::Pretty,
-        lex::{Entry, GetVisibleTokenBatch, LexInterrupt, Lexer, LexerRoot, VisibleTokenBatch},
+        lex::{Entry, LexInterrupt, Lexer, LexerRoot, TokenChange},
         parse::{GetParseTokens, TokenData},
     },
     scheme::{Context, NonTopLayer, Outcome, Resolve},
@@ -19,7 +19,7 @@ pub struct GetTokens(pub Span);
 impl<Root, Lower> Resolve<GetTokens> for Lexer<Root, Lower>
 where
     Root: LexerRoot + Clone,
-    Lower: NonTopLayer<_Key = Span, _Value = usize>,
+    Lower: NonTopLayer<Change = TokenChange> + Send + Sync + 'static,
 {
     type Output = Vec<Entry<Root>>;
 
@@ -36,7 +36,7 @@ where
 impl<Root, Lower, T> Resolve<Pretty<T>> for Lexer<Root, Lower>
 where
     Root: LexerRoot + Clone,
-    Lower: NonTopLayer<_Key = Span, _Value = usize>,
+    Lower: NonTopLayer<Change = TokenChange> + Send + Sync + 'static,
     T: PrettyDisplay<Lexer<Root, Lower>> + Send + Sync,
 {
     type Output = String;
@@ -54,7 +54,7 @@ where
 impl<Root, Lower> Resolve<GetParseTokens> for Lexer<Root, Lower>
 where
     Root: LexerRoot + Clone,
-    Lower: NonTopLayer<_Key = Span, _Value = usize>,
+    Lower: NonTopLayer<Change = TokenChange> + Send + Sync + 'static,
 {
     type Output = Vec<TokenData>;
 
@@ -67,23 +67,6 @@ where
     }
 }
 
-#[resolve_action]
-impl<Root, Lower> Resolve<GetVisibleTokenBatch> for Lexer<Root, Lower>
-where
-    Root: LexerRoot + Clone,
-    Lower: NonTopLayer<_Key = Span, _Value = usize>,
-{
-    type Output = Option<VisibleTokenBatch>;
-
-    fn resolve<'a>(
-        &'a mut self,
-        ctx: &'a Context,
-        action: &'a GetVisibleTokenBatch,
-    ) -> impl Future<Output = Outcome<GetVisibleTokenBatch, Self>> + Send + 'a {
-        async move { Outcome::ok(self.visible_batch(ctx.snapshot(), action.0)) }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GetTokenById<T>(pub usize, pub PhantomData<T>);
 
@@ -91,7 +74,7 @@ pub struct GetTokenById<T>(pub usize, pub PhantomData<T>);
 impl<Root, Lower, T> Resolve<GetTokenById<T>> for Lexer<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<_Key = Span, _Value = usize>,
+    Lower: NonTopLayer<Change = TokenChange> + Send + Sync + 'static,
     T: Clone + Send + Sync + 'static,
 {
     type Output = T;

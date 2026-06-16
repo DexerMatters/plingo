@@ -176,9 +176,8 @@ pub fn expand_layer_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                 type __Error = <Self as ::plingo::scheme::MiddleLayer>::Error;
             }
             impl #impl_generics ::plingo::scheme::NonTopLayer for #self_type #where_clause {
-                type _Key = <Self as ::plingo::scheme::MiddleLayer>::Key;
                 type _Error = <Self as ::plingo::scheme::MiddleLayer>::Error;
-                type _Value = <Self as ::plingo::scheme::MiddleLayer>::Value;
+                type Change = <Self as ::plingo::scheme::MiddleLayer>::Change;
             }
         },
         LayerRole::Bottom => quote! {
@@ -186,9 +185,8 @@ pub fn expand_layer_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                 type __Error = <Self as ::plingo::scheme::BottomLayer>::Error;
             }
             impl #impl_generics ::plingo::scheme::NonTopLayer for #self_type #where_clause {
-                type _Key = <Self as ::plingo::scheme::BottomLayer>::Key;
                 type _Error = <Self as ::plingo::scheme::BottomLayer>::Error;
-                type _Value = <Self as ::plingo::scheme::BottomLayer>::Value;
+                type Change = <Self as ::plingo::scheme::BottomLayer>::Change;
             }
         },
     };

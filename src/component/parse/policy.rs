@@ -7,7 +7,7 @@ use crate::{
     component::{
         lex::{Lexer, LexerRoot, policy::GetTokenById},
         parse::{
-            AstToken, IncrementalParseStats, ParsePath, Parser, ParserSessionState,
+            AstToken, IncrementalParseStats, ParseChange, ParsePath, Parser, ParserSessionState,
             data::{
                 ast::AstBox,
                 green::{ParseErrorInfo, TreeData},
@@ -25,7 +25,7 @@ pub struct GetNode(pub ParsePath);
 impl<Root, Lower> Resolve<GetNode> for Parser<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = ParseChange> + Send + Sync + 'static,
 {
     type Output = Vec<ProductId>;
 
@@ -48,7 +48,7 @@ pub struct DerefAstBox<T>(pub AstBox<T>);
 impl<Root, Lower, T> Resolve<DerefAstBox<T>> for Parser<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = ParseChange> + Send + Sync + 'static,
     T: Clone + Send + Sync + 'static,
 {
     type Output = T;
@@ -81,7 +81,7 @@ pub struct DerefAstToken<T>(pub AstToken<T>);
 impl<Root, Lower, T> Resolve<DerefAstToken<T>> for Parser<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = ParseChange> + Send + Sync + 'static,
     T: Clone + Send + Sync + 'static,
 {
     type Output = T;
@@ -112,7 +112,7 @@ pub struct GetAstTree<T>(pub ParsePath, pub PhantomData<T>);
 impl<Root, Lower, T> Resolve<GetAstTree<T>> for Parser<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = ParseChange> + Send + Sync + 'static,
     T: Send + Sync + 'static,
 {
     type Output = Vec<AstBox<T>>;
@@ -136,7 +136,7 @@ pub struct GetAstToken<T>(pub ParsePath, pub PhantomData<T>);
 impl<Root, Lower, T> Resolve<GetAstToken<T>> for Parser<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = ParseChange> + Send + Sync + 'static,
     T: Send + Sync + 'static,
 {
     type Output = Vec<AstToken<T>>;
@@ -160,7 +160,7 @@ pub struct GetRootAstBox<T>(pub Uri<&'static str>, pub PhantomData<T>);
 impl<Root, Lower, T> Resolve<GetRootAstBox<T>> for Parser<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = ParseChange> + Send + Sync + 'static,
     T: Send + Sync + 'static,
 {
     type Output = Vec<AstBox<T>>;
@@ -207,7 +207,7 @@ pub struct GetParseDiagnostics(pub Uri<&'static str>);
 impl<Root, Lower> Resolve<DescribeProduct> for Parser<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = ParseChange> + Send + Sync + 'static,
 {
     type Output = String;
 
@@ -252,7 +252,7 @@ where
 impl<Root, Lower> Resolve<GetIncrementalStats> for Parser<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = ParseChange> + Send + Sync + 'static,
 {
     type Output = Option<IncrementalParseStats>;
 
@@ -269,7 +269,7 @@ where
 impl<Root, Lower> Resolve<GetParseDiagnostics> for Parser<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<_Key = ParsePath, _Value = super::ParseForest> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = ParseChange> + Send + Sync + 'static,
 {
     type Output = Vec<ParseErrorInfo>;
 

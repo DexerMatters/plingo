@@ -4,7 +4,7 @@ use fluent_uri::Uri;
 use indexmap::{IndexMap, IndexSet};
 
 use crate::component::{
-    lex::LexerRoot,
+    lex::{LexerRoot, TokenChange},
     parse::{
         build::{ActionSet, Conflict, LR1State, LRStateId},
         data::{
@@ -18,7 +18,9 @@ use crate::component::{
     },
 };
 use crate::layer;
-use crate::scheme::{Context, Delta, LayerDeltas, MiddleLayer, NonTopLayer, SnapshotLayer};
+use crate::scheme::{
+    Context, LayerChanges, MiddleLayer, NonTopLayer, ReplacementChange, SnapshotLayer,
+};
 use crate::utils::{RangeOrPoint, Span};
 
 pub(crate) mod analyze;
@@ -92,10 +94,23 @@ impl fmt::Display for ParsePath {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ParseForest {
     pub roots: Vec<ProductId>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParseAddress {
+    pub uri: Uri<&'static str>,
+    pub parent_path: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseUnit {
+    pub product: ProductId,
+}
+
+pub type ParseChange = ReplacementChange<ParseAddress, ParseUnit>;
 
 pub type TokenOccurrenceId = usize;
 
@@ -322,46 +337,30 @@ impl<Root, Lower> Parser<Root, Lower> {
 impl<Root, Lower> MiddleLayer for Parser<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<_Key = ParsePath, _Value = ParseForest> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = ParseChange> + Send + Sync + 'static,
 {
     type Lower = Lower;
-    type Key = Span;
     type Error = ParseError;
-    type Value = usize;
+    type Change = TokenChange;
 
     fn pass(
         &mut self,
         ctx: &Context,
-        deltas: LayerDeltas<Self>,
-    ) -> impl Future<Output = Result<LayerDeltas<Self::Lower>, Self::Error>> + Send {
+        changes: LayerChanges<Self>,
+    ) -> impl Future<Output = Result<LayerChanges<Self::Lower>, Self::Error>> + Send {
         async move {
             let mut working = self.latest.clone();
-            let mut lower_deltas = Vec::new();
-            let mut grouped: Vec<(Uri<&'static str>, Vec<Delta<Span, usize>>)> = Vec::new();
+            let mut lower_changes = Vec::new();
 
-            for delta in deltas {
-                let uri = delta.key().uri;
-                if let Some((_, batch)) =
-                    grouped.iter_mut().find(|(group_uri, _)| *group_uri == uri)
-                {
-                    batch.push(delta);
-                } else {
-                    grouped.push((uri, vec![delta]));
-                }
-            }
-
-            for (uri, batch) in grouped {
-                lower_deltas.extend(
-                    self.parse_delta_batch(&mut working, uri, &batch, ctx)
-                        .await?,
-                );
+            for change in changes {
+                lower_changes.extend(self.parse_delta_batch(&mut working, change).await?);
             }
 
             self.latest = working;
             if let Some(snapshot) = ctx.snapshot() {
                 self.push_state(snapshot);
             }
-            Ok(lower_deltas)
+            Ok(lower_changes)
         }
     }
 }

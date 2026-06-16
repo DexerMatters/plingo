@@ -23,9 +23,9 @@ pub trait Receiver<Input> {
     type _Output: Send + Sync + 'static;
 }
 
-/// A trait for types that can receive a key and produce an output type.
-pub trait HasKey<K> {
-    type Key;
+/// A trait for types whose changes are addressed by `A`.
+pub trait HasAddress<A> {
+    type Address;
 }
 
 /// A trait for types that contain an error type.

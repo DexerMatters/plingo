@@ -3,14 +3,13 @@ use std::{any::TypeId, cmp::Ordering, collections::HashMap};
 use fluent_uri::Uri;
 
 use super::{
-    ParseForest, ParsePath, ProductId,
+    ParseAddress, ParseChange, ParseUnit, ProductId,
     data::{
         green::{GreenId, TreeArena, TreeData},
         product::{ProductArena, ProductData},
     },
 };
-use crate::scheme::Delta;
-use crate::utils::RangeOrPoint;
+use crate::scheme::{ReplacementBatch, ReplacementChange};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Cost {
@@ -144,7 +143,7 @@ pub(crate) fn diff_trees(
     old_roots: &[ProductId],
     new_roots: &[ProductId],
     uri: Uri<&'static str>,
-) -> Vec<Delta<ParsePath, ParseForest>> {
+) -> Vec<ParseChange> {
     let mut cx = DiffCx::new(products, trees);
     let mut deltas = Vec::new();
     cx.diff_sequence(old_roots, new_roots, &[], 0, uri, &mut deltas);
@@ -152,28 +151,31 @@ pub(crate) fn diff_trees(
 }
 
 fn replace_node(
+    old_pid: ProductId,
     new_pid: ProductId,
     path: &[usize],
     uri: Uri<&'static str>,
-    deltas: &mut Vec<Delta<ParsePath, ParseForest>>,
+    deltas: &mut Vec<ParseChange>,
 ) {
-    deltas.push(Delta::Delete {
-        key: ParsePath {
-            uri: uri.clone(),
-            path: path.to_vec(),
-            range: RangeOrPoint::Point(0),
+    let (parent_path, slot) = parent_slot(path);
+    deltas.push(ReplacementChange::new(
+        ParseAddress { uri, parent_path },
+        ReplacementBatch {
+            old_units: vec![ParseUnit { product: old_pid }],
+            new_units: vec![ParseUnit { product: new_pid }],
+            prefix_len: slot,
+            suffix_len: 0,
+            old_changed_range: slot..slot + 1,
+            new_changed_range: slot..slot + 1,
         },
-    });
-    deltas.push(Delta::Insert {
-        key: ParsePath {
-            uri,
-            path: path.to_vec(),
-            range: RangeOrPoint::Point(0),
-        },
-        value: ParseForest {
-            roots: vec![new_pid],
-        },
-    });
+    ));
+}
+
+fn parent_slot(path: &[usize]) -> (Vec<usize>, usize) {
+    match path.split_last() {
+        Some((&slot, parent_path)) => (parent_path.to_vec(), slot),
+        None => (Vec::new(), 0),
+    }
 }
 
 struct DiffCx<'a> {
@@ -523,16 +525,24 @@ impl<'a> DiffCx<'a> {
         &self,
         parent_path: &[usize],
         slot: usize,
+        old_pid: ProductId,
         uri: Uri<&'static str>,
-        deltas: &mut Vec<Delta<ParsePath, ParseForest>>,
+        deltas: &mut Vec<ParseChange>,
     ) {
-        deltas.push(Delta::Delete {
-            key: ParsePath {
+        deltas.push(ReplacementChange::new(
+            ParseAddress {
                 uri,
-                path: path_at(parent_path, slot),
-                range: RangeOrPoint::Point(0),
+                parent_path: parent_path.to_vec(),
             },
-        });
+            ReplacementBatch {
+                old_units: vec![ParseUnit { product: old_pid }],
+                new_units: Vec::new(),
+                prefix_len: slot,
+                suffix_len: 0,
+                old_changed_range: slot..slot + 1,
+                new_changed_range: slot..slot,
+            },
+        ));
     }
 
     fn emit_insert(
@@ -541,18 +551,22 @@ impl<'a> DiffCx<'a> {
         slot: usize,
         new_pid: ProductId,
         uri: Uri<&'static str>,
-        deltas: &mut Vec<Delta<ParsePath, ParseForest>>,
+        deltas: &mut Vec<ParseChange>,
     ) {
-        deltas.push(Delta::Insert {
-            key: ParsePath {
+        deltas.push(ReplacementChange::new(
+            ParseAddress {
                 uri,
-                path: path_at(parent_path, slot),
-                range: RangeOrPoint::Point(0),
+                parent_path: parent_path.to_vec(),
             },
-            value: ParseForest {
-                roots: vec![new_pid],
+            ReplacementBatch {
+                old_units: Vec::new(),
+                new_units: vec![ParseUnit { product: new_pid }],
+                prefix_len: slot,
+                suffix_len: 0,
+                old_changed_range: slot..slot,
+                new_changed_range: slot..slot + 1,
             },
-        });
+        ));
     }
 
     fn diff_product(
@@ -561,7 +575,7 @@ impl<'a> DiffCx<'a> {
         new_pid: ProductId,
         path: &[usize],
         uri: Uri<&'static str>,
-        deltas: &mut Vec<Delta<ParsePath, ParseForest>>,
+        deltas: &mut Vec<ParseChange>,
     ) {
         if old_pid == new_pid {
             return;
@@ -571,19 +585,19 @@ impl<'a> DiffCx<'a> {
         }
 
         let Some(old_product) = self.products.get(old_pid) else {
-            replace_node(new_pid, path, uri, deltas);
+            replace_node(old_pid, new_pid, path, uri, deltas);
             return;
         };
         let Some(new_product) = self.products.get(new_pid) else {
-            replace_node(new_pid, path, uri, deltas);
+            replace_node(old_pid, new_pid, path, uri, deltas);
             return;
         };
         let Some(old_tree) = self.trees.get(old_product.green) else {
-            replace_node(new_pid, path, uri, deltas);
+            replace_node(old_pid, new_pid, path, uri, deltas);
             return;
         };
         let Some(new_tree) = self.trees.get(new_product.green) else {
-            replace_node(new_pid, path, uri, deltas);
+            replace_node(old_pid, new_pid, path, uri, deltas);
             return;
         };
 
@@ -613,7 +627,7 @@ impl<'a> DiffCx<'a> {
                 TreeData::Leaf { id: old_id },
                 TreeData::Leaf { id: new_id },
             ) if old_id == new_id => {
-                replace_node(new_pid, path, uri, deltas);
+                replace_node(old_pid, new_pid, path, uri, deltas);
             }
             (
                 ProductData::Error,
@@ -621,9 +635,9 @@ impl<'a> DiffCx<'a> {
                 TreeData::Error { .. },
                 TreeData::Error { .. },
             ) => {
-                replace_node(new_pid, path, uri, deltas);
+                replace_node(old_pid, new_pid, path, uri, deltas);
             }
-            _ => replace_node(new_pid, path, uri, deltas),
+            _ => replace_node(old_pid, new_pid, path, uri, deltas),
         }
     }
 
@@ -634,7 +648,7 @@ impl<'a> DiffCx<'a> {
         parent_path: &[usize],
         prefix_offset: usize,
         uri: Uri<&'static str>,
-        deltas: &mut Vec<Delta<ParsePath, ParseForest>>,
+        deltas: &mut Vec<ParseChange>,
     ) {
         let mut old_start = 0usize;
         let mut new_start = 0usize;
@@ -676,10 +690,11 @@ impl<'a> DiffCx<'a> {
         }
 
         if new_mid.is_empty() {
-            for (index, _) in old_mid.iter().enumerate() {
+            for (index, &old_pid) in old_mid.iter().enumerate() {
                 self.emit_delete(
                     parent_path,
                     prefix_offset + old_start + index,
+                    old_pid,
                     uri.clone(),
                     deltas,
                 );
@@ -701,7 +716,7 @@ impl<'a> DiffCx<'a> {
                 continue;
             }
             if j == new_mid.len() {
-                self.emit_delete(parent_path, slot, uri.clone(), deltas);
+                self.emit_delete(parent_path, slot, old_mid[i], uri.clone(), deltas);
                 i += 1;
                 shift -= 1;
                 continue;
@@ -721,7 +736,7 @@ impl<'a> DiffCx<'a> {
                     j += 1;
                 }
                 Step::Delete => {
-                    self.emit_delete(parent_path, slot, uri.clone(), deltas);
+                    self.emit_delete(parent_path, slot, old_mid[i], uri.clone(), deltas);
                     i += 1;
                     shift -= 1;
                 }
@@ -735,8 +750,6 @@ impl<'a> DiffCx<'a> {
     }
 }
 
-pub(crate) fn compact(
-    deltas: Vec<Delta<ParsePath, ParseForest>>,
-) -> Vec<Delta<ParsePath, ParseForest>> {
+pub(crate) fn compact(deltas: Vec<ParseChange>) -> Vec<ParseChange> {
     deltas
 }

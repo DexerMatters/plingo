@@ -4,7 +4,7 @@ use crate::{
         debug::DebugSink,
         lex::{Entry, Lexer, LexerState},
         parse::{
-            AstToken, GetParseTokens, IncrementalParseStats, ParseErrorInfo, ParseForest,
+            AstToken, GetParseTokens, IncrementalParseStats, ParseChange, ParseErrorInfo,
             ParsePath, Parser, ParserConfig, TokenData,
             data::{
                 ast::{AstArena, AstBox},
@@ -16,9 +16,9 @@ use crate::{
                 DerefAstBox, DerefAstToken, GetAstTree, GetIncrementalStats, GetParseDiagnostics,
             },
         },
-        source::Source,
+        source::{Source, SourceEdit},
     },
-    scheme::{Context, Delta, Runtime},
+    scheme::{Context, Runtime},
     tokens,
     utils::{RangeOrPoint, Span},
 };
@@ -105,26 +105,8 @@ enum JsonObject {
 
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonMembers {
-    #[rule($head(JsonMember), $tail(JsonMembersTail))]
-    Many(
-        #[from(head)] AstBox<JsonMember>,
-        #[from(tail)] AstBox<JsonMembersTail>,
-    ),
-
-    #[parse_err]
-    Error(#[from(0)] ParseErrorInfo),
-}
-
-#[derive(NonTerminal, Debug, Clone)]
-enum JsonMembersTail {
-    #[rule()]
-    End,
-
-    #[rule(JsonToken::Comma, $head(JsonMember), $tail(JsonMembersTail))]
-    More(
-        #[from(head)] AstBox<JsonMember>,
-        #[from(tail)] AstBox<JsonMembersTail>,
-    ),
+    #[rule({$members(JsonMember)}{JsonToken::Comma})]
+    Many(#[from(members)] Vec<AstBox<JsonMember>>),
 
     #[parse_err]
     Error(#[from(0)] ParseErrorInfo),
@@ -155,32 +137,14 @@ enum JsonArray {
 
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonElements {
-    #[rule($head(JsonValue), $tail(JsonElementsTail))]
-    Many(
-        #[from(head)] AstBox<JsonValue>,
-        #[from(tail)] AstBox<JsonElementsTail>,
-    ),
+    #[rule({$elements(JsonValue)}{JsonToken::Comma})]
+    Many(#[from(elements)] Vec<AstBox<JsonValue>>),
 
     #[parse_err]
     Error(#[from(0)] ParseErrorInfo),
 }
 
-#[derive(NonTerminal, Debug, Clone)]
-enum JsonElementsTail {
-    #[rule()]
-    End,
-
-    #[rule(JsonToken::Comma, $head(JsonValue), $tail(JsonElementsTail))]
-    More(
-        #[from(head)] AstBox<JsonValue>,
-        #[from(tail)] AstBox<JsonElementsTail>,
-    ),
-
-    #[parse_err]
-    Error(#[from(0)] ParseErrorInfo),
-}
-
-type JsonSink = DebugSink<ParsePath, ParseForest>;
+type JsonSink = DebugSink<ParseChange>;
 type JsonDirectParser = Parser<JsonToken>;
 type JsonRuntimeParser = Parser<JsonToken, JsonSink>;
 
@@ -539,6 +503,21 @@ fn token_data_from_entries(entries: &[(usize, Entry<JsonToken>, usize, usize)]) 
         .collect()
 }
 
+#[test]
+fn json_runtime_grammar_uses_repetition_not_manual_tail_nonterminals() {
+    let grammar = Grammar::from_spec::<JsonValue>();
+    let labels = grammar
+        .non_terminals
+        .iter()
+        .map(|non_terminal| non_terminal.label)
+        .collect::<Vec<_>>();
+
+    assert!(labels.contains(&"JsonMembers"));
+    assert!(labels.contains(&"JsonElements"));
+    assert!(!labels.contains(&"JsonMembersTail"));
+    assert!(!labels.contains(&"JsonElementsTail"));
+}
+
 fn find_location(text: &str, locate: Locate) -> anyhow::Result<usize> {
     let pos = match locate {
         Locate::First(needle) => text
@@ -560,12 +539,12 @@ fn apply_edit(
     current: &mut String,
     uri: Uri<&'static str>,
     op: EditOp,
-) -> anyhow::Result<Delta<Span, String>> {
+) -> anyhow::Result<SourceEdit> {
     match op {
         EditOp::InsertBefore { locate, text } => {
             let pos = find_location(current, locate)?;
             current.insert_str(pos, text);
-            Ok(Delta::Insert {
+            Ok(SourceEdit::Insert {
                 key: Span::new_uri(uri, pos, pos)?,
                 value: text.to_string(),
             })
@@ -578,7 +557,7 @@ fn apply_edit(
                     Locate::Occurrence { needle, .. } => needle.len(),
                 };
             current.insert_str(at, text);
-            Ok(Delta::Insert {
+            Ok(SourceEdit::Insert {
                 key: Span::new_uri(uri, at, at)?,
                 value: text.to_string(),
             })
@@ -586,7 +565,7 @@ fn apply_edit(
         EditOp::Delete { locate, len } => {
             let pos = find_location(current, locate)?;
             current.replace_range(pos..pos + len, "");
-            Ok(Delta::Delete {
+            Ok(SourceEdit::Delete {
                 key: Span::new_uri(uri, pos, pos + len)?,
             })
         }
@@ -610,7 +589,7 @@ fn apply_edits(
     initial: &str,
     ops: &[EditOp],
     uri: Uri<&'static str>,
-) -> anyhow::Result<(String, Vec<Delta<Span, String>>)> {
+) -> anyhow::Result<(String, Vec<SourceEdit>)> {
     let mut current = initial.to_string();
     let mut deltas = Vec::with_capacity(ops.len());
     for &op in ops {
@@ -666,38 +645,20 @@ fn direct_root_keys(
     let JsonObject::Members(mems) = obj else {
         return Ok(keys);
     };
-    let JsonMembers::Many(head, tail) = ast
+    let JsonMembers::Many(members) = ast
         .get(*mems)
         .ok_or_else(|| anyhow::anyhow!("missing JsonMembers"))?
     else {
         return Ok(keys);
     };
-    let head = ast
-        .get(*head)
-        .ok_or_else(|| anyhow::anyhow!("missing JsonMember"))?;
-    let JsonMember::Pair(key, _) = head else {
-        return Ok(keys);
-    };
-    keys.push(token_text(key.id)?);
-
-    let mut current = tail;
-    loop {
-        let tail = ast
-            .get(*current)
-            .ok_or_else(|| anyhow::anyhow!("missing JsonMembersTail"))?;
-        match tail {
-            JsonMembersTail::End | JsonMembersTail::Error(_) => break,
-            JsonMembersTail::More(head, next_tail) => {
-                let member = ast
-                    .get(*head)
-                    .ok_or_else(|| anyhow::anyhow!("missing JsonMember"))?;
-                let JsonMember::Pair(key, _) = member else {
-                    return Ok(keys);
-                };
-                keys.push(token_text(key.id)?);
-                current = next_tail;
-            }
-        }
+    for member in members {
+        let member = ast
+            .get(*member)
+            .ok_or_else(|| anyhow::anyhow!("missing JsonMember"))?;
+        let JsonMember::Pair(key, _) = member else {
+            return Ok(keys);
+        };
+        keys.push(token_text(key.id)?);
     }
     Ok(keys)
 }
@@ -746,47 +707,23 @@ async fn runtime_root_keys(ctx: &Context, obj: &JsonObject) -> anyhow::Result<Ve
     let members = ctx
         .post::<JsonRuntimeParser, DerefAstBox<JsonMembers>>(DerefAstBox(*mems))
         .await?;
-    let JsonMembers::Many(head, tail) = members else {
+    let JsonMembers::Many(members) = members else {
         return Ok(keys);
     };
-    let member = ctx
-        .post::<JsonRuntimeParser, DerefAstBox<JsonMember>>(DerefAstBox(head))
-        .await?;
-    let JsonMember::Pair(key, _) = member else {
-        return Ok(keys);
-    };
-    let JsonToken::String(s) = ctx
-        .post::<JsonRuntimeParser, DerefAstToken<JsonToken>>(DerefAstToken(key))
-        .await?
-    else {
-        return Err(anyhow::anyhow!("expected string token for object key"));
-    };
-    keys.push(s);
-
-    let mut current = tail;
-    loop {
-        let tail = ctx
-            .post::<JsonRuntimeParser, DerefAstBox<JsonMembersTail>>(DerefAstBox(current))
+    for member in members {
+        let member = ctx
+            .post::<JsonRuntimeParser, DerefAstBox<JsonMember>>(DerefAstBox(member))
             .await?;
-        match tail {
-            JsonMembersTail::End | JsonMembersTail::Error(_) => break,
-            JsonMembersTail::More(head, next_tail) => {
-                let member = ctx
-                    .post::<JsonRuntimeParser, DerefAstBox<JsonMember>>(DerefAstBox(head))
-                    .await?;
-                let JsonMember::Pair(key, _) = member else {
-                    return Ok(keys);
-                };
-                let JsonToken::String(s) = ctx
-                    .post::<JsonRuntimeParser, DerefAstToken<JsonToken>>(DerefAstToken(key))
-                    .await?
-                else {
-                    return Err(anyhow::anyhow!("expected string token for object key"));
-                };
-                keys.push(s);
-                current = next_tail;
-            }
-        }
+        let JsonMember::Pair(key, _) = member else {
+            return Ok(keys);
+        };
+        let JsonToken::String(s) = ctx
+            .post::<JsonRuntimeParser, DerefAstToken<JsonToken>>(DerefAstToken(key))
+            .await?
+        else {
+            return Err(anyhow::anyhow!("expected string token for object key"));
+        };
+        keys.push(s);
     }
     Ok(keys)
 }
@@ -812,8 +749,8 @@ async fn runtime_summary(ctx: &Context, root: AstBox<JsonValue>) -> anyhow::Resu
 }
 
 async fn recv_non_empty_parse_batch(
-    rx: &mut mpsc::Receiver<Vec<Delta<ParsePath, ParseForest>>>,
-) -> anyhow::Result<Vec<Delta<ParsePath, ParseForest>>> {
+    rx: &mut mpsc::Receiver<Vec<ParseChange>>,
+) -> anyhow::Result<Vec<ParseChange>> {
     let batch = timeout(Duration::from_secs(2), rx.recv())
         .await?
         .ok_or_else(|| anyhow::anyhow!("parse sink channel closed"))?;
@@ -821,8 +758,8 @@ async fn recv_non_empty_parse_batch(
 }
 
 async fn recv_parse_batches_until_quiet(
-    rx: &mut mpsc::Receiver<Vec<Delta<ParsePath, ParseForest>>>,
-) -> anyhow::Result<Vec<Vec<Delta<ParsePath, ParseForest>>>> {
+    rx: &mut mpsc::Receiver<Vec<ParseChange>>,
+) -> anyhow::Result<Vec<Vec<ParseChange>>> {
     let mut batches = vec![recv_non_empty_parse_batch(rx).await?];
     loop {
         match timeout(Duration::from_millis(500), rx.recv()).await {
@@ -839,7 +776,7 @@ async fn run_runtime_case(
     ops: &[EditOp],
 ) -> anyhow::Result<(
     JsonSummary,
-    Vec<Vec<Delta<ParsePath, ParseForest>>>,
+    Vec<Vec<ParseChange>>,
     Vec<IncrementalParseStats>,
     String,
 )> {
@@ -868,7 +805,7 @@ async fn run_runtime_case(
     )?
     .uri;
     source_tx
-        .send(Delta::Insert {
+        .send(SourceEdit::Insert {
             key: Span::new_uri(uri.clone(), 0, 0)?,
             value: initial.to_string(),
         })
@@ -922,7 +859,7 @@ async fn run_runtime_batched_case(
     ops: &[EditOp],
 ) -> anyhow::Result<(
     JsonSummary,
-    Vec<Vec<Delta<ParsePath, ParseForest>>>,
+    Vec<Vec<ParseChange>>,
     Vec<IncrementalParseStats>,
     String,
     usize,
@@ -952,7 +889,7 @@ async fn run_runtime_batched_case(
         0,
     )?
     .uri;
-    source_tx.try_send(Delta::Insert {
+    source_tx.try_send(SourceEdit::Insert {
         key: Span::new_uri(uri.clone(), 0, 0)?,
         value: initial.to_string(),
     })?;
@@ -1034,7 +971,7 @@ async fn run_runtime_summary_case(
     let debug_sink = debug_sink!(|_ctx, deltas| {
         let sink_tx = sink_tx.clone();
         async move {
-            let _: &Vec<Delta<ParsePath, ParseForest>> = &deltas;
+            let _: &Vec<ParseChange> = &deltas;
             let _ = sink_tx.send(deltas.clone()).await;
             Ok(())
         }
@@ -1055,7 +992,7 @@ async fn run_runtime_summary_case(
     )?
     .uri;
     source_tx
-        .send(Delta::Insert {
+        .send(SourceEdit::Insert {
             key: Span::new_uri(uri.clone(), 0, 0)?,
             value: initial.to_string(),
         })
@@ -1119,7 +1056,7 @@ async fn run_runtime_diagnostic_counts(
     )?
     .uri;
     source_tx
-        .send(Delta::Insert {
+        .send(SourceEdit::Insert {
             key: Span::new_uri(uri.clone(), 0, 0)?,
             value: initial.to_string(),
         })
@@ -1748,7 +1685,7 @@ async fn json_runtime_skip_token_boundary_stress_is_parse_noop() -> anyhow::Resu
 
     let uri = Span::new("test://json-skip-boundary-stress", 0, 0)?.uri;
     source_tx
-        .send(Delta::Insert {
+        .send(SourceEdit::Insert {
             key: Span::new_uri(uri.clone(), 0, 0)?,
             value: initial.to_string(),
         })
@@ -1772,7 +1709,7 @@ async fn json_runtime_skip_token_boundary_stress_is_parse_noop() -> anyhow::Resu
 
         current.insert_str(boundary, skip);
         source_tx
-            .send(Delta::Insert {
+            .send(SourceEdit::Insert {
                 key: Span::new_uri(uri.clone(), boundary, boundary)?,
                 value: skip.to_string(),
             })
@@ -1790,7 +1727,7 @@ async fn json_runtime_skip_token_boundary_stress_is_parse_noop() -> anyhow::Resu
 
         current.replace_range(boundary..boundary + skip.len(), "");
         source_tx
-            .send(Delta::Delete {
+            .send(SourceEdit::Delete {
                 key: Span::new_uri(uri.clone(), boundary, boundary + skip.len())?,
             })
             .await?;
@@ -1839,7 +1776,7 @@ async fn json_runtime_extreme_mixed_edits_match_fresh_parse_after_each_step() ->
 
     let uri = Span::new("test://json-extreme-mixed-edits", 0, 0)?.uri;
     source_tx
-        .send(Delta::Insert {
+        .send(SourceEdit::Insert {
             key: Span::new_uri(uri.clone(), 0, 0)?,
             value: initial.to_string(),
         })

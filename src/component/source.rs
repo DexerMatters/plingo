@@ -2,8 +2,8 @@ use std::{collections::HashMap, io, marker::PhantomData, sync::Arc};
 
 use crate::{
     scheme::{
-        Context, Delta, EmittedDeltas, NonTopLayer, Outcome, Resolve, SnapshotId, SnapshotLayer,
-        TopLayer,
+        Context, EmittedChanges, NonTopLayer, Outcome, ReplacementBatch, ReplacementChange,
+        Resolve, SnapshotId, SnapshotLayer, TopLayer,
     },
     utils::{OwnedRopeSlice, RangeOrPoint, Span},
 };
@@ -17,9 +17,31 @@ use tokio::sync::mpsc::Receiver;
 pub struct Source<Lower> {
     #[snapshot]
     pub sources: HashMap<Uri<&'static str>, Arc<Rope>>,
-    pub receiver: Receiver<Delta<Span, String>>,
+    pub receiver: Receiver<SourceEdit>,
     _marker: PhantomData<fn() -> Lower>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceEdit {
+    Insert { key: Span, value: String },
+    Delete { key: Span },
+}
+
+impl SourceEdit {
+    pub fn span(&self) -> &Span {
+        match self {
+            SourceEdit::Insert { key, .. } | SourceEdit::Delete { key } => key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextUnit {
+    pub span: Span,
+    pub len: usize,
+}
+
+pub type TextChange = ReplacementChange<Uri<&'static str>, TextUnit>;
 
 #[derive(Error, Debug)]
 pub enum SourceError {
@@ -30,7 +52,7 @@ pub enum SourceError {
 }
 
 impl<Lower> Source<Lower> {
-    pub fn new(receiver: Receiver<Delta<Span, String>>) -> Self {
+    pub fn new(receiver: Receiver<SourceEdit>) -> Self {
         Self {
             sources: HashMap::new(),
             receiver,
@@ -71,42 +93,69 @@ impl<Lower> Source<Lower> {
         Ok(OwnedRopeSlice::new(Arc::clone(source), start, end))
     }
 
-    fn modify(&mut self, delta: &Delta<Span, String>) -> Result<(), SourceError> {
-        let uri = delta.key().uri;
+    fn modify(&mut self, edit: &SourceEdit) -> Result<(), SourceError> {
+        let uri = edit.span().uri;
         self.load(uri);
 
         let source = self.sources.get_mut(&uri).unwrap();
         let source = Arc::make_mut(source);
-        match delta {
-            Delta::Delete { key, .. } => {
+        match edit {
+            SourceEdit::Delete { key } => {
                 let (start_byte, end_byte) = key.trim(&source).range.into();
                 let start = source.byte_to_char(start_byte);
                 let end = source.byte_to_char(end_byte);
                 source.remove(start..end);
             }
-            Delta::Insert { key, value } => {
+            SourceEdit::Insert { key, value } => {
                 let byte_offset = key.trim(&source).range.start();
                 let char_offset = source.byte_to_char(byte_offset);
-                source.insert(char_offset, &value);
+                source.insert(char_offset, value);
             }
         }
         Ok(())
     }
 
-    fn lower_delta(&self, delta: &Delta<Span, String>) -> Delta<Span, usize> {
-        let start = delta.key().range.start();
-        match delta {
-            Delta::Insert { key, value } => {
+    fn lower_change(&self, edit: &SourceEdit) -> TextChange {
+        let start = edit.span().range.start();
+        match edit {
+            SourceEdit::Insert { key, value } => {
                 let end = start + value.len();
-                Delta::Insert {
-                    key: Span {
-                        uri: key.uri,
-                        range: RangeOrPoint::from_range(start, end),
+                let inserted_span = Span {
+                    uri: key.uri,
+                    range: RangeOrPoint::from_range(start, end),
+                };
+                ReplacementChange::new(
+                    key.uri,
+                    ReplacementBatch {
+                        old_units: Vec::new(),
+                        new_units: vec![TextUnit {
+                            span: inserted_span,
+                            len: value.len(),
+                        }],
+                        prefix_len: start,
+                        suffix_len: 0,
+                        old_changed_range: start..start,
+                        new_changed_range: start..end,
                     },
-                    value: value.len(),
-                }
+                )
             }
-            Delta::Delete { key, .. } => Delta::Delete { key: *key },
+            SourceEdit::Delete { key } => {
+                let end = key.range.end();
+                ReplacementChange::new(
+                    key.uri,
+                    ReplacementBatch {
+                        old_units: vec![TextUnit {
+                            span: *key,
+                            len: end.saturating_sub(start),
+                        }],
+                        new_units: Vec::new(),
+                        prefix_len: start,
+                        suffix_len: 0,
+                        old_changed_range: start..end,
+                        new_changed_range: start..start,
+                    },
+                )
+            }
         }
     }
 
@@ -118,7 +167,7 @@ impl<Lower> Source<Lower> {
 #[layer(top)]
 impl<Lower> TopLayer for Source<Lower>
 where
-    Lower: NonTopLayer<_Key = Span, _Value = usize>,
+    Lower: NonTopLayer<Change = TextChange>,
 {
     type Error = SourceError;
     type Lower = Lower;
@@ -126,24 +175,24 @@ where
     fn emit<'a>(
         &'a mut self,
         ctx: &'a Context,
-    ) -> impl Future<Output = Result<Option<EmittedDeltas<Self::Lower>>, Self::Error>> + Send + 'a
+    ) -> impl Future<Output = Result<Option<EmittedChanges<Self::Lower>>, Self::Error>> + Send + 'a
     {
         async move {
-            let Some(delta) = self.receiver.recv().await else {
+            let Some(edit) = self.receiver.recv().await else {
                 return Ok(None);
             };
-            let mut batch = vec![delta];
+            let mut batch = vec![edit];
             while let Ok(next) = self.receiver.try_recv() {
                 batch.push(next);
             }
 
-            for delta in &batch {
-                self.modify(delta)?;
+            for edit in &batch {
+                self.modify(edit)?;
             }
             let snapshot_id = ctx.allocate_snapshot();
             self.capture_snapshot(snapshot_id);
-            let deltas = batch.iter().map(|delta| self.lower_delta(delta)).collect();
-            Ok(Some(EmittedDeltas::new(snapshot_id, deltas)))
+            let changes = batch.iter().map(|edit| self.lower_change(edit)).collect();
+            Ok(Some(EmittedChanges::new(snapshot_id, changes)))
         }
     }
 }
@@ -151,7 +200,7 @@ where
 #[resolve_action]
 impl<Lower> Resolve<Span> for Source<Lower>
 where
-    Lower: NonTopLayer<_Key = Span, _Value = usize>,
+    Lower: NonTopLayer<Change = TextChange>,
 {
     type Output = OwnedRopeSlice;
 
@@ -169,43 +218,24 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Change(pub Delta<Span, String>);
-
 #[resolve_action]
-impl<Lower> Resolve<Change> for Source<Lower>
+impl<Lower> Resolve<SourceEdit> for Source<Lower>
 where
-    Lower: NonTopLayer<_Key = Span, _Value = usize>,
+    Lower: NonTopLayer<Change = TextChange>,
 {
     type Output = ();
 
     fn resolve<'a>(
         &'a mut self,
         ctx: &'a Context,
-        Change(action): &'a Change,
-    ) -> impl Future<Output = Outcome<Change, Self>> + Send + 'a {
+        action: &'a SourceEdit,
+    ) -> impl Future<Output = Outcome<SourceEdit, Self>> + Send + 'a {
         async move {
             match self.modify(&action) {
                 Ok(()) => {
-                    let start = action.key().range.start();
                     let snapshot_id = ctx.snapshot().unwrap_or_else(|| ctx.allocate_snapshot());
                     self.capture_snapshot(snapshot_id);
-                    let deltas = match &action {
-                        Delta::Insert { key, value } => {
-                            let end = start + value.len();
-                            vec![Delta::Insert {
-                                key: Span {
-                                    uri: key.uri,
-                                    range: RangeOrPoint::from_range(start, end),
-                                },
-                                value: value.len(),
-                            }]
-                        }
-                        Delta::Delete { key, .. } => {
-                            vec![Delta::Delete { key: *key }]
-                        }
-                    };
-                    Outcome::emit(deltas)
+                    Outcome::emit(vec![self.lower_change(action)])
                 }
                 Err(err) => Outcome::fail(err),
             }

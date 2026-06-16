@@ -82,7 +82,7 @@ where
 {
     tokio::spawn(async move {
         enum TopEvent<TLower: NonTopLayer, TError> {
-            Emit(Result<Option<EmittedDeltas<TLower>>, TError>),
+            Emit(Result<Option<EmittedChanges<TLower>>, TError>),
             Message(Option<WorkerMessage>),
         }
 
@@ -104,7 +104,7 @@ where
                         &context,
                         DeltaEnvelope {
                             snapshot: emitted.snapshot,
-                            payload: Box::new(emitted.deltas),
+                            payload: Box::new(emitted.changes),
                         },
                     )
                     .await
@@ -193,19 +193,19 @@ async fn handle_any_message_top<T>(
     }
 }
 
-fn downcast_layer_deltas<L>(layer_name: &'static str, delta: DeltaEnvelope) -> LayerDeltas<L>
+fn downcast_layer_changes<L>(layer_name: &'static str, delta: DeltaEnvelope) -> LayerChanges<L>
 where
     L: NonTopLayer,
 {
     delta
         .payload
-        .downcast::<LayerDeltas<L>>()
+        .downcast::<LayerChanges<L>>()
         .map(|typed| *typed)
         .unwrap_or_else(|_| {
             unreachable!(
-                "layer delta downcast must match pipeline wiring: layer={}, expected={}",
+                "layer change downcast must match pipeline wiring: layer={}, expected={}",
                 layer_name,
-                type_name::<LayerDeltas<L>>()
+                type_name::<LayerChanges<L>>()
             )
         })
 }
@@ -292,7 +292,7 @@ where
     M: MiddleLayer,
 {
     let snapshot = delta.snapshot;
-    let typed = downcast_layer_deltas::<M>(layer_name, delta);
+    let typed = downcast_layer_changes::<M>(layer_name, delta);
     let delta_ctx = context.with_snapshot(Some(snapshot));
 
     let out =
@@ -363,7 +363,7 @@ where
                             ContinuationTransition::Done => {}
                             ContinuationTransition::Propagate { envelope, demand } => {
                                 let snapshot = envelope.snapshot;
-                                let typed = downcast_layer_deltas::<B>(layer_name, envelope);
+                                let typed = downcast_layer_changes::<B>(layer_name, envelope);
                                 let delta_ctx = context.with_snapshot(Some(snapshot));
                                 if let Err(err) = layer.consume(&delta_ctx, typed).await {
                                     eprintln!(
@@ -388,7 +388,7 @@ where
                 }
                 WorkerMessage::Delta(delta_box) => {
                     let snapshot = delta_box.snapshot;
-                    let typed = downcast_layer_deltas::<B>(layer_name, delta_box);
+                    let typed = downcast_layer_changes::<B>(layer_name, delta_box);
                     let delta_ctx = context.with_snapshot(Some(snapshot));
                     if let Err(err) = layer.consume(&delta_ctx, typed).await {
                         eprintln!(

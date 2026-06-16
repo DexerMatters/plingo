@@ -1,11 +1,11 @@
 use color_print::cprintln;
 use plingo::{
     component::{
-        lex::{Lexer, policy::GetTokens},
+        lex::{Lexer, TokenChange},
         sink::DebugSink,
         source::Source,
     },
-    scheme::{Delta, Runtime},
+    scheme::Runtime,
     tokens,
 };
 use tokio::sync::mpsc;
@@ -38,38 +38,15 @@ async fn test_lexer() -> anyhow::Result<()> {
     let (sender, receiver) = mpsc::channel(256);
 
     let debug_sink = plingo::debug_sink!(|ctx, deltas| async move {
-        let _: &Vec<Delta<plingo::utils::Span, usize>> = &deltas;
+        let _: &Vec<TokenChange> = &deltas;
+        let _ = ctx;
         cprintln!("<dim>---------Received---------</dim>");
-        for delta in &deltas {
-            match delta {
-                Delta::Insert { key, value } => {
-                    let token_span = key.extend_right(*value);
-                    match ctx
-                        .post::<Lexer<MainTokens, DebugSink<_, _>>, _>(GetTokens(token_span))
-                        .await
-                    {
-                        Ok(tokens) => {
-                            for token in &tokens {
-                                cprintln!(" <b><green>+</green></b> {token:?}");
-                            }
-                        }
-                        Err(e) => eprintln!("token error: {e}"),
-                    }
-                }
-                Delta::Delete { key } => {
-                    let ctx = ctx.last_snapshot();
-                    match ctx
-                        .post::<Lexer<MainTokens, DebugSink<_, _>>, _>(GetTokens(*key))
-                        .await
-                    {
-                        Ok(tokens) => {
-                            for token in &tokens {
-                                cprintln!(" <b><red>-</red></b> {token:?}");
-                            }
-                        }
-                        Err(e) => eprintln!("token error: {e}"),
-                    }
-                }
+        for change in &deltas {
+            for token in &change.batch.old_units[change.batch.old_changed_range.clone()] {
+                cprintln!(" <b><red>-</red></b> {token:?}");
+            }
+            for token in &change.batch.new_units[change.batch.new_changed_range.clone()] {
+                cprintln!(" <b><green>+</green></b> {token:?}");
             }
         }
         Ok(())

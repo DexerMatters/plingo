@@ -9,11 +9,11 @@ use crate::{
     component::{
         lex::{
             BestMatch, Entry, ErrorToken, LexInterrupt, LexedToken, Lexer, LexerRoot,
-            LexerSnapshotState, LexerState, MatchReport, State, StateAction,
+            LexerSnapshotState, LexerState, MatchReport, State, StateAction, TokenChange,
         },
-        source::Source,
+        source::{Source, TextChange},
     },
-    scheme::{Delta, LayerDeltas, MiddleLayer, NonTopLayer},
+    scheme::{LayerChange, LayerChanges, MiddleLayer, NonTopLayer, ReplacementChange},
     utils::{RangeOrPoint, Span},
 };
 
@@ -38,38 +38,38 @@ fn shift_state(state: &LexerState, shift: isize) -> LexerState {
 impl<Root, Lower> Lexer<Root, Lower>
 where
     Root: LexerRoot,
-    Lower: NonTopLayer<_Key = Span, _Value = usize> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = TokenChange> + Send + Sync + 'static,
 {
     #[allow(dead_code)]
-    pub(crate) fn lex_delta<'a>(
+    pub(crate) fn lex_change<'a>(
         &'a mut self,
         ctx: &'a crate::scheme::Context,
         state: &'a mut LexerSnapshotState<Root>,
-        delta: Delta<Span, usize>,
+        change: TextChange,
     ) -> impl Future<
-        Output = Result<LayerDeltas<<Lexer<Root, Lower> as MiddleLayer>::Lower>, LexInterrupt>,
+        Output = Result<LayerChanges<<Lexer<Root, Lower> as MiddleLayer>::Lower>, LexInterrupt>,
     > + Send
     + 'a {
         async move {
-            self.lex_deltas(ctx, state, std::slice::from_ref(&delta))
+            self.lex_changes(ctx, state, std::slice::from_ref(&change))
                 .await
         }
     }
 
-    pub(crate) fn lex_deltas<'a>(
+    pub(crate) fn lex_changes<'a>(
         &'a mut self,
         ctx: &'a crate::scheme::Context,
         state: &'a mut LexerSnapshotState<Root>,
-        deltas: &'a [Delta<Span, usize>],
+        changes: &'a [TextChange],
     ) -> impl Future<
-        Output = Result<LayerDeltas<<Lexer<Root, Lower> as MiddleLayer>::Lower>, LexInterrupt>,
+        Output = Result<LayerChanges<<Lexer<Root, Lower> as MiddleLayer>::Lower>, LexInterrupt>,
     > + Send
     + 'a {
         async move {
-            let Some(first) = deltas.first() else {
+            let Some(first) = changes.first() else {
                 return Ok(Vec::new());
             };
-            let uri = first.key().uri;
+            let uri = *first.address();
             let total_start = Instant::now();
             let fetch_source_start = Instant::now();
             let snapshot = ctx
@@ -84,7 +84,7 @@ where
                 state,
                 uri,
                 snapshot.to_string(),
-                deltas,
+                changes,
                 total_start,
                 fetch_source_elapsed,
             )
@@ -96,10 +96,10 @@ where
         snapshot_state: &mut LexerSnapshotState<Root>,
         uri: fluent_uri::Uri<&'static str>,
         snapshot: String,
-        deltas: &[Delta<Span, usize>],
+        changes: &[TextChange],
         total_start: Instant,
         fetch_source_elapsed: Duration,
-    ) -> Result<LayerDeltas<<Lexer<Root, Lower> as MiddleLayer>::Lower>, LexInterrupt> {
+    ) -> Result<LayerChanges<<Lexer<Root, Lower> as MiddleLayer>::Lower>, LexInterrupt> {
         let root_state = self
             .state_id_of::<Root>()
             .ok_or(LexInterrupt::MissingState)?;
@@ -115,26 +115,21 @@ where
         let old_visible_elapsed = old_visible_start.elapsed();
 
         let delta_scan_start = Instant::now();
-        let restart_point = deltas
+        let restart_point = changes
             .iter()
-            .map(|delta| delta.key().range.start())
+            .map(|change| change.batch.old_changed_range.start)
             .min()
             .unwrap_or(0);
-        let net_shift: isize = deltas
+        let net_shift: isize = changes
             .iter()
-            .map(|delta| match delta {
-                Delta::Insert { value, .. } => *value as isize,
-                Delta::Delete { key } => {
-                    -(key.range.end().saturating_sub(key.range.start()) as isize)
-                }
+            .map(|change| {
+                change.batch.new_changed_range.len() as isize
+                    - change.batch.old_changed_range.len() as isize
             })
             .sum();
-        let new_change_end = deltas
+        let new_change_end = changes
             .iter()
-            .map(|delta| match delta {
-                Delta::Insert { key, value } => key.range.start().saturating_add(*value),
-                Delta::Delete { key } => key.range.start(),
-            })
+            .map(|change| change.batch.new_changed_range.end)
             .max()
             .unwrap_or(restart_point);
         let delta_scan_elapsed = delta_scan_start.elapsed();
@@ -293,14 +288,13 @@ where
         let new_visible_tokens = self.token_data_for_uri(snapshot_state, uri);
         let new_visible_elapsed = new_visible_start.elapsed();
         let batch_diff_start = Instant::now();
-        let visible_batch = Self::build_visible_batch(old_visible_tokens, new_visible_tokens);
-        let changed = visible_batch.is_changed();
-        let old_visible_len = visible_batch.old_tokens.len();
-        let new_visible_len = visible_batch.new_tokens.len();
-        let prefix_len = visible_batch.prefix_len;
-        let suffix_len = visible_batch.suffix_len;
+        let token_batch = Self::build_visible_batch(old_visible_tokens, new_visible_tokens);
+        let changed = token_batch.is_changed();
+        let old_visible_len = token_batch.old_units.len();
+        let new_visible_len = token_batch.new_units.len();
+        let prefix_len = token_batch.prefix_len;
+        let suffix_len = token_batch.suffix_len;
         let batch_diff_elapsed = batch_diff_start.elapsed();
-        snapshot_state.visible_batches.insert(uri, visible_batch);
         let total_elapsed = total_start.elapsed();
 
         log::debug!(
@@ -332,7 +326,7 @@ where
         );
 
         if changed {
-            Ok(deltas.to_vec())
+            Ok(vec![ReplacementChange::new(uri, token_batch)])
         } else {
             Ok(Vec::new())
         }

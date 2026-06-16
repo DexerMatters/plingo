@@ -6,10 +6,7 @@ mod mode;
 pub mod __macro_private;
 pub mod policy;
 
-use std::{
-    collections::HashMap, error::Error, fmt, hash::Hash, marker::PhantomData, ops::Range,
-    str::FromStr,
-};
+use std::{collections::HashMap, error::Error, fmt, hash::Hash, marker::PhantomData, str::FromStr};
 
 use fluent_uri::Uri;
 use plingo_macros::layer;
@@ -22,9 +19,10 @@ pub use mode::{LexerState, State, StateAction, StateInfo};
 use crate::{
     component::parse::identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
     component::parse::{TokenData, grammar::TerminalId},
+    component::source::TextChange,
     scheme::{
-        ActionError, Context, Delta, LayerDeltas, MiddleLayer, NonTopLayer, SnapshotId,
-        SnapshotLayer,
+        ActionError, Context, LayerChange, LayerChanges, MiddleLayer, NonTopLayer,
+        ReplacementBatch, ReplacementChange, SnapshotId, SnapshotLayer,
     },
     utils::{PrettyDisplay, Span},
 };
@@ -187,25 +185,8 @@ where
     Error(usize, ErrorToken),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VisibleTokenBatch {
-    pub old_tokens: Vec<TokenData>,
-    pub new_tokens: Vec<TokenData>,
-    pub prefix_len: usize,
-    pub suffix_len: usize,
-    pub old_changed_range: Range<usize>,
-    pub new_changed_range: Range<usize>,
-}
-
-impl VisibleTokenBatch {
-    pub fn is_changed(&self) -> bool {
-        self.old_changed_range.start != self.old_changed_range.end
-            || self.new_changed_range.start != self.new_changed_range.end
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct GetVisibleTokenBatch(pub Uri<&'static str>);
+pub type TokenBatch = ReplacementBatch<TokenData>;
+pub type TokenChange = ReplacementChange<Uri<&'static str>, TokenData>;
 
 impl<Root> Entry<Root>
 where
@@ -293,7 +274,6 @@ where
     state_instances: HashMap<Uri<&'static str>, Vec<LexerState>>,
     token_instances: HashMap<Uri<&'static str>, Vec<usize>>,
     token_ranges: HashMap<Uri<&'static str>, Vec<(usize, usize)>>,
-    visible_batches: HashMap<Uri<&'static str>, VisibleTokenBatch>,
     _root: PhantomData<Root>,
 }
 
@@ -306,7 +286,6 @@ where
             state_instances: self.state_instances.clone(),
             token_instances: self.token_instances.clone(),
             token_ranges: self.token_ranges.clone(),
-            visible_batches: self.visible_batches.clone(),
             _root: PhantomData,
         }
     }
@@ -321,7 +300,6 @@ where
             state_instances: HashMap::new(),
             token_instances: HashMap::new(),
             token_ranges: HashMap::new(),
-            visible_batches: HashMap::new(),
             _root: PhantomData,
         }
     }
@@ -411,10 +389,7 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         a.terminal == b.terminal && a.length == b.length && a.fingerprint == b.fingerprint
     }
 
-    fn build_visible_batch(
-        old_tokens: Vec<TokenData>,
-        new_tokens: Vec<TokenData>,
-    ) -> VisibleTokenBatch {
+    fn build_visible_batch(old_tokens: Vec<TokenData>, new_tokens: Vec<TokenData>) -> TokenBatch {
         let mut prefix_len = 0usize;
         while prefix_len < old_tokens.len()
             && prefix_len < new_tokens.len()
@@ -435,11 +410,11 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             suffix_len += 1;
         }
 
-        VisibleTokenBatch {
+        TokenBatch {
             old_changed_range: prefix_len..old_tokens.len().saturating_sub(suffix_len),
             new_changed_range: prefix_len..new_tokens.len().saturating_sub(suffix_len),
-            old_tokens,
-            new_tokens,
+            old_units: old_tokens,
+            new_units: new_tokens,
             prefix_len,
             suffix_len,
         }
@@ -625,17 +600,6 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         out
     }
 
-    pub(crate) fn visible_batch(
-        &self,
-        snapshot: Option<SnapshotId>,
-        uri: Uri<&'static str>,
-    ) -> Option<VisibleTokenBatch> {
-        self.snapshot_state(snapshot)
-            .visible_batches
-            .get(&uri)
-            .cloned()
-    }
-
     fn is_skip_terminal(&self, terminal: TerminalId) -> bool {
         self.tokens.iter().any(|state_tokens| {
             state_tokens
@@ -657,44 +621,43 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
 impl<Root, Lower> MiddleLayer for Lexer<Root, Lower>
 where
     Root: LexerRoot,
-    Lower: NonTopLayer<_Key = Span, _Value = usize> + Send + Sync + 'static,
+    Lower: NonTopLayer<Change = TokenChange> + Send + Sync + 'static,
 {
     type Lower = Lower;
-    type Key = Span;
     type Error = LexInterrupt;
-    type Value = usize;
+    type Change = TextChange;
 
     fn pass(
         &mut self,
         ctx: &Context,
-        deltas: LayerDeltas<Self>,
-    ) -> impl Future<Output = Result<LayerDeltas<Self::Lower>, Self::Error>> + Send {
+        changes: LayerChanges<Self>,
+    ) -> impl Future<Output = Result<LayerChanges<Self::Lower>, Self::Error>> + Send {
         async move {
             let mut working = self.latest.clone();
-            let mut lower_deltas = Vec::new();
+            let mut lower_changes = Vec::new();
 
-            let mut grouped: Vec<(Uri<&'static str>, Vec<Delta<Span, usize>>)> = Vec::new();
-            for delta in deltas {
-                let uri = delta.key().uri;
+            let mut grouped: Vec<(Uri<&'static str>, Vec<TextChange>)> = Vec::new();
+            for change in changes {
+                let uri = *change.address();
                 if let Some((_, batch)) =
                     grouped.iter_mut().find(|(group_uri, _)| *group_uri == uri)
                 {
-                    batch.push(delta);
+                    batch.push(change);
                 } else {
-                    grouped.push((uri, vec![delta]));
+                    grouped.push((uri, vec![change]));
                 }
             }
 
             for (_, batch) in grouped {
-                let uri_lower_deltas = self.lex_deltas(ctx, &mut working, &batch).await?;
-                lower_deltas.extend(uri_lower_deltas);
+                let uri_lower_changes = self.lex_changes(ctx, &mut working, &batch).await?;
+                lower_changes.extend(uri_lower_changes);
             }
 
             self.latest = working.clone();
             if let Some(snapshot) = ctx.snapshot() {
                 self.push_state(snapshot);
             }
-            Ok(lower_deltas)
+            Ok(lower_changes)
         }
     }
 }

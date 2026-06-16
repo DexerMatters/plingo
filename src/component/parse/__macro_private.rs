@@ -1,7 +1,11 @@
 use std::any::TypeId;
 
 use crate::component::parse::{
-    data::{AstBox, AstToken, ParseErrorInfo, ProductData, ProductId, TokenEntryId, TreeData},
+    data::{
+        ast::{AstBox, AstToken, TokenEntryId},
+        green::{ParseErrorInfo, TreeData},
+        product::{ProductData, ProductId},
+    },
     grammar::{BuildCx, BuildError, GrammarBuilder, ProductionId, Symbol},
 };
 use crate::utils::Either;

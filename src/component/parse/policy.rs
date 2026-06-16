@@ -7,8 +7,12 @@ use crate::{
     component::{
         lex::{Lexer, LexerRoot, policy::GetTokenById},
         parse::{
-            AstToken, IncrementalParseStats, ParsePath, Parser, ParserSessionState, data::AstBox,
-            data::{ParseErrorInfo, ProductData, ProductId, TreeData},
+            AstToken, IncrementalParseStats, ParsePath, Parser, ParserSessionState,
+            data::{
+                ast::AstBox,
+                green::{ParseErrorInfo, TreeData},
+                product::{ProductData, ProductId},
+            },
         },
     },
     scheme::{Context, NonTopLayer, Outcome, Resolve, SnapshotLayer},
@@ -221,7 +225,7 @@ where
             };
             let desc = match arenas.trees.get(product.green) {
                 Some(tree) => {
-                    use crate::component::parse::data::TreeData;
+                    use crate::component::parse::data::green::TreeData;
                     match &tree.data {
                         TreeData::Node { id, .. } => {
                             let nt = &self.grammar.non_terminals[*id as usize];
@@ -280,11 +284,8 @@ where
                 return Outcome::ok(Vec::new());
             };
             let roots = state.roots.get(&action.0).map(Vec::as_slice).unwrap_or(&[]);
-            let diagnostics = collect_parse_diagnostics(
-                session,
-                self.session_arenas.get(&action.0),
-                roots,
-            );
+            let diagnostics =
+                collect_parse_diagnostics(session, self.session_arenas.get(&action.0), roots);
             Outcome::ok(diagnostics)
         }
     }
@@ -349,7 +350,8 @@ fn collect_ast_parse_diagnostics(
                 recovered,
                 location,
                 ..
-            } = &tree.data else {
+            } = &tree.data
+            else {
                 return;
             };
             let info = ParseErrorInfo {

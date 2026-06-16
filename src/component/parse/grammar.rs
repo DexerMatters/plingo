@@ -5,8 +5,9 @@ use bitvec::vec::BitVec;
 use crate::component::parse::{
     __macro_private::NonTerminalSpec,
     data::{
-        AstArena, AstBox, ErrorKind, GreenId, Product, ProductArena, ProductData, ProductId,
-        TokenEntryId, TreeArena,
+        ast::{AstArena, AstBox, TokenEntryId},
+        green::{ErrorKind, GreenId, TreeArena},
+        product::{Product, ProductArena, ProductData, ProductId},
     },
     identity::TokenFingerprint,
 };

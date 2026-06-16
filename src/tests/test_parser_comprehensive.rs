@@ -6,7 +6,10 @@ use crate::{
         parse::{
             AstToken, GetParseTokens, IncrementalParseStats, ParseErrorInfo, ParseForest,
             ParsePath, Parser, ParserConfig, TokenData,
-            data::{AstArena, AstBox, ProductData},
+            data::{
+                ast::{AstArena, AstBox},
+                product::ProductData,
+            },
             grammar::Grammar,
             identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
             policy::{
@@ -20,7 +23,13 @@ use crate::{
     utils::{RangeOrPoint, Span},
 };
 use fluent_uri::Uri;
-use std::{marker::PhantomData, time::Duration};
+use log::{Level, LevelFilter, Metadata, Record};
+use std::{
+    collections::HashMap,
+    marker::PhantomData,
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -1217,6 +1226,125 @@ async fn assert_runtime_matches_fresh_parse(
     Ok(runtime)
 }
 
+struct MeasureLogCapture {
+    lines: Mutex<Vec<String>>,
+}
+
+impl MeasureLogCapture {
+    const fn new() -> Self {
+        Self {
+            lines: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn clear(&self) {
+        self.lines
+            .lock()
+            .expect("measure log mutex poisoned")
+            .clear();
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.lines
+            .lock()
+            .expect("measure log mutex poisoned")
+            .clone()
+    }
+}
+
+impl log::Log for MeasureLogCapture {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.target() == "Measure" && metadata.level() <= Level::Debug
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        self.lines
+            .lock()
+            .expect("measure log mutex poisoned")
+            .push(record.args().to_string());
+    }
+
+    fn flush(&self) {}
+}
+
+#[derive(Default)]
+struct MeasureAggregate {
+    parse_samples: usize,
+    lex_samples: usize,
+    parse: HashMap<String, Duration>,
+    lex: HashMap<String, Duration>,
+}
+
+fn measure_logger() -> &'static MeasureLogCapture {
+    static LOGGER: OnceLock<MeasureLogCapture> = OnceLock::new();
+    let logger = LOGGER.get_or_init(MeasureLogCapture::new);
+    let _ = log::set_logger(logger);
+    log::set_max_level(LevelFilter::Debug);
+    logger.clear();
+    logger
+}
+
+fn parse_measure_duration(value: &str) -> Option<Duration> {
+    let (number, scale) = if let Some(value) = value.strip_suffix("ns") {
+        (value, 1e-9)
+    } else if let Some(value) = value.strip_suffix("µs") {
+        (value, 1e-6)
+    } else if let Some(value) = value.strip_suffix("ms") {
+        (value, 1e-3)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1.0)
+    } else {
+        return None;
+    };
+    let value = number.parse::<f64>().ok()?;
+    Some(Duration::from_secs_f64(value * scale))
+}
+
+fn aggregate_measure_lines(lines: &[String]) -> MeasureAggregate {
+    let mut aggregate = MeasureAggregate::default();
+
+    for line in lines {
+        let mut parts = line.split_whitespace();
+        let Some(kind) = parts.next() else {
+            continue;
+        };
+        let Some(_uri) = parts.next() else {
+            continue;
+        };
+
+        let (sample_count, totals) = match kind {
+            "parse" => (&mut aggregate.parse_samples, &mut aggregate.parse),
+            "lex" => (&mut aggregate.lex_samples, &mut aggregate.lex),
+            _ => continue,
+        };
+        *sample_count += 1;
+
+        for part in parts {
+            let Some((phase, value)) = part.split_once('=') else {
+                continue;
+            };
+            let Some(duration) = parse_measure_duration(value) else {
+                continue;
+            };
+            *totals.entry(phase.to_string()).or_default() += duration;
+        }
+    }
+
+    aggregate
+}
+
+fn print_measure_totals(label: &str, samples: usize, totals: &HashMap<String, Duration>) {
+    eprintln!("{label} samples={samples}");
+    let mut rows = totals.iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| right.1.cmp(left.1));
+    for (phase, duration) in rows {
+        eprintln!("  {phase}={duration:?}");
+    }
+}
+
 fn assert_summary(case: &EditCase, summary: &JsonSummary) {
     let expected_keys = case
         .expected_keys
@@ -1329,6 +1457,103 @@ async fn json_runtime_comprehensive_edit_matrix() -> anyhow::Result<()> {
             case.name
         );
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore]
+async fn json_runtime_measure_profile_summary() -> anyhow::Result<()> {
+    let logger = measure_logger();
+
+    for case in json_runtime_cases() {
+        let _ = run_runtime_case(case.name, case.initial, case.ops)
+            .await
+            .map_err(|e| anyhow::anyhow!("case {} failed: {e}", case.name))?;
+    }
+
+    let batched_case = EditCase {
+        name: "runtime_large_member_append_profile",
+        initial: r#"{"a":1}"#,
+        ops: &[
+            EditOp::InsertBefore {
+                locate: Locate::Last("}"),
+                text: r#","j":true"#,
+            },
+            EditOp::InsertBefore {
+                locate: Locate::Last("}"),
+                text: r#","k":[1,2,3]"#,
+            },
+            EditOp::InsertBefore {
+                locate: Locate::Last("}"),
+                text: r#","l":{"a":1,"b":2}"#,
+            },
+            EditOp::InsertBefore {
+                locate: Locate::Last("}"),
+                text: r#","m":null"#,
+            },
+        ],
+        expected_keys: &["a", "j", "k", "l", "m"],
+        min_errors: 0,
+        requires_convergence: true,
+        expect_reparse: true,
+    };
+    let _ =
+        run_runtime_batched_case(batched_case.name, batched_case.initial, batched_case.ops).await?;
+
+    let recovery_case = EditCase {
+        name: "invalid_extra_comma_recovers_profile",
+        initial: r#"{"a":1,"b":2,"c":3}"#,
+        ops: &[EditOp::InsertBefore {
+            locate: Locate::First("\"b\""),
+            text: ",",
+        }],
+        expected_keys: &["a", "b", "c"],
+        min_errors: 1,
+        requires_convergence: false,
+        expect_reparse: true,
+    };
+    let _ = run_runtime_case(recovery_case.name, recovery_case.initial, recovery_case.ops).await?;
+
+    let _ = run_runtime_summary_case(
+        "invalid_null_suffix_keeps_tail_profile",
+        r#"{"xddd":null,"he":222,"well":{}}"#,
+        &[EditOp::InsertAfter {
+            locate: Locate::First("null"),
+            text: "s",
+        }],
+    )
+    .await?;
+
+    let _ = run_runtime_diagnostic_counts(
+        "fixed_error_clears_diagnostics_profile",
+        r#"{"xddd":null,"he":222,"well":{}}"#,
+        &[
+            EditOp::InsertAfter {
+                locate: Locate::First("null"),
+                text: "s",
+            },
+            EditOp::Delete {
+                locate: Locate::First("s"),
+                len: 1,
+            },
+        ],
+    )
+    .await?;
+
+    let lines = logger.snapshot();
+    assert!(
+        !lines.is_empty(),
+        "no Measure logs captured; run this ignored profiling test in isolation"
+    );
+    let aggregate = aggregate_measure_lines(&lines);
+    assert!(
+        aggregate.parse_samples > 0,
+        "no parse Measure samples captured"
+    );
+    assert!(aggregate.lex_samples > 0, "no lex Measure samples captured");
+
+    print_measure_totals("parse", aggregate.parse_samples, &aggregate.parse);
+    print_measure_totals("lex", aggregate.lex_samples, &aggregate.lex);
     Ok(())
 }
 

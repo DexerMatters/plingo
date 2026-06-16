@@ -5,7 +5,7 @@ use crate::{
         lex::Lexer,
         parse::{
             AstToken, ParseErrorInfo, ParseForest, ParsePath, Parser,
-            data::AstBox,
+            data::ast::AstBox,
             grammar::Grammar,
             policy::{
                 DerefAstBox, DerefAstToken, DescribeProduct, GetAstTree, GetIncrementalStats,

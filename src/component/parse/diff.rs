@@ -1,11 +1,13 @@
-use std::{cmp::Ordering, collections::HashMap};
+use std::{any::TypeId, cmp::Ordering, collections::HashMap};
 
 use fluent_uri::Uri;
 
 use super::{
     ParseForest, ParsePath, ProductId,
-    data::{ErrorKind, ProductArena, ProductData, TreeArena, TreeData},
-    grammar::{NonTerminalId, Symbol, TerminalId},
+    data::{
+        green::{GreenId, TreeArena, TreeData},
+        product::{ProductArena, ProductData},
+    },
 };
 use crate::scheme::Delta;
 use crate::utils::RangeOrPoint;
@@ -60,25 +62,19 @@ impl PartialOrd for Cost {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Signature {
+enum ShapeKey {
     Node {
-        id: NonTerminalId,
-        length: usize,
-        children: Vec<Signature>,
+        green: GreenId,
+        ty: TypeId,
+        child_hashes: Vec<u64>,
     },
     Token {
-        terminal: TerminalId,
+        green: GreenId,
         fingerprint: u64,
-        length: usize,
+        ty: TypeId,
     },
     Error {
-        kind: ErrorKind,
-        node: NonTerminalId,
-        length: usize,
-        unexpected: Option<Symbol>,
-        expected: Symbol,
-        recovered: bool,
-        location: Option<usize>,
+        green: GreenId,
     },
     Missing {
         product: ProductId,
@@ -87,7 +83,7 @@ enum Signature {
 
 #[derive(Clone, Debug)]
 struct Summary {
-    signature: Signature,
+    shape: ShapeKey,
     weight: usize,
 }
 
@@ -206,82 +202,48 @@ impl<'a> DiffCx<'a> {
 
         let summary = match self.products.get(product_id) {
             Some(product) => match &product.data {
-                ProductData::Node { children, .. } => {
-                    let Some(tree) = self.trees.get(product.green) else {
-                        return self.missing_summary(product_id);
-                    };
-                    let TreeData::Node { id, .. } = &tree.data else {
-                        return self.missing_summary(product_id);
-                    };
-
-                    let child_summaries = children
+                ProductData::Node { children, ty, .. } => {
+                    let child_hashes = children
                         .iter()
                         .copied()
-                        .map(|child| self.summary(child))
+                        .map(|child| {
+                            self.products
+                                .get(child)
+                                .map_or(0, |product| product.semantic_hash())
+                        })
                         .collect::<Vec<_>>();
                     let weight = 1usize.saturating_add(
-                        child_summaries
+                        children
                             .iter()
-                            .map(|summary| summary.weight)
+                            .copied()
+                            .map(|child| self.summary(child).weight)
                             .sum::<usize>(),
                     );
                     Summary {
-                        signature: Signature::Node {
-                            id: *id,
-                            length: tree.length,
-                            children: child_summaries
-                                .into_iter()
-                                .map(|summary| summary.signature)
-                                .collect(),
+                        shape: ShapeKey::Node {
+                            green: product.green,
+                            ty: *ty,
+                            child_hashes,
                         },
                         weight,
                     }
                 }
-                ProductData::Token { fingerprint, .. } => {
-                    let Some(tree) = self.trees.get(product.green) else {
-                        return self.missing_summary(product_id);
-                    };
-                    let TreeData::Leaf { id } = &tree.data else {
-                        return self.missing_summary(product_id);
-                    };
-                    Summary {
-                        signature: Signature::Token {
-                            terminal: *id,
-                            fingerprint: *fingerprint,
-                            length: tree.length,
-                        },
-                        weight: 1,
-                    }
-                }
-                ProductData::Error => {
-                    let Some(tree) = self.trees.get(product.green) else {
-                        return self.missing_summary(product_id);
-                    };
-                    let TreeData::Error {
-                        kind,
-                        node,
-                        unexpected,
-                        expected,
-                        recovered,
-                        location,
-                        ..
-                    } = &tree.data
-                    else {
-                        return self.missing_summary(product_id);
-                    };
-                    Summary {
-                        signature: Signature::Error {
-                            kind: kind.clone(),
-                            node: *node,
-                            length: tree.length,
-                            unexpected: *unexpected,
-                            expected: *expected,
-                            recovered: *recovered,
-                            location: *location,
-                        },
-                        weight: 1,
-                    }
-                }
+                ProductData::Token {
+                    fingerprint, ty, ..
+                } => Summary {
+                    shape: ShapeKey::Token {
+                        green: product.green,
+                        fingerprint: *fingerprint,
+                        ty: *ty,
+                    },
+                    weight: 1,
+                },
+                ProductData::Error => Summary {
+                    shape: ShapeKey::Error {
+                        green: product.green,
+                    },
+                    weight: 1,
+                },
             },
             None => self.missing_summary(product_id),
         };
@@ -292,7 +254,7 @@ impl<'a> DiffCx<'a> {
 
     fn missing_summary(&self, product_id: ProductId) -> Summary {
         Summary {
-            signature: Signature::Missing {
+            shape: ShapeKey::Missing {
                 product: product_id,
             },
             weight: 1,
@@ -300,7 +262,7 @@ impl<'a> DiffCx<'a> {
     }
 
     fn same_public_shape(&mut self, old: ProductId, new: ProductId) -> bool {
-        self.summary(old).signature == self.summary(new).signature
+        self.summary(old).shape == self.summary(new).shape
     }
 
     fn weight(&mut self, product_id: ProductId) -> usize {
@@ -318,7 +280,7 @@ impl<'a> DiffCx<'a> {
 
         let old_summary = self.summary(old);
         let new_summary = self.summary(new);
-        if old_summary.signature == new_summary.signature {
+        if old_summary.shape == new_summary.shape {
             self.pair_cost_cache.insert((old, new), Cost::ZERO);
             self.pair_cost_cache.insert((new, old), Cost::ZERO);
             return Cost::ZERO;
@@ -326,21 +288,23 @@ impl<'a> DiffCx<'a> {
 
         let cost = match (self.products.get(old), self.products.get(new)) {
             (
-                Some(crate::component::parse::data::Product {
+                Some(crate::component::parse::data::product::Product {
                     data:
                         ProductData::Node {
                             children: old_children,
                             ..
                         },
                     green: old_green,
+                    ..
                 }),
-                Some(crate::component::parse::data::Product {
+                Some(crate::component::parse::data::product::Product {
                     data:
                         ProductData::Node {
                             children: new_children,
                             ..
                         },
                     green: new_green,
+                    ..
                 }),
             ) => match (self.trees.get(*old_green), self.trees.get(*new_green)) {
                 (Some(old_tree), Some(new_tree)) => match (&old_tree.data, &new_tree.data) {
@@ -354,21 +318,23 @@ impl<'a> DiffCx<'a> {
                 _ => Cost::replace(old_summary.weight, new_summary.weight),
             },
             (
-                Some(crate::component::parse::data::Product {
+                Some(crate::component::parse::data::product::Product {
                     data:
                         ProductData::Token {
                             fingerprint: old_fingerprint,
                             ..
                         },
                     green: old_green,
+                    ..
                 }),
-                Some(crate::component::parse::data::Product {
+                Some(crate::component::parse::data::product::Product {
                     data:
                         ProductData::Token {
                             fingerprint: new_fingerprint,
                             ..
                         },
                     green: new_green,
+                    ..
                 }),
             ) => match (self.trees.get(*old_green), self.trees.get(*new_green)) {
                 (Some(old_tree), Some(new_tree)) => match (&old_tree.data, &new_tree.data) {
@@ -382,13 +348,15 @@ impl<'a> DiffCx<'a> {
                 _ => Cost::replace(old_summary.weight, new_summary.weight),
             },
             (
-                Some(crate::component::parse::data::Product {
+                Some(crate::component::parse::data::product::Product {
                     data: ProductData::Error,
                     green: old_green,
+                    ..
                 }),
-                Some(crate::component::parse::data::Product {
+                Some(crate::component::parse::data::product::Product {
                     data: ProductData::Error,
                     green: new_green,
+                    ..
                 }),
             ) => match (self.trees.get(*old_green), self.trees.get(*new_green)) {
                 (Some(old_tree), Some(new_tree)) => match (&old_tree.data, &new_tree.data) {

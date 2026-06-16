@@ -1,3 +1,4 @@
+mod build;
 mod lexing;
 mod mode;
 
@@ -6,29 +7,21 @@ pub mod __macro_private;
 pub mod policy;
 
 use std::{
-    collections::HashMap,
-    error::Error,
-    fmt,
-    hash::Hash,
-    marker::PhantomData,
-    ops::Range,
+    collections::HashMap, error::Error, fmt, hash::Hash, marker::PhantomData, ops::Range,
     str::FromStr,
 };
 
 use fluent_uri::Uri;
 use plingo_macros::layer;
-use regex_automata::{
-    MatchKind,
-    dfa::{StartKind, dense::DFA},
-};
-use regex_syntax::hir::{Hir, HirKind, Look};
+use regex_automata::dfa::dense::DFA;
+use regex_syntax::hir::HirKind;
 use thiserror::Error;
 
 pub use mode::{LexerState, State, StateAction, StateInfo};
 
 use crate::{
-    component::parse::{TokenData, grammar::TerminalId},
     component::parse::identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
+    component::parse::{TokenData, grammar::TerminalId},
     scheme::{
         ActionError, Context, Delta, LayerDeltas, MiddleLayer, NonTopLayer, SnapshotId,
         SnapshotLayer,
@@ -36,7 +29,7 @@ use crate::{
     utils::{PrettyDisplay, Span},
 };
 
-use self::__macro_private::{BuildToken, StateDirective, StateRegistration, TokenSpec};
+use self::__macro_private::{BuildToken, StateRegistration, TokenSpec};
 
 pub trait TokenState: Send + Sync + 'static {
     fn display_name() -> &'static str;
@@ -357,7 +350,8 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         token_ranges: &[(usize, usize)],
     ) -> Vec<TokenData> {
         let mut out = Vec::new();
-        for (column, (&id, &(start, _end))) in token_ids.iter().zip(token_ranges.iter()).enumerate() {
+        for (column, (&id, &(start, _end))) in token_ids.iter().zip(token_ranges.iter()).enumerate()
+        {
             let Some(entry) = self.arena.get(id) else {
                 continue;
             };
@@ -417,7 +411,10 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         a.terminal == b.terminal && a.length == b.length && a.fingerprint == b.fingerprint
     }
 
-    fn build_visible_batch(old_tokens: Vec<TokenData>, new_tokens: Vec<TokenData>) -> VisibleTokenBatch {
+    fn build_visible_batch(
+        old_tokens: Vec<TokenData>,
+        new_tokens: Vec<TokenData>,
+    ) -> VisibleTokenBatch {
         let mut prefix_len = 0usize;
         while prefix_len < old_tokens.len()
             && prefix_len < new_tokens.len()
@@ -470,9 +467,12 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             let mut patterns = Vec::new();
             for spec in (registration.rules)() {
                 patterns.push(spec.regex);
-                state_tokens.push(resolve_token(spec, &state_ids)?);
+                state_tokens.push(build::resolve_token(spec, &state_ids)?);
             }
-            state_matchers.push(build_state_matcher(registration.display_name, &patterns)?);
+            state_matchers.push(build::build_state_matcher(
+                registration.display_name,
+                &patterns,
+            )?);
             tokens.push(state_tokens);
         }
 
@@ -567,7 +567,8 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         };
 
         let mut out = Vec::new();
-        for (column, (&id, &(start, end))) in token_ids.iter().zip(token_ranges.iter()).enumerate() {
+        for (column, (&id, &(start, end))) in token_ids.iter().zip(token_ranges.iter()).enumerate()
+        {
             let Some(entry) = self.arena.get(id) else {
                 continue;
             };
@@ -584,7 +585,9 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             if include {
                 match entry {
                     Entry::Token {
-                        length, terminal, value,
+                        length,
+                        terminal,
+                        value,
                     } => {
                         out.push(TokenData {
                             id,
@@ -627,13 +630,18 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         snapshot: Option<SnapshotId>,
         uri: Uri<&'static str>,
     ) -> Option<VisibleTokenBatch> {
-        self.snapshot_state(snapshot).visible_batches.get(&uri).cloned()
+        self.snapshot_state(snapshot)
+            .visible_batches
+            .get(&uri)
+            .cloned()
     }
 
     fn is_skip_terminal(&self, terminal: TerminalId) -> bool {
-        self.tokens
-            .iter()
-            .any(|state_tokens| state_tokens.iter().any(|t| t.terminal == terminal && t.skip))
+        self.tokens.iter().any(|state_tokens| {
+            state_tokens
+                .iter()
+                .any(|t| t.terminal == terminal && t.skip)
+        })
     }
 
     pub fn state_id_of<S: TokenState>(&self) -> Option<State> {
@@ -668,9 +676,8 @@ where
             let mut grouped: Vec<(Uri<&'static str>, Vec<Delta<Span, usize>>)> = Vec::new();
             for delta in deltas {
                 let uri = delta.key().uri;
-                if let Some((_, batch)) = grouped
-                    .iter_mut()
-                    .find(|(group_uri, _)| *group_uri == uri)
+                if let Some((_, batch)) =
+                    grouped.iter_mut().find(|(group_uri, _)| *group_uri == uri)
                 {
                     batch.push(delta);
                 } else {
@@ -679,9 +686,7 @@ where
             }
 
             for (_, batch) in grouped {
-                let uri_lower_deltas = self
-                    .lex_deltas(ctx, &mut working, &batch)
-                    .await?;
+                let uri_lower_deltas = self.lex_deltas(ctx, &mut working, &batch).await?;
                 lower_deltas.extend(uri_lower_deltas);
             }
 
@@ -701,33 +706,7 @@ where
     Root: Send + Sync + 'static,
     Nested: LexerRoot + 'static,
 {
-    Nested::state_registrations()
-        .into_iter()
-        .map(|registration| {
-            StateRegistration::new(
-                registration.display_name,
-                registration.type_name,
-                move || {
-                    (registration.rules)()
-                        .into_iter()
-                        .map(|spec| TokenSpec {
-                            regex: spec.regex,
-                            terminal: spec.terminal,
-                            precedence: spec.precedence,
-                            label: spec.label,
-                            action: spec.action,
-                            skip: spec.skip,
-                            build: std::sync::Arc::new(move |lexeme| {
-                                (spec.build)(lexeme).map(wrap)
-                            }),
-                            captures_context: spec.captures_context,
-                            validate: spec.validate,
-                        })
-                        .collect()
-                },
-            )
-        })
-        .collect()
+    build::lift_state_registrations(wrap)
 }
 
 #[derive(Debug, Error)]
@@ -883,90 +862,3 @@ macro_rules! impl_from_lexeme_via_parse {
 impl_from_lexeme_via_parse!(
     bool, i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64,
 );
-
-fn resolve_token<Root>(
-    spec: TokenSpec<Root>,
-    state_ids: &HashMap<&'static str, State>,
-) -> Result<ResolvedToken<Root>, LexerCreationError> {
-    let hir = regex_syntax::parse(spec.regex).map_err(|error| {
-        LexerCreationError::RegexParsingError(spec.regex.to_string(), spec.label.to_string(), error)
-    })?;
-
-    if let Some(kind) = find_unsupported_regex_features(&hir) {
-        return Err(LexerCreationError::UnsupportedRegexFeature(
-            spec.label.to_string(),
-            spec.regex.to_string(),
-            kind,
-        ));
-    }
-
-    let minimum_length = hir.properties().minimum_len().ok_or_else(|| {
-        LexerCreationError::ImpossibleToken(spec.label.to_string(), spec.regex.to_string())
-    })?;
-    if minimum_length == 0 {
-        return Err(LexerCreationError::EmptyMatchToken(
-            spec.label.to_string(),
-            spec.regex.to_string(),
-        ));
-    }
-    let maximum_length = hir.properties().maximum_len().unwrap_or(usize::MAX);
-
-    Ok(ResolvedToken {
-        terminal: spec.terminal,
-        precedence: spec.precedence,
-        label: spec.label,
-        action: resolve_action(spec.action, state_ids)?,
-        skip: spec.skip,
-        build: spec.build,
-        minimum_length,
-        maximum_length,
-        captures_context: spec.captures_context,
-        validate: spec.validate,
-    })
-}
-
-fn build_state_matcher(
-    state: &'static str,
-    patterns: &[&'static str],
-) -> Result<StateMatcher, LexerCreationError> {
-    let dfa = DFA::builder()
-        .configure(
-            DFA::config()
-                .start_kind(StartKind::Anchored)
-                .match_kind(MatchKind::All),
-        )
-        .build_many(patterns)
-        .map_err(|source| LexerCreationError::RegexMatcherBuildError { state, source })?;
-    let token_index_by_pattern = (0..patterns.len()).collect();
-    Ok(StateMatcher {
-        dfa,
-        token_index_by_pattern,
-    })
-}
-
-fn resolve_action(
-    action: StateDirective,
-    state_ids: &HashMap<&'static str, State>,
-) -> Result<StateAction, LexerCreationError> {
-    match action {
-        StateDirective::None => Ok(StateAction::None),
-        StateDirective::Enter(target) => state_ids
-            .get(target)
-            .cloned()
-            .map(StateAction::Enter)
-            .ok_or_else(|| LexerCreationError::UnknownState(target.to_string())),
-        StateDirective::Leave => Ok(StateAction::Leave),
-    }
-}
-
-fn find_unsupported_regex_features(hir: &Hir) -> Option<HirKind> {
-    match hir.kind() {
-        HirKind::Alternation(parts) | HirKind::Concat(parts) => {
-            parts.iter().find_map(find_unsupported_regex_features)
-        }
-        HirKind::Capture(_) => Some(hir.kind().clone()),
-        HirKind::Look(Look::Start) => Some(hir.kind().clone()),
-        HirKind::Empty | HirKind::Literal(_) | HirKind::Class(_) | HirKind::Look(_) => None,
-        HirKind::Repetition(rep) => find_unsupported_regex_features(&rep.sub),
-    }
-}

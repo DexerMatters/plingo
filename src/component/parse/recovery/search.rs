@@ -1,46 +1,18 @@
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Instant,
 };
 
 use crate::component::parse::{
     build::{Action, ActionSet},
     grammar::{Grammar, TerminalId},
     parsing::{ParseToken, SessionContext},
+    recovery::{RecoveryError, RecoveryResult, Repair},
 };
 
 const MIN_REAL_SHIFTS: usize = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum Repair {
-    Insert(TerminalId),
-    Delete,
-    Shift,
-    ShiftAsError,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RecoveryResult {
-    pub(crate) repairs: Vec<Repair>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RecoveryError {
-    Timeout { elapsed: Duration },
-}
-
-impl std::fmt::Display for RecoveryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Timeout { elapsed } => write!(
-                f,
-                "recovery search timed out after {:?} (no complete repair found)",
-                elapsed
-            ),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct SearchConfig {
@@ -126,11 +98,31 @@ struct ClosedStack {
     accepted: bool,
 }
 
-pub(crate) fn find_recovery(
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClosedStackKey {
+    stack: Vec<usize>,
+    lookahead: TerminalId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ShiftSuffixKey {
+    stack: Vec<usize>,
+    input: usize,
+    remaining_shifts: usize,
+}
+
+#[derive(Default)]
+struct RecoverySearchCache {
+    closed_stacks: HashMap<ClosedStackKey, Arc<[ClosedStack]>>,
+    insert_terminals: HashMap<Vec<usize>, Arc<[TerminalId]>>,
+    can_shift_suffix: HashMap<ShiftSuffixKey, bool>,
+}
+
+pub(super) fn find_recovery(
     ctx: &SessionContext<'_>,
     column: usize,
     tokens: &[ParseToken],
-    timeout: Duration,
+    timeout: std::time::Duration,
 ) -> Result<Option<RecoveryResult>, RecoveryError> {
     let start = Instant::now();
     let stacks = active_stack_paths(ctx, column);
@@ -140,6 +132,7 @@ pub(crate) fn find_recovery(
 
     let mut queue = BinaryHeap::new();
     let mut best_seen: HashMap<SearchKey, SearchRecord> = HashMap::new();
+    let mut cache = RecoverySearchCache::default();
     let mut enqueue_order = 0usize;
     for stack in stacks {
         let config = SearchConfig {
@@ -179,8 +172,16 @@ pub(crate) fn find_recovery(
             ctx.gotos,
             &item.config.stack,
             lookahead,
+            &mut cache,
         );
-        if is_viable_completion(ctx, tokens, item.config.input, &closed, &item.config) {
+        if is_viable_completion(
+            ctx,
+            tokens,
+            item.config.input,
+            &closed,
+            &item.config,
+            &mut cache,
+        ) {
             let repairs = item.config.repairs.clone();
             if solution_cost.is_none() {
                 solution_cost = Some(item.cost);
@@ -194,7 +195,7 @@ pub(crate) fn find_recovery(
             continue;
         }
 
-        for closed_stack in closed {
+        for closed_stack in closed.iter() {
             push_shift_neighbours(
                 ctx,
                 tokens,
@@ -220,6 +221,7 @@ pub(crate) fn find_recovery(
                 &item.config,
                 &closed_stack.stack,
                 item.cost,
+                &mut cache,
                 &mut queue,
                 &mut best_seen,
                 &mut enqueue_order,
@@ -295,14 +297,17 @@ fn is_viable_completion(
     ctx: &SessionContext<'_>,
     tokens: &[ParseToken],
     input: usize,
-    closed: &[ClosedStack],
+    closed: &Arc<[ClosedStack]>,
     config: &SearchConfig,
+    cache: &mut RecoverySearchCache,
 ) -> bool {
     if config.repairs.is_empty() {
         return false;
     }
-    for stack in closed {
-        if stack.accepted || can_shift_suffix(ctx, tokens, input, &stack.stack, MIN_REAL_SHIFTS) {
+    for stack in closed.iter() {
+        if stack.accepted
+            || can_shift_suffix(ctx, tokens, input, &stack.stack, MIN_REAL_SHIFTS, cache)
+        {
             return true;
         }
     }
@@ -315,44 +320,60 @@ fn can_shift_suffix(
     input: usize,
     stack: &[usize],
     remaining_shifts: usize,
+    cache: &mut RecoverySearchCache,
 ) -> bool {
+    let key = ShiftSuffixKey {
+        stack: stack.to_vec(),
+        input,
+        remaining_shifts,
+    };
+    if let Some(&cached) = cache.can_shift_suffix.get(&key) {
+        return cached;
+    }
+
     if remaining_shifts == 0 {
+        cache.can_shift_suffix.insert(key, true);
         return true;
     }
 
     let lookahead = token_at(ctx.grammar, tokens, input);
-    for closed in close_stacks(ctx.grammar, ctx.actions, ctx.gotos, stack, lookahead) {
-        if closed.accepted {
-            return true;
-        }
-
-        let Some(&state) = closed.stack.last() else {
-            continue;
-        };
-        if !action_set(ctx.grammar, ctx.actions, state, lookahead).has_shift() {
-            continue;
-        }
-
-        for next_state in shift_targets(ctx.grammar, ctx.actions, state, lookahead) {
-            let next_stack = pushed(&closed.stack, next_state);
-            let next_remaining = if lookahead == ctx.grammar.error_terminal {
-                remaining_shifts
-            } else {
-                remaining_shifts - 1
-            };
-            if can_shift_suffix(
-                ctx,
-                tokens,
-                input.saturating_add(1),
-                &next_stack,
-                next_remaining,
-            ) {
+    let result = close_stacks(ctx.grammar, ctx.actions, ctx.gotos, stack, lookahead, cache)
+        .iter()
+        .any(|closed| {
+            if closed.accepted {
                 return true;
             }
-        }
-    }
 
-    false
+            let Some(&state) = closed.stack.last() else {
+                return false;
+            };
+            if !action_set(ctx.grammar, ctx.actions, state, lookahead).has_shift() {
+                return false;
+            }
+
+            for next_state in shift_targets(ctx.grammar, ctx.actions, state, lookahead) {
+                let next_stack = pushed(&closed.stack, next_state);
+                let next_remaining = if lookahead == ctx.grammar.error_terminal {
+                    remaining_shifts
+                } else {
+                    remaining_shifts - 1
+                };
+                if can_shift_suffix(
+                    ctx,
+                    tokens,
+                    input.saturating_add(1),
+                    &next_stack,
+                    next_remaining,
+                    cache,
+                ) {
+                    return true;
+                }
+            }
+
+            false
+        });
+    cache.can_shift_suffix.insert(key, result);
+    result
 }
 
 fn push_shift_neighbours(
@@ -417,12 +438,15 @@ fn push_insert_neighbours(
     config: &SearchConfig,
     stack: &[usize],
     cost: usize,
+    cache: &mut RecoverySearchCache,
     queue: &mut BinaryHeap<QueueItem>,
     best_seen: &mut HashMap<SearchKey, SearchRecord>,
     enqueue_order: &mut usize,
 ) {
-    for terminal in insert_terminals(ctx, stack) {
-        for closed in close_stacks(ctx.grammar, ctx.actions, ctx.gotos, stack, terminal) {
+    for terminal in insert_terminals(ctx, stack, cache).iter().copied() {
+        for closed in
+            close_stacks(ctx.grammar, ctx.actions, ctx.gotos, stack, terminal, cache).iter()
+        {
             let Some(&state) = closed.stack.last() else {
                 continue;
             };
@@ -554,6 +578,29 @@ fn close_stacks(
     gotos: &[Option<usize>],
     stack: &[usize],
     lookahead: TerminalId,
+    cache: &mut RecoverySearchCache,
+) -> Arc<[ClosedStack]> {
+    let key = ClosedStackKey {
+        stack: stack.to_vec(),
+        lookahead,
+    };
+    if let Some(cached) = cache.closed_stacks.get(&key) {
+        return Arc::clone(cached);
+    }
+
+    let out = Arc::<[ClosedStack]>::from(compute_closed_stacks(
+        grammar, actions, gotos, stack, lookahead,
+    ));
+    cache.closed_stacks.insert(key, Arc::clone(&out));
+    out
+}
+
+fn compute_closed_stacks(
+    grammar: &Grammar,
+    actions: &[ActionSet],
+    gotos: &[Option<usize>],
+    stack: &[usize],
+    lookahead: TerminalId,
 ) -> Vec<ClosedStack> {
     let mut out = Vec::new();
     let mut queue = VecDeque::from([stack.to_vec()]);
@@ -603,14 +650,22 @@ fn close_stacks(
     out
 }
 
-fn insert_terminals(ctx: &SessionContext<'_>, stack: &[usize]) -> Vec<TerminalId> {
+fn insert_terminals(
+    ctx: &SessionContext<'_>,
+    stack: &[usize],
+    cache: &mut RecoverySearchCache,
+) -> Arc<[TerminalId]> {
+    if let Some(cached) = cache.insert_terminals.get(stack) {
+        return Arc::clone(cached);
+    }
+
     let mut terminals = Vec::new();
     for index in 0..ctx.grammar.terminal_count() {
         let terminal = ctx.grammar.terminal_at(index);
         if terminal == ctx.grammar.eof {
             continue;
         }
-        let can_shift = close_stacks(ctx.grammar, ctx.actions, ctx.gotos, stack, terminal)
+        let can_shift = close_stacks(ctx.grammar, ctx.actions, ctx.gotos, stack, terminal, cache)
             .iter()
             .any(|closed| {
                 closed.stack.last().is_some_and(|state| {
@@ -621,6 +676,10 @@ fn insert_terminals(ctx: &SessionContext<'_>, stack: &[usize]) -> Vec<TerminalId
             terminals.push(terminal);
         }
     }
+    let terminals = Arc::<[TerminalId]>::from(terminals);
+    cache
+        .insert_terminals
+        .insert(stack.to_vec(), Arc::clone(&terminals));
     terminals
 }
 

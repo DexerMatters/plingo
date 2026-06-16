@@ -8,7 +8,11 @@ use crate::{
     component::parse::{
         AstToken, ErrorKind, ParseErrorInfo, ParserConfig, TokenData,
         build::Action,
-        data::{AstArena, AstBox, Product, ProductArena, ProductData, TreeArena},
+        data::{
+            ast::{AstArena, AstBox},
+            green::TreeArena,
+            product::{Product, ProductArena, ProductData},
+        },
         diff,
         grammar::{ERROR_TERMINAL, Grammar, Symbol},
         identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
@@ -397,7 +401,7 @@ fn test_parse_session_accepts_streamed_number_then_eof() {
     let green = parser.session_green(uri, product.green).unwrap();
     assert!(matches!(
         green.data,
-        crate::component::parse::data::TreeData::Node { .. }
+        crate::component::parse::data::green::TreeData::Node { .. }
     ));
 }
 
@@ -455,7 +459,7 @@ fn test_parse_session_accepts_nullable_grammar_on_eof() {
     let green = parser.session_green(uri, product.green).unwrap();
     assert!(matches!(
         green.data,
-        crate::component::parse::data::TreeData::Node { .. }
+        crate::component::parse::data::green::TreeData::Node { .. }
     ));
 }
 

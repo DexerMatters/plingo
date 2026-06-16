@@ -8,8 +8,10 @@ use crate::component::{
     parse::{
         build::{ActionSet, Conflict, LR1State, LRStateId},
         data::{
-            AstArena, AstBox, GreenTree, GssArena, Product, ProductArena, ProductData, ProductId,
-            TokenEntryId, TreeArena,
+            ast::{AstArena, AstBox, TokenEntryId},
+            green::{GreenTree, TreeArena},
+            gss::GssArena,
+            product::{Product, ProductArena, ProductData, ProductId},
         },
         grammar::{Grammar, Symbol, TerminalId},
         parsing::{ParserSessionState, SessionContext},
@@ -32,7 +34,8 @@ pub(crate) mod parsing;
 pub mod policy;
 pub(crate) mod recovery;
 
-pub use data::{AstToken, ErrorKind, ParseErrorInfo};
+pub use data::ast::AstToken;
+pub use data::green::{ErrorKind, ParseErrorInfo};
 pub use identity::TokenFingerprint;
 pub use parsing::ParseError;
 

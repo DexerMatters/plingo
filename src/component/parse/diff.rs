@@ -327,54 +327,60 @@ impl<'a> DiffCx<'a> {
         let cost = match (self.products.get(old), self.products.get(new)) {
             (
                 Some(crate::component::parse::data::Product {
-                    data: ProductData::Node { children: old_children, .. },
+                    data:
+                        ProductData::Node {
+                            children: old_children,
+                            ..
+                        },
                     green: old_green,
                 }),
                 Some(crate::component::parse::data::Product {
-                    data: ProductData::Node { children: new_children, .. },
+                    data:
+                        ProductData::Node {
+                            children: new_children,
+                            ..
+                        },
                     green: new_green,
                 }),
-            ) => {
-                match (self.trees.get(*old_green), self.trees.get(*new_green)) {
-                    (Some(old_tree), Some(new_tree)) => match (&old_tree.data, &new_tree.data) {
+            ) => match (self.trees.get(*old_green), self.trees.get(*new_green)) {
+                (Some(old_tree), Some(new_tree)) => match (&old_tree.data, &new_tree.data) {
                     (TreeData::Node { id: old_id, .. }, TreeData::Node { id: new_id, .. })
                         if old_id == new_id =>
                     {
                         self.sequence_cost(old_children, new_children)
                     }
-                        _ => Cost::replace(old_summary.weight, new_summary.weight),
-                    },
                     _ => Cost::replace(old_summary.weight, new_summary.weight),
-                }
-            }
+                },
+                _ => Cost::replace(old_summary.weight, new_summary.weight),
+            },
             (
                 Some(crate::component::parse::data::Product {
-                    data: ProductData::Token {
-                        fingerprint: old_fingerprint,
-                        ..
-                    },
+                    data:
+                        ProductData::Token {
+                            fingerprint: old_fingerprint,
+                            ..
+                        },
                     green: old_green,
                 }),
                 Some(crate::component::parse::data::Product {
-                    data: ProductData::Token {
-                        fingerprint: new_fingerprint,
-                        ..
-                    },
+                    data:
+                        ProductData::Token {
+                            fingerprint: new_fingerprint,
+                            ..
+                        },
                     green: new_green,
                 }),
-            ) => {
-                match (self.trees.get(*old_green), self.trees.get(*new_green)) {
-                    (Some(old_tree), Some(new_tree)) => match (&old_tree.data, &new_tree.data) {
+            ) => match (self.trees.get(*old_green), self.trees.get(*new_green)) {
+                (Some(old_tree), Some(new_tree)) => match (&old_tree.data, &new_tree.data) {
                     (TreeData::Leaf { id: old_id }, TreeData::Leaf { id: new_id })
                         if old_id == new_id && old_fingerprint == new_fingerprint =>
                     {
                         Cost::ZERO
                     }
-                        _ => Cost::replace(old_summary.weight, new_summary.weight),
-                    },
                     _ => Cost::replace(old_summary.weight, new_summary.weight),
-                }
-            }
+                },
+                _ => Cost::replace(old_summary.weight, new_summary.weight),
+            },
             (
                 Some(crate::component::parse::data::Product {
                     data: ProductData::Error,
@@ -384,9 +390,8 @@ impl<'a> DiffCx<'a> {
                     data: ProductData::Error,
                     green: new_green,
                 }),
-            ) => {
-                match (self.trees.get(*old_green), self.trees.get(*new_green)) {
-                    (Some(old_tree), Some(new_tree)) => match (&old_tree.data, &new_tree.data) {
+            ) => match (self.trees.get(*old_green), self.trees.get(*new_green)) {
+                (Some(old_tree), Some(new_tree)) => match (&old_tree.data, &new_tree.data) {
                     (
                         TreeData::Error {
                             kind: old_kind,
@@ -414,12 +419,11 @@ impl<'a> DiffCx<'a> {
                         && old_location == new_location =>
                     {
                         Cost::ZERO
-                        }
-                        _ => Cost::replace(old_summary.weight, new_summary.weight),
-                    },
+                    }
                     _ => Cost::replace(old_summary.weight, new_summary.weight),
-                }
-            }
+                },
+                _ => Cost::replace(old_summary.weight, new_summary.weight),
+            },
             _ => Cost::replace(old_summary.weight, new_summary.weight),
         };
 
@@ -524,13 +528,14 @@ impl<'a> DiffCx<'a> {
             for j in (0..cols).rev() {
                 let delete = Cost::delete(self.weight(old_mid[i])).add(costs[i + 1][j]);
                 let insert = Cost::insert(self.weight(new_mid[j])).add(costs[i][j + 1]);
-                let pair = self.diff_cost(old_mid[i], new_mid[j]).add(costs[i + 1][j + 1]);
+                let pair = self
+                    .diff_cost(old_mid[i], new_mid[j])
+                    .add(costs[i + 1][j + 1]);
 
                 let mut best = (pair, Step::Pair);
                 for candidate in [(delete, Step::Delete), (insert, Step::Insert)] {
                     let ordering = candidate.0.cmp(&best.0);
-                    if ordering.is_lt()
-                        || (ordering.is_eq() && candidate.1.rank() < best.1.rank())
+                    if ordering.is_lt() || (ordering.is_eq() && candidate.1.rank() < best.1.rank())
                     {
                         best = candidate;
                     }
@@ -614,10 +619,21 @@ impl<'a> DiffCx<'a> {
             return;
         };
 
-        match (&old_product.data, &new_product.data, &old_tree.data, &new_tree.data) {
+        match (
+            &old_product.data,
+            &new_product.data,
+            &old_tree.data,
+            &new_tree.data,
+        ) {
             (
-                ProductData::Node { children: old_children, .. },
-                ProductData::Node { children: new_children, .. },
+                ProductData::Node {
+                    children: old_children,
+                    ..
+                },
+                ProductData::Node {
+                    children: new_children,
+                    ..
+                },
                 TreeData::Node { id: old_id, .. },
                 TreeData::Node { id: new_id, .. },
             ) if old_id == new_id => {
@@ -631,7 +647,12 @@ impl<'a> DiffCx<'a> {
             ) if old_id == new_id => {
                 replace_node(new_pid, path, uri, deltas);
             }
-            (ProductData::Error, ProductData::Error, TreeData::Error { .. }, TreeData::Error { .. }) => {
+            (
+                ProductData::Error,
+                ProductData::Error,
+                TreeData::Error { .. },
+                TreeData::Error { .. },
+            ) => {
                 replace_node(new_pid, path, uri, deltas);
             }
             _ => replace_node(new_pid, path, uri, deltas),
@@ -675,14 +696,25 @@ impl<'a> DiffCx<'a> {
 
         if old_mid.is_empty() {
             for (index, &pid) in new_mid.iter().enumerate() {
-                self.emit_insert(parent_path, prefix_offset + old_start + index, pid, uri.clone(), deltas);
+                self.emit_insert(
+                    parent_path,
+                    prefix_offset + old_start + index,
+                    pid,
+                    uri.clone(),
+                    deltas,
+                );
             }
             return;
         }
 
         if new_mid.is_empty() {
             for (index, _) in old_mid.iter().enumerate() {
-                self.emit_delete(parent_path, prefix_offset + old_start + index, uri.clone(), deltas);
+                self.emit_delete(
+                    parent_path,
+                    prefix_offset + old_start + index,
+                    uri.clone(),
+                    deltas,
+                );
             }
             return;
         }
@@ -710,7 +742,13 @@ impl<'a> DiffCx<'a> {
             let step = plan.steps[i][j];
             match step {
                 Step::Pair => {
-                    self.diff_product(old_mid[i], new_mid[j], &path_at(parent_path, slot), uri.clone(), deltas);
+                    self.diff_product(
+                        old_mid[i],
+                        new_mid[j],
+                        &path_at(parent_path, slot),
+                        uri.clone(),
+                        deltas,
+                    );
                     i += 1;
                     j += 1;
                 }

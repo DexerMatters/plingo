@@ -5,8 +5,7 @@ use std::{
 
 use super::{
     data::{
-        ErrorKind, GssArena, GssNodeId, ParseErrorInfo, ProductArena, ProductData, ProductId,
-        TreeArena, TreeData,
+        ErrorKind, GssArena, GssNodeId, ProductArena, ProductData, ProductId, TreeArena, TreeData,
     },
     grammar::Symbol,
     parsing::ParseColumn,
@@ -14,7 +13,6 @@ use super::{
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BoundaryCheckpoint {
-    pub column_index: usize,
     pub frontier_key: u64,
     pub semantic_key: u64,
     pub accepted_key: u64,
@@ -33,7 +31,6 @@ impl PartialEq for BoundaryCheckpoint {
 impl Eq for BoundaryCheckpoint {}
 
 pub(crate) fn checkpoint_for_column(
-    column_index: usize,
     column: &ParseColumn,
     gss: &GssArena,
     products: &ProductArena,
@@ -46,7 +43,6 @@ pub(crate) fn checkpoint_for_column(
     let frontier_semantic_key = frontier_semantic_hash(column, gss, products, trees);
 
     BoundaryCheckpoint {
-        column_index,
         frontier_key,
         semantic_key: hash_value(&(
             frontier_key,
@@ -142,14 +138,7 @@ fn frontier_semantic_set_hash(
 ) -> u64 {
     let mut hashes = nodes
         .map(|node_id| {
-            frontier_semantic_node_hash(
-                node_id,
-                gss,
-                products,
-                trees,
-                node_memo,
-                product_memo,
-            )
+            frontier_semantic_node_hash(node_id, gss, products, trees, node_memo, product_memo)
         })
         .collect::<Vec<_>>();
     hashes.sort_unstable();
@@ -294,8 +283,4 @@ fn hash_value<T: Hash + ?Sized>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
-}
-
-pub(crate) fn diagnostics_hash(diagnostics: &[ParseErrorInfo]) -> u64 {
-    hash_value(diagnostics)
 }

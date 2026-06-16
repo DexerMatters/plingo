@@ -7,9 +7,11 @@ use crate::{
             AstToken, GetParseTokens, IncrementalParseStats, ParseErrorInfo, ParseForest,
             ParsePath, Parser, ParserConfig, TokenData,
             data::{AstArena, AstBox, ProductData},
-            identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
             grammar::Grammar,
-            policy::{DerefAstBox, DerefAstToken, GetAstTree, GetIncrementalStats, GetParseDiagnostics},
+            identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
+            policy::{
+                DerefAstBox, DerefAstToken, GetAstTree, GetIncrementalStats, GetParseDiagnostics,
+            },
         },
         source::Source,
     },
@@ -497,7 +499,9 @@ fn token_data_from_entries(entries: &[(usize, Entry<JsonToken>, usize, usize)]) 
         .enumerate()
         .map(|(column, (id, entry, start, _end))| match entry {
             Entry::Token {
-                length, terminal, value,
+                length,
+                terminal,
+                value,
             } => TokenData {
                 id: *id,
                 terminal: Some(*terminal),
@@ -559,10 +563,11 @@ fn apply_edit(
         }
         EditOp::InsertAfter { locate, text } => {
             let pos = find_location(current, locate)?;
-            let at = pos + match locate {
-                Locate::First(needle) | Locate::Last(needle) => needle.len(),
-                Locate::Occurrence { needle, .. } => needle.len(),
-            };
+            let at = pos
+                + match locate {
+                    Locate::First(needle) | Locate::Last(needle) => needle.len(),
+                    Locate::Occurrence { needle, .. } => needle.len(),
+                };
             current.insert_str(at, text);
             Ok(Delta::Insert {
                 key: Span::new_uri(uri, at, at)?,
@@ -609,8 +614,13 @@ fn build_direct_case(
     initial: &str,
     ops: &[EditOp],
     config: ParserConfig,
-) -> anyhow::Result<(JsonDirectParser, Lexer<JsonToken>, Uri<&'static str>, Vec<TokenData>, String)>
-{
+) -> anyhow::Result<(
+    JsonDirectParser,
+    Lexer<JsonToken>,
+    Uri<&'static str>,
+    Vec<TokenData>,
+    String,
+)> {
     let uri = Span::new("test://json-comprehensive", 0, 0)?.uri;
     let (final_source, _) = apply_edits(initial, ops, uri.clone())?;
     let parser = Grammar::from_spec::<JsonValue>().build_lr1_with_config::<JsonToken, ()>(config);
@@ -786,9 +796,7 @@ async fn runtime_summary(ctx: &Context, root: AstBox<JsonValue>) -> anyhow::Resu
         _ => Vec::new(),
     };
     let diagnostics = ctx
-        .post::<JsonRuntimeParser, GetParseDiagnostics>(GetParseDiagnostics(
-            root.uri.clone(),
-        ))
+        .post::<JsonRuntimeParser, GetParseDiagnostics>(GetParseDiagnostics(root.uri.clone()))
         .await?;
     let errors = diagnostics.len();
     Ok(JsonSummary { keys, errors })
@@ -844,7 +852,12 @@ async fn run_runtime_case(
         .finish(debug_sink);
     runtime.run().await?;
 
-    let uri = Span::new(format!("test://json-comprehensive-runtime/{case_name}"), 0, 0)?.uri;
+    let uri = Span::new(
+        format!("test://json-comprehensive-runtime/{case_name}"),
+        0,
+        0,
+    )?
+    .uri;
     source_tx
         .send(Delta::Insert {
             key: Span::new_uri(uri.clone(), 0, 0)?,
@@ -924,12 +937,16 @@ async fn run_runtime_batched_case(
         .finish(debug_sink);
     runtime.run().await?;
 
-    let uri = Span::new(format!("test://json-comprehensive-runtime/{case_name}"), 0, 0)?.uri;
-    source_tx
-        .try_send(Delta::Insert {
-            key: Span::new_uri(uri.clone(), 0, 0)?,
-            value: initial.to_string(),
-        })?;
+    let uri = Span::new(
+        format!("test://json-comprehensive-runtime/{case_name}"),
+        0,
+        0,
+    )?
+    .uri;
+    source_tx.try_send(Delta::Insert {
+        key: Span::new_uri(uri.clone(), 0, 0)?,
+        value: initial.to_string(),
+    })?;
 
     let mut batches = vec![recv_non_empty_parse_batch(&mut sink_rx).await?];
     let mut stats = Vec::new();
@@ -962,10 +979,8 @@ async fn run_runtime_batched_case(
         "case {} runtime token stream diverged from fresh lexing",
         case_name
     );
-    let mut direct_parser =
-        Grammar::from_spec::<JsonValue>().build_lr1_with_config::<JsonToken, ()>(
-            ParserConfig::default(),
-        );
+    let mut direct_parser = Grammar::from_spec::<JsonValue>()
+        .build_lr1_with_config::<JsonToken, ()>(ParserConfig::default());
     direct_parser
         .parse_tokens_at(uri.clone(), &token_data)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -990,7 +1005,14 @@ async fn run_runtime_batched_case(
     }
     let summary = runtime_summary(&ctx, roots[0]).await?;
     runtime.shutdown().await;
-    Ok((summary, batches, stats, current, token_data.len(), first_eof))
+    Ok((
+        summary,
+        batches,
+        stats,
+        current,
+        token_data.len(),
+        first_eof,
+    ))
 }
 
 async fn run_runtime_summary_case(
@@ -1017,7 +1039,12 @@ async fn run_runtime_summary_case(
         .finish(debug_sink);
     runtime.run().await?;
 
-    let uri = Span::new(format!("test://json-comprehensive-runtime/{case_name}"), 0, 0)?.uri;
+    let uri = Span::new(
+        format!("test://json-comprehensive-runtime/{case_name}"),
+        0,
+        0,
+    )?
+    .uri;
     source_tx
         .send(Delta::Insert {
             key: Span::new_uri(uri.clone(), 0, 0)?,
@@ -1076,7 +1103,12 @@ async fn run_runtime_diagnostic_counts(
         .finish(debug_sink);
     runtime.run().await?;
 
-    let uri = Span::new(format!("test://json-comprehensive-runtime/{case_name}"), 0, 0)?.uri;
+    let uri = Span::new(
+        format!("test://json-comprehensive-runtime/{case_name}"),
+        0,
+        0,
+    )?
+    .uri;
     source_tx
         .send(Delta::Insert {
             key: Span::new_uri(uri.clone(), 0, 0)?,
@@ -1110,6 +1142,81 @@ async fn run_runtime_diagnostic_counts(
     Ok(counts)
 }
 
+fn visible_token_boundary_positions(source: &str) -> anyhow::Result<Vec<usize>> {
+    let mut lexer = Lexer::<JsonToken>::new()?;
+    let entries = collect_entries(&mut lexer, source);
+    let mut positions = vec![0, source.len()];
+
+    for (_, entry, start, end) in entries {
+        if !matches!(entry, Entry::EOF) {
+            positions.push(start);
+            positions.push(end);
+        }
+    }
+
+    positions.sort_unstable();
+    positions.dedup();
+    Ok(positions)
+}
+
+async fn runtime_token_data(
+    ctx: &Context,
+    uri: Uri<&'static str>,
+) -> anyhow::Result<Vec<TokenData>> {
+    type Jl = Lexer<JsonToken, JsonRuntimeParser>;
+    Ok(ctx
+        .post::<Jl, GetParseTokens>(GetParseTokens(Span {
+            uri,
+            range: RangeOrPoint::Range(0, usize::MAX),
+        }))
+        .await?)
+}
+
+async fn assert_runtime_matches_fresh_parse(
+    ctx: &Context,
+    uri: Uri<&'static str>,
+    source: &str,
+    label: &str,
+) -> anyhow::Result<JsonSummary> {
+    let token_data = runtime_token_data(ctx, uri.clone()).await?;
+    let mut fresh_lexer = Lexer::<JsonToken>::new()?;
+    let fresh_entries = collect_entries(&mut fresh_lexer, source);
+    let expected_token_data = token_data_from_entries(&fresh_entries);
+    assert_eq!(
+        token_data_shape(&token_data),
+        token_data_shape(&expected_token_data),
+        "{label}: runtime token stream diverged from fresh lexing"
+    );
+
+    let mut direct_parser = Grammar::from_spec::<JsonValue>()
+        .build_lr1_with_config::<JsonToken, ()>(ParserConfig::default());
+    direct_parser
+        .parse_tokens_at(uri.clone(), &token_data)
+        .map_err(|e| anyhow::anyhow!("{label}: {}", e))?;
+    let direct = direct_summary(&direct_parser, &token_data, source, uri.clone())?;
+
+    let root_path = ParsePath {
+        uri: uri.clone(),
+        path: Vec::new(),
+        range: RangeOrPoint::Point(0),
+    };
+    let roots = ctx
+        .post::<JsonRuntimeParser, GetAstTree<JsonValue>>(GetAstTree(root_path, PhantomData))
+        .await?;
+    assert_eq!(
+        roots.len(),
+        1,
+        "{label}: expected exactly one runtime root, found {}",
+        roots.len()
+    );
+    let runtime = runtime_summary(ctx, roots[0]).await?;
+    assert_eq!(
+        runtime, direct,
+        "{label}: runtime parse summary diverged from fresh direct parse"
+    );
+    Ok(runtime)
+}
+
 fn assert_summary(case: &EditCase, summary: &JsonSummary) {
     let expected_keys = case
         .expected_keys
@@ -1132,7 +1239,10 @@ fn assert_summary(case: &EditCase, summary: &JsonSummary) {
 
 #[test]
 fn json_syntax_comprehensive_edit_matrix() -> anyhow::Result<()> {
-    for case in json_edit_cases().into_iter().filter(|case| case.min_errors == 0) {
+    for case in json_edit_cases()
+        .into_iter()
+        .filter(|case| case.min_errors == 0)
+    {
         let (mut parser, _lexer, uri, token_data, final_source) =
             build_direct_case(case.initial, case.ops, ParserConfig::default())?;
         parser
@@ -1200,8 +1310,8 @@ async fn json_runtime_comprehensive_edit_matrix() -> anyhow::Result<()> {
     for case in json_runtime_cases() {
         let (summary, batches, stats, final_source) =
             run_runtime_case(case.name, case.initial, case.ops)
-            .await
-            .map_err(|e| anyhow::anyhow!("case {} failed: {e}", case.name))?;
+                .await
+                .map_err(|e| anyhow::anyhow!("case {} failed: {e}", case.name))?;
         assert_summary(&case, &summary);
         assert!(
             batches.iter().any(|batch| !batch.is_empty()),
@@ -1281,7 +1391,10 @@ async fn json_runtime_batched_large_append_matrix() -> anyhow::Result<()> {
         "case {} expected parser activity but got a skip-only edit",
         case.name
     );
-    assert_eq!(final_source, r#"{"a":1,"j":true,"k":[1,2,3],"l":{"a":1,"b":2},"m":null}"#);
+    assert_eq!(
+        final_source,
+        r#"{"a":1,"j":true,"k":[1,2,3],"l":{"a":1,"b":2},"m":null}"#
+    );
     Ok(())
 }
 
@@ -1320,10 +1433,9 @@ async fn json_runtime_null_suffix_preserves_tail() -> anyhow::Result<()> {
         expect_reparse: true,
     };
 
-    let (summary, final_source) =
-        run_runtime_summary_case(case.name, case.initial, case.ops)
-            .await
-            .map_err(|e| anyhow::anyhow!("case {} failed: {e}", case.name))?;
+    let (summary, final_source) = run_runtime_summary_case(case.name, case.initial, case.ops)
+        .await
+        .map_err(|e| anyhow::anyhow!("case {} failed: {e}", case.name))?;
     assert_summary(&case, &summary);
     assert_eq!(final_source, r#"{"xddd":nulls,"he":222,"well":{}}"#);
     Ok(())
@@ -1344,10 +1456,9 @@ async fn json_runtime_null_suffix_preserves_tail_w() -> anyhow::Result<()> {
         expect_reparse: true,
     };
 
-    let (summary, final_source) =
-        run_runtime_summary_case(case.name, case.initial, case.ops)
-            .await
-            .map_err(|e| anyhow::anyhow!("case {} failed: {e}", case.name))?;
+    let (summary, final_source) = run_runtime_summary_case(case.name, case.initial, case.ops)
+        .await
+        .map_err(|e| anyhow::anyhow!("case {} failed: {e}", case.name))?;
     assert_summary(&case, &summary);
     assert_eq!(final_source, r#"{"xddd":nullw,"he":222,"well":{}}"#);
     Ok(())
@@ -1372,5 +1483,347 @@ async fn json_runtime_fixed_error_clears_diagnostics() -> anyhow::Result<()> {
     .await?;
 
     assert_eq!(counts, vec![0, 1, 0]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn json_runtime_skip_token_boundary_stress_is_parse_noop() -> anyhow::Result<()> {
+    let initial =
+        r#"{"alpha":1,"beta":[true,false,null,{"z":"q"}],"gamma":{"inner":[-1,2,3]},"empty":[]}"#;
+    let expected_summary = JsonSummary {
+        keys: ["alpha", "beta", "gamma", "empty"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        errors: 0,
+    };
+    let boundaries = visible_token_boundary_positions(initial)?;
+    assert!(
+        boundaries.len() > 30,
+        "stress input should expose many token boundaries"
+    );
+
+    let (source_tx, source_rx) = mpsc::channel(256);
+    let (sink_tx, mut sink_rx) = mpsc::channel(256);
+    let debug_sink = debug_sink!(|_ctx, deltas| {
+        let sink_tx = sink_tx.clone();
+        async move {
+            let _ = sink_tx.send(deltas.clone()).await;
+            Ok(())
+        }
+    });
+    let parser = Grammar::from_spec::<JsonValue>().build_lr1::<JsonToken, JsonSink>();
+    type Jl = Lexer<JsonToken, JsonRuntimeParser>;
+    let mut runtime = Runtime::new()
+        .with(Source::new(source_rx))
+        .with(Jl::new()?)
+        .with(parser)
+        .finish(debug_sink);
+    runtime.run().await?;
+
+    let uri = Span::new("test://json-skip-boundary-stress", 0, 0)?.uri;
+    source_tx
+        .send(Delta::Insert {
+            key: Span::new_uri(uri.clone(), 0, 0)?,
+            value: initial.to_string(),
+        })
+        .await?;
+    let initial_batch = recv_non_empty_parse_batch(&mut sink_rx).await?;
+    assert!(
+        !initial_batch.is_empty(),
+        "initial parse should emit root insertion"
+    );
+
+    let mut current = initial.to_string();
+    let summary =
+        assert_runtime_matches_fresh_parse(&runtime.context(), uri.clone(), &current, "initial")
+            .await?;
+    assert_eq!(summary, expected_summary);
+
+    let skip_texts = [" ", "\t", "\n", " \n\t "];
+    for (index, boundary) in boundaries.iter().copied().enumerate() {
+        let skip = skip_texts[index % skip_texts.len()];
+        let label = format!("boundary {index} at byte {boundary}");
+
+        current.insert_str(boundary, skip);
+        source_tx
+            .send(Delta::Insert {
+                key: Span::new_uri(uri.clone(), boundary, boundary)?,
+                value: skip.to_string(),
+            })
+            .await?;
+        let insert_batch = recv_non_empty_parse_batch(&mut sink_rx).await?;
+        assert!(
+            insert_batch.is_empty(),
+            "{label}: skip-token insertion emitted {} parse delta(s)",
+            insert_batch.len()
+        );
+        let summary =
+            assert_runtime_matches_fresh_parse(&runtime.context(), uri.clone(), &current, &label)
+                .await?;
+        assert_eq!(summary, expected_summary, "{label}: summary changed");
+
+        current.replace_range(boundary..boundary + skip.len(), "");
+        source_tx
+            .send(Delta::Delete {
+                key: Span::new_uri(uri.clone(), boundary, boundary + skip.len())?,
+            })
+            .await?;
+        let delete_batch = recv_non_empty_parse_batch(&mut sink_rx).await?;
+        assert!(
+            delete_batch.is_empty(),
+            "{label}: skip-token deletion emitted {} parse delta(s)",
+            delete_batch.len()
+        );
+        let summary = assert_runtime_matches_fresh_parse(
+            &runtime.context(),
+            uri.clone(),
+            &current,
+            &format!("{label} delete"),
+        )
+        .await?;
+        assert_eq!(summary, expected_summary, "{label}: delete changed summary");
+    }
+
+    runtime.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn json_runtime_extreme_mixed_edits_match_fresh_parse_after_each_step() -> anyhow::Result<()>
+{
+    let initial =
+        r#"{"alpha":1,"beta":[true,false,null],"nil":null,"gamma":{"inner":"x"},"tail":0}"#;
+    let (source_tx, source_rx) = mpsc::channel(256);
+    let (sink_tx, mut sink_rx) = mpsc::channel(256);
+    let debug_sink = debug_sink!(|_ctx, deltas| {
+        let sink_tx = sink_tx.clone();
+        async move {
+            let _ = sink_tx.send(deltas.clone()).await;
+            Ok(())
+        }
+    });
+    let parser = Grammar::from_spec::<JsonValue>().build_lr1::<JsonToken, JsonSink>();
+    type Jl = Lexer<JsonToken, JsonRuntimeParser>;
+    let mut runtime = Runtime::new()
+        .with(Source::new(source_rx))
+        .with(Jl::new()?)
+        .with(parser)
+        .finish(debug_sink);
+    runtime.run().await?;
+
+    let uri = Span::new("test://json-extreme-mixed-edits", 0, 0)?.uri;
+    source_tx
+        .send(Delta::Insert {
+            key: Span::new_uri(uri.clone(), 0, 0)?,
+            value: initial.to_string(),
+        })
+        .await?;
+    let initial_batch = recv_non_empty_parse_batch(&mut sink_rx).await?;
+    assert!(
+        !initial_batch.is_empty(),
+        "initial parse should emit root insertion"
+    );
+
+    let mut current = initial.to_string();
+    let initial_summary =
+        assert_runtime_matches_fresh_parse(&runtime.context(), uri.clone(), &current, "initial")
+            .await?;
+    assert_eq!(
+        initial_summary,
+        JsonSummary {
+            keys: ["alpha", "beta", "nil", "gamma", "tail"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            errors: 0,
+        }
+    );
+
+    struct Step {
+        label: &'static str,
+        op: EditOp,
+        expect_empty_batch: bool,
+        expected_keys: &'static [&'static str],
+        expected_errors: usize,
+    }
+
+    let steps = [
+        Step {
+            label: "skip before beta",
+            op: EditOp::InsertBefore {
+                locate: Locate::First("\"beta\""),
+                text: "\n\t ",
+            },
+            expect_empty_batch: true,
+            expected_keys: &["alpha", "beta", "nil", "gamma", "tail"],
+            expected_errors: 0,
+        },
+        Step {
+            label: "delete skip before beta",
+            op: EditOp::Delete {
+                locate: Locate::First("\n\t "),
+                len: 3,
+            },
+            expect_empty_batch: true,
+            expected_keys: &["alpha", "beta", "nil", "gamma", "tail"],
+            expected_errors: 0,
+        },
+        Step {
+            label: "rename first key inside string token",
+            op: EditOp::InsertAfter {
+                locate: Locate::First("alpha"),
+                text: "_long",
+            },
+            expect_empty_batch: false,
+            expected_keys: &["alpha_long", "beta", "nil", "gamma", "tail"],
+            expected_errors: 0,
+        },
+        Step {
+            label: "grow first number token",
+            op: EditOp::InsertAfter {
+                locate: Locate::First(":1"),
+                text: "23",
+            },
+            expect_empty_batch: false,
+            expected_keys: &["alpha_long", "beta", "nil", "gamma", "tail"],
+            expected_errors: 0,
+        },
+        Step {
+            label: "append nested object to array",
+            op: EditOp::InsertBefore {
+                locate: Locate::First("]"),
+                text: r#",{"deep":[1,2,3]}"#,
+            },
+            expect_empty_batch: false,
+            expected_keys: &["alpha_long", "beta", "nil", "gamma", "tail"],
+            expected_errors: 0,
+        },
+        Step {
+            label: "insert lexer garbage after null",
+            op: EditOp::InsertAfter {
+                locate: Locate::Occurrence {
+                    needle: "null",
+                    index: 1,
+                },
+                text: "oops",
+            },
+            expect_empty_batch: true,
+            expected_keys: &["alpha_long", "beta", "nil", "gamma", "tail"],
+            expected_errors: 1,
+        },
+        Step {
+            label: "delete lexer garbage",
+            op: EditOp::Delete {
+                locate: Locate::First("oops"),
+                len: 4,
+            },
+            expect_empty_batch: true,
+            expected_keys: &["alpha_long", "beta", "nil", "gamma", "tail"],
+            expected_errors: 0,
+        },
+        Step {
+            label: "delete whole trailing member",
+            op: EditOp::Delete {
+                locate: Locate::First(r#","tail":0"#),
+                len: 9,
+            },
+            expect_empty_batch: false,
+            expected_keys: &["alpha_long", "beta", "nil", "gamma"],
+            expected_errors: 0,
+        },
+        Step {
+            label: "insert replacement trailing object member",
+            op: EditOp::InsertBefore {
+                locate: Locate::Last("}"),
+                text: r#","omega":{"x":false}"#,
+            },
+            expect_empty_batch: false,
+            expected_keys: &["alpha_long", "beta", "nil", "gamma", "omega"],
+            expected_errors: 0,
+        },
+        Step {
+            label: "skip at end of document",
+            op: EditOp::InsertAfter {
+                locate: Locate::Last("}"),
+                text: "\n",
+            },
+            expect_empty_batch: true,
+            expected_keys: &["alpha_long", "beta", "nil", "gamma", "omega"],
+            expected_errors: 0,
+        },
+        Step {
+            label: "delete skip at end of document",
+            op: EditOp::Delete {
+                locate: Locate::Last("\n"),
+                len: 1,
+            },
+            expect_empty_batch: true,
+            expected_keys: &["alpha_long", "beta", "nil", "gamma", "omega"],
+            expected_errors: 0,
+        },
+    ];
+
+    for step in steps {
+        let delta = apply_edit(&mut current, uri.clone(), step.op)?;
+        source_tx.send(delta).await?;
+        let batches = recv_parse_batches_until_quiet(&mut sink_rx).await?;
+        let delta_count = batches.iter().map(Vec::len).sum::<usize>();
+        let has_non_empty_batch = batches.iter().any(|batch| !batch.is_empty());
+        assert_eq!(
+            !has_non_empty_batch, step.expect_empty_batch,
+            "{}: unexpected parse delta batch total length {}",
+            step.label, delta_count
+        );
+
+        let summary = assert_runtime_matches_fresh_parse(
+            &runtime.context(),
+            uri.clone(),
+            &current,
+            step.label,
+        )
+        .await?;
+        let expected_keys = step
+            .expected_keys
+            .iter()
+            .map(|key| key.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary.keys, expected_keys,
+            "{}: key summary changed",
+            step.label
+        );
+        if step.expected_errors == 0 {
+            assert_eq!(summary.errors, 0, "{}: expected no diagnostics", step.label);
+        } else {
+            assert!(
+                summary.errors >= step.expected_errors,
+                "{}: expected at least {} diagnostic(s), found {}",
+                step.label,
+                step.expected_errors,
+                summary.errors
+            );
+        }
+
+        if !step.expect_empty_batch {
+            let stat = runtime
+                .context()
+                .post::<JsonRuntimeParser, GetIncrementalStats>(GetIncrementalStats(uri.clone()))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("{}: missing incremental stats", step.label))?;
+            assert!(
+                stat.reparsed > 0,
+                "{}: visible edit did not report parser replay: {stat:?}",
+                step.label
+            );
+        }
+    }
+
+    assert_eq!(
+        current,
+        r#"{"alpha_long":123,"beta":[true,false,null,{"deep":[1,2,3]}],"nil":null,"gamma":{"inner":"x"},"omega":{"x":false}}"#
+    );
+
+    runtime.shutdown().await;
     Ok(())
 }

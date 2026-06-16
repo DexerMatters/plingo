@@ -28,7 +28,7 @@ pub enum StateAction {
     Leave,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LexerState {
     pub offset: usize,
     pub state_stack: SmallVec<[State; 4]>,

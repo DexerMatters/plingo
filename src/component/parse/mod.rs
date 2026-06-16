@@ -176,7 +176,7 @@ impl<Root, Lower> Parser<Root, Lower> {
         let state = self.latest.sessions.entry(uri).or_default();
         if state.columns.is_empty() {
             let start = arenas.gss.node(0, 0, 0);
-            state.columns = vec![parsing::ParseColumn::new(0, None, IndexSet::from([start]))];
+            state.columns = vec![parsing::ParseColumn::new(None, IndexSet::from([start]))];
         }
         let mut ctx = SessionContext {
             state,

@@ -89,17 +89,15 @@ impl BuildField for ParseErrorInfo {
                 recovered,
                 location,
                 ..
-            } => {
-                Ok(ParseErrorInfo {
-                    kind: kind.clone(),
-                    node: *node,
-                    length: tree.length,
-                    unexpected: *unexpected,
-                    expected: *expected,
-                    recovered: *recovered,
-                    location: *location,
-                })
-            }
+            } => Ok(ParseErrorInfo {
+                kind: kind.clone(),
+                node: *node,
+                length: tree.length,
+                unexpected: *unexpected,
+                expected: *expected,
+                recovered: *recovered,
+                location: *location,
+            }),
             _ => Err(BuildError::TypeMismatch { product }),
         }
     }

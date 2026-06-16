@@ -1,1 +1,17 @@
-{"a":222,"xsssss":22,"v":2,"x":55,"y":66,"z":77}
+{
+  "id": 101,
+  "name": "Jane Doe",
+  "email": "jane.doe@example.com",
+  "isActive": true,
+  "roles": ["Admin", "Editor"],
+  "address": {
+    "street": "123 Main St",
+    "city": "Metropolis",
+    "zipCode": "10001"
+  },
+  "hobbies": ["Reading", "Traveling", "Cooking"],
+  "preferences": {
+    "theme": "dark",
+    "notifications": null
+  }
+}

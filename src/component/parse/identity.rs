@@ -4,7 +4,11 @@ use crate::component::parse::grammar::TerminalId;
 
 pub type TokenFingerprint = u64;
 
-pub fn token_fingerprint<T: Hash>(terminal: Option<TerminalId>, value: &T, length: usize) -> TokenFingerprint {
+pub fn token_fingerprint<T: Hash>(
+    terminal: Option<TerminalId>,
+    value: &T,
+    length: usize,
+) -> TokenFingerprint {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     terminal.hash(&mut hasher);
     value.hash(&mut hasher);

@@ -260,7 +260,8 @@ impl<'a> BuildCx<'a> {
         fingerprint: TokenFingerprint,
     ) -> ProductId {
         let green = self.trees.leaf(length, terminal);
-        self.products.insert(Product::token(green, entry, fingerprint))
+        self.products
+            .insert(Product::token(green, entry, fingerprint))
     }
 
     pub fn alloc_typed_token<T>(
@@ -291,14 +292,7 @@ impl<'a> BuildCx<'a> {
         recovered: bool,
     ) -> ProductId {
         let green = self.trees.error(
-            length,
-            kind,
-            node,
-            children,
-            unexpected,
-            expected,
-            recovered,
-            None,
+            length, kind, node, children, unexpected, expected, recovered, None,
         );
         self.products.insert(Product::error(green))
     }

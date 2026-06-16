@@ -1,3 +1,8 @@
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
 use regex_automata::{Anchored, Input, dfa::Automaton};
 
 use crate::{
@@ -12,24 +17,22 @@ use crate::{
     utils::{RangeOrPoint, Span},
 };
 
-fn entries_semantically_equal<Root: LexerRoot>(a: &Entry<Root>, b: &Entry<Root>) -> bool {
-    match (a, b) {
-        (Entry::Token { terminal: t1, value: v1, .. },
-         Entry::Token { terminal: t2, value: v2, .. }) => t1 == t2 && v1 == v2,
-        (Entry::EOF, Entry::EOF) => true,
-        (Entry::Error(l1, _), Entry::Error(l2, _)) => l1 == l2,
-        _ => false,
+fn shift_offset(offset: usize, shift: isize) -> usize {
+    if shift >= 0 {
+        offset.saturating_add(shift as usize)
+    } else {
+        offset.saturating_sub((-shift) as usize)
     }
 }
 
 fn shift_range((start, end): (usize, usize), shift: isize) -> (usize, usize) {
-    if shift >= 0 {
-        let shift = shift as usize;
-        (start.saturating_add(shift), end.saturating_add(shift))
-    } else {
-        let shift = (-shift) as usize;
-        (start.saturating_sub(shift), end.saturating_sub(shift))
-    }
+    (shift_offset(start, shift), shift_offset(end, shift))
+}
+
+fn shift_state(state: &LexerState, shift: isize) -> LexerState {
+    let mut shifted = state.clone();
+    shifted.offset = shift_offset(shifted.offset, shift);
+    shifted
 }
 
 impl<Root, Lower> Lexer<Root, Lower>
@@ -47,7 +50,10 @@ where
         Output = Result<LayerDeltas<<Lexer<Root, Lower> as MiddleLayer>::Lower>, LexInterrupt>,
     > + Send
     + 'a {
-        async move { self.lex_deltas(ctx, state, std::slice::from_ref(&delta)).await }
+        async move {
+            self.lex_deltas(ctx, state, std::slice::from_ref(&delta))
+                .await
+        }
     }
 
     pub(crate) fn lex_deltas<'a>(
@@ -64,6 +70,8 @@ where
                 return Ok(Vec::new());
             };
             let uri = first.key().uri;
+            let total_start = Instant::now();
+            let fetch_source_start = Instant::now();
             let snapshot = ctx
                 .post::<Source<Lexer<Root, Lower>>, _>(Span {
                     uri,
@@ -71,7 +79,15 @@ where
                 })
                 .await
                 .map_err(LexInterrupt::ActionError)?;
-            self.apply_deltas(state, uri, snapshot.to_string(), deltas)
+            let fetch_source_elapsed = fetch_source_start.elapsed();
+            self.apply_deltas(
+                state,
+                uri,
+                snapshot.to_string(),
+                deltas,
+                total_start,
+                fetch_source_elapsed,
+            )
         }
     }
 
@@ -81,6 +97,8 @@ where
         uri: fluent_uri::Uri<&'static str>,
         snapshot: String,
         deltas: &[Delta<Span, usize>],
+        total_start: Instant,
+        fetch_source_elapsed: Duration,
     ) -> Result<LayerDeltas<<Lexer<Root, Lower> as MiddleLayer>::Lower>, LexInterrupt> {
         let root_state = self
             .state_id_of::<Root>()
@@ -92,8 +110,11 @@ where
             .or_insert_with(|| vec![LexerState::new(root_state)]);
         snapshot_state.token_instances.entry(uri).or_default();
         snapshot_state.token_ranges.entry(uri).or_default();
+        let old_visible_start = Instant::now();
         let old_visible_tokens = self.token_data_for_uri(snapshot_state, uri);
+        let old_visible_elapsed = old_visible_start.elapsed();
 
+        let delta_scan_start = Instant::now();
         let restart_point = deltas
             .iter()
             .map(|delta| delta.key().range.start())
@@ -108,19 +129,44 @@ where
                 }
             })
             .sum();
+        let new_change_end = deltas
+            .iter()
+            .map(|delta| match delta {
+                Delta::Insert { key, value } => key.range.start().saturating_add(*value),
+                Delta::Delete { key } => key.range.start(),
+            })
+            .max()
+            .unwrap_or(restart_point);
+        let delta_scan_elapsed = delta_scan_start.elapsed();
 
+        let restart_lookup_start = Instant::now();
         let restart_token_pos = {
             let states = &snapshot_state.state_instances[&uri];
             let tokens = &snapshot_state.token_instances[&uri];
+            let ranges = &snapshot_state.token_ranges[&uri];
             debug_assert_eq!(states.len(), tokens.len() + 1);
-            states
+            let position = states
                 .windows(2)
-                .position(|window| restart_point < window[1].offset)
-                .unwrap_or(tokens.len())
+                .position(|window| restart_point <= window[1].offset)
+                .unwrap_or(tokens.len());
+            if position == tokens.len()
+                && tokens
+                    .last()
+                    .is_some_and(|&token_id| matches!(self.get(token_id), Entry::EOF))
+                && ranges
+                    .last()
+                    .is_some_and(|&(start, end)| restart_point >= start && restart_point <= end)
+            {
+                tokens.len().saturating_sub(1)
+            } else {
+                position
+            }
         };
+        let restart_lookup_elapsed = restart_lookup_start.elapsed();
 
         let restart_state_pos = restart_token_pos;
 
+        let old_suffix_snapshot_start = Instant::now();
         let (start_state, old_states, old_tokens, old_ranges) = {
             let states = snapshot_state
                 .state_instances
@@ -157,66 +203,51 @@ where
 
             (start_state, old_states, old_tokens, old_ranges)
         };
+        let old_suffix_snapshot_elapsed = old_suffix_snapshot_start.elapsed();
 
         let mut new_token_ids: Vec<usize> = Vec::new();
         let mut new_states: Vec<LexerState> = Vec::new();
         let mut new_ranges: Vec<(usize, usize)> = Vec::new();
+        let lookup_build_start = Instant::now();
+        let mut old_state_lookup: HashMap<LexerState, Vec<usize>> = HashMap::new();
+        for (index, state) in old_states.iter().enumerate() {
+            old_state_lookup
+                .entry(shift_state(state, net_shift))
+                .or_default()
+                .push(index);
+        }
+        let old_boundary_is_eof = old_tokens
+            .iter()
+            .map(|&token_id| matches!(self.get(token_id), Entry::EOF))
+            .collect::<Vec<_>>();
+        let lookup_build_elapsed = lookup_build_start.elapsed();
+        let mut convergence: Option<(usize, usize)> = None;
+        let replay_start = Instant::now();
         self.lex_cont(start_state, snapshot, |token_id, state, start, end| {
             new_token_ids.push(token_id);
             new_states.push(state.clone());
             new_ranges.push((start, end));
-            true
-        })?;
-
-        if new_token_ids.len() == old_tokens.len()
-            && new_token_ids
-                .iter()
-                .zip(&old_tokens)
-                .all(|(&new_id, &old_id)| {
-                    entries_semantically_equal(self.get(new_id), self.get(old_id))
-                })
-        {
-            let states = snapshot_state
-                .state_instances
-                .get_mut(&uri)
-                .ok_or(LexInterrupt::MissingState)?;
-            let tokens = snapshot_state
-                .token_instances
-                .get_mut(&uri)
-                .ok_or(LexInterrupt::MissingState)?;
-            let ranges = snapshot_state
-                .token_ranges
-                .get_mut(&uri)
-                .ok_or(LexInterrupt::MissingState)?;
-            debug_assert_eq!(states.len(), restart_state_pos + 1);
-            debug_assert_eq!(tokens.len(), restart_token_pos);
-
-            for os in &old_states {
-                let mut adjusted = os.clone();
-                adjusted.offset = if net_shift >= 0 {
-                    (adjusted.offset as isize + net_shift) as usize
-                } else {
-                    adjusted.offset.saturating_sub((-net_shift) as usize)
-                };
-                if adjusted.offset >= states.last().map(|s| s.offset).unwrap_or(0) {
-                    states.push(adjusted);
+            if state.offset >= new_change_end {
+                let new_boundary_is_eof = start == end;
+                if let Some(old_state_index) = old_state_lookup.get(state).and_then(|indices| {
+                    indices
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|&index| !old_boundary_is_eof[index] || new_boundary_is_eof)
+                }) {
+                    convergence = Some((new_token_ids.len(), old_state_index + 1));
+                    return false;
                 }
             }
-            tokens.extend_from_slice(&old_tokens);
-            ranges.extend(old_ranges.iter().copied().map(|(start, end)| {
-                shift_range((start, end), net_shift)
-            }));
+            true
+        })?;
+        let replay_elapsed = replay_start.elapsed();
 
-            debug_assert_eq!(states.len(), tokens.len() + 1);
-            debug_assert_eq!(tokens.len(), ranges.len());
-            let new_visible_tokens = self.token_data_for_uri(snapshot_state, uri);
-            snapshot_state.visible_batches.insert(
-                uri,
-                Self::build_visible_batch(old_visible_tokens, new_visible_tokens),
-            );
-            return Ok(Vec::new());
-        }
+        let (new_prefix_len, old_suffix_start_index) =
+            convergence.unwrap_or_else(|| (new_token_ids.len(), old_tokens.len()));
 
+        let state_splice_start = Instant::now();
         {
             let states = snapshot_state
                 .state_instances
@@ -234,21 +265,71 @@ where
             debug_assert_eq!(tokens.len(), restart_token_pos);
             debug_assert_eq!(tokens.len(), ranges.len());
 
-            states.extend(new_states);
+            states.extend(new_states.iter().take(new_prefix_len).cloned());
+            states.extend(
+                old_states
+                    .iter()
+                    .skip(old_suffix_start_index)
+                    .map(|state| shift_state(state, net_shift)),
+            );
 
-            tokens.extend(new_token_ids.iter().copied());
-            // The freshly lexed tail is authoritative; do not splice in the
-            // old suffix here, or we can reintroduce an EOF before the tail.
-            ranges.extend(new_ranges.iter().copied());
+            tokens.extend(new_token_ids.iter().take(new_prefix_len).copied());
+            tokens.extend(old_tokens.iter().skip(old_suffix_start_index).copied());
+            ranges.extend(new_ranges.iter().take(new_prefix_len).copied());
+            ranges.extend(
+                old_ranges
+                    .iter()
+                    .skip(old_suffix_start_index)
+                    .copied()
+                    .map(|range| shift_range(range, net_shift)),
+            );
 
             debug_assert_eq!(states.len(), tokens.len() + 1);
             debug_assert_eq!(tokens.len(), ranges.len());
         }
+        let state_splice_elapsed = state_splice_start.elapsed();
 
+        let new_visible_start = Instant::now();
         let new_visible_tokens = self.token_data_for_uri(snapshot_state, uri);
+        let new_visible_elapsed = new_visible_start.elapsed();
+        let batch_diff_start = Instant::now();
         let visible_batch = Self::build_visible_batch(old_visible_tokens, new_visible_tokens);
         let changed = visible_batch.is_changed();
+        let old_visible_len = visible_batch.old_tokens.len();
+        let new_visible_len = visible_batch.new_tokens.len();
+        let prefix_len = visible_batch.prefix_len;
+        let suffix_len = visible_batch.suffix_len;
+        let batch_diff_elapsed = batch_diff_start.elapsed();
         snapshot_state.visible_batches.insert(uri, visible_batch);
+        let total_elapsed = total_start.elapsed();
+
+        log::debug!(
+            target: "Measure",
+            "lex {} total={:?} fetch_source={:?} old_visible={:?} delta_scan={:?} restart_lookup={:?} old_suffix={:?} lookup_build={:?} replay={:?} splice={:?} new_visible={:?} batch_diff={:?} changed={} restart={} restart_token={} change_end={} net_shift={} new_prefix={} reused_suffix={} old_tokens={} new_tokens={} prefix={} suffix={}",
+            uri,
+            total_elapsed,
+            fetch_source_elapsed,
+            old_visible_elapsed,
+            delta_scan_elapsed,
+            restart_lookup_elapsed,
+            old_suffix_snapshot_elapsed,
+            lookup_build_elapsed,
+            replay_elapsed,
+            state_splice_elapsed,
+            new_visible_elapsed,
+            batch_diff_elapsed,
+            changed,
+            restart_point,
+            restart_token_pos,
+            new_change_end,
+            net_shift,
+            new_prefix_len,
+            old_tokens.len().saturating_sub(old_suffix_start_index),
+            old_visible_len,
+            new_visible_len,
+            prefix_len,
+            suffix_len,
+        );
 
         if changed {
             Ok(deltas.to_vec())

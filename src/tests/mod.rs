@@ -9,9 +9,9 @@ use crate::{
         AstToken, ErrorKind, ParseErrorInfo, ParserConfig, TokenData,
         build::Action,
         data::{AstArena, AstBox, Product, ProductArena, ProductData, TreeArena},
-        identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
         diff,
         grammar::{ERROR_TERMINAL, Grammar, Symbol},
+        identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
     },
     scheme::Delta,
     tokens,
@@ -33,7 +33,9 @@ fn token_data_from_entries(entries: &[(usize, Entry<RootTokens>, usize, usize)])
         .map(|(column, (id, entry, start, _end))| {
             let data = match entry {
                 Entry::Token {
-                    length, terminal, value,
+                    length,
+                    terminal,
+                    value,
                 } => TokenData {
                     id: *id,
                     terminal: Some(*terminal),
@@ -798,9 +800,7 @@ fn test_diff_trees_aligns_middle_delete_without_cascade() {
     let deltas = diff::diff_trees(&products, &trees, &[old_root], &[new_root], uri);
 
     assert_eq!(deltas.len(), 1);
-    assert!(
-        matches!(&deltas[0], Delta::Delete { key } if key.path == vec![0, 1])
-    );
+    assert!(matches!(&deltas[0], Delta::Delete { key } if key.path == vec![0, 1]));
 }
 
 #[test]

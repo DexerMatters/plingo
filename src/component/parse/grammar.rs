@@ -5,7 +5,7 @@ use bitvec::vec::BitVec;
 use crate::component::parse::{
     __macro_private::NonTerminalSpec,
     data::{
-        ast::{AstArena, AstBox, TokenEntryId},
+        ast::{AstArena, AstBox, AstId, TokenEntryId},
         green::{ErrorKind, GreenId, TreeArena},
         product::{Product, ProductArena, ProductData, ProductId},
     },
@@ -173,6 +173,8 @@ struct PendingProduction {
 pub enum BuildError {
     MissingProduct(ProductId),
     MissingProduction(ProductionId),
+    MissingAst(AstId),
+    MissingToken(TokenEntryId),
     MissingBuild,
     ExpectedNode { product: ProductId },
     ExpectedToken { product: ProductId },
@@ -198,7 +200,7 @@ impl<'a> BuildCx<'a> {
                 .ast
                 .expect(ast)
                 .ok_or(BuildError::TypeMismatch { product }),
-            ProductData::Error => Err(BuildError::UnexpectedErrorProduct { product }),
+            ProductData::Error { .. } => Err(BuildError::UnexpectedErrorProduct { product }),
             ProductData::Token { .. } => Err(BuildError::ExpectedNode { product }),
         }
     }
@@ -206,7 +208,7 @@ impl<'a> BuildCx<'a> {
     pub fn expect_token(&self, product: ProductId) -> Result<TokenEntryId, BuildError> {
         match self.product(product)?.data {
             ProductData::Token { entry, .. } => Ok(entry),
-            ProductData::Error => Err(BuildError::UnexpectedErrorProduct { product }),
+            ProductData::Error { .. } => Err(BuildError::UnexpectedErrorProduct { product }),
             ProductData::Node { .. } => Err(BuildError::ExpectedToken { product }),
         }
     }
@@ -225,7 +227,7 @@ impl<'a> BuildCx<'a> {
                 .cloned(ast)
                 .ok_or(BuildError::TypeMismatch { product }),
             ProductData::Token { ast: None, .. } => Err(BuildError::TypeMismatch { product }),
-            ProductData::Error => Err(BuildError::UnexpectedErrorProduct { product }),
+            ProductData::Error { .. } => Err(BuildError::UnexpectedErrorProduct { product }),
         }
     }
 
@@ -244,9 +246,11 @@ impl<'a> BuildCx<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let green = self.trees.node(self.lhs(production)?, greens);
         let ast = self.ast.insert(value);
-        Ok(self
+        let product = self
             .products
-            .insert(Product::node(green, ast, children.to_vec())))
+            .insert(Product::node(green, ast, children.to_vec()));
+        self.ast.bind_product(ast.id, product);
+        Ok(product)
     }
 
     pub fn lhs(&self, production: ProductionId) -> Result<NonTerminalId, BuildError> {
@@ -278,8 +282,11 @@ impl<'a> BuildCx<'a> {
     {
         let green = self.trees.leaf(length, terminal);
         let ast = self.ast.insert(value);
-        self.products
-            .insert(Product::typed_token(green, entry, fingerprint, ast))
+        let product = self
+            .products
+            .insert(Product::typed_token(green, entry, fingerprint, ast));
+        self.ast.bind_product(ast.id, product);
+        product
     }
 
     pub fn alloc_error(
@@ -315,11 +322,19 @@ impl<'a> BuildCx<'a> {
             .iter()
             .map(|g| self.trees.get(*g).map_or(0, |t| t.length))
             .sum();
-        Ok(self.alloc_error(length, kind, node, greens, unexpected, expected, recovered))
+        let green = self.trees.error(
+            length, kind, node, greens, unexpected, expected, recovered, None,
+        );
+        Ok(self
+            .products
+            .insert(Product::error_with_children(green, children.to_vec())))
     }
 
     pub fn is_error(&self, product: ProductId) -> Result<bool, BuildError> {
-        Ok(matches!(self.product(product)?.data, ProductData::Error))
+        Ok(matches!(
+            self.product(product)?.data,
+            ProductData::Error { .. }
+        ))
     }
 
     fn product(&self, product: ProductId) -> Result<&Product, BuildError> {

@@ -4,21 +4,18 @@ use crate::{
         debug::DebugSink,
         lex::{Entry, Lexer, LexerState},
         parse::{
-            AstToken, GetParseTokens, IncrementalParseStats, ParseChange, ParseErrorInfo,
-            ParsePath, Parser, ParserConfig, TokenData,
+            AstToken, IncrementalParseStats, ParseChange, ParseErrorInfo, ParsePath, Parser,
+            ParserConfig, TokenData,
             data::{
                 ast::{AstArena, AstBox},
                 product::ProductData,
             },
             grammar::Grammar,
             identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
-            policy::{
-                DerefAstBox, DerefAstToken, GetAstTree, GetIncrementalStats, GetParseDiagnostics,
-            },
         },
         source::{Source, SourceEdit},
     },
-    scheme::{Context, Runtime},
+    scheme::{context::Context, runtime::Runtime},
     tokens,
     utils::{RangeOrPoint, Span},
 };
@@ -26,7 +23,6 @@ use fluent_uri::Uri;
 use log::{Level, LevelFilter, Metadata, Record};
 use std::{
     collections::HashMap,
-    marker::PhantomData,
     sync::{Mutex, OnceLock},
     time::Duration,
 };
@@ -695,7 +691,7 @@ fn direct_summary(
         .ok_or_else(|| anyhow::anyhow!("missing root AST value"))?;
 
     let keys = direct_root_keys(&arenas.ast, token_data, source, &root)?;
-    let errors = parser.parse_diagnostics(uri).len();
+    let errors = parser.latest_parse_diagnostics(uri).len();
     Ok(JsonSummary { keys, errors })
 }
 
@@ -705,20 +701,20 @@ async fn runtime_root_keys(ctx: &Context, obj: &JsonObject) -> anyhow::Result<Ve
         return Ok(keys);
     };
     let members = ctx
-        .post::<JsonRuntimeParser, DerefAstBox<JsonMembers>>(DerefAstBox(*mems))
+        .call(JsonRuntimeParser::deref_ast_box::<JsonMembers>, *mems)
         .await?;
     let JsonMembers::Many(members) = members else {
         return Ok(keys);
     };
     for member in members {
         let member = ctx
-            .post::<JsonRuntimeParser, DerefAstBox<JsonMember>>(DerefAstBox(member))
+            .call(JsonRuntimeParser::deref_ast_box::<JsonMember>, member)
             .await?;
         let JsonMember::Pair(key, _) = member else {
             return Ok(keys);
         };
         let JsonToken::String(s) = ctx
-            .post::<JsonRuntimeParser, DerefAstToken<JsonToken>>(DerefAstToken(key))
+            .call(JsonRuntimeParser::deref_ast_token::<JsonToken>, key)
             .await?
         else {
             return Err(anyhow::anyhow!("expected string token for object key"));
@@ -730,19 +726,19 @@ async fn runtime_root_keys(ctx: &Context, obj: &JsonObject) -> anyhow::Result<Ve
 
 async fn runtime_summary(ctx: &Context, root: AstBox<JsonValue>) -> anyhow::Result<JsonSummary> {
     let value = ctx
-        .post::<JsonRuntimeParser, DerefAstBox<JsonValue>>(DerefAstBox(root))
+        .call(JsonRuntimeParser::deref_ast_box::<JsonValue>, root)
         .await?;
     let keys = match &value {
         JsonValue::Object(obj) => {
             let obj = ctx
-                .post::<JsonRuntimeParser, DerefAstBox<JsonObject>>(DerefAstBox(*obj))
+                .call(JsonRuntimeParser::deref_ast_box::<JsonObject>, *obj)
                 .await?;
             runtime_root_keys(ctx, &obj).await?
         }
         _ => Vec::new(),
     };
     let diagnostics = ctx
-        .post::<JsonRuntimeParser, GetParseDiagnostics>(GetParseDiagnostics(root.uri.clone()))
+        .call(JsonRuntimeParser::parse_diagnostics, root.uri)
         .await?;
     let errors = diagnostics.len();
     Ok(JsonSummary { keys, errors })
@@ -827,7 +823,7 @@ async fn run_runtime_case(
         );
         let stat = runtime
             .context()
-            .post::<JsonRuntimeParser, GetIncrementalStats>(GetIncrementalStats(uri.clone()))
+            .call(JsonRuntimeParser::incremental_stats_for, uri.clone())
             .await?
             .ok_or_else(|| anyhow::anyhow!("missing incremental stats"))?;
         stats.push(stat);
@@ -840,7 +836,7 @@ async fn run_runtime_case(
         range: RangeOrPoint::Point(0),
     };
     let roots = ctx
-        .post::<JsonRuntimeParser, GetAstTree<JsonValue>>(GetAstTree(root_path, PhantomData))
+        .call(JsonRuntimeParser::get_ast_tree::<JsonValue>, root_path)
         .await?;
     if roots.len() != 1 {
         return Err(anyhow::anyhow!(
@@ -904,17 +900,20 @@ async fn run_runtime_batched_case(
     batches.extend(recv_parse_batches_until_quiet(&mut sink_rx).await?);
     let stat = runtime
         .context()
-        .post::<JsonRuntimeParser, GetIncrementalStats>(GetIncrementalStats(uri.clone()))
+        .call(JsonRuntimeParser::incremental_stats_for, uri.clone())
         .await?
         .ok_or_else(|| anyhow::anyhow!("missing incremental stats"))?;
     stats.push(stat);
 
     let ctx = runtime.context();
     let token_data = ctx
-        .post::<Jl, GetParseTokens>(GetParseTokens(Span {
-            uri: uri.clone(),
-            range: RangeOrPoint::Range(0, usize::MAX),
-        }))
+        .call(
+            Jl::parse_tokens,
+            Span {
+                uri: uri.clone(),
+                range: RangeOrPoint::Range(0, usize::MAX),
+            },
+        )
         .await?;
     let mut fresh_lexer = Lexer::<JsonToken>::new()?;
     let fresh_entries = collect_entries(&mut fresh_lexer, &current);
@@ -941,7 +940,7 @@ async fn run_runtime_batched_case(
         range: RangeOrPoint::Point(0),
     };
     let roots = ctx
-        .post::<JsonRuntimeParser, GetAstTree<JsonValue>>(GetAstTree(root_path, PhantomData))
+        .call(JsonRuntimeParser::get_ast_tree::<JsonValue>, root_path)
         .await?;
     if roots.len() != 1 {
         return Err(anyhow::anyhow!(
@@ -1013,7 +1012,7 @@ async fn run_runtime_summary_case(
         range: RangeOrPoint::Point(0),
     };
     let roots = ctx
-        .post::<JsonRuntimeParser, GetAstTree<JsonValue>>(GetAstTree(root_path, PhantomData))
+        .call(JsonRuntimeParser::get_ast_tree::<JsonValue>, root_path)
         .await?;
     if roots.len() != 1 {
         return Err(anyhow::anyhow!(
@@ -1067,7 +1066,7 @@ async fn run_runtime_diagnostic_counts(
     let mut counts = Vec::with_capacity(ops.len() + 1);
     let initial_count = runtime
         .context()
-        .post::<JsonRuntimeParser, GetParseDiagnostics>(GetParseDiagnostics(uri.clone()))
+        .call(JsonRuntimeParser::parse_diagnostics, uri.clone())
         .await?
         .len();
     counts.push(initial_count);
@@ -1078,7 +1077,7 @@ async fn run_runtime_diagnostic_counts(
         let _ = recv_non_empty_parse_batch(&mut sink_rx).await?;
         let count = runtime
             .context()
-            .post::<JsonRuntimeParser, GetParseDiagnostics>(GetParseDiagnostics(uri.clone()))
+            .call(JsonRuntimeParser::parse_diagnostics, uri.clone())
             .await?
             .len();
         counts.push(count);
@@ -1111,10 +1110,13 @@ async fn runtime_token_data(
 ) -> anyhow::Result<Vec<TokenData>> {
     type Jl = Lexer<JsonToken, JsonRuntimeParser>;
     Ok(ctx
-        .post::<Jl, GetParseTokens>(GetParseTokens(Span {
-            uri,
-            range: RangeOrPoint::Range(0, usize::MAX),
-        }))
+        .call(
+            Jl::parse_tokens,
+            Span {
+                uri,
+                range: RangeOrPoint::Range(0, usize::MAX),
+            },
+        )
         .await?)
 }
 
@@ -1147,7 +1149,7 @@ async fn assert_runtime_matches_fresh_parse(
         range: RangeOrPoint::Point(0),
     };
     let roots = ctx
-        .post::<JsonRuntimeParser, GetAstTree<JsonValue>>(GetAstTree(root_path, PhantomData))
+        .call(JsonRuntimeParser::get_ast_tree::<JsonValue>, root_path)
         .await?;
     assert_eq!(
         roots.len(),
@@ -1970,7 +1972,7 @@ async fn json_runtime_extreme_mixed_edits_match_fresh_parse_after_each_step() ->
         if !step.expect_empty_batch {
             let stat = runtime
                 .context()
-                .post::<JsonRuntimeParser, GetIncrementalStats>(GetIncrementalStats(uri.clone()))
+                .call(JsonRuntimeParser::incremental_stats_for, uri.clone())
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("{}: missing incremental stats", step.label))?;
             assert!(

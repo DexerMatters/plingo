@@ -19,9 +19,11 @@ use crate::component::{
 };
 use crate::layer;
 use crate::scheme::{
-    Context, LayerChanges, MiddleLayer, NonTopLayer, ReplacementChange, SnapshotLayer,
+    change::{LayerChanges, ReplacementChange},
+    context::Context,
+    layer::{MiddleLayer, NonTopLayer, SnapshotLayer},
 };
-use crate::utils::{RangeOrPoint, Span};
+use crate::utils::RangeOrPoint;
 
 pub(crate) mod analyze;
 pub(crate) mod build;
@@ -32,8 +34,8 @@ pub(crate) mod emit;
 pub mod grammar;
 pub(crate) mod identity;
 pub(crate) mod incremental;
+pub mod interface;
 pub(crate) mod parsing;
-pub mod policy;
 pub(crate) mod recovery;
 
 pub use data::ast::AstToken;
@@ -143,9 +145,6 @@ pub struct TokenData {
     pub fingerprint: TokenFingerprint,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct GetParseTokens(pub Span);
-
 #[derive(Clone, Default)]
 pub struct ParserSnapshotState {
     pub sessions: HashMap<Uri<&'static str>, ParserSessionState>,
@@ -228,7 +227,10 @@ impl<Root, Lower> Parser<Root, Lower> {
         self.latest_incremental_stats.get(&uri).copied()
     }
 
-    pub fn parse_diagnostics(&self, uri: fluent_uri::Uri<&'static str>) -> Vec<ParseErrorInfo> {
+    pub fn latest_parse_diagnostics(
+        &self,
+        uri: fluent_uri::Uri<&'static str>,
+    ) -> Vec<ParseErrorInfo> {
         let Some(state) = self.latest.sessions.get(&uri) else {
             return Vec::new();
         };
@@ -238,7 +240,7 @@ impl<Root, Lower> Parser<Root, Lower> {
             .get(&uri)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        policy::collect_parse_diagnostics(state, self.session_arenas.get(&uri), roots)
+        interface::collect_parse_diagnostics(state, self.session_arenas.get(&uri), roots)
     }
 
     pub fn session_product(

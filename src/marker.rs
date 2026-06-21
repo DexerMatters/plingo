@@ -18,11 +18,6 @@ pub struct Linked<Upper, Edge>(pub(super) PhantomData<fn() -> (Upper, Edge)>);
 /// Only the [`sRuntime`] in this state is complete and runnable.
 pub struct Sealed;
 
-/// A trait for types that can receive types and produce an output type.
-pub trait Receiver<Input> {
-    type _Output: Send + Sync + 'static;
-}
-
 /// A trait for types whose changes are addressed by `A`.
 pub trait HasAddress<A> {
     type Address;

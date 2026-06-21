@@ -81,22 +81,22 @@ pub fn expand_layer_struct(item: TokenStream) -> TokenStream {
 
     if let Some(ref snapshot_ty) = snapshot_ty {
         fields.push(parse_quote! {
-            _snapshot: ::std::collections::HashMap<::plingo::scheme::SnapshotId, #snapshot_ty>
+            _snapshot: ::std::collections::HashMap<::plingo::scheme::context::SnapshotId, #snapshot_ty>
         });
     }
 
     let snapshot_impl = match (snapshot_field_ident, snapshot_ty.as_ref()) {
         (Some(field_ident), Some(snapshot_ty)) => quote! {
-            impl #impl_generics ::plingo::scheme::SnapshotLayer for #self_ident #ty_generics #where_clause {
+            impl #impl_generics ::plingo::scheme::layer::SnapshotLayer for #self_ident #ty_generics #where_clause {
                 type State = #snapshot_ty;
 
-                fn push_state(&mut self, snapshot: ::plingo::scheme::SnapshotId) {
+                fn push_state(&mut self, snapshot: ::plingo::scheme::context::SnapshotId) {
                     self._snapshot.insert(snapshot, self.#field_ident.clone());
                 }
 
                 fn state(
                     &self,
-                    snapshot: ::std::option::Option<::plingo::scheme::SnapshotId>,
+                    snapshot: ::std::option::Option<::plingo::scheme::context::SnapshotId>,
                 ) -> ::std::option::Option<&Self::State> {
                     match snapshot {
                         Some(snapshot) => self._snapshot.get(&snapshot),
@@ -167,26 +167,26 @@ pub fn expand_layer_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let conduit_impls = match role {
         LayerRole::Top => quote! {
-            impl #impl_generics ::plingo::scheme::FallibleLayer for #self_type #where_clause {
-                type __Error = <Self as ::plingo::scheme::TopLayer>::Error;
+            impl #impl_generics ::plingo::scheme::layer::FallibleLayer for #self_type #where_clause {
+                type __Error = <Self as ::plingo::scheme::layer::TopLayer>::Error;
             }
         },
         LayerRole::Middle => quote! {
-            impl #impl_generics ::plingo::scheme::FallibleLayer for #self_type #where_clause {
-                type __Error = <Self as ::plingo::scheme::MiddleLayer>::Error;
+            impl #impl_generics ::plingo::scheme::layer::FallibleLayer for #self_type #where_clause {
+                type __Error = <Self as ::plingo::scheme::layer::MiddleLayer>::Error;
             }
-            impl #impl_generics ::plingo::scheme::NonTopLayer for #self_type #where_clause {
-                type _Error = <Self as ::plingo::scheme::MiddleLayer>::Error;
-                type Change = <Self as ::plingo::scheme::MiddleLayer>::Change;
+            impl #impl_generics ::plingo::scheme::layer::NonTopLayer for #self_type #where_clause {
+                type _Error = <Self as ::plingo::scheme::layer::MiddleLayer>::Error;
+                type Change = <Self as ::plingo::scheme::layer::MiddleLayer>::Change;
             }
         },
         LayerRole::Bottom => quote! {
-            impl #impl_generics ::plingo::scheme::FallibleLayer for #self_type #where_clause {
-                type __Error = <Self as ::plingo::scheme::BottomLayer>::Error;
+            impl #impl_generics ::plingo::scheme::layer::FallibleLayer for #self_type #where_clause {
+                type __Error = <Self as ::plingo::scheme::layer::BottomLayer>::Error;
             }
-            impl #impl_generics ::plingo::scheme::NonTopLayer for #self_type #where_clause {
-                type _Error = <Self as ::plingo::scheme::BottomLayer>::Error;
-                type Change = <Self as ::plingo::scheme::BottomLayer>::Change;
+            impl #impl_generics ::plingo::scheme::layer::NonTopLayer for #self_type #where_clause {
+                type _Error = <Self as ::plingo::scheme::layer::BottomLayer>::Error;
+                type Change = <Self as ::plingo::scheme::layer::BottomLayer>::Change;
             }
         },
     };

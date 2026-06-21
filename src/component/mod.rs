@@ -1,4 +1,3 @@
-pub mod common;
 pub mod debug;
 pub mod lex;
 pub mod parse;

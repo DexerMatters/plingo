@@ -4,23 +4,18 @@ use crate::{
         debug::DebugSink,
         lex::Lexer,
         parse::{
-            AstToken, ParseChange, ParseErrorInfo, ParsePath, Parser,
-            data::ast::AstBox,
+            AstToken, ParseChange, ParseErrorInfo, ParsePath, Parser, data::ast::AstBox,
             grammar::Grammar,
-            policy::{
-                DerefAstBox, DerefAstToken, DescribeProduct, GetAstTree, GetIncrementalStats,
-                GetNode, GetParseDiagnostics,
-            },
         },
         source::{Source, SourceEdit},
     },
-    scheme::{Context, Runtime},
+    scheme::{context::Context, runtime::Runtime},
     tests::fs_watch,
     tokens,
     utils::{RangeOrPoint, Span},
 };
 use color_print::cprintln;
-use std::{marker::PhantomData, time::Duration};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -132,8 +127,8 @@ type JsonSink = DebugSink<ParseChange>;
 type Jp = Parser<JsonToken, JsonSink>;
 
 macro_rules! deref {
-    ($ctx:expr, $ty:ty, $action:expr, $label:expr, $indent:expr) => {
-        match $ctx.post::<Jp, $ty>($action).await {
+    ($ctx:expr, $method:expr, $arg:expr, $label:expr, $indent:expr) => {
+        match $ctx.call($method, $arg).await {
             Ok(v) => Some(v),
             Err(e) => {
                 let p = "  ".repeat($indent);
@@ -150,8 +145,8 @@ async fn walk_value(ctx: &Context, v: &JsonValue, indent: usize) {
         JsonValue::String(tok) => {
             if let Some(JsonToken::String(s)) = deref!(
                 ctx,
-                DerefAstToken<JsonToken>,
-                DerefAstToken(*tok),
+                Jp::deref_ast_token::<JsonToken>,
+                *tok,
                 "String tok",
                 indent
             ) {
@@ -161,8 +156,8 @@ async fn walk_value(ctx: &Context, v: &JsonValue, indent: usize) {
         JsonValue::Number(tok) => {
             if let Some(JsonToken::Number(n)) = deref!(
                 ctx,
-                DerefAstToken<JsonToken>,
-                DerefAstToken(*tok),
+                Jp::deref_ast_token::<JsonToken>,
+                *tok,
                 "Number tok",
                 indent
             ) {
@@ -176,8 +171,8 @@ async fn walk_value(ctx: &Context, v: &JsonValue, indent: usize) {
             println!("{pad}Object");
             if let Some(obj) = deref!(
                 ctx,
-                DerefAstBox<JsonObject>,
-                DerefAstBox(*obj),
+                Jp::deref_ast_box::<JsonObject>,
+                *obj,
                 "JsonObject",
                 indent
             ) {
@@ -188,8 +183,8 @@ async fn walk_value(ctx: &Context, v: &JsonValue, indent: usize) {
             println!("{pad}Array");
             if let Some(arr) = deref!(
                 ctx,
-                DerefAstBox<JsonArray>,
-                DerefAstBox(*arr),
+                Jp::deref_ast_box::<JsonArray>,
+                *arr,
                 "JsonArray",
                 indent
             ) {
@@ -209,8 +204,8 @@ async fn walk_object(ctx: &Context, obj: &JsonObject, indent: usize) {
         JsonObject::Members(mems) => {
             if let Some(mems) = deref!(
                 ctx,
-                DerefAstBox<JsonMembers>,
-                DerefAstBox(*mems),
+                Jp::deref_ast_box::<JsonMembers>,
+                *mems,
                 "JsonMembers",
                 indent
             ) {
@@ -230,8 +225,8 @@ async fn walk_array(ctx: &Context, arr: &JsonArray, indent: usize) {
         JsonArray::Elements(els) => {
             if let Some(els) = deref!(
                 ctx,
-                DerefAstBox<JsonElements>,
-                DerefAstBox(*els),
+                Jp::deref_ast_box::<JsonElements>,
+                *els,
                 "JsonElements",
                 indent
             ) {
@@ -262,8 +257,8 @@ async fn walk_member(ctx: &Context, member: &AstBox<JsonMember>, indent: usize) 
     let pad = "  ".repeat(indent);
     let Some(m) = deref!(
         ctx,
-        DerefAstBox<JsonMember>,
-        DerefAstBox(*member),
+        Jp::deref_ast_box::<JsonMember>,
+        *member,
         "JsonMember",
         indent
     ) else {
@@ -273,15 +268,15 @@ async fn walk_member(ctx: &Context, member: &AstBox<JsonMember>, indent: usize) 
         JsonMember::Pair(key, val) => {
             let k = deref!(
                 ctx,
-                DerefAstToken<JsonToken>,
-                DerefAstToken(key),
+                Jp::deref_ast_token::<JsonToken>,
+                key,
                 "member key",
                 indent
             );
             let v = deref!(
                 ctx,
-                DerefAstBox<JsonValue>,
-                DerefAstBox(val),
+                Jp::deref_ast_box::<JsonValue>,
+                val,
                 "member val",
                 indent
             );
@@ -306,8 +301,8 @@ async fn walk_elements(ctx: &Context, els: &JsonElements, indent: usize) {
             for val in items {
                 if let Some(v) = deref!(
                     ctx,
-                    DerefAstBox<JsonValue>,
-                    DerefAstBox(*val),
+                    Jp::deref_ast_box::<JsonValue>,
+                    *val,
                     "Elements::Many val",
                     indent
                 ) {
@@ -335,37 +330,26 @@ async fn collect_root_json_member_keys(
     ctx: &Context,
     root: AstBox<JsonValue>,
 ) -> anyhow::Result<Vec<String>> {
-    let value = ctx
-        .post::<Jp, DerefAstBox<JsonValue>>(DerefAstBox(root))
-        .await?;
+    let value = ctx.call(Jp::deref_ast_box::<JsonValue>, root).await?;
     let JsonValue::Object(obj) = value else {
         return Ok(Vec::new());
     };
-    let obj = ctx
-        .post::<Jp, DerefAstBox<JsonObject>>(DerefAstBox(obj))
-        .await?;
+    let obj = ctx.call(Jp::deref_ast_box::<JsonObject>, obj).await?;
     let JsonObject::Members(mems) = obj else {
         return Ok(Vec::new());
     };
-    let mems = ctx
-        .post::<Jp, DerefAstBox<JsonMembers>>(DerefAstBox(mems))
-        .await?;
+    let mems = ctx.call(Jp::deref_ast_box::<JsonMembers>, mems).await?;
     let JsonMembers::Many(items) = mems else {
         return Ok(Vec::new());
     };
 
     let mut keys = Vec::with_capacity(items.len());
     for member in items {
-        let member = ctx
-            .post::<Jp, DerefAstBox<JsonMember>>(DerefAstBox(member))
-            .await?;
+        let member = ctx.call(Jp::deref_ast_box::<JsonMember>, member).await?;
         let JsonMember::Pair(key, _) = member else {
             continue;
         };
-        let JsonToken::String(key) = ctx
-            .post::<Jp, DerefAstToken<JsonToken>>(DerefAstToken(key))
-            .await?
-        else {
+        let JsonToken::String(key) = ctx.call(Jp::deref_ast_token::<JsonToken>, key).await? else {
             return Err(anyhow::anyhow!("expected string member key"));
         };
         keys.push(key);
@@ -397,23 +381,14 @@ async fn json_runtime_parse_output() -> anyhow::Result<()> {
             path: Vec::new(),
             range: RangeOrPoint::Point(0),
         };
-        if let Ok(trees) = ctx
-            .post::<Jp, GetAstTree<JsonValue>>(GetAstTree(root_path, PhantomData))
-            .await
-        {
+        if let Ok(trees) = ctx.call(Jp::get_ast_tree::<JsonValue>, root_path).await {
             for rb in &trees {
-                if let Ok(val) = ctx
-                    .post::<Jp, DerefAstBox<JsonValue>>(DerefAstBox(*rb))
-                    .await
-                {
+                if let Ok(val) = ctx.call(Jp::deref_ast_box::<JsonValue>, *rb).await {
                     walk_value(ctx, &val, 0).await;
                 }
             }
         }
-        if let Ok(diagnostics) = ctx
-            .post::<Jp, GetParseDiagnostics>(GetParseDiagnostics(uri))
-            .await
-        {
+        if let Ok(diagnostics) = ctx.call(Jp::parse_diagnostics, uri).await {
             for info in diagnostics {
                 print_parse_error("", &info);
             }
@@ -430,12 +405,9 @@ async fn json_runtime_parse_output() -> anyhow::Result<()> {
             if !change.batch.old_units.is_empty() {
                 let prev = ctx.last_snapshot();
                 let mut names = Vec::new();
-                if let Ok(pids) = prev.post::<Jp, GetNode>(GetNode(key.clone())).await {
+                if let Ok(pids) = prev.call(Jp::get_node, key.clone()).await {
                     for &pid in &pids {
-                        if let Ok(desc) = prev
-                            .post::<Jp, DescribeProduct>(DescribeProduct(key.uri, pid))
-                            .await
-                        {
+                        if let Ok(desc) = prev.call(Jp::describe_product, (key.uri, pid)).await {
                             names.push(desc);
                         } else {
                             names.push("?".to_string());
@@ -457,7 +429,7 @@ async fn json_runtime_parse_output() -> anyhow::Result<()> {
                 let mut names = Vec::new();
                 for unit in &change.batch.new_units {
                     if let Ok(desc) = ctx
-                        .post::<Jp, DescribeProduct>(DescribeProduct(key.uri, unit.product))
+                        .call(Jp::describe_product, (key.uri, unit.product))
                         .await
                     {
                         names.push(desc);
@@ -524,6 +496,241 @@ async fn recv_parse_batches_until_quiet(
     Ok(batches)
 }
 
+#[tokio::test]
+async fn context_callable_methods_work_for_source_and_parser() -> anyhow::Result<()> {
+    let (_source_tx, source_rx) = mpsc::channel(1);
+    let (sink_tx, mut sink_rx) = mpsc::channel(8);
+    let debug_sink = debug_sink!(|_ctx, deltas| {
+        let sink_tx = sink_tx.clone();
+        async move {
+            let _ = sink_tx.send(deltas.clone()).await;
+            Ok(())
+        }
+    });
+    let parser = Grammar::from_spec::<JsonValue>().build_lr1::<JsonToken, JsonSink>();
+    type Jl = Lexer<JsonToken, Jp>;
+    let mut runtime = Runtime::new()
+        .with(Source::new(source_rx))
+        .with(Jl::new()?)
+        .with(parser)
+        .finish(debug_sink);
+    runtime.run().await?;
+
+    let ctx = runtime.context();
+    let uri = Span::new("test://direct-source-call", 0, 0)?.uri;
+    ctx.call(
+        Source::<Jl>::apply_edit,
+        SourceEdit::Insert {
+            key: Span::new_uri(uri, 0, 0)?,
+            value: r#"{"a":1}"#.to_string(),
+        },
+    )
+    .await?;
+
+    let text = ctx
+        .call(
+            Source::<Jl>::read_span,
+            Span {
+                uri,
+                range: RangeOrPoint::Range(0, usize::MAX),
+            },
+        )
+        .await?
+        .to_string();
+    assert_eq!(text, r#"{"a":1}"#);
+    let _ = recv_non_empty_parse_batch(&mut sink_rx).await?;
+
+    let root_path = ParsePath {
+        uri,
+        path: Vec::new(),
+        range: RangeOrPoint::Point(0),
+    };
+    let roots = ctx.call(Jp::get_ast_tree::<JsonValue>, root_path).await?;
+    let root = roots[0];
+    let JsonValue::Object(obj) = ctx.call(Jp::deref_ast_box::<JsonValue>, root).await? else {
+        anyhow::bail!("expected object root");
+    };
+    let JsonObject::Members(members) = ctx.call(Jp::deref_ast_box::<JsonObject>, obj).await? else {
+        anyhow::bail!("expected object members");
+    };
+    let JsonMembers::Many(items) = ctx.call(Jp::deref_ast_box::<JsonMembers>, members).await?
+    else {
+        anyhow::bail!("expected member list");
+    };
+    let JsonMember::Pair(key, _) = ctx.call(Jp::deref_ast_box::<JsonMember>, items[0]).await?
+    else {
+        anyhow::bail!("expected pair member");
+    };
+    let JsonToken::String(key_text) = ctx.call(Jp::deref_ast_token::<JsonToken>, key).await? else {
+        anyhow::bail!("expected string key token");
+    };
+    assert_eq!(key_text, "a");
+
+    runtime.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn parser_layer_can_return_on_demand_spans_for_ast_handles() -> anyhow::Result<()> {
+    let (source_tx, source_rx) = mpsc::channel(32);
+    let (sink_tx, mut sink_rx) = mpsc::channel(32);
+    let debug_sink = debug_sink!(|_ctx, deltas| {
+        let sink_tx = sink_tx.clone();
+        async move {
+            let _ = sink_tx.send(deltas.clone()).await;
+            Ok(())
+        }
+    });
+    let parser = Grammar::from_spec::<JsonValue>().build_lr1::<JsonToken, JsonSink>();
+    type Jl = Lexer<JsonToken, Jp>;
+    let mut runtime = Runtime::new()
+        .with(Source::new(source_rx))
+        .with(Jl::new()?)
+        .with(parser)
+        .finish(debug_sink);
+    runtime.run().await?;
+
+    let ctx = runtime.context();
+    let uri = Span::new("test://ast-handle-spans", 0, 0)?.uri;
+    source_tx
+        .send(SourceEdit::Insert {
+            key: Span::new_uri(uri, 0, 0)?,
+            value: r#"{"a":{"bc":2}}"#.to_string(),
+        })
+        .await?;
+    let _ = recv_non_empty_parse_batch(&mut sink_rx).await?;
+
+    let root_path = ParsePath {
+        uri,
+        path: Vec::new(),
+        range: RangeOrPoint::Point(0),
+    };
+    let roots = ctx
+        .call(Jp::get_ast_tree::<JsonValue>, root_path.clone())
+        .await?;
+    let root = roots[0];
+    let JsonValue::Object(obj) = ctx.call(Jp::deref_ast_box::<JsonValue>, root).await? else {
+        anyhow::bail!("expected root object");
+    };
+    let JsonObject::Members(members) = ctx.call(Jp::deref_ast_box::<JsonObject>, obj).await? else {
+        anyhow::bail!("expected object members");
+    };
+    let JsonMembers::Many(items) = ctx.call(Jp::deref_ast_box::<JsonMembers>, members).await?
+    else {
+        anyhow::bail!("expected member list");
+    };
+    let JsonMember::Pair(_, value) = ctx.call(Jp::deref_ast_box::<JsonMember>, items[0]).await?
+    else {
+        anyhow::bail!("expected member pair");
+    };
+    let JsonValue::Object(nested) = ctx.call(Jp::deref_ast_box::<JsonValue>, value).await? else {
+        anyhow::bail!("expected nested object");
+    };
+    let JsonObject::Members(nested_members) =
+        ctx.call(Jp::deref_ast_box::<JsonObject>, nested).await?
+    else {
+        anyhow::bail!("expected nested members");
+    };
+    let JsonMembers::Many(nested_items) = ctx
+        .call(Jp::deref_ast_box::<JsonMembers>, nested_members)
+        .await?
+    else {
+        anyhow::bail!("expected nested member list");
+    };
+    let JsonMember::Pair(key, _) = ctx
+        .call(Jp::deref_ast_box::<JsonMember>, nested_items[0])
+        .await?
+    else {
+        anyhow::bail!("expected nested pair");
+    };
+
+    assert_eq!(
+        ctx.call(Jp::span_of_ast_box::<JsonValue>, root).await?,
+        Span::new_uri(uri, 0, 14)?
+    );
+    assert_eq!(
+        ctx.call(Jp::span_of_ast_box::<JsonObject>, nested).await?,
+        Span::new_uri(uri, 5, 13)?
+    );
+    assert_eq!(
+        ctx.call(Jp::span_of_ast_token::<JsonToken>, key).await?,
+        Span::new_uri(uri, 6, 10)?
+    );
+
+    source_tx
+        .send(SourceEdit::Insert {
+            key: Span::new_uri(uri, 0, 0)?,
+            value: " ".to_string(),
+        })
+        .await?;
+    let _ = recv_non_empty_parse_batch(&mut sink_rx).await?;
+
+    let shifted_roots = ctx.call(Jp::get_ast_tree::<JsonValue>, root_path).await?;
+    let shifted_root = shifted_roots[0];
+    let JsonValue::Object(shifted_obj) = ctx
+        .call(Jp::deref_ast_box::<JsonValue>, shifted_root)
+        .await?
+    else {
+        anyhow::bail!("expected shifted root object");
+    };
+    let JsonObject::Members(shifted_members) = ctx
+        .call(Jp::deref_ast_box::<JsonObject>, shifted_obj)
+        .await?
+    else {
+        anyhow::bail!("expected shifted object members");
+    };
+    let JsonMembers::Many(shifted_items) = ctx
+        .call(Jp::deref_ast_box::<JsonMembers>, shifted_members)
+        .await?
+    else {
+        anyhow::bail!("expected shifted member list");
+    };
+    let JsonMember::Pair(_, shifted_value) = ctx
+        .call(Jp::deref_ast_box::<JsonMember>, shifted_items[0])
+        .await?
+    else {
+        anyhow::bail!("expected shifted pair");
+    };
+    let JsonValue::Object(shifted_nested) = ctx
+        .call(Jp::deref_ast_box::<JsonValue>, shifted_value)
+        .await?
+    else {
+        anyhow::bail!("expected shifted nested object");
+    };
+    let JsonObject::Members(shifted_nested_members) = ctx
+        .call(Jp::deref_ast_box::<JsonObject>, shifted_nested)
+        .await?
+    else {
+        anyhow::bail!("expected shifted nested members");
+    };
+    let JsonMembers::Many(shifted_nested_items) = ctx
+        .call(Jp::deref_ast_box::<JsonMembers>, shifted_nested_members)
+        .await?
+    else {
+        anyhow::bail!("expected shifted nested member list");
+    };
+    let JsonMember::Pair(shifted_key, _) = ctx
+        .call(Jp::deref_ast_box::<JsonMember>, shifted_nested_items[0])
+        .await?
+    else {
+        anyhow::bail!("expected shifted nested pair");
+    };
+
+    assert_eq!(
+        ctx.call(Jp::span_of_ast_box::<JsonObject>, shifted_nested)
+            .await?,
+        Span::new_uri(uri, 6, 14)?
+    );
+    assert_eq!(
+        ctx.call(Jp::span_of_ast_token::<JsonToken>, shifted_key)
+            .await?,
+        Span::new_uri(uri, 7, 11)?
+    );
+
+    runtime.shutdown().await;
+    Ok(())
+}
+
 async fn run_json_incremental_case(
     initial: &str,
     changes: Vec<SourceEdit>,
@@ -565,7 +772,7 @@ async fn run_json_incremental_case(
         batches.push(recv_non_empty_parse_batch(&mut sink_rx).await?);
         let stat = runtime
             .context()
-            .post::<Jp, GetIncrementalStats>(GetIncrementalStats(uri))
+            .call(Jp::incremental_stats_for, uri)
             .await?
             .ok_or_else(|| anyhow::anyhow!("missing incremental stats"))?;
         stats.push(stat);
@@ -619,7 +826,7 @@ async fn run_json_incremental_case_member_keys(
     };
     let roots = runtime
         .context()
-        .post::<Jp, GetAstTree<JsonValue>>(GetAstTree(root_path, PhantomData))
+        .call(Jp::get_ast_tree::<JsonValue>, root_path)
         .await?;
     let keys = if let Some(root) = roots.first().copied() {
         let ctx = runtime.context();
@@ -680,7 +887,7 @@ async fn run_json_incremental_batched_case_member_keys(
     };
     let roots = runtime
         .context()
-        .post::<Jp, GetAstTree<JsonValue>>(GetAstTree(root_path, PhantomData))
+        .call(Jp::get_ast_tree::<JsonValue>, root_path)
         .await?;
     let keys = if let Some(root) = roots.first().copied() {
         let ctx = runtime.context();

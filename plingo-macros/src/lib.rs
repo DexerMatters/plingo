@@ -1,6 +1,6 @@
+mod context_callable;
 mod layer;
 mod non_terminal;
-mod resolve_action;
 mod shared;
 mod tokens;
 
@@ -17,8 +17,8 @@ pub fn layer(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-pub fn resolve_action(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    resolve_action::expand_resolve_impl(item)
+pub fn context_callable(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    context_callable::expand_context_callable(item)
 }
 
 #[proc_macro_attribute]

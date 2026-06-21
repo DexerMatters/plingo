@@ -4,7 +4,7 @@ mod mode;
 
 #[doc(hidden)]
 pub mod __macro_private;
-pub mod policy;
+pub mod interface;
 
 use std::{collections::HashMap, error::Error, fmt, hash::Hash, marker::PhantomData, str::FromStr};
 
@@ -21,8 +21,10 @@ use crate::{
     component::parse::{TokenData, grammar::TerminalId},
     component::source::TextChange,
     scheme::{
-        ActionError, Context, LayerChange, LayerChanges, MiddleLayer, NonTopLayer,
-        ReplacementBatch, ReplacementChange, SnapshotId, SnapshotLayer,
+        change::{LayerChange, LayerChanges, ReplacementBatch, ReplacementChange},
+        context::{Context, SnapshotId},
+        error::ActionError,
+        layer::{MiddleLayer, NonTopLayer, SnapshotLayer},
     },
     utils::{PrettyDisplay, Span},
 };
@@ -466,7 +468,7 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         &self.state_info
     }
 
-    pub fn tokens(&self) -> &[Vec<ResolvedToken<Root>>] {
+    pub fn resolved_tokens(&self) -> &[Vec<ResolvedToken<Root>>] {
         &self.tokens
     }
 
@@ -497,6 +499,21 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
 
     pub(crate) fn snapshot_state(&self, snapshot: Option<SnapshotId>) -> &LexerSnapshotState<Root> {
         self.state(snapshot).unwrap_or_else(|| self.latest_state())
+    }
+
+    pub(crate) fn entry_span(&self, snapshot: Option<SnapshotId>, id: usize) -> Option<Span> {
+        let state = self.snapshot_state(snapshot);
+        for (&uri, token_ids) in &state.token_instances {
+            let Some(token_ranges) = state.token_ranges.get(&uri) else {
+                continue;
+            };
+            for (&token_id, &(start, end)) in token_ids.iter().zip(token_ranges.iter()) {
+                if token_id == id {
+                    return Span::new_uri(uri, start, end).ok();
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn entries_in_span(

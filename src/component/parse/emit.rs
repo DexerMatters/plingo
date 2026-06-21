@@ -1,6 +1,6 @@
 use fluent_uri::Uri;
 
-use crate::scheme::{ReplacementBatch, ReplacementChange};
+use crate::scheme::change::{ReplacementBatch, ReplacementChange};
 
 use super::{ParseAddress, ParseChange, ParseUnit, ProductId};
 

@@ -9,7 +9,7 @@ use super::{
         product::{ProductArena, ProductData},
     },
 };
-use crate::scheme::{ReplacementBatch, ReplacementChange};
+use crate::scheme::change::{ReplacementBatch, ReplacementChange};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Cost {
@@ -240,7 +240,7 @@ impl<'a> DiffCx<'a> {
                     },
                     weight: 1,
                 },
-                ProductData::Error => Summary {
+                ProductData::Error { .. } => Summary {
                     shape: ShapeKey::Error {
                         green: product.green,
                     },
@@ -351,12 +351,12 @@ impl<'a> DiffCx<'a> {
             },
             (
                 Some(crate::component::parse::data::product::Product {
-                    data: ProductData::Error,
+                    data: ProductData::Error { .. },
                     green: old_green,
                     ..
                 }),
                 Some(crate::component::parse::data::product::Product {
-                    data: ProductData::Error,
+                    data: ProductData::Error { .. },
                     green: new_green,
                     ..
                 }),
@@ -630,8 +630,8 @@ impl<'a> DiffCx<'a> {
                 replace_node(old_pid, new_pid, path, uri, deltas);
             }
             (
-                ProductData::Error,
-                ProductData::Error,
+                ProductData::Error { .. },
+                ProductData::Error { .. },
                 TreeData::Error { .. },
                 TreeData::Error { .. },
             ) => {

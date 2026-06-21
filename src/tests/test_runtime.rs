@@ -5,7 +5,7 @@ use plingo::{
         sink::DebugSink,
         source::Source,
     },
-    scheme::Runtime,
+    scheme::runtime::Runtime,
     tokens,
 };
 use tokio::sync::mpsc;

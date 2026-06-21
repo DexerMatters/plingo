@@ -31,7 +31,16 @@ impl Product {
     }
 
     pub fn error(green: GreenId) -> Self {
-        Self::new(green, ProductData::Error)
+        Self::new(
+            green,
+            ProductData::Error {
+                children: Vec::new(),
+            },
+        )
+    }
+
+    pub fn error_with_children(green: GreenId, children: Vec<ProductId>) -> Self {
+        Self::new(green, ProductData::Error { children })
     }
 
     pub fn token(green: GreenId, entry: TokenEntryId, fingerprint: TokenFingerprint) -> Self {
@@ -81,7 +90,9 @@ impl Product {
 
 #[derive(Debug, Clone)]
 pub enum ProductData {
-    Error,
+    Error {
+        children: Vec<ProductId>,
+    },
     Token {
         entry: TokenEntryId,
         fingerprint: TokenFingerprint,
@@ -130,7 +141,19 @@ impl ProductArena {
 
 fn product_semantic_hash(product: &Product, products: &[Product]) -> u64 {
     match &product.data {
-        ProductData::Error => hash_value(&("err", product.green)),
+        ProductData::Error { children } => hash_value(&(
+            "err",
+            product.green,
+            children
+                .iter()
+                .map(|&child| {
+                    products.get(child).map_or_else(
+                        || hash_value(&("missing-child-product", child)),
+                        Product::semantic_hash,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )),
         ProductData::Token {
             fingerprint, ty, ..
         } => hash_value(&("tok", product.green, fingerprint, ty)),

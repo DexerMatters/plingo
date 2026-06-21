@@ -76,7 +76,7 @@ pub(super) fn resolve_token<Root>(
         terminal: spec.terminal,
         precedence: spec.precedence,
         label: spec.label,
-        action: resolve_action(spec.action, state_ids)?,
+        action: resolve_state_action(spec.action, state_ids)?,
         skip: spec.skip,
         build: spec.build,
         minimum_length,
@@ -105,7 +105,7 @@ pub(super) fn build_state_matcher(
     })
 }
 
-fn resolve_action(
+fn resolve_state_action(
     action: StateDirective,
     state_ids: &HashMap<&'static str, State>,
 ) -> Result<StateAction, LexerCreationError> {

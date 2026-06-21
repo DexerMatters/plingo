@@ -43,4 +43,5 @@ version = "1.52.3"
 [dev-dependencies]
 notify = "8.2.0"
 similar = "3.1.1"
+trybuild = "1.0.114"
 workspace_root = "0.2.0"

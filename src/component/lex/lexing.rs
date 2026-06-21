@@ -13,7 +13,10 @@ use crate::{
         },
         source::{Source, TextChange},
     },
-    scheme::{LayerChange, LayerChanges, MiddleLayer, NonTopLayer, ReplacementChange},
+    scheme::{
+        change::{LayerChange, LayerChanges, ReplacementChange},
+        layer::{MiddleLayer, NonTopLayer},
+    },
     utils::{RangeOrPoint, Span},
 };
 
@@ -43,7 +46,7 @@ where
     #[allow(dead_code)]
     pub(crate) fn lex_change<'a>(
         &'a mut self,
-        ctx: &'a crate::scheme::Context,
+        ctx: &'a crate::scheme::context::Context,
         state: &'a mut LexerSnapshotState<Root>,
         change: TextChange,
     ) -> impl Future<
@@ -58,7 +61,7 @@ where
 
     pub(crate) fn lex_changes<'a>(
         &'a mut self,
-        ctx: &'a crate::scheme::Context,
+        ctx: &'a crate::scheme::context::Context,
         state: &'a mut LexerSnapshotState<Root>,
         changes: &'a [TextChange],
     ) -> impl Future<
@@ -73,10 +76,13 @@ where
             let total_start = Instant::now();
             let fetch_source_start = Instant::now();
             let snapshot = ctx
-                .post::<Source<Lexer<Root, Lower>>, _>(Span {
-                    uri,
-                    range: RangeOrPoint::Range(0, usize::MAX),
-                })
+                .call(
+                    Source::<Lexer<Root, Lower>>::read_span,
+                    Span {
+                        uri,
+                        range: RangeOrPoint::Range(0, usize::MAX),
+                    },
+                )
                 .await
                 .map_err(LexInterrupt::ActionError)?;
             let fetch_source_elapsed = fetch_source_start.elapsed();

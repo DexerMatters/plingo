@@ -2,6 +2,8 @@ use std::{any::Any, marker::PhantomData, sync::Arc};
 
 use fluent_uri::Uri;
 
+use super::product::ProductId;
+
 pub type AstId = usize;
 pub type TokenEntryId = usize;
 
@@ -54,6 +56,7 @@ impl<T> AstToken<T> {
 #[derive(Clone)]
 pub struct AstArena {
     values: Vec<Arc<dyn Any + Send + Sync>>,
+    owners: Vec<Option<ProductId>>,
     uri: Uri<&'static str>,
 }
 
@@ -61,6 +64,7 @@ impl AstArena {
     pub fn new(uri: Uri<&'static str>) -> Self {
         Self {
             values: Vec::new(),
+            owners: Vec::new(),
             uri,
         }
     }
@@ -71,6 +75,7 @@ impl AstArena {
     {
         let id = self.values.len();
         self.values.push(Arc::new(value));
+        self.owners.push(None);
         AstBox::new(id, self.uri)
     }
 
@@ -88,5 +93,15 @@ impl AstArena {
         T: Clone + 'static,
     {
         self.values.get(id)?.downcast_ref::<T>().cloned()
+    }
+
+    pub fn bind_product(&mut self, id: AstId, product: ProductId) {
+        if let Some(owner) = self.owners.get_mut(id) {
+            *owner = Some(product);
+        }
+    }
+
+    pub fn product_of(&self, id: AstId) -> Option<ProductId> {
+        self.owners.get(id).copied().flatten()
     }
 }

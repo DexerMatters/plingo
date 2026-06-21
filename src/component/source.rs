@@ -1,14 +1,17 @@
 use std::{collections::HashMap, io, marker::PhantomData, sync::Arc};
 
 use crate::{
+    context_callable,
     scheme::{
-        Context, EmittedChanges, NonTopLayer, Outcome, ReplacementBatch, ReplacementChange,
-        Resolve, SnapshotId, SnapshotLayer, TopLayer,
+        call::CallOutcome,
+        change::{EmittedChanges, ReplacementBatch, ReplacementChange},
+        context::{Context, SnapshotId},
+        layer::{NonTopLayer, SnapshotLayer, TopLayer},
     },
     utils::{OwnedRopeSlice, RangeOrPoint, Span},
 };
 use fluent_uri::Uri;
-use plingo_macros::{layer, resolve_action};
+use plingo_macros::layer;
 use ropey::Rope;
 use thiserror::Error;
 use tokio::sync::mpsc::Receiver;
@@ -162,6 +165,40 @@ impl<Lower> Source<Lower> {
     fn capture_snapshot(&mut self, snapshot: SnapshotId) {
         self.push_state(snapshot);
     }
+
+    #[context_callable]
+    pub async fn read_span<'a>(
+        &'a mut self,
+        ctx: &'a Context,
+        span: &'a Span,
+    ) -> CallOutcome<Self, OwnedRopeSlice>
+    where
+        Lower: NonTopLayer<Change = TextChange>,
+    {
+        match self.get_at(ctx.snapshot(), *span).await {
+            Ok(value) => CallOutcome::ok(value),
+            Err(err) => CallOutcome::fail(err),
+        }
+    }
+
+    #[context_callable]
+    pub async fn apply_edit<'a>(
+        &'a mut self,
+        ctx: &'a Context,
+        edit: &'a SourceEdit,
+    ) -> CallOutcome<Self, ()>
+    where
+        Lower: NonTopLayer<Change = TextChange>,
+    {
+        match self.modify(edit) {
+            Ok(()) => {
+                let snapshot_id = ctx.snapshot().unwrap_or_else(|| ctx.allocate_snapshot());
+                self.capture_snapshot(snapshot_id);
+                CallOutcome::emit(vec![self.lower_change(edit)])
+            }
+            Err(err) => CallOutcome::fail(err),
+        }
+    }
 }
 
 #[layer(top)]
@@ -193,52 +230,6 @@ where
             self.capture_snapshot(snapshot_id);
             let changes = batch.iter().map(|edit| self.lower_change(edit)).collect();
             Ok(Some(EmittedChanges::new(snapshot_id, changes)))
-        }
-    }
-}
-
-#[resolve_action]
-impl<Lower> Resolve<Span> for Source<Lower>
-where
-    Lower: NonTopLayer<Change = TextChange>,
-{
-    type Output = OwnedRopeSlice;
-
-    fn resolve<'a>(
-        &'a mut self,
-        ctx: &'a Context,
-        action: &'a Span,
-    ) -> impl Future<Output = Outcome<Span, Self>> + Send + 'a {
-        async move {
-            match self.get_at(ctx.snapshot(), *action).await {
-                Ok(value) => Outcome::ok(value),
-                Err(err) => Outcome::fail(err),
-            }
-        }
-    }
-}
-
-#[resolve_action]
-impl<Lower> Resolve<SourceEdit> for Source<Lower>
-where
-    Lower: NonTopLayer<Change = TextChange>,
-{
-    type Output = ();
-
-    fn resolve<'a>(
-        &'a mut self,
-        ctx: &'a Context,
-        action: &'a SourceEdit,
-    ) -> impl Future<Output = Outcome<SourceEdit, Self>> + Send + 'a {
-        async move {
-            match self.modify(&action) {
-                Ok(()) => {
-                    let snapshot_id = ctx.snapshot().unwrap_or_else(|| ctx.allocate_snapshot());
-                    self.capture_snapshot(snapshot_id);
-                    Outcome::emit(vec![self.lower_change(action)])
-                }
-                Err(err) => Outcome::fail(err),
-            }
         }
     }
 }

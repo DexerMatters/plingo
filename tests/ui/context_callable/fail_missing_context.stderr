@@ -1,0 +1,13 @@
+error: #[context_callable] requires signature `(&'a mut self, &'a Context, &'a Args)`
+  --> tests/ui/context_callable/fail_missing_context.rs:34:9
+   |
+34 |         &'a mut self,
+   |         ^
+
+warning: unused import: `call::CallOutcome`
+ --> tests/ui/context_callable/fail_missing_context.rs:6:9
+  |
+6 |         call::CallOutcome,
+  |         ^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

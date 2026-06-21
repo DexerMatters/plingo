@@ -12,7 +12,10 @@ use crate::component::{
         incremental::ReplayPlan,
     },
 };
-use crate::scheme::{LayerChange, LayerChanges, NonTopLayer};
+use crate::scheme::{
+    change::{LayerChange, LayerChanges},
+    layer::NonTopLayer,
+};
 
 fn maybe_reuse_suffix(
     plan: &ReplayPlan,

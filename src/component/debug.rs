@@ -2,7 +2,11 @@ use std::{convert::Infallible, marker::PhantomData, pin::Pin};
 
 use plingo_macros::layer;
 
-use crate::scheme::{BottomLayer, Context, LayerChange, LayerChanges, MiddleLayer, NonTopLayer};
+use crate::scheme::{
+    change::{LayerChange, LayerChanges},
+    context::Context,
+    layer::{BottomLayer, MiddleLayer, NonTopLayer},
+};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 

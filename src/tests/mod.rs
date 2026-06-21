@@ -18,7 +18,7 @@ use crate::{
         grammar::{ERROR_TERMINAL, Grammar, Symbol},
         identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
     },
-    scheme::ReplacementBatch,
+    scheme::change::ReplacementBatch,
     tokens,
     utils::{PrettyDisplay, Span},
 };
@@ -30,6 +30,7 @@ mod test_parser_comprehensive;
 
 #[cfg(test)]
 mod fs_watch;
+mod scheme;
 
 fn token_data_from_entries(entries: &[(usize, Entry<RootTokens>, usize, usize)]) -> Vec<TokenData> {
     entries
@@ -112,6 +113,22 @@ fn test_enum_iterator() {
     }
     let tokens: Vec<TestTokens> = enum_iterator::all::<TestTokens>().collect();
     println!("{:#?}", tokens);
+}
+
+#[test]
+fn scheme_submodules_are_reachable() {
+    let ctx = crate::scheme::context::Context::default();
+    assert!(ctx.snapshot().is_none());
+
+    let batch = crate::scheme::change::ReplacementBatch {
+        old_units: vec![1usize],
+        new_units: vec![2usize],
+        prefix_len: 0,
+        suffix_len: 0,
+        old_changed_range: 0..1,
+        new_changed_range: 0..1,
+    };
+    assert!(batch.is_changed());
 }
 
 fn parse_usize(text: &str) -> Result<usize, std::num::ParseIntError> {

@@ -117,7 +117,7 @@ impl SessionContext<'_> {
         };
 
         let score = match &product.data {
-            ProductData::Error => (1, 1, tree.length),
+            ProductData::Error { .. } => (1, 1, tree.length),
             ProductData::Token { .. } => (0, 1, tree.length),
             ProductData::Node { children, .. } => {
                 let mut errors = 0usize;
@@ -295,7 +295,7 @@ impl SessionContext<'_> {
             for &product in &self.state.columns[column].products {
                 if matches!(
                     self.products.get(product).map(|p| &p.data),
-                    Some(ProductData::Error)
+                    Some(ProductData::Error { .. })
                 ) {
                     paths.push(ReductionPath {
                         predecessor: node,

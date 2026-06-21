@@ -77,7 +77,7 @@ impl BuildField for ParseErrorInfo {
             .products
             .get(product)
             .ok_or(BuildError::MissingProduct(product))?;
-        if !matches!(p.data, ProductData::Error) {
+        if !matches!(p.data, ProductData::Error { .. }) {
             return Err(BuildError::TypeMismatch { product });
         }
         let tree = cx
@@ -175,6 +175,6 @@ pub fn expect_product_type(
         ProductData::Node { ty, .. } if *ty == expected => Ok(()),
         ProductData::Node { .. } => Err(BuildError::TypeMismatch { product }),
         ProductData::Token { .. } => Err(BuildError::ExpectedNode { product }),
-        ProductData::Error => Err(BuildError::UnexpectedErrorProduct { product }),
+        ProductData::Error { .. } => Err(BuildError::UnexpectedErrorProduct { product }),
     }
 }

@@ -29,7 +29,10 @@ use crate::{
     utils::{PrettyDisplay, Span},
 };
 
-use self::__macro_private::{BuildToken, StateRegistration, TokenSpec};
+use self::__macro_private::{
+    BuildErrorToken, BuildLiftedToken, BuildToken, StateBoundary, StateRegistration, TokenSpec,
+    WrapLiftedToken,
+};
 
 pub trait TokenState: Send + Sync + 'static {
     fn display_name() -> &'static str;
@@ -38,9 +41,18 @@ pub trait TokenState: Send + Sync + 'static {
 
 pub trait StateTokens: TokenState + Sized {
     fn token_specs() -> Vec<TokenSpec<Self>>;
+    fn error_builder() -> BuildErrorToken<Self>;
 
     fn state_registration() -> StateRegistration<Self> {
-        StateRegistration::new(Self::display_name(), Self::state_key(), Self::token_specs)
+        let error_builder = Self::error_builder();
+        StateRegistration::new(
+            Self::display_name(),
+            Self::state_key(),
+            Self::token_specs,
+            error_builder.clone(),
+            error_builder,
+            None,
+        )
     }
 }
 
@@ -65,7 +77,7 @@ pub struct ResolvedToken<Root> {
     pub(crate) minimum_length: usize,
     pub(crate) maximum_length: usize,
     pub(crate) captures_context: bool,
-    pub(crate) validate: Option<fn(&str, Option<&str>) -> bool>,
+    pub(crate) validate: Option<self::__macro_private::ValidateLexeme>,
 }
 
 impl<Root> fmt::Debug for ResolvedToken<Root> {
@@ -167,6 +179,38 @@ impl LexInterrupt {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LexErrorKind {
+    UnexpectedInput,
+    RequiredBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LexErrorInfo {
+    pub kind: LexErrorKind,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Error)]
+pub enum GenerateError {
+    #[error("token generator for {token} could not compile the regex: {err}")]
+    RegexCompile { token: &'static str, err: String },
+    #[error("token generator for {token} could not produce an accepted sample")]
+    NoAcceptedSample { token: &'static str },
+    #[error("generate! does not know variant {state}::{variant}")]
+    UnknownVariant {
+        state: &'static str,
+        variant: &'static str,
+    },
+    #[error("generate! does not support #[from(...)] variant {token}")]
+    UnsupportedFromVariant { token: &'static str },
+    #[error("generate! does not support validated variant {token}")]
+    UnsupportedValidatedVariant { token: &'static str },
+    #[error("failed to write generated token")]
+    Write(#[source] fmt::Error),
+}
+
 #[derive(Debug)]
 pub(crate) struct StateMatcher {
     pub(crate) dfa: DFA<Vec<u32>>,
@@ -184,7 +228,11 @@ where
         value: Root,
     },
     EOF,
-    Error(usize, ErrorToken),
+    Error {
+        length: usize,
+        info: LexErrorInfo,
+        value: Root,
+    },
 }
 
 pub type TokenBatch = ReplacementBatch<TokenData>;
@@ -199,12 +247,12 @@ where
     }
 
     pub fn is_error(&self) -> bool {
-        matches!(self, Self::Error(_, _))
+        matches!(self, Self::Error { .. })
     }
 
     pub fn length(&self) -> usize {
         match self {
-            Self::Token { length, .. } | Self::Error(length, _) => *length,
+            Self::Token { length, .. } | Self::Error { length, .. } => *length,
             Self::EOF => 0,
         }
     }
@@ -214,7 +262,7 @@ impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> fo
     fn pretty_fmt(
         &self,
         f: &mut core::fmt::Formatter<'_>,
-        context: &Lexer<Root, Lower>,
+        _context: &Lexer<Root, Lower>,
     ) -> core::fmt::Result {
         use color_print::cwrite;
         match self {
@@ -226,12 +274,12 @@ impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> fo
                     value
                 )
             }
-            Entry::Error(length, error) => {
+            Entry::Error { length, value, .. } => {
                 cwrite!(
                     f,
                     "<dim>[{}]\t</dim><red>Error</red>: {}",
                     length,
-                    error.pretty(context)
+                    value
                 )
             }
             Entry::EOF => cwrite!(f, "<dim>[0]\t</dim><green>EOF</green>"),
@@ -255,12 +303,12 @@ impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> fo
                     value
                 )
             }
-            Entry::Error(length, error) => {
+            Entry::Error { length, value, .. } => {
                 cwrite!(
                     f,
                     "<dim>[{}]\t</dim><red>Error</red>: {}",
                     length,
-                    error.pretty(context)
+                    value
                 )
             }
             Entry::EOF => cwrite!(f, "<dim>[0]\t</dim><green>EOF</green>"),
@@ -307,7 +355,6 @@ where
     }
 }
 
-#[derive(Debug)]
 #[layer]
 pub struct Lexer<Root, Lower = ()>
 where
@@ -316,6 +363,9 @@ where
     tokens: Vec<Vec<ResolvedToken<Root>>>,
     state_matchers: Vec<StateMatcher>,
     state_info: Vec<StateInfo>,
+    state_boundaries: Vec<Option<StateBoundary>>,
+    state_recovery_errors: Vec<BuildErrorToken<Root>>,
+    state_boundary_errors: Vec<BuildErrorToken<Root>>,
 
     #[snapshot]
     latest: LexerSnapshotState<Root>,
@@ -356,13 +406,13 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                     column,
                     fingerprint: eof_fingerprint(),
                 }),
-                Entry::Error(length, error) => Some(TokenData {
+                Entry::Error { length, info, .. } => Some(TokenData {
                     id,
                     terminal: None,
                     start,
                     length: *length,
                     column,
-                    fingerprint: error_fingerprint(error, *length),
+                    fingerprint: error_fingerprint(info, *length),
                 }),
                 _ => None,
             };
@@ -427,18 +477,21 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         let state_ids = registrations
             .iter()
             .enumerate()
-            .map(|(index, registration)| (registration.type_name, State::new(index)))
+            .map(|(index, registration)| (registration.type_name.clone(), State::new(index)))
             .collect::<HashMap<_, _>>();
         let states = registrations
             .iter()
             .map(|registration| StateInfo {
                 name: registration.display_name,
-                type_name: registration.type_name,
+                type_name: registration.type_name.clone(),
             })
             .collect::<Vec<_>>();
 
         let mut tokens = Vec::with_capacity(registrations.len());
         let mut state_matchers = Vec::with_capacity(registrations.len());
+        let mut state_boundaries = Vec::with_capacity(registrations.len());
+        let mut state_recovery_errors = Vec::with_capacity(registrations.len());
+        let mut state_boundary_errors = Vec::with_capacity(registrations.len());
         for registration in &registrations {
             let mut state_tokens = Vec::new();
             let mut patterns = Vec::new();
@@ -446,6 +499,9 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                 patterns.push(spec.regex);
                 state_tokens.push(build::resolve_token(spec, &state_ids)?);
             }
+            state_boundaries.push(registration.boundary);
+            state_recovery_errors.push(registration.recovery_error_builder.clone());
+            state_boundary_errors.push(registration.boundary_error_builder.clone());
             state_matchers.push(build::build_state_matcher(
                 registration.display_name,
                 &patterns,
@@ -458,6 +514,9 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             tokens,
             arena: Vec::new(),
             state_matchers,
+            state_boundaries,
+            state_recovery_errors,
+            state_boundary_errors,
             latest: LexerSnapshotState::default(),
             _lower: PhantomData,
             _snapshot: HashMap::new(),
@@ -493,7 +552,7 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
     pub fn terminal_of(&self, index: usize) -> Option<TerminalId> {
         match self.get(index) {
             Entry::Token { terminal, .. } => Some(*terminal),
-            Entry::EOF | Entry::Error(_, _) => None,
+            Entry::EOF | Entry::Error { .. } => None,
         }
     }
 
@@ -570,7 +629,7 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                         && start < span.range.end()
                         && end > span.range.start()
                 }
-                Entry::Error(_, _) => start < span.range.end() && end > span.range.start(),
+                Entry::Error { .. } => start < span.range.end() && end > span.range.start(),
                 Entry::EOF => start >= span.range.start() && start <= span.range.end(),
             };
 
@@ -600,14 +659,14 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                             fingerprint: eof_fingerprint(),
                         });
                     }
-                    Entry::Error(length, error) => {
+                    Entry::Error { length, info, .. } => {
                         out.push(TokenData {
                             id,
                             terminal: None,
                             start,
                             length: *length,
                             column,
-                            fingerprint: error_fingerprint(error, *length),
+                            fingerprint: error_fingerprint(info, *length),
                         });
                     }
                 }
@@ -631,6 +690,18 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             .iter()
             .position(|state| state.type_name == type_name)
             .map(|p| State::new(p))
+    }
+
+    pub(crate) fn state_boundary(&self, state: State) -> Option<StateBoundary> {
+        self.state_boundaries.get(state.id).copied().flatten()
+    }
+
+    pub(crate) fn recovery_error_builder(&self, state: State) -> Option<&BuildErrorToken<Root>> {
+        self.state_recovery_errors.get(state.id)
+    }
+
+    pub(crate) fn boundary_error_builder(&self, state: State) -> Option<&BuildErrorToken<Root>> {
+        self.state_boundary_errors.get(state.id)
     }
 }
 
@@ -680,13 +751,29 @@ where
 }
 
 pub fn lift_state_registrations<Root, Nested>(
-    wrap: fn(Nested) -> Root,
+    build_outer: BuildLiftedToken<Root, Nested>,
+    wrap_nested: Option<WrapLiftedToken<Root, Nested>>,
+    boundary_error_builder: BuildErrorToken<Root>,
+    synthetic_key: &'static str,
+    boundary: Option<StateBoundary>,
+    terminal: TerminalId,
+    label: &'static str,
+    outer_validate: Option<self::__macro_private::ValidateLexeme>,
 ) -> Vec<StateRegistration<Root>>
 where
     Root: Send + Sync + 'static,
     Nested: LexerRoot + 'static,
 {
-    build::lift_state_registrations(wrap)
+    build::lift_state_registrations(
+        build_outer,
+        wrap_nested,
+        boundary_error_builder,
+        synthetic_key,
+        boundary,
+        terminal,
+        label,
+        outer_validate,
+    )
 }
 
 #[derive(Debug, Error)]
@@ -695,7 +782,7 @@ pub enum LexerCreationError {
     RegexParsingError(String, String, regex_syntax::Error),
     #[error("Failed to build grouped regex matcher for state {state}: {source}")]
     RegexMatcherBuildError {
-        state: &'static str,
+        state: String,
         #[source]
         source: regex_automata::dfa::dense::BuildError,
     },
@@ -709,80 +796,6 @@ pub enum LexerCreationError {
     UnknownState(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ErrorToken {
-    UnexpectedEndOfInput {
-        state: usize,
-    },
-    UnexpectedToken {
-        start: usize,
-        end: usize,
-        expected_state: usize,
-    },
-    MissingToken {
-        state: usize,
-        token: usize,
-        offset: usize,
-    },
-}
-
-impl<Root: LexerRoot, Lower> PrettyDisplay<Lexer<Root, Lower>> for ErrorToken {
-    fn pretty_fmt(
-        &self,
-        f: &mut core::fmt::Formatter<'_>,
-        context: &Lexer<Root, Lower>,
-    ) -> core::fmt::Result {
-        use color_print::cwrite;
-
-        match self {
-            Self::UnexpectedEndOfInput { state } => {
-                let tokens = context
-                    .tokens_in_state(State::new(*state))
-                    .ok_or_else(|| fmt::Error)?;
-                cwrite!(
-                    f,
-                    "Unexpected end of input, expected one of the following tokens: {}",
-                    tokens
-                        .iter()
-                        .map(|token| token.label)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
-            Self::UnexpectedToken {
-                start,
-                end,
-                expected_state,
-            } => {
-                let tokens = context
-                    .tokens_in_state(State::new(*expected_state))
-                    .ok_or_else(|| fmt::Error)?;
-                cwrite!(
-                    f,
-                    "Unexpected token from offset {} to {}, expected one of the following tokens: {}",
-                    start,
-                    end,
-                    tokens
-                        .iter()
-                        .map(|token| token.label)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
-            Self::MissingToken {
-                state,
-                token,
-                offset,
-            } => {
-                let token = context
-                    .tokens_in_state(State::new(*state))
-                    .and_then(|tokens| tokens.get(*token))
-                    .ok_or_else(|| fmt::Error)?;
-                cwrite!(f, "Missing token {} at offset {}", token.label, offset)
-            }
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct UnsupportedDefaultParseError {

@@ -69,5 +69,19 @@ impl LexerState {
 #[derive(Debug, Clone)]
 pub struct StateInfo {
     pub name: &'static str,
-    pub type_name: &'static str,
+    pub type_name: String,
+}
+
+impl LexerState {
+    pub fn parent_state(&self) -> Option<State> {
+        self.state_stack
+            .get(self.state_stack.len().checked_sub(2)?)
+            .cloned()
+    }
+
+    pub fn parent_context(&self) -> Option<&str> {
+        self.state_stack
+            .get(self.state_stack.len().checked_sub(2)?)
+            .and_then(|s| s.context.as_deref())
+    }
 }

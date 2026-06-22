@@ -4,7 +4,8 @@ use enum_iterator::Sequence;
 
 use crate::{
     NonTerminal,
-    component::lex::{Entry, Lexer, LexerState},
+    Terminal,
+    component::lex::{Entry, LexErrorInfo, Lexer, LexerState},
     component::parse::{
         AstToken, ErrorKind, ParseAddress, ParseChange, ParseErrorInfo, ParseUnit, ParserConfig,
         TokenData,
@@ -19,7 +20,6 @@ use crate::{
         identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
     },
     scheme::change::ReplacementBatch,
-    tokens,
     utils::{PrettyDisplay, Span},
 };
 
@@ -27,6 +27,7 @@ use crate::{
 
 mod test_parser;
 mod test_parser_comprehensive;
+mod test_terminal_from;
 
 #[cfg(test)]
 mod fs_watch;
@@ -58,13 +59,13 @@ fn token_data_from_entries(entries: &[(usize, Entry<RootTokens>, usize, usize)])
                     column,
                     fingerprint: eof_fingerprint(),
                 },
-                Entry::Error(length, error) => TokenData {
+                Entry::Error { length, info, .. } => TokenData {
                     id: *id,
                     terminal: None,
                     start: *start,
                     length: *length,
                     column,
-                    fingerprint: error_fingerprint(error, *length),
+                    fingerprint: error_fingerprint(info, *length),
                 },
             };
             data
@@ -131,47 +132,118 @@ fn scheme_submodules_are_reachable() {
     assert!(batch.is_changed());
 }
 
+#[test]
+fn parse_replay_plan_lives_under_parsing_module() {
+    let batch = crate::component::lex::TokenBatch {
+        old_units: vec![crate::component::parse::TokenData {
+            id: 1,
+            terminal: None,
+            start: 0,
+            length: 1,
+            column: 0,
+            fingerprint: 11,
+        }],
+        new_units: vec![
+            crate::component::parse::TokenData {
+                id: 1,
+                terminal: None,
+                start: 0,
+                length: 1,
+                column: 0,
+                fingerprint: 11,
+            },
+            crate::component::parse::TokenData {
+                id: 2,
+                terminal: None,
+                start: 1,
+                length: 1,
+                column: 1,
+                fingerprint: 22,
+            },
+        ],
+        prefix_len: 1,
+        suffix_len: 0,
+        old_changed_range: 1..1,
+        new_changed_range: 1..2,
+    };
+
+    let plan = crate::component::parse::parsing::ReplayPlan::from_batch(batch);
+    assert_eq!(plan.restart_boundary, 1);
+    assert_eq!(plan.replay_tokens().len(), 1);
+}
+
 fn parse_usize(text: &str) -> Result<usize, std::num::ParseIntError> {
     text.parse()
 }
 
-#[tokens]
-#[derive(Debug, Clone)]
+#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
 enum RootTokens {
     #[regex(r#"""#)]
-    #[enter(StringTokens)]
-    QuoteStart,
+    Quote,
 
     #[regex(r"[0-9]+")]
     Number(#[parse(parse_usize)] usize),
+
+    #[error]
+    Error(LexErrorInfo),
 }
 
 impl fmt::Display for RootTokens {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::QuoteStart => write!(f, "QuoteStart"),
+            Self::Quote => write!(f, "Quote"),
             Self::Number(n) => write!(f, "Number({n})"),
-            Self::StringTokens(st) => write!(f, "StringTokens({st})"),
+            Self::Error(info) => write!(f, "Error({info:?})"),
         }
     }
 }
 
-#[tokens]
-#[derive(Debug, Clone)]
-enum StringTokens {
+#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
+enum NestedRootTokens {
+    #[regex(r#"""#)]
+    #[then_require(StringLiteral)]
+    QuoteStart,
+
+    #[from(NestedStringTokens)]
+    #[till(QuoteEnd)]
+    StringLiteral(NestedStringTokens),
+
+    #[regex(r#"""#)]
+    QuoteEnd,
+
+    #[regex(r"[0-9]+")]
+    Number(#[parse(parse_usize)] usize),
+
+    #[error]
+    Error(LexErrorInfo),
+}
+
+impl fmt::Display for NestedRootTokens {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QuoteStart => write!(f, "QuoteStart"),
+            Self::StringLiteral(part) => write!(f, "StringLiteral({part:?})"),
+            Self::QuoteEnd => write!(f, "QuoteEnd"),
+            Self::Number(n) => write!(f, "Number({n})"),
+            Self::Error(info) => write!(f, "Error({info:?})"),
+        }
+    }
+}
+
+#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
+enum NestedStringTokens {
     #[regex(r#"[^"]+"#)]
     Text(String),
 
-    #[regex(r#"""#)]
-    #[leave]
-    QuoteEnd,
+    #[error]
+    Error(LexErrorInfo),
 }
 
-impl fmt::Display for StringTokens {
+impl fmt::Display for NestedStringTokens {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Text(t) => write!(f, "Text(\"{t}\")"),
-            Self::QuoteEnd => write!(f, "QuoteEnd"),
+            Self::Error(info) => write!(f, "Error({info:?})"),
         }
     }
 }
@@ -181,61 +253,70 @@ fn raw_delimiter(lexeme: &str) -> &str {
     after_r.strip_suffix('"').unwrap_or(after_r)
 }
 
-fn raw_string_matches(lexeme: &str, context: Option<&str>) -> bool {
+fn raw_end_matches(lexeme: &str, context: Option<&str>) -> bool {
     let Some(ctx) = context else {
         return false;
     };
     let delim = raw_delimiter(ctx);
-    lexeme.ends_with(delimiter_closer(delim))
+    lexeme == delimiter_closer(delim)
 }
 
-fn delimiter_closer(hashes: &str) -> &str {
-    if hashes.is_empty() { "\"" } else { hashes }
+fn delimiter_closer(hashes: &str) -> String {
+    format!("\"{hashes}")
 }
 
-#[tokens]
-#[derive(Debug, Clone)]
+#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
 enum RawRoot {
     #[regex("r#*\"")]
-    #[enter(RawBody)]
+    #[then_require(RawLiteral)]
     RawStart(String),
+
+    #[from(RawBody)]
+    #[till(RawEnd)]
+    RawLiteral(RawBody),
+
+    #[regex("\"#*")]
+    #[validate(raw_end_matches)]
+    RawEnd(String),
 
     #[regex(r"\s+")]
     #[skip]
     RawWs,
+
+    #[error]
+    Error(LexErrorInfo),
 }
 
 impl fmt::Display for RawRoot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RawStart(d) => write!(f, "RawStart({d})"),
-            Self::RawBody(rb) => write!(f, "RawBody({rb:?})"),
+            Self::RawLiteral(rb) => write!(f, "RawLiteral({rb:?})"),
+            Self::RawEnd(d) => write!(f, "RawEnd({d})"),
             Self::RawWs => write!(f, "RawWs"),
+            Self::Error(info) => write!(f, "Error({info:?})"),
         }
     }
 }
 
-#[tokens]
-#[derive(Debug, Clone)]
+#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
 enum RawBody {
-    #[regex("[^\"]*\"")]
-    #[leave]
-    #[validate(raw_string_matches)]
-    RawEnd(String),
-
     #[regex("[^\"]+")]
     Content(String),
 
     #[regex("\"")]
     EmbeddedQuote,
+
+    #[error]
+    Error(LexErrorInfo),
 }
 
 impl fmt::Display for RawBody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RawEnd(d) => write!(f, "RawEnd({d})"),
             Self::Content(c) => write!(f, "Content({c})"),
             Self::EmbeddedQuote => write!(f, "EmbeddedQuote"),
+            Self::Error(info) => write!(f, "Error({info:?})"),
         }
     }
 }
@@ -246,7 +327,7 @@ enum ExprAst {
     #[rule(RootTokens::Number)]
     Number(#[from(0)] AstToken<RootTokens>),
 
-    #[rule(ExprAst, RootTokens::QuoteStart, ExprAst)]
+    #[rule(ExprAst, RootTokens::Quote, ExprAst)]
     Pair(#[from(0)] AstBox<ExprAst>, #[from(2)] AstBox<ExprAst>),
 }
 
@@ -267,16 +348,16 @@ enum TokenClassAst {
     #[rule(RootTokens::Number)]
     Number(#[from(0)] AstToken<RootTokens>),
 
-    #[rule(RootTokens::QuoteStart)]
-    QuoteStart(#[from(0)] AstToken<RootTokens>),
+    #[rule(RootTokens::Quote)]
+    Quote(#[from(0)] AstToken<RootTokens>),
 }
 
 #[derive(NonTerminal, Debug, Clone)]
 enum ErrorOnlyAst {
     #[rule(
-        RootTokens::QuoteStart,
-        RootTokens::QuoteStart,
-        RootTokens::QuoteStart,
+        RootTokens::Quote,
+        RootTokens::Quote,
+        RootTokens::Quote,
         RootTokens::Number
     )]
     Pair,
@@ -308,11 +389,11 @@ enum EbnfExprAst {
 
 #[test]
 fn test_multi_enum_token_schema() {
-    let mut lexer = Lexer::<RootTokens>::new().unwrap();
+    let mut lexer = Lexer::<NestedRootTokens>::new().unwrap();
     let input = r#""world"456"#;
     let mut receiver = Vec::new();
     let error = lexer.lex_cont(
-        LexerState::new(lexer.state_id_of::<RootTokens>().unwrap()),
+        LexerState::new(lexer.state_id_of::<NestedRootTokens>().unwrap()),
         input.to_string(),
         |token_id, _state, _, _| {
             receiver.push(token_id);
@@ -354,6 +435,60 @@ fn test_raw_string_nonmatching_delimiter_rejected() {
         },
     );
     assert!(error.is_err() || !received.is_empty());
+}
+
+#[derive(Default)]
+struct BufferSink(String);
+
+impl fmt::Write for BufferSink {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0.push_str(s);
+        Ok(())
+    }
+}
+
+#[test]
+fn token_generate_number_round_trips_through_lexer() {
+    let mut out = String::new();
+    crate::generate!(RootTokens::Number, 7, &mut out).unwrap();
+
+    let mut lexer = Lexer::<RootTokens>::new().unwrap();
+    let entries = collect_entries(&mut lexer, &out);
+    assert!(matches!(
+        entries.first().map(|(_, entry, _, _)| entry),
+        Some(Entry::Token {
+            value: RootTokens::Number(_),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn token_generate_accepts_general_fmt_write_destinations() {
+    let mut out = BufferSink::default();
+    crate::generate!(RawRoot::RawWs, 11, &mut out).unwrap();
+
+    assert!(!out.0.is_empty());
+    assert!(out.0.chars().all(char::is_whitespace));
+}
+
+#[test]
+fn token_generate_rejects_context_sensitive_validated_tokens() {
+    let mut out = String::new();
+    let err = crate::generate!(RawRoot::RawEnd, 19, &mut out).unwrap_err();
+    assert!(matches!(
+        err,
+        crate::component::lex::GenerateError::UnsupportedValidatedVariant { token }
+            if token == "RawRoot::RawEnd"
+    ));
+}
+
+#[test]
+fn token_generate_unit_variant_from_external_path() {
+    let mut out = String::new();
+    crate::generate!(NestedRootTokens::QuoteEnd, 23, &mut out).unwrap();
+
+    assert_eq!(out, "\"");
 }
 
 #[test]

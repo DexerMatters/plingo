@@ -1,8 +1,9 @@
 mod context_callable;
+mod generate;
 mod layer;
 mod non_terminal;
 mod shared;
-mod tokens;
+mod terminal;
 
 use proc_macro::TokenStream;
 use syn::{ItemEnum, parse_macro_input};
@@ -21,9 +22,14 @@ pub fn context_callable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     context_callable::expand_context_callable(item)
 }
 
-#[proc_macro_attribute]
-pub fn tokens(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    match tokens::expand_tokens_attr(parse_macro_input!(item as ItemEnum)) {
+#[proc_macro]
+pub fn generate(input: TokenStream) -> TokenStream {
+    generate::expand_generate(input)
+}
+
+#[proc_macro_derive(Terminal, attributes(regex, from, then_require, till, skip, validate, parse, error))]
+pub fn derive_terminal(item: TokenStream) -> TokenStream {
+    match terminal::expand_terminal_derive(parse_macro_input!(item as ItemEnum)) {
         Ok(tokens) => tokens,
         Err(err) => err.to_compile_error().into(),
     }

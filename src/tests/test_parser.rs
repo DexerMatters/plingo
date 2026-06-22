@@ -1,8 +1,9 @@
 use crate::{
     NonTerminal,
+    Terminal,
     component::{
         debug::DebugSink,
-        lex::Lexer,
+        lex::{LexErrorInfo, Lexer},
         parse::{
             AstToken, ParseChange, ParseErrorInfo, ParsePath, Parser, data::ast::AstBox,
             grammar::Grammar,
@@ -11,7 +12,6 @@ use crate::{
     },
     scheme::{context::Context, runtime::Runtime},
     tests::fs_watch,
-    tokens,
     utils::{RangeOrPoint, Span},
 };
 use color_print::cprintln;
@@ -19,8 +19,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-#[tokens]
-#[derive(Debug, Clone)]
+#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
 enum JsonToken {
     #[regex(r"\s+")]
     #[skip]
@@ -47,6 +46,8 @@ enum JsonToken {
     Number(#[parse(parse_i64)] i64),
     #[regex(r#""[^"]*""#)]
     String(#[parse(parse_json_string)] String),
+    #[error]
+    Error(LexErrorInfo),
 }
 fn parse_i64(text: &str) -> Result<i64, std::num::ParseIntError> {
     text.parse()
@@ -355,6 +356,22 @@ async fn collect_root_json_member_keys(
         keys.push(key);
     }
     Ok(keys)
+}
+
+#[test]
+fn json_test_generator() -> anyhow::Result<()> {
+    let mut writer = String::new();
+    crate::generate!(JsonToken::Null, 7, &mut writer)?;
+    println!("Generated token: {}", writer);
+    Ok(())
+}
+
+#[test]
+fn parent_token_generator_macro_works_from_child_module() -> anyhow::Result<()> {
+    let mut writer = String::new();
+    crate::generate!(super::RootTokens::Number, 5, &mut writer)?;
+    assert!(writer.chars().all(|ch| ch.is_ascii_digit()));
+    Ok(())
 }
 
 #[tokio::test]

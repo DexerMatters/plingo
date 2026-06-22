@@ -8,8 +8,9 @@ use regex_automata::{Anchored, Input, dfa::Automaton};
 use crate::{
     component::{
         lex::{
-            BestMatch, Entry, ErrorToken, LexInterrupt, LexedToken, Lexer, LexerRoot,
-            LexerSnapshotState, LexerState, MatchReport, State, StateAction, TokenChange,
+            BestMatch, Entry, LexErrorInfo, LexErrorKind, LexInterrupt, LexedToken, Lexer,
+            LexerRoot, LexerSnapshotState, LexerState, MatchReport, State, StateAction,
+            TokenChange,
         },
         source::{Source, TextChange},
     },
@@ -351,19 +352,61 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         let mut unexpected_input: Vec<u8> = Vec::new();
 
         while state.offset < input.end() {
+            if let Some(boundary_match) = self.boundary_match(&state, &mut input) {
+                if !unexpected_input.is_empty() {
+                    let taken = std::mem::take(&mut unexpected_input);
+                    let start = state.offset - taken.len();
+                    let end = state.offset;
+                    if !self.emit_state_error(
+                        &state,
+                        LexErrorInfo {
+                            kind: LexErrorKind::UnexpectedInput,
+                            start,
+                            end,
+                        },
+                        false,
+                        &mut cont,
+                    )? {
+                        return Ok(());
+                    }
+                }
+                let is_skip = state
+                    .parent_state()
+                    .and_then(|parent| self.tokens_in_state(parent))
+                    .and_then(|tokens| tokens.get(boundary_match.token_index))
+                    .is_some_and(|t| t.skip);
+                state.apply_action(StateAction::Leave);
+                let token = self.next_token(&mut state, &boundary_match, &mut input)?;
+                if !is_skip {
+                    let length = boundary_match.end - boundary_match.start;
+                    let token_id = self.alloc(Entry::Token {
+                        length,
+                        terminal: token.terminal,
+                        value: token.value,
+                    });
+                    if !cont(token_id, &state, boundary_match.start, boundary_match.end) {
+                        return Ok(());
+                    }
+                }
+                continue;
+            }
             let MatchReport { best, .. } = self.select_best_match(&state, &mut input);
             match best {
                 Some(best_match) => {
                     if !unexpected_input.is_empty() {
                         let taken = std::mem::take(&mut unexpected_input);
-                        let current_state = state.current_state()?;
-                        let error = ErrorToken::UnexpectedToken {
-                            start: state.offset - taken.len(),
-                            end: state.offset,
-                            expected_state: current_state.id,
-                        };
-                        let token_id = self.alloc(Entry::Error(taken.len(), error));
-                        if !cont(token_id, &state, state.offset - taken.len(), state.offset) {
+                        let start = state.offset - taken.len();
+                        let end = state.offset;
+                        if !self.emit_state_error(
+                            &state,
+                            LexErrorInfo {
+                                kind: LexErrorKind::UnexpectedInput,
+                                start,
+                                end,
+                            },
+                            false,
+                            &mut cont,
+                        )? {
                             return Ok(());
                         }
                     }
@@ -416,16 +459,39 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
 
         if !unexpected_input.is_empty() {
             let taken = std::mem::take(&mut unexpected_input);
-            let current_state = state.current_state()?;
-            let error = ErrorToken::UnexpectedToken {
-                start: state.offset - taken.len(),
-                end: state.offset,
-                expected_state: current_state.id,
-            };
-            let token_id = self.alloc(Entry::Error(taken.len(), error));
-            if !cont(token_id, &state, state.offset - taken.len(), state.offset) {
+            let start = state.offset - taken.len();
+            let end = state.offset;
+            if !self.emit_state_error(
+                &state,
+                LexErrorInfo {
+                    kind: LexErrorKind::UnexpectedInput,
+                    start,
+                    end,
+                },
+                false,
+                &mut cont,
+            )? {
                 return Ok(());
             }
+        }
+
+        if state
+            .current_state()
+            .ok()
+            .and_then(|current| self.state_boundary(current))
+            .is_some()
+            && !self.emit_state_error(
+                &state,
+                LexErrorInfo {
+                    kind: LexErrorKind::RequiredBoundary,
+                    start: state.offset,
+                    end: state.offset,
+                },
+                true,
+                &mut cont,
+            )?
+        {
+            return Ok(());
         }
 
         let eof = self.alloc(Entry::EOF);
@@ -434,6 +500,118 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         }
 
         Ok(())
+    }
+
+    fn emit_state_error(
+        &mut self,
+        state: &LexerState,
+        info: LexErrorInfo,
+        boundary: bool,
+        cont: &mut impl FnMut(usize, &LexerState, usize, usize) -> bool,
+    ) -> Result<bool, LexInterrupt> {
+        let current = state.current_state()?;
+        let builder = if boundary {
+            self.boundary_error_builder(current)
+        } else {
+            self.recovery_error_builder(current)
+        }
+        .ok_or(LexInterrupt::MissingState)?
+        .clone();
+        let value = builder(info)?;
+        let token_id = self.alloc(Entry::Error {
+            length: info.end.saturating_sub(info.start),
+            info,
+            value,
+        });
+        Ok(cont(token_id, state, info.start, info.end))
+    }
+
+    fn boundary_match(
+        &self,
+        state: &LexerState,
+        input: &mut Input,
+    ) -> Option<BestMatch> {
+        let Some(current) = state.current_state().ok() else {
+            return None;
+        };
+        let Some(boundary) = self.state_boundary(current) else {
+            return None;
+        };
+        let Some(parent) = state.parent_state() else {
+            return None;
+        };
+
+        self.find_token_match_in_state(
+            parent,
+            boundary.target_terminal,
+            input,
+            state.offset,
+            state.parent_context(),
+        )
+    }
+
+    fn find_token_match_in_state(
+        &self,
+        state: State,
+        target_terminal: crate::component::parse::grammar::TerminalId,
+        input: &mut Input,
+        offset: usize,
+        context: Option<&str>,
+    ) -> Option<BestMatch> {
+        let Some(matcher) = self.state_matcher(state.clone()) else {
+            return None;
+        };
+        let Some(tokens) = self.tokens_in_state(state) else {
+            return None;
+        };
+
+        input.set_range(offset..input.end());
+        input.set_anchored(Anchored::Yes);
+
+        let haystack = input.haystack();
+        let search_start = input.start();
+        let search_end = input.end();
+        let Ok(mut dfa_state) = matcher.dfa.start_state_forward(input) else {
+            return None;
+        };
+        let mut best: Option<BestMatch> = None;
+
+        for (offset_delta, &byte) in haystack[search_start..search_end].iter().enumerate() {
+            dfa_state = matcher.dfa.next_state(dfa_state, byte);
+            if matcher.dfa.is_special_state(dfa_state) {
+                let match_end = search_start + offset_delta + 1;
+                record_terminal_match(
+                    &matcher.dfa,
+                    &matcher.token_index_by_pattern,
+                    dfa_state,
+                    match_end,
+                    tokens,
+                    haystack,
+                    search_start,
+                    context,
+                    target_terminal,
+                    &mut best,
+                );
+                if matcher.dfa.is_dead_state(dfa_state) || matcher.dfa.is_quit_state(dfa_state) {
+                    return best;
+                }
+            }
+        }
+
+        let dfa_state = matcher.dfa.next_eoi_state(dfa_state);
+        record_terminal_match(
+            &matcher.dfa,
+            &matcher.token_index_by_pattern,
+            dfa_state,
+            search_end,
+            tokens,
+            haystack,
+            search_start,
+            context,
+            target_terminal,
+            &mut best,
+        );
+        best
     }
 
     pub(crate) fn next_token(
@@ -602,7 +780,7 @@ fn record_best_match<A: Automaton, R>(
         let token_index = token_index_by_pattern[dfa.match_pattern(dfa_state, pattern_index)];
 
         if let Some(token) = tokens.get(token_index) {
-            if let Some(validate) = token.validate {
+            if let Some(validate) = &token.validate {
                 if let Ok(lexeme) = std::str::from_utf8(&haystack[search_start..lexeme_end]) {
                     if !validate(lexeme, ctx) {
                         continue;
@@ -621,6 +799,54 @@ fn record_best_match<A: Automaton, R>(
         };
         if should_replace {
             *best = Some((token_index, match_end));
+        }
+    }
+}
+
+fn record_terminal_match<A: Automaton, R>(
+    dfa: &A,
+    token_index_by_pattern: &[usize],
+    dfa_state: regex_automata::util::primitives::StateID,
+    match_end: usize,
+    tokens: &[crate::component::lex::ResolvedToken<R>],
+    haystack: &[u8],
+    search_start: usize,
+    context: Option<&str>,
+    target_terminal: crate::component::parse::grammar::TerminalId,
+    best: &mut Option<BestMatch>,
+) {
+    if !dfa.is_match_state(dfa_state) {
+        return;
+    }
+
+    for pattern_index in 0..dfa.match_len(dfa_state) {
+        let token_index = token_index_by_pattern[dfa.match_pattern(dfa_state, pattern_index)];
+        let Some(token) = tokens.get(token_index) else {
+            continue;
+        };
+        if token.terminal != target_terminal {
+            continue;
+        }
+
+        if let Some(validate) = &token.validate {
+            let Ok(lexeme) = std::str::from_utf8(&haystack[search_start..match_end]) else {
+                continue;
+            };
+            if !validate(lexeme, context) {
+                continue;
+            }
+        }
+
+        let should_replace = match best {
+            None => true,
+            Some(current) => match_end > current.end || (match_end == current.end && token_index < current.token_index),
+        };
+        if should_replace {
+            *best = Some(BestMatch {
+                token_index,
+                start: search_start,
+                end: match_end,
+            });
         }
     }
 }

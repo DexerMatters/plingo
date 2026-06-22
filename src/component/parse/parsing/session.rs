@@ -11,6 +11,7 @@ use crate::component::parse::{
         product::{Product, ProductData, ProductId},
     },
     grammar::{BuildCx, NonTerminalId, Symbol, TerminalId},
+    identity::eof_fingerprint,
     recovery::{self, Repair},
 };
 
@@ -18,7 +19,7 @@ impl SessionContext<'_> {
     pub(crate) fn resolve_terminal(&self, data: &TokenData) -> TerminalId {
         match data.terminal {
             Some(t) => t,
-            None if data.length == 0 => self.grammar.eof,
+            None if data.fingerprint == eof_fingerprint() => self.grammar.eof,
             None => self.grammar.error_terminal,
         }
     }

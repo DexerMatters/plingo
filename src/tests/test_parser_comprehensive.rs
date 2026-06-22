@@ -1,8 +1,9 @@
 use crate::{
     NonTerminal,
+    Terminal,
     component::{
         debug::DebugSink,
-        lex::{Entry, Lexer, LexerState},
+        lex::{Entry, LexErrorInfo, Lexer, LexerState},
         parse::{
             AstToken, IncrementalParseStats, ParseChange, ParseErrorInfo, ParsePath, Parser,
             ParserConfig, TokenData,
@@ -16,7 +17,6 @@ use crate::{
         source::{Source, SourceEdit},
     },
     scheme::{context::Context, runtime::Runtime},
-    tokens,
     utils::{RangeOrPoint, Span},
 };
 use fluent_uri::Uri;
@@ -29,8 +29,7 @@ use std::{
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-#[tokens]
-#[derive(Debug, Clone)]
+#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
 enum JsonToken {
     #[regex(r"\s+")]
     #[skip]
@@ -57,6 +56,8 @@ enum JsonToken {
     Number(#[parse(parse_i64)] i64),
     #[regex(r#""[^"]*""#)]
     String(#[parse(parse_json_string)] String),
+    #[error]
+    Error(LexErrorInfo),
 }
 
 fn parse_i64(text: &str) -> Result<i64, std::num::ParseIntError> {
@@ -487,13 +488,13 @@ fn token_data_from_entries(entries: &[(usize, Entry<JsonToken>, usize, usize)]) 
                 column,
                 fingerprint: eof_fingerprint(),
             },
-            Entry::Error(length, error) => TokenData {
+            Entry::Error { length, info, .. } => TokenData {
                 id: *id,
                 terminal: None,
                 start: *start,
                 length: *length,
                 column,
-                fingerprint: error_fingerprint(error, *length),
+                fingerprint: error_fingerprint(info, *length),
             },
         })
         .collect()

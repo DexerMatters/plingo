@@ -2,17 +2,46 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::component::parse::{
     build::{Action, ActionSet},
     grammar::{Grammar, TerminalId},
     parsing::{ParseToken, SessionContext},
-    recovery::{RecoveryError, RecoveryResult, Repair},
 };
 
 const MIN_REAL_SHIFTS: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum Repair {
+    Insert(TerminalId),
+    Delete,
+    Shift,
+    ShiftAsError,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RecoveryResult {
+    pub(crate) repairs: Vec<Repair>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoveryError {
+    Timeout { elapsed: Duration },
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout { elapsed } => write!(
+                f,
+                "recovery search timed out after {:?} (no complete repair found)",
+                elapsed
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct SearchConfig {
@@ -118,11 +147,11 @@ struct RecoverySearchCache {
     can_shift_suffix: HashMap<ShiftSuffixKey, bool>,
 }
 
-pub(super) fn find_recovery(
+pub(crate) fn find_recovery(
     ctx: &SessionContext<'_>,
     column: usize,
     tokens: &[ParseToken],
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> Result<Option<RecoveryResult>, RecoveryError> {
     let start = Instant::now();
     let stacks = active_stack_paths(ctx, column);

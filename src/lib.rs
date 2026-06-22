@@ -1,6 +1,6 @@
 extern crate self as plingo;
 
-pub use plingo_macros::{NonTerminal, context_callable, layer, tokens};
+pub use plingo_macros::{NonTerminal, Terminal, context_callable, generate, layer};
 
 #[macro_export]
 macro_rules! debug_relay {

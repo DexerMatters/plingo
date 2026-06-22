@@ -1,0 +1,11 @@
+error: legacy #[each(...)] is unsupported; use #[from(...)]
+ --> tests/ui/terminal-reject-each.rs:5:5
+  |
+5 |     #[each(InnerToken)]
+  |     ^
+
+error: cannot find attribute `each` in this scope
+ --> tests/ui/terminal-reject-each.rs:5:7
+  |
+5 |     #[each(InnerToken)]
+  |       ^^^^

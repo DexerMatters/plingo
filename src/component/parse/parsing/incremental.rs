@@ -1,19 +1,24 @@
 use std::time::{Duration, Instant};
 
+use fluent_uri::Uri;
 use indexmap::IndexSet;
 
-use super::{ParseColumn, ParseError, ParseToken, SessionContext};
+use super::{ParseColumn, ParseError, ParseToken, ReplayPlan, SessionContext};
 use crate::component::{
     lex::{LexerRoot, TokenChange},
     parse::{
-        IncrementalParseStats, ParseChange, Parser, ParserSnapshotState, SessionArenas, checkpoint,
-        data::{ast::AstArena, green::TreeArena, gss::GssArena, product::ProductArena},
-        emit,
-        incremental::ReplayPlan,
+        IncrementalParseStats, ParseAddress, ParseChange, ParseUnit, Parser, ParserSnapshotState,
+        SessionArenas, checkpoint,
+        data::{
+            ast::AstArena,
+            green::TreeArena,
+            gss::GssArena,
+            product::{ProductArena, ProductId},
+        },
     },
 };
 use crate::scheme::{
-    change::{LayerChange, LayerChanges},
+    change::{LayerChange, LayerChanges, ReplacementBatch, ReplacementChange},
     layer::NonTopLayer,
 };
 
@@ -87,6 +92,48 @@ fn maybe_reuse_suffix(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn insert_root(uri: Uri<&'static str>, roots: Vec<ProductId>) -> ParseChange {
+    let new_units = roots
+        .into_iter()
+        .map(|product| ParseUnit { product })
+        .collect::<Vec<_>>();
+    ReplacementChange::new(
+        ParseAddress {
+            uri,
+            parent_path: Vec::new(),
+        },
+        ReplacementBatch {
+            old_units: Vec::new(),
+            new_changed_range: 0..new_units.len(),
+            new_units,
+            prefix_len: 0,
+            suffix_len: 0,
+            old_changed_range: 0..0,
+        },
+    )
+}
+
+fn delete_root(uri: Uri<&'static str>, roots: Vec<ProductId>) -> ParseChange {
+    let old_units = roots
+        .into_iter()
+        .map(|product| ParseUnit { product })
+        .collect::<Vec<_>>();
+    ReplacementChange::new(
+        ParseAddress {
+            uri,
+            parent_path: Vec::new(),
+        },
+        ReplacementBatch {
+            old_changed_range: 0..old_units.len(),
+            old_units,
+            new_units: Vec::new(),
+            prefix_len: 0,
+            suffix_len: 0,
+            new_changed_range: 0..0,
+        },
+    )
 }
 
 impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
@@ -391,10 +438,10 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
             if roots_after.is_empty() {
                 Vec::new()
             } else {
-                vec![emit::insert_root(uri.clone(), roots_after.clone())]
+                vec![insert_root(uri.clone(), roots_after.clone())]
             }
         } else if roots_after.is_empty() {
-            vec![emit::delete_root(uri.clone(), roots_before.clone())]
+            vec![delete_root(uri.clone(), roots_before.clone())]
         } else {
             super::super::diff::compact(super::super::diff::diff_trees(
                 &arenas.products,

@@ -1,75 +1,49 @@
 use quote::{format_ident, quote};
-use syn::{Expr, Field, Meta, Type, spanned::Spanned};
-
-pub enum MatcherConfig {
-    Regex(syn::LitStr),
-    From(Type),
-}
+use syn::{Expr, Field, Meta, spanned::Spanned};
 
 pub struct VariantConfig {
-    pub matcher: Option<MatcherConfig>,
-    pub then_require: Option<syn::Ident>,
-    pub till: Option<syn::Ident>,
+    pub regex: Option<syn::LitStr>,
     pub skip: bool,
-    pub validate: Option<syn::Expr>,
+    pub when: Option<syn::Expr>,
+    pub recover_when: Option<syn::Expr>,
     pub error: bool,
 }
 
 pub fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig> {
     let mut regex = None;
-    let mut from = None;
-    let mut then_require = None;
-    let mut till = None;
     let mut skip = false;
-    let mut validate = None;
+    let mut when = None;
+    let mut recover_when = None;
     let mut error = false;
 
     for attr in &variant.attrs {
         match &attr.meta {
             Meta::List(meta) if meta.path.is_ident("regex") => {
-                if regex.is_some() || from.is_some() {
+                if regex.is_some() {
                     return Err(syn::Error::new(
                         attr.span(),
-                        "token variants require exactly one matcher attribute",
+                        "duplicate #[regex(...)] attribute",
                     ));
                 }
                 regex = Some(attr.parse_args::<syn::LitStr>()?);
             }
-            Meta::List(meta) if meta.path.is_ident("from") => {
-                if regex.is_some() || from.is_some() {
+            Meta::List(meta) if meta.path.is_ident("when") => {
+                if when.is_some() {
                     return Err(syn::Error::new(
                         attr.span(),
-                        "token variants require exactly one matcher attribute",
+                        "duplicate #[when(...)] attribute",
                     ));
                 }
-                from = Some(attr.parse_args::<Type>()?);
+                when = Some(attr.parse_args::<syn::Expr>()?);
             }
-            Meta::List(meta) if meta.path.is_ident("then_require") => {
-                if then_require.is_some() {
+            Meta::List(meta) if meta.path.is_ident("recover_when") => {
+                if recover_when.is_some() {
                     return Err(syn::Error::new(
                         attr.span(),
-                        "duplicate #[then_require(...)] attribute",
+                        "duplicate #[recover_when(...)] attribute",
                     ));
                 }
-                then_require = Some(attr.parse_args::<syn::Ident>()?);
-            }
-            Meta::List(meta) if meta.path.is_ident("till") => {
-                if till.is_some() {
-                    return Err(syn::Error::new(
-                        attr.span(),
-                        "duplicate #[till(...)] attribute",
-                    ));
-                }
-                till = Some(attr.parse_args::<syn::Ident>()?);
-            }
-            Meta::List(meta) if meta.path.is_ident("validate") => {
-                if validate.is_some() {
-                    return Err(syn::Error::new(
-                        attr.span(),
-                        "duplicate #[validate(...)] attribute",
-                    ));
-                }
-                validate = Some(attr.parse_args::<syn::Expr>()?);
+                recover_when = Some(attr.parse_args::<syn::Expr>()?);
             }
             Meta::Path(path) if path.is_ident("skip") => {
                 if skip {
@@ -83,49 +57,51 @@ pub fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig
                 }
                 error = true;
             }
-            Meta::List(meta) if meta.path.is_ident("each") => {
+            Meta::List(meta) if meta.path.is_ident("one_of") => {
                 return Err(syn::Error::new(
                     attr.span(),
-                    "legacy #[each(...)] is unsupported; use #[from(...)]",
+                    "#[one_of(...)] was removed; use enum-level #[scopes(...)] entries instead",
                 ));
             }
-            Meta::Path(path) if path.is_ident("enter") || path.is_ident("leave") => {
+            Meta::List(meta) if meta.path.is_ident("enter") => {
                 return Err(syn::Error::new(
                     attr.span(),
-                    "legacy #[enter]/#[leave] is unsupported; use #[then_require(...)] and #[from(...)]",
+                    "token-level #[enter(...)] was removed; use enum-level #[scopes(...)] entries instead",
+                ));
+            }
+            Meta::Path(path) if path.is_ident("leave") => {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "token-level #[leave] was removed; use enum-level #[scopes(...)] exit(...) entries instead",
+                ));
+            }
+            Meta::List(meta) if meta.path.is_ident("leave_when") => {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "token-level #[leave_when(...)] was removed; use enum-level #[scopes(...)] exit(...) entries instead",
                 ));
             }
             _ => {}
         }
     }
 
-    let matcher = match (regex, from, error) {
-        (Some(regex), None, false) => Some(MatcherConfig::Regex(regex)),
-        (None, Some(from), false) => Some(MatcherConfig::From(from)),
-        (None, None, true) => None,
-        (Some(_), _, true) | (_, Some(_), true) => {
-            return Err(syn::Error::new(
-                variant.span(),
-                "#[error] variants cannot also define #[regex(...)] or #[from(...)]",
-            ));
-        }
-        (None, None, false) => {
-            return Err(syn::Error::new(
-                variant.span(),
-                "token variants require exactly one of #[regex(...)] or #[from(...)] unless they are marked #[error]",
-            ));
-        }
-        _ => unreachable!(),
-    };
-
-    Ok(VariantConfig {
-        matcher,
-        then_require,
-        till,
-        skip,
-        validate,
-        error,
-    })
+    match (regex.is_some(), error) {
+        (true, true) => Err(syn::Error::new(
+            variant.span(),
+            "#[error] variants cannot also define #[regex(...)]",
+        )),
+        (false, false) => Err(syn::Error::new(
+            variant.span(),
+            "token variants require #[regex(...)] unless they are marked #[error]",
+        )),
+        _ => Ok(VariantConfig {
+            regex,
+            skip,
+            when,
+            recover_when,
+            error,
+        }),
+    }
 }
 
 pub fn ensure_no_field_parse_attrs(variant: &syn::Variant) -> syn::Result<()> {

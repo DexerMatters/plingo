@@ -1,5 +1,0 @@
-error: #[till(...)] is only valid on #[from(...)] variants
- --> tests/ui/terminal-reject-till-on-regex.rs:5:5
-  |
-5 |     #[regex(r"[a-z]+")]
-  |     ^

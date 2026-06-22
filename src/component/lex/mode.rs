@@ -5,18 +5,18 @@ use super::LexInterrupt;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct State {
     pub id: usize,
-    pub context: Option<String>,
+    pub key: Option<String>,
 }
 
 impl State {
     pub fn new(id: usize) -> Self {
-        Self { id, context: None }
+        Self { id, key: None }
     }
 
-    pub fn with_context(id: usize, lexeme: &str) -> Self {
+    pub fn with_key(id: usize, key: String) -> Self {
         Self {
             id,
-            context: Some(lexeme.to_string()),
+            key: Some(key),
         }
     }
 }
@@ -51,8 +51,8 @@ impl LexerState {
             .ok_or(LexInterrupt::MissingState)
     }
 
-    pub fn current_context(&self) -> Option<&str> {
-        self.state_stack.last().and_then(|s| s.context.as_deref())
+    pub fn current_key(&self) -> Option<&str> {
+        self.state_stack.last().and_then(|s| s.key.as_deref())
     }
 
     pub fn apply_action(&mut self, action: StateAction) {
@@ -64,24 +64,16 @@ impl LexerState {
             }
         }
     }
+
+    pub fn parent_state(&self) -> Option<State> {
+        self.state_stack
+            .get(self.state_stack.len().checked_sub(2)?)
+            .cloned()
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct StateInfo {
     pub name: &'static str,
     pub type_name: String,
-}
-
-impl LexerState {
-    pub fn parent_state(&self) -> Option<State> {
-        self.state_stack
-            .get(self.state_stack.len().checked_sub(2)?)
-            .cloned()
-    }
-
-    pub fn parent_context(&self) -> Option<&str> {
-        self.state_stack
-            .get(self.state_stack.len().checked_sub(2)?)
-            .and_then(|s| s.context.as_deref())
-    }
 }

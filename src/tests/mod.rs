@@ -5,7 +5,7 @@ use enum_iterator::Sequence;
 use crate::{
     NonTerminal,
     Terminal,
-    component::lex::{Entry, LexErrorInfo, Lexer, LexerState},
+    component::lex::{LexErrorInfo, LexToken, Lexer, LexerState},
     component::parse::{
         AstToken, ErrorKind, ParseAddress, ParseChange, ParseErrorInfo, ParseUnit, ParserConfig,
         TokenData,
@@ -27,64 +27,65 @@ use crate::{
 
 mod test_parser;
 mod test_parser_comprehensive;
-mod test_terminal_from;
+mod test_terminal_scopes;
 
 #[cfg(test)]
 mod fs_watch;
 mod scheme;
 
-fn token_data_from_entries(entries: &[(usize, Entry<RootTokens>, usize, usize)]) -> Vec<TokenData> {
-    entries
+
+mod test_lexer;
+
+fn token_data_from_entries(entries: &[LexToken<RootTokens>]) -> Vec<TokenData> {
+    let mut data = entries
         .iter()
         .enumerate()
-        .map(|(column, (id, entry, start, _end))| {
-            let data = match entry {
-                Entry::Token {
-                    length,
-                    terminal,
-                    value,
-                } => TokenData {
-                    id: *id,
-                    terminal: Some(*terminal),
-                    start: *start,
-                    length: *length,
-                    column,
-                    fingerprint: token_fingerprint(Some(*terminal), value, *length),
-                },
-                Entry::EOF => TokenData {
-                    id: *id,
-                    terminal: None,
-                    start: *start,
-                    length: 0,
-                    column,
-                    fingerprint: eof_fingerprint(),
-                },
-                Entry::Error { length, info, .. } => TokenData {
-                    id: *id,
-                    terminal: None,
-                    start: *start,
-                    length: *length,
-                    column,
-                    fingerprint: error_fingerprint(info, *length),
-                },
-            };
-            data
+        .map(|(column, token)| match token.error {
+            Some(info) => TokenData {
+                id: token.id,
+                terminal: None,
+                start: token.start,
+                length: token.length,
+                column,
+                fingerprint: error_fingerprint(&info, token.length),
+            },
+            None => TokenData {
+                id: token.id,
+                terminal: token.terminal,
+                start: token.start,
+                length: token.length,
+                column,
+                fingerprint: token_fingerprint(token.terminal, &token.value, token.length),
+            },
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let eof_start = entries
+        .last()
+        .map(|token| token.start + token.length)
+        .unwrap_or(0);
+    data.push(TokenData {
+        id: usize::MAX,
+        terminal: None,
+        start: eof_start,
+        length: 0,
+        column: data.len(),
+        fingerprint: eof_fingerprint(),
+    });
+    data
 }
 
 fn collect_entries(
     lexer: &mut Lexer<RootTokens>,
     input: &str,
-) -> Vec<(usize, Entry<RootTokens>, usize, usize)> {
-    let token_ids: Vec<(usize, usize, usize)> = {
+) -> Vec<LexToken<RootTokens>> {
+    let token_ids: Vec<usize> = {
         let mut ids = Vec::new();
         lexer
             .lex_cont(
                 LexerState::new(lexer.state_id_of::<RootTokens>().unwrap()),
                 input.to_string(),
-                |token_id, _, start, end| {
-                    ids.push((token_id, start, end));
+                |token_id, _, _, _| {
+                    ids.push(token_id);
                     true
                 },
             )
@@ -93,7 +94,7 @@ fn collect_entries(
     };
     token_ids
         .into_iter()
-        .map(|(id, start, end)| (id, lexer.get(id).clone(), start, end))
+        .map(|id| lexer.token(id).unwrap().clone())
         .collect()
 }
 
@@ -199,14 +200,22 @@ impl fmt::Display for RootTokens {
 }
 
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
+#[scopes(
+    root {
+        QuoteStart => enter(string, fixed_quote_key),
+        Number,
+    },
+    string {
+        StringLiteral,
+        QuoteEnd => exit(fixed_quote_end_matches),
+    },
+)]
 enum NestedRootTokens {
     #[regex(r#"""#)]
-    #[then_require(StringLiteral)]
     QuoteStart,
 
-    #[from(NestedStringTokens)]
-    #[till(QuoteEnd)]
-    StringLiteral(NestedStringTokens),
+    #[regex(r#"[^"]+"#)]
+    StringLiteral(String),
 
     #[regex(r#"""#)]
     QuoteEnd,
@@ -230,22 +239,12 @@ impl fmt::Display for NestedRootTokens {
     }
 }
 
-#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
-enum NestedStringTokens {
-    #[regex(r#"[^"]+"#)]
-    Text(String),
-
-    #[error]
-    Error(LexErrorInfo),
+fn fixed_quote_key(token: &NestedRootTokens) -> Option<String> {
+    matches!(token, NestedRootTokens::QuoteStart).then(|| "\"".to_string())
 }
 
-impl fmt::Display for NestedStringTokens {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Text(t) => write!(f, "Text(\"{t}\")"),
-            Self::Error(info) => write!(f, "Error({info:?})"),
-        }
-    }
+fn fixed_quote_end_matches(token: &NestedRootTokens, key: &str) -> bool {
+    matches!(token, NestedRootTokens::QuoteEnd) && key == "\""
 }
 
 fn raw_delimiter(lexeme: &str) -> &str {
@@ -253,8 +252,8 @@ fn raw_delimiter(lexeme: &str) -> &str {
     after_r.strip_suffix('"').unwrap_or(after_r)
 }
 
-fn raw_end_matches(lexeme: &str, context: Option<&str>) -> bool {
-    let Some(ctx) = context else {
+fn raw_end_matches(lexeme: &str, key: Option<&str>) -> bool {
+    let Some(ctx) = key else {
         return false;
     };
     let delim = raw_delimiter(ctx);
@@ -266,17 +265,29 @@ fn delimiter_closer(hashes: &str) -> String {
 }
 
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
+#[scopes(
+    root {
+        RawStart => enter(raw, raw_scope_key),
+        RawWs,
+    },
+    raw {
+        RawContent,
+        EmbeddedQuote,
+        RawEnd => exit(raw_end_matches_token),
+    },
+)]
 enum RawRoot {
     #[regex("r#*\"")]
-    #[then_require(RawLiteral)]
     RawStart(String),
 
-    #[from(RawBody)]
-    #[till(RawEnd)]
-    RawLiteral(RawBody),
+    #[regex("[^\"]+")]
+    RawContent(String),
+
+    #[regex("\"")]
+    EmbeddedQuote,
 
     #[regex("\"#*")]
-    #[validate(raw_end_matches)]
+    #[when(raw_end_matches)]
     RawEnd(String),
 
     #[regex(r"\s+")]
@@ -291,7 +302,8 @@ impl fmt::Display for RawRoot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RawStart(d) => write!(f, "RawStart({d})"),
-            Self::RawLiteral(rb) => write!(f, "RawLiteral({rb:?})"),
+            Self::RawContent(c) => write!(f, "RawContent({c})"),
+            Self::EmbeddedQuote => write!(f, "EmbeddedQuote"),
             Self::RawEnd(d) => write!(f, "RawEnd({d})"),
             Self::RawWs => write!(f, "RawWs"),
             Self::Error(info) => write!(f, "Error({info:?})"),
@@ -299,26 +311,16 @@ impl fmt::Display for RawRoot {
     }
 }
 
-#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
-enum RawBody {
-    #[regex("[^\"]+")]
-    Content(String),
-
-    #[regex("\"")]
-    EmbeddedQuote,
-
-    #[error]
-    Error(LexErrorInfo),
+fn raw_scope_key(token: &RawRoot) -> Option<String> {
+    match token {
+        RawRoot::RawStart(value) => Some(value.clone()),
+        _ => None,
+    }
 }
 
-impl fmt::Display for RawBody {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Content(c) => write!(f, "Content({c})"),
-            Self::EmbeddedQuote => write!(f, "EmbeddedQuote"),
-            Self::Error(info) => write!(f, "Error({info:?})"),
-        }
-    }
+fn raw_end_matches_token(token: &RawRoot, key: &str) -> bool {
+    let delim = raw_delimiter(key);
+    matches!(token, RawRoot::RawEnd(value) if value == &delimiter_closer(delim))
 }
 
 #[allow(dead_code)]
@@ -455,11 +457,8 @@ fn token_generate_number_round_trips_through_lexer() {
     let mut lexer = Lexer::<RootTokens>::new().unwrap();
     let entries = collect_entries(&mut lexer, &out);
     assert!(matches!(
-        entries.first().map(|(_, entry, _, _)| entry),
-        Some(Entry::Token {
-            value: RootTokens::Number(_),
-            ..
-        })
+        entries.first().map(|token| &token.value),
+        Some(RootTokens::Number(_))
     ));
 }
 
@@ -473,12 +472,12 @@ fn token_generate_accepts_general_fmt_write_destinations() {
 }
 
 #[test]
-fn token_generate_rejects_context_sensitive_validated_tokens() {
+fn token_generate_rejects_context_sensitive_when_tokens() {
     let mut out = String::new();
     let err = crate::generate!(RawRoot::RawEnd, 19, &mut out).unwrap_err();
     assert!(matches!(
         err,
-        crate::component::lex::GenerateError::UnsupportedValidatedVariant { token }
+        crate::component::lex::GenerateError::UnsupportedWhenVariant { token }
             if token == "RawRoot::RawEnd"
     ));
 }

@@ -3,7 +3,7 @@ use crate::{
     Terminal,
     component::{
         debug::DebugSink,
-        lex::{Entry, LexErrorInfo, Lexer, LexerState},
+        lex::{LexErrorInfo, LexToken, Lexer, LexerState},
         parse::{
             AstToken, IncrementalParseStats, ParseChange, ParseErrorInfo, ParsePath, Parser,
             ParserConfig, TokenData,
@@ -442,15 +442,15 @@ fn json_runtime_cases() -> Vec<EditCase> {
 fn collect_entries(
     lexer: &mut Lexer<JsonToken>,
     input: &str,
-) -> Vec<(usize, Entry<JsonToken>, usize, usize)> {
-    let token_ids: Vec<(usize, usize, usize)> = {
+) -> Vec<LexToken<JsonToken>> {
+    let token_ids: Vec<usize> = {
         let mut ids = Vec::new();
         lexer
             .lex_cont(
                 LexerState::new(lexer.state_id_of::<JsonToken>().unwrap()),
                 input.to_string(),
-                |token_id, _, start, end| {
-                    ids.push((token_id, start, end));
+                |token_id, _, _, _| {
+                    ids.push(token_id);
                     true
                 },
             )
@@ -459,45 +459,46 @@ fn collect_entries(
     };
     token_ids
         .into_iter()
-        .map(|(id, start, end)| (id, lexer.get(id).clone(), start, end))
+        .map(|id| lexer.token(id).unwrap().clone())
         .collect()
 }
 
-fn token_data_from_entries(entries: &[(usize, Entry<JsonToken>, usize, usize)]) -> Vec<TokenData> {
-    entries
+fn token_data_from_entries(entries: &[LexToken<JsonToken>]) -> Vec<TokenData> {
+    let mut data = entries
         .iter()
         .enumerate()
-        .map(|(column, (id, entry, start, _end))| match entry {
-            Entry::Token {
-                length,
-                terminal,
-                value,
-            } => TokenData {
-                id: *id,
-                terminal: Some(*terminal),
-                start: *start,
-                length: *length,
-                column,
-                fingerprint: token_fingerprint(Some(*terminal), value, *length),
-            },
-            Entry::EOF => TokenData {
-                id: *id,
+        .map(|(column, token)| match token.error {
+            Some(info) => TokenData {
+                id: token.id,
                 terminal: None,
-                start: *start,
-                length: 0,
+                start: token.start,
+                length: token.length,
                 column,
-                fingerprint: eof_fingerprint(),
+                fingerprint: error_fingerprint(&info, token.length),
             },
-            Entry::Error { length, info, .. } => TokenData {
-                id: *id,
-                terminal: None,
-                start: *start,
-                length: *length,
+            None => TokenData {
+                id: token.id,
+                terminal: token.terminal,
+                start: token.start,
+                length: token.length,
                 column,
-                fingerprint: error_fingerprint(info, *length),
+                fingerprint: token_fingerprint(token.terminal, &token.value, token.length),
             },
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let eof_start = entries
+        .last()
+        .map(|token| token.start + token.length)
+        .unwrap_or(0);
+    data.push(TokenData {
+        id: usize::MAX,
+        terminal: None,
+        start: eof_start,
+        length: 0,
+        column: data.len(),
+        fingerprint: eof_fingerprint(),
+    });
+    data
 }
 
 #[test]
@@ -1093,11 +1094,9 @@ fn visible_token_boundary_positions(source: &str) -> anyhow::Result<Vec<usize>> 
     let entries = collect_entries(&mut lexer, source);
     let mut positions = vec![0, source.len()];
 
-    for (_, entry, start, end) in entries {
-        if !matches!(entry, Entry::EOF) {
-            positions.push(start);
-            positions.push(end);
-        }
+    for token in entries {
+        positions.push(token.start);
+        positions.push(token.start + token.length);
     }
 
     positions.sort_unstable();

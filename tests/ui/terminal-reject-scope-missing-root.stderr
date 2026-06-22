@@ -1,0 +1,5 @@
+error: #[scopes(...)] requires a root scope
+  --> tests/ui/terminal-reject-scope-missing-root.rs:10:6
+   |
+10 | enum Tokens {
+   |      ^^^^^^

@@ -114,7 +114,7 @@ where
         let mut span: Option<Span> = None;
         for entry in entries {
             let next = match ctx
-                .call(Lexer::<Root, Self>::span_of_token_entry, entry)
+                .call(Lexer::<Root, Self>::span_of_token, entry)
                 .await
             {
                 Ok(span) => span,
@@ -149,7 +149,7 @@ where
     {
         let _ = self;
         let id = token.id;
-        match ctx.call(Lexer::<Root, Self>::span_of_token_entry, id).await {
+        match ctx.call(Lexer::<Root, Self>::span_of_token, id).await {
             Ok(span) => CallOutcome::ok(span),
             Err(_) => CallOutcome::fail(super::ParseError::Build(
                 super::grammar::BuildError::MissingToken(id),

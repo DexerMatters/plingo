@@ -1,6 +1,6 @@
 use crate::{
     component::{
-        lex::{Entry, LexInterrupt, Lexer, LexerRoot, TokenChange},
+        lex::{LexInterrupt, LexToken, Lexer, LexerRoot, TokenChange},
         parse::TokenData,
     },
     context_callable,
@@ -18,8 +18,8 @@ where
         &'a mut self,
         ctx: &'a Context,
         span: &'a Span,
-    ) -> CallOutcome<Self, Vec<Entry<Root>>> {
-        CallOutcome::ok(self.entries_in_span(ctx.snapshot(), *span))
+    ) -> CallOutcome<Self, Vec<LexToken<Root>>> {
+        CallOutcome::ok(self.tokens_in_span_snapshot(ctx.snapshot(), *span))
     }
 
     #[context_callable]
@@ -55,10 +55,9 @@ where
         T: Clone + Send + Sync + 'static,
     {
         let id = *id;
-        let entry = self.arena.get(id).cloned();
-        match entry {
-            Some(Entry::Token { value, .. }) => {
-                let p: &dyn std::any::Any = &value;
+        match self.token(id) {
+            Some(token) => {
+                let p: &dyn std::any::Any = &token.value;
                 match p.downcast_ref::<T>() {
                     Some(v) => CallOutcome::ok(v.clone()),
                     None => CallOutcome::fail(LexInterrupt::InternalError(format!(
@@ -67,9 +66,6 @@ where
                     ))),
                 }
             }
-            Some(_) => CallOutcome::fail(LexInterrupt::InternalError(
-                "entry exists but is not a Token variant".into(),
-            )),
             None => CallOutcome::fail(LexInterrupt::InternalError(format!(
                 "token_by_id: id {id} out of range (arena size {})",
                 self.arena.len()
@@ -78,16 +74,16 @@ where
     }
 
     #[context_callable]
-    pub async fn span_of_token_entry<'a>(
+    pub async fn span_of_token<'a>(
         &'a mut self,
         ctx: &'a Context,
         id: &'a usize,
     ) -> CallOutcome<Self, Span> {
         let id = *id;
-        match self.entry_span(ctx.snapshot(), id) {
+        match self.token_span(ctx.snapshot(), id) {
             Some(span) => CallOutcome::ok(span),
             None => CallOutcome::fail(LexInterrupt::InternalError(format!(
-                "span_of_token_entry: id {id} not found in current lexer snapshot"
+                "span_of_token: id {id} not found in current lexer snapshot"
             ))),
         }
     }

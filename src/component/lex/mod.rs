@@ -6,7 +6,14 @@ mod mode;
 pub mod __macro_private;
 pub mod interface;
 
-use std::{collections::HashMap, error::Error, fmt, hash::Hash, marker::PhantomData, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
+    hash::Hash,
+    marker::PhantomData,
+    str::FromStr,
+};
 
 use fluent_uri::Uri;
 use plingo_macros::layer;
@@ -30,8 +37,7 @@ use crate::{
 };
 
 use self::__macro_private::{
-    BuildErrorToken, BuildLiftedToken, BuildToken, StateBoundary, StateRegistration, TokenSpec,
-    WrapLiftedToken,
+    BuildErrorToken, BuildToken, EnterScopeKey, ExitScopeGuard, ScopeRegistration,
 };
 
 pub trait TokenState: Send + Sync + 'static {
@@ -39,25 +45,8 @@ pub trait TokenState: Send + Sync + 'static {
     fn state_key() -> &'static str;
 }
 
-pub trait StateTokens: TokenState + Sized {
-    fn token_specs() -> Vec<TokenSpec<Self>>;
-    fn error_builder() -> BuildErrorToken<Self>;
-
-    fn state_registration() -> StateRegistration<Self> {
-        let error_builder = Self::error_builder();
-        StateRegistration::new(
-            Self::display_name(),
-            Self::state_key(),
-            Self::token_specs,
-            error_builder.clone(),
-            error_builder,
-            None,
-        )
-    }
-}
-
 pub trait LexerRoot: TokenState + Hash + Eq + PartialEq + Sized + Send + Sync + 'static {
-    fn state_registrations() -> Vec<StateRegistration<Self>>;
+    fn state_registrations() -> Vec<ScopeRegistration<Self>>;
 }
 
 pub trait FromLexeme: Sized {
@@ -71,13 +60,13 @@ pub struct ResolvedToken<Root> {
     pub terminal: TerminalId,
     pub precedence: usize,
     pub label: &'static str,
-    pub action: StateAction,
+    pub action: TokenAction<Root>,
     pub skip: bool,
     pub(crate) build: BuildToken<Root>,
     pub(crate) minimum_length: usize,
     pub(crate) maximum_length: usize,
-    pub(crate) captures_context: bool,
-    pub(crate) validate: Option<self::__macro_private::ValidateLexeme>,
+    pub(crate) when: Option<self::__macro_private::WhenGuard>,
+    pub(crate) recover_when: Option<self::__macro_private::RecoverWhen>,
 }
 
 impl<Root> fmt::Debug for ResolvedToken<Root> {
@@ -108,33 +97,47 @@ impl<Root> ResolvedToken<Root> {
 }
 
 #[derive(Clone)]
-pub struct LexedToken<Root> {
-    pub terminal: TerminalId,
+pub enum TokenAction<Root> {
+    None,
+    Enter {
+        next: State,
+        key: EnterScopeKey<Root>,
+    },
+    Leave {
+        matches: ExitScopeGuard<Root>,
+    },
+}
+
+impl<Root> fmt::Debug for TokenAction<Root> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Enter { next, .. } => f.debug_struct("Enter").field("next", next).finish(),
+            Self::Leave { .. } => f.write_str("Leave"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LexToken<Root>
+where
+    Root: LexerRoot,
+{
+    pub id: usize,
+    pub start: usize,
+    pub length: usize,
+    pub terminal: Option<TerminalId>,
+    pub error: Option<LexErrorInfo>,
     pub value: Root,
 }
 
 #[derive(Debug, Clone)]
-pub struct BestMatch {
+pub(crate) struct TokenMatch<Root> {
     pub token_index: usize,
     pub start: usize,
     pub end: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct MatchReport {
-    pub best: Option<BestMatch>,
-    pub stop_offset: usize,
-    pub stop_reason: LexInterrupt,
-}
-
-impl MatchReport {
-    pub fn best_match(&self) -> Option<&BestMatch> {
-        self.best.as_ref()
-    }
-
-    pub fn has_match(&self) -> bool {
-        self.best.is_some()
-    }
+    pub value: Root,
+    pub transition: StateAction,
 }
 
 #[derive(Debug, Error, Clone)]
@@ -203,10 +206,8 @@ pub enum GenerateError {
         state: &'static str,
         variant: &'static str,
     },
-    #[error("generate! does not support #[from(...)] variant {token}")]
-    UnsupportedFromVariant { token: &'static str },
-    #[error("generate! does not support validated variant {token}")]
-    UnsupportedValidatedVariant { token: &'static str },
+    #[error("generate! does not support #[when(...)] variant {token}")]
+    UnsupportedWhenVariant { token: &'static str },
     #[error("failed to write generated token")]
     Write(#[source] fmt::Error),
 }
@@ -217,72 +218,51 @@ pub(crate) struct StateMatcher {
     pub(crate) token_index_by_pattern: Vec<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Entry<Root>
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TokenOccurrence
+{
+    pub id: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+pub(crate) struct CompiledState<Root>
 where
     Root: LexerRoot,
 {
-    Token {
-        length: usize,
-        terminal: TerminalId,
-        value: Root,
-    },
-    EOF,
-    Error {
-        length: usize,
-        info: LexErrorInfo,
-        value: Root,
-    },
+    pub(crate) info: StateInfo,
+    pub(crate) matcher: StateMatcher,
+    pub(crate) tokens: Vec<ResolvedToken<Root>>,
+    pub(crate) recovery_error: BuildErrorToken<Root>,
+    pub(crate) boundary_error: BuildErrorToken<Root>,
 }
 
 pub type TokenBatch = ReplacementBatch<TokenData>;
 pub type TokenChange = ReplacementChange<Uri<&'static str>, TokenData>;
 
-impl<Root> Entry<Root>
-where
-    Root: LexerRoot,
-{
-    pub fn is_token(&self) -> bool {
-        matches!(self, Self::Token { .. })
-    }
+const SYNTHETIC_EOF_ID: usize = usize::MAX;
 
-    pub fn is_error(&self) -> bool {
-        matches!(self, Self::Error { .. })
-    }
-
-    pub fn length(&self) -> usize {
-        match self {
-            Self::Token { length, .. } | Self::Error { length, .. } => *length,
-            Self::EOF => 0,
-        }
-    }
-}
-
-impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> for Entry<Root> {
+impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> for LexToken<Root> {
     fn pretty_fmt(
         &self,
         f: &mut core::fmt::Formatter<'_>,
         _context: &Lexer<Root, Lower>,
     ) -> core::fmt::Result {
         use color_print::cwrite;
-        match self {
-            Entry::Token { length, value, .. } => {
-                cwrite!(
-                    f,
-                    "<dim>[{}]\t</dim><green>Token</green>: {}",
-                    length,
-                    value
-                )
-            }
-            Entry::Error { length, value, .. } => {
-                cwrite!(
-                    f,
-                    "<dim>[{}]\t</dim><red>Error</red>: {}",
-                    length,
-                    value
-                )
-            }
-            Entry::EOF => cwrite!(f, "<dim>[0]\t</dim><green>EOF</green>"),
+        if self.error.is_some() {
+            cwrite!(
+                f,
+                "<dim>[{}]\t</dim><red>Error</red>: {}",
+                self.length,
+                self.value
+            )
+        } else {
+            cwrite!(
+                f,
+                "<dim>[{}]\t</dim><green>Token</green>: {}",
+                self.length,
+                self.value
+            )
         }
     }
 }
@@ -294,24 +274,24 @@ impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> fo
         context: &Lexer<Root, Lower>,
     ) -> core::fmt::Result {
         use color_print::cwrite;
-        match context.get(*self) {
-            Entry::Token { length, value, .. } => {
-                cwrite!(
-                    f,
-                    "<dim>[{}]\t</dim><green>Token</green>: {}",
-                    length,
-                    value
-                )
-            }
-            Entry::Error { length, value, .. } => {
+        match context.token(*self) {
+            Some(token) if token.error.is_some() => {
                 cwrite!(
                     f,
                     "<dim>[{}]\t</dim><red>Error</red>: {}",
-                    length,
-                    value
+                    token.length,
+                    token.value
                 )
             }
-            Entry::EOF => cwrite!(f, "<dim>[0]\t</dim><green>EOF</green>"),
+            Some(token) => {
+                cwrite!(
+                    f,
+                    "<dim>[{}]\t</dim><green>Token</green>: {}",
+                    token.length,
+                    token.value
+                )
+            }
+            None => cwrite!(f, "<red>Missing token {}</red>", self),
         }
     }
 }
@@ -322,8 +302,7 @@ where
     Root: LexerRoot,
 {
     state_instances: HashMap<Uri<&'static str>, Vec<LexerState>>,
-    token_instances: HashMap<Uri<&'static str>, Vec<usize>>,
-    token_ranges: HashMap<Uri<&'static str>, Vec<(usize, usize)>>,
+    occurrences: HashMap<Uri<&'static str>, Vec<TokenOccurrence>>,
     _root: PhantomData<Root>,
 }
 
@@ -334,8 +313,7 @@ where
     fn clone(&self) -> Self {
         Self {
             state_instances: self.state_instances.clone(),
-            token_instances: self.token_instances.clone(),
-            token_ranges: self.token_ranges.clone(),
+            occurrences: self.occurrences.clone(),
             _root: PhantomData,
         }
     }
@@ -348,8 +326,7 @@ where
     fn default() -> Self {
         Self {
             state_instances: HashMap::new(),
-            token_instances: HashMap::new(),
-            token_ranges: HashMap::new(),
+            occurrences: HashMap::new(),
             _root: PhantomData,
         }
     }
@@ -360,65 +337,94 @@ pub struct Lexer<Root, Lower = ()>
 where
     Root: LexerRoot,
 {
-    tokens: Vec<Vec<ResolvedToken<Root>>>,
-    state_matchers: Vec<StateMatcher>,
-    state_info: Vec<StateInfo>,
-    state_boundaries: Vec<Option<StateBoundary>>,
-    state_recovery_errors: Vec<BuildErrorToken<Root>>,
-    state_boundary_errors: Vec<BuildErrorToken<Root>>,
+    compiled_states: Vec<CompiledState<Root>>,
+    state_ids: HashMap<String, State>,
+    skip_terminals: HashSet<TerminalId>,
 
     #[snapshot]
     latest: LexerSnapshotState<Root>,
-    arena: Vec<Entry<Root>>,
+    arena: Vec<LexToken<Root>>,
     _lower: PhantomData<fn() -> Lower>,
 }
 
 impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
-    fn token_data_from_instances(
+    fn materialize_token(
         &self,
-        token_ids: &[usize],
-        token_ranges: &[(usize, usize)],
+        occurrence: TokenOccurrence,
+    ) -> Option<LexToken<Root>>
+    where
+        Root: Clone,
+    {
+        let token = self.arena.get(occurrence.id)?.clone();
+        Some(LexToken {
+            start: occurrence.start,
+            length: occurrence.end.saturating_sub(occurrence.start),
+            ..token
+        })
+    }
+
+    fn token_data_from_occurrences(
+        &self,
+        occurrences: &[TokenOccurrence],
+        span: Option<Span>,
     ) -> Vec<TokenData> {
         let mut out = Vec::new();
-        for (column, (&id, &(start, _end))) in token_ids.iter().zip(token_ranges.iter()).enumerate()
-        {
-            let Some(entry) = self.arena.get(id) else {
+        for (column, occurrence) in occurrences.iter().enumerate() {
+            let Some(token) = self.arena.get(occurrence.id) else {
                 continue;
             };
-            let data = match entry {
-                Entry::Token {
-                    length,
-                    terminal,
-                    value,
-                } if !self.is_skip_terminal(*terminal) => Some(TokenData {
-                    id,
-                    terminal: Some(*terminal),
-                    start,
-                    length: *length,
-                    column,
-                    fingerprint: token_fingerprint(Some(*terminal), value, *length),
-                }),
-                Entry::EOF => Some(TokenData {
-                    id,
-                    terminal: None,
-                    start,
-                    length: 0,
-                    column,
-                    fingerprint: eof_fingerprint(),
-                }),
-                Entry::Error { length, info, .. } => Some(TokenData {
-                    id,
-                    terminal: None,
-                    start,
-                    length: *length,
-                    column,
-                    fingerprint: error_fingerprint(info, *length),
-                }),
-                _ => None,
-            };
-            if let Some(data) = data {
-                out.push(data);
+            if let Some(span) = span {
+                if occurrence.start >= span.range.end() || occurrence.end <= span.range.start() {
+                    continue;
+                }
             }
+            if let Some(error) = token.error {
+                out.push(TokenData {
+                    id: token.id,
+                    terminal: None,
+                    start: occurrence.start,
+                    length: occurrence.end.saturating_sub(occurrence.start),
+                    column,
+                    fingerprint: error_fingerprint(
+                        &error,
+                        occurrence.end.saturating_sub(occurrence.start),
+                    ),
+                });
+                continue;
+            }
+            let Some(terminal) = token.terminal else {
+                continue;
+            };
+            if self.is_skip_terminal(terminal) {
+                continue;
+            }
+            out.push(TokenData {
+                id: token.id,
+                terminal: Some(terminal),
+                start: occurrence.start,
+                length: occurrence.end.saturating_sub(occurrence.start),
+                column,
+                fingerprint: token_fingerprint(
+                    Some(terminal),
+                    &token.value,
+                    occurrence.end.saturating_sub(occurrence.start),
+                ),
+            });
+        }
+
+        let eof_start = occurrences.last().map(|occurrence| occurrence.end).unwrap_or(0);
+        let include_eof = span.is_none_or(|span| {
+            eof_start >= span.range.start() && eof_start <= span.range.end()
+        });
+        if include_eof {
+            out.push(TokenData {
+                id: SYNTHETIC_EOF_ID,
+                terminal: None,
+                start: eof_start,
+                length: 0,
+                column: occurrences.len(),
+                fingerprint: eof_fingerprint(),
+            });
         }
         out
     }
@@ -428,13 +434,10 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         state: &LexerSnapshotState<Root>,
         uri: Uri<&'static str>,
     ) -> Vec<TokenData> {
-        let Some(token_ids) = state.token_instances.get(&uri) else {
+        let Some(occurrences) = state.occurrences.get(&uri) else {
             return Vec::new();
         };
-        let Some(token_ranges) = state.token_ranges.get(&uri) else {
-            return Vec::new();
-        };
-        self.token_data_from_instances(token_ids, token_ranges)
+        self.token_data_from_occurrences(occurrences, None)
     }
 
     fn token_data_semantically_equal(a: &TokenData, b: &TokenData) -> bool {
@@ -479,128 +482,121 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             .enumerate()
             .map(|(index, registration)| (registration.type_name.clone(), State::new(index)))
             .collect::<HashMap<_, _>>();
-        let states = registrations
-            .iter()
-            .map(|registration| StateInfo {
-                name: registration.display_name,
-                type_name: registration.type_name.clone(),
-            })
-            .collect::<Vec<_>>();
-
-        let mut tokens = Vec::with_capacity(registrations.len());
-        let mut state_matchers = Vec::with_capacity(registrations.len());
-        let mut state_boundaries = Vec::with_capacity(registrations.len());
-        let mut state_recovery_errors = Vec::with_capacity(registrations.len());
-        let mut state_boundary_errors = Vec::with_capacity(registrations.len());
+        let mut compiled_states = Vec::with_capacity(registrations.len());
+        let mut skip_terminals = HashSet::new();
         for registration in &registrations {
             let mut state_tokens = Vec::new();
             let mut patterns = Vec::new();
             for spec in (registration.rules)() {
                 patterns.push(spec.regex);
-                state_tokens.push(build::resolve_token(spec, &state_ids)?);
+                let resolved = build::resolve_token(spec, &state_ids)?;
+                if resolved.skip {
+                    skip_terminals.insert(resolved.terminal);
+                }
+                state_tokens.push(resolved);
             }
-            state_boundaries.push(registration.boundary);
-            state_recovery_errors.push(registration.recovery_error_builder.clone());
-            state_boundary_errors.push(registration.boundary_error_builder.clone());
-            state_matchers.push(build::build_state_matcher(
-                registration.display_name,
-                &patterns,
-            )?);
-            tokens.push(state_tokens);
+            let matcher = build::build_state_matcher(registration.display_name, &patterns)?;
+            compiled_states.push(CompiledState {
+                info: StateInfo {
+                    name: registration.display_name,
+                    type_name: registration.type_name.clone(),
+                },
+                matcher,
+                tokens: state_tokens,
+                recovery_error: registration.recovery_error_builder.clone(),
+                boundary_error: registration.boundary_error_builder.clone(),
+            });
         }
 
         Ok(Self {
-            state_info: states,
-            tokens,
+            compiled_states,
+            state_ids,
+            skip_terminals,
             arena: Vec::new(),
-            state_matchers,
-            state_boundaries,
-            state_recovery_errors,
-            state_boundary_errors,
             latest: LexerSnapshotState::default(),
             _lower: PhantomData,
             _snapshot: HashMap::new(),
         })
     }
 
-    pub fn state_info(&self) -> &[StateInfo] {
-        &self.state_info
+    pub fn state_info(&self) -> impl ExactSizeIterator<Item = &StateInfo> {
+        self.compiled_states.iter().map(|state| &state.info)
     }
 
-    pub fn resolved_tokens(&self) -> &[Vec<ResolvedToken<Root>>] {
-        &self.tokens
+    pub fn resolved_tokens(&self) -> impl ExactSizeIterator<Item = &[ResolvedToken<Root>]> {
+        self.compiled_states.iter().map(|state| state.tokens.as_slice())
     }
 
     pub fn tokens_in_state(&self, state: State) -> Option<&[ResolvedToken<Root>]> {
-        self.tokens.get(state.id).map(Vec::as_slice)
+        self.compiled_states.get(state.id).map(|state| state.tokens.as_slice())
     }
 
     pub(crate) fn state_matcher(&self, state: State) -> Option<&StateMatcher> {
-        self.state_matchers.get(state.id)
+        self.compiled_states.get(state.id).map(|state| &state.matcher)
     }
 
-    pub fn alloc(&mut self, entry: Entry<Root>) -> usize {
-        let index = self.arena.len();
-        self.arena.push(entry);
-        index
+    pub fn alloc_token(
+        &mut self,
+        start: usize,
+        length: usize,
+        terminal: Option<TerminalId>,
+        error: Option<LexErrorInfo>,
+        value: Root,
+    ) -> usize {
+        let id = self.arena.len();
+        self.arena.push(LexToken {
+            id,
+            start,
+            length,
+            terminal,
+            error,
+            value,
+        });
+        id
     }
 
-    pub fn get(&self, index: usize) -> &Entry<Root> {
-        self.arena.get(index).unwrap()
+    pub fn token(&self, index: usize) -> Option<&LexToken<Root>> {
+        self.arena.get(index)
     }
 
     pub fn terminal_of(&self, index: usize) -> Option<TerminalId> {
-        match self.get(index) {
-            Entry::Token { terminal, .. } => Some(*terminal),
-            Entry::EOF | Entry::Error { .. } => None,
-        }
+        self.token(index).and_then(|token| token.error.is_none().then_some(token.terminal).flatten())
     }
 
     pub(crate) fn snapshot_state(&self, snapshot: Option<SnapshotId>) -> &LexerSnapshotState<Root> {
         self.state(snapshot).unwrap_or_else(|| self.latest_state())
     }
 
-    pub(crate) fn entry_span(&self, snapshot: Option<SnapshotId>, id: usize) -> Option<Span> {
+    pub(crate) fn token_span(&self, snapshot: Option<SnapshotId>, id: usize) -> Option<Span> {
         let state = self.snapshot_state(snapshot);
-        for (&uri, token_ids) in &state.token_instances {
-            let Some(token_ranges) = state.token_ranges.get(&uri) else {
-                continue;
-            };
-            for (&token_id, &(start, end)) in token_ids.iter().zip(token_ranges.iter()) {
-                if token_id == id {
-                    return Span::new_uri(uri, start, end).ok();
+        for (&uri, occurrences) in &state.occurrences {
+            for occurrence in occurrences {
+                if occurrence.id == id {
+                    return Span::new_uri(uri, occurrence.start, occurrence.end).ok();
                 }
             }
         }
         None
     }
 
-    pub(crate) fn entries_in_span(
+    pub(crate) fn tokens_in_span_snapshot(
         &self,
         snapshot: Option<SnapshotId>,
         span: Span,
-    ) -> Vec<Entry<Root>>
+    ) -> Vec<LexToken<Root>>
     where
         Root: Clone,
     {
         let state = self.snapshot_state(snapshot);
-        let Some(token_ids) = state.token_instances.get(&span.uri) else {
+        let Some(occurrences) = state.occurrences.get(&span.uri) else {
             return Vec::new();
         };
-        let Some(token_ranges) = state.token_ranges.get(&span.uri) else {
-            return Vec::new();
-        };
-
-        token_ids
+        occurrences
             .iter()
-            .zip(token_ranges.iter())
-            .filter_map(|(&token_id, &(start, end))| {
-                if start < span.range.end() && end > span.range.start() {
-                    self.arena.get(token_id).cloned()
-                } else {
-                    None
-                }
+            .filter(|occurrence| {
+                occurrence.start < span.range.end() && occurrence.end > span.range.start()
             })
+            .filter_map(|occurrence| self.materialize_token(*occurrence))
             .collect()
     }
 
@@ -610,98 +606,26 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         span: Span,
     ) -> Vec<crate::component::parse::TokenData> {
         let state = self.snapshot_state(snapshot);
-        let Some(token_ids) = state.token_instances.get(&span.uri) else {
+        let Some(occurrences) = state.occurrences.get(&span.uri) else {
             return Vec::new();
         };
-        let Some(token_ranges) = state.token_ranges.get(&span.uri) else {
-            return Vec::new();
-        };
-
-        let mut out = Vec::new();
-        for (column, (&id, &(start, end))) in token_ids.iter().zip(token_ranges.iter()).enumerate()
-        {
-            let Some(entry) = self.arena.get(id) else {
-                continue;
-            };
-            let include = match entry {
-                Entry::Token { terminal, .. } => {
-                    !self.is_skip_terminal(*terminal)
-                        && start < span.range.end()
-                        && end > span.range.start()
-                }
-                Entry::Error { .. } => start < span.range.end() && end > span.range.start(),
-                Entry::EOF => start >= span.range.start() && start <= span.range.end(),
-            };
-
-            if include {
-                match entry {
-                    Entry::Token {
-                        length,
-                        terminal,
-                        value,
-                    } => {
-                        out.push(TokenData {
-                            id,
-                            terminal: Some(*terminal),
-                            start,
-                            length: *length,
-                            column,
-                            fingerprint: token_fingerprint(Some(*terminal), value, *length),
-                        });
-                    }
-                    Entry::EOF => {
-                        out.push(TokenData {
-                            id,
-                            terminal: None,
-                            start,
-                            length: 0,
-                            column,
-                            fingerprint: eof_fingerprint(),
-                        });
-                    }
-                    Entry::Error { length, info, .. } => {
-                        out.push(TokenData {
-                            id,
-                            terminal: None,
-                            start,
-                            length: *length,
-                            column,
-                            fingerprint: error_fingerprint(info, *length),
-                        });
-                    }
-                }
-            }
-        }
-
-        out
+        self.token_data_from_occurrences(occurrences, Some(span))
     }
 
     fn is_skip_terminal(&self, terminal: TerminalId) -> bool {
-        self.tokens.iter().any(|state_tokens| {
-            state_tokens
-                .iter()
-                .any(|t| t.terminal == terminal && t.skip)
-        })
+        self.skip_terminals.contains(&terminal)
     }
 
     pub fn state_id_of<S: TokenState>(&self) -> Option<State> {
-        let type_name = S::state_key();
-        self.state_info
-            .iter()
-            .position(|state| state.type_name == type_name)
-            .map(|p| State::new(p))
-    }
-
-    pub(crate) fn state_boundary(&self, state: State) -> Option<StateBoundary> {
-        self.state_boundaries.get(state.id).copied().flatten()
+        self.state_ids.get(S::state_key()).cloned()
     }
 
     pub(crate) fn recovery_error_builder(&self, state: State) -> Option<&BuildErrorToken<Root>> {
-        self.state_recovery_errors.get(state.id)
+        self.compiled_states.get(state.id).map(|state| &state.recovery_error)
     }
 
     pub(crate) fn boundary_error_builder(&self, state: State) -> Option<&BuildErrorToken<Root>> {
-        self.state_boundary_errors.get(state.id)
+        self.compiled_states.get(state.id).map(|state| &state.boundary_error)
     }
 }
 
@@ -748,32 +672,6 @@ where
             Ok(lower_changes)
         }
     }
-}
-
-pub fn lift_state_registrations<Root, Nested>(
-    build_outer: BuildLiftedToken<Root, Nested>,
-    wrap_nested: Option<WrapLiftedToken<Root, Nested>>,
-    boundary_error_builder: BuildErrorToken<Root>,
-    synthetic_key: &'static str,
-    boundary: Option<StateBoundary>,
-    terminal: TerminalId,
-    label: &'static str,
-    outer_validate: Option<self::__macro_private::ValidateLexeme>,
-) -> Vec<StateRegistration<Root>>
-where
-    Root: Send + Sync + 'static,
-    Nested: LexerRoot + 'static,
-{
-    build::lift_state_registrations(
-        build_outer,
-        wrap_nested,
-        boundary_error_builder,
-        synthetic_key,
-        boundary,
-        terminal,
-        label,
-        outer_validate,
-    )
 }
 
 #[derive(Debug, Error)]

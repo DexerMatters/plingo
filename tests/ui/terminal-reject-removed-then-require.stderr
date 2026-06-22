@@ -1,0 +1,5 @@
+error: cannot find attribute `then_require` in this scope
+ --> tests/ui/terminal-reject-removed-then-require.rs:6:7
+  |
+6 |     #[then_require(Content)]
+  |       ^^^^^^^^^^^^

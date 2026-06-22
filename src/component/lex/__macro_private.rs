@@ -12,25 +12,65 @@ use super::{GenerateError, LexErrorInfo, LexInterrupt};
 pub type BuildToken<Root> = Arc<dyn Fn(&str) -> Result<Root, LexInterrupt> + Send + Sync>;
 pub type BuildErrorToken<Root> =
     Arc<dyn Fn(LexErrorInfo) -> Result<Root, LexInterrupt> + Send + Sync>;
-pub type BuildLiftedToken<Root, Nested> =
-    Arc<dyn Fn(&str, Nested) -> Result<Root, LexInterrupt> + Send + Sync>;
-pub type WrapLiftedToken<Root, Nested> =
-    Arc<dyn Fn(Nested) -> Result<Root, LexInterrupt> + Send + Sync>;
-pub type ValidateLexeme =
+pub type WhenGuard =
     Arc<dyn for<'a, 'b> Fn(&'a str, Option<&'b str>) -> bool + Send + Sync>;
+pub type RecoverWhen =
+    Arc<dyn for<'a, 'b> Fn(&'a str, Option<&'b str>) -> usize + Send + Sync>;
+pub type EnterScopeKey<Root> = Arc<dyn Fn(&Root) -> Option<String> + Send + Sync>;
+pub type ExitScopeGuard<Root> = Arc<dyn Fn(&Root, &str) -> bool + Send + Sync>;
 
 use std::error::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StateDirective {
+#[derive(Clone)]
+pub enum ScopeDirective<Root> {
     None,
-    Enter(String),
-    Leave,
+    Enter {
+        target: String,
+        key: EnterScopeKey<Root>,
+    },
+    Leave {
+        matches: ExitScopeGuard<Root>,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StateBoundary {
-    pub target_terminal: TerminalId,
+#[derive(Clone)]
+pub struct TokenSpec<Root> {
+    pub regex: &'static str,
+    pub terminal: TerminalId,
+    pub precedence: usize,
+    pub label: &'static str,
+    pub action: ScopeDirective<Root>,
+    pub skip: bool,
+    pub build: BuildToken<Root>,
+    pub when: Option<WhenGuard>,
+    pub recover_when: Option<RecoverWhen>,
+}
+
+#[derive(Clone)]
+pub struct ScopeRegistration<Root> {
+    pub display_name: &'static str,
+    pub type_name: String,
+    pub rules: Arc<dyn Fn() -> Vec<TokenSpec<Root>> + Send + Sync>,
+    pub recovery_error_builder: BuildErrorToken<Root>,
+    pub boundary_error_builder: BuildErrorToken<Root>,
+}
+
+impl<Root> ScopeRegistration<Root> {
+    pub fn new(
+        display_name: &'static str,
+        type_name: impl Into<String>,
+        rules: impl Fn() -> Vec<TokenSpec<Root>> + Send + Sync + 'static,
+        recovery_error_builder: BuildErrorToken<Root>,
+        boundary_error_builder: BuildErrorToken<Root>,
+    ) -> Self {
+        Self {
+            display_name,
+            type_name: type_name.into(),
+            rules: Arc::new(rules),
+            recovery_error_builder,
+            boundary_error_builder,
+        }
+    }
 }
 
 pub trait IntoLexemeResult<T> {
@@ -55,49 +95,6 @@ where
 
     fn into_lexeme_result(self) -> Result<T, Self::Error> {
         self
-    }
-}
-
-#[derive(Clone)]
-pub struct TokenSpec<Root> {
-    pub regex: &'static str,
-    pub terminal: TerminalId,
-    pub precedence: usize,
-    pub label: &'static str,
-    pub action: StateDirective,
-    pub skip: bool,
-    pub build: BuildToken<Root>,
-    pub captures_context: bool,
-    pub validate: Option<ValidateLexeme>,
-}
-
-#[derive(Clone)]
-pub struct StateRegistration<Root> {
-    pub display_name: &'static str,
-    pub type_name: String,
-    pub rules: Arc<dyn Fn() -> Vec<TokenSpec<Root>> + Send + Sync>,
-    pub recovery_error_builder: BuildErrorToken<Root>,
-    pub boundary_error_builder: BuildErrorToken<Root>,
-    pub boundary: Option<StateBoundary>,
-}
-
-impl<Root> StateRegistration<Root> {
-    pub fn new(
-        display_name: &'static str,
-        type_name: impl Into<String>,
-        rules: impl Fn() -> Vec<TokenSpec<Root>> + Send + Sync + 'static,
-        recovery_error_builder: BuildErrorToken<Root>,
-        boundary_error_builder: BuildErrorToken<Root>,
-        boundary: Option<StateBoundary>,
-    ) -> Self {
-        Self {
-            display_name,
-            type_name: type_name.into(),
-            rules: Arc::new(rules),
-            recovery_error_builder,
-            boundary_error_builder,
-            boundary,
-        }
     }
 }
 

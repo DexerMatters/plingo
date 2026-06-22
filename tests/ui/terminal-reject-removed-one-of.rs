@@ -2,8 +2,8 @@ use plingo::{Terminal, component::lex::LexErrorInfo};
 
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
 enum RootToken {
-    #[each(InnerToken)]
-    Content(Vec<InnerToken>),
+    #[one_of(InnerToken)]
+    Content(InnerToken),
 
     #[error]
     Error(LexErrorInfo),

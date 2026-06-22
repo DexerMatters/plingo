@@ -8,9 +8,8 @@ use regex_automata::{Anchored, Input, dfa::Automaton};
 use crate::{
     component::{
         lex::{
-            BestMatch, Entry, LexErrorInfo, LexErrorKind, LexInterrupt, LexedToken, Lexer,
-            LexerRoot, LexerSnapshotState, LexerState, MatchReport, State, StateAction,
-            TokenChange,
+            LexErrorInfo, LexErrorKind, LexInterrupt, Lexer, LexerRoot, LexerSnapshotState,
+            LexerState, State, StateAction, TokenAction, TokenChange, TokenMatch, TokenOccurrence,
         },
         source::{Source, TextChange},
     },
@@ -29,8 +28,12 @@ fn shift_offset(offset: usize, shift: isize) -> usize {
     }
 }
 
-fn shift_range((start, end): (usize, usize), shift: isize) -> (usize, usize) {
-    (shift_offset(start, shift), shift_offset(end, shift))
+fn shift_occurrence(occurrence: TokenOccurrence, shift: isize) -> TokenOccurrence {
+    TokenOccurrence {
+        id: occurrence.id,
+        start: shift_offset(occurrence.start, shift),
+        end: shift_offset(occurrence.end, shift),
+    }
 }
 
 fn shift_state(state: &LexerState, shift: isize) -> LexerState {
@@ -115,8 +118,8 @@ where
             .state_instances
             .entry(uri)
             .or_insert_with(|| vec![LexerState::new(root_state)]);
-        snapshot_state.token_instances.entry(uri).or_default();
-        snapshot_state.token_ranges.entry(uri).or_default();
+        snapshot_state.occurrences.entry(uri).or_default();
+
         let old_visible_start = Instant::now();
         let old_visible_tokens = self.token_data_for_uri(snapshot_state, uri);
         let old_visible_elapsed = old_visible_start.elapsed();
@@ -144,72 +147,42 @@ where
         let restart_lookup_start = Instant::now();
         let restart_token_pos = {
             let states = &snapshot_state.state_instances[&uri];
-            let tokens = &snapshot_state.token_instances[&uri];
-            let ranges = &snapshot_state.token_ranges[&uri];
-            debug_assert_eq!(states.len(), tokens.len() + 1);
-            let position = states
+            let occurrences = &snapshot_state.occurrences[&uri];
+            debug_assert_eq!(states.len(), occurrences.len() + 1);
+            states
                 .windows(2)
                 .position(|window| restart_point <= window[1].offset)
-                .unwrap_or(tokens.len());
-            if position == tokens.len()
-                && tokens
-                    .last()
-                    .is_some_and(|&token_id| matches!(self.get(token_id), Entry::EOF))
-                && ranges
-                    .last()
-                    .is_some_and(|&(start, end)| restart_point >= start && restart_point <= end)
-            {
-                tokens.len().saturating_sub(1)
-            } else {
-                position
-            }
+                .unwrap_or(occurrences.len())
         };
         let restart_lookup_elapsed = restart_lookup_start.elapsed();
 
         let restart_state_pos = restart_token_pos;
 
         let old_suffix_snapshot_start = Instant::now();
-        let (start_state, old_states, old_tokens, old_ranges) = {
+        let (start_state, old_states, old_occurrences) = {
             let states = snapshot_state
                 .state_instances
                 .get_mut(&uri)
                 .ok_or(LexInterrupt::MissingState)?;
-            let tokens = snapshot_state
-                .token_instances
+            let occurrences = snapshot_state
+                .occurrences
                 .get_mut(&uri)
                 .ok_or(LexInterrupt::MissingState)?;
-            let ranges = snapshot_state
-                .token_ranges
-                .get_mut(&uri)
-                .ok_or(LexInterrupt::MissingState)?;
-            debug_assert_eq!(states.len(), tokens.len() + 1);
-            debug_assert_eq!(tokens.len(), ranges.len());
+            debug_assert_eq!(states.len(), occurrences.len() + 1);
 
             let start_state = states[restart_state_pos].clone();
-            let mut old_states: Vec<LexerState> =
-                states[restart_state_pos + 1..].iter().cloned().collect();
-            let mut old_tokens: Vec<usize> = tokens[restart_token_pos..].to_vec();
-            let mut old_ranges: Vec<(usize, usize)> = ranges[restart_token_pos..].to_vec();
-
-            if restart_token_pos == tokens.len() && !old_tokens.is_empty() {
-                old_tokens.pop();
-                old_ranges.pop();
-                if !old_states.is_empty() {
-                    old_states.pop();
-                }
-            }
+            let old_states = states[restart_state_pos + 1..].to_vec();
+            let old_occurrences = occurrences[restart_token_pos..].to_vec();
 
             states.truncate(restart_state_pos + 1);
-            tokens.truncate(restart_token_pos);
-            ranges.truncate(restart_token_pos);
+            occurrences.truncate(restart_token_pos);
 
-            (start_state, old_states, old_tokens, old_ranges)
+            (start_state, old_states, old_occurrences)
         };
         let old_suffix_snapshot_elapsed = old_suffix_snapshot_start.elapsed();
 
-        let mut new_token_ids: Vec<usize> = Vec::new();
-        let mut new_states: Vec<LexerState> = Vec::new();
-        let mut new_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut new_occurrences = Vec::new();
+        let mut new_states = Vec::new();
         let lookup_build_start = Instant::now();
         let mut old_state_lookup: HashMap<LexerState, Vec<usize>> = HashMap::new();
         for (index, state) in old_states.iter().enumerate() {
@@ -218,36 +191,40 @@ where
                 .or_default()
                 .push(index);
         }
-        let old_boundary_is_eof = old_tokens
-            .iter()
-            .map(|&token_id| matches!(self.get(token_id), Entry::EOF))
-            .collect::<Vec<_>>();
         let lookup_build_elapsed = lookup_build_start.elapsed();
+
         let mut convergence: Option<(usize, usize)> = None;
         let replay_start = Instant::now();
-        self.lex_cont(start_state, snapshot, |token_id, state, start, end| {
-            new_token_ids.push(token_id);
+        let final_state = self.lex_cont(start_state, snapshot, |token_id, state, start, end| {
+            new_occurrences.push(TokenOccurrence {
+                id: token_id,
+                start,
+                end,
+            });
             new_states.push(state.clone());
-            new_ranges.push((start, end));
             if state.offset >= new_change_end {
-                let new_boundary_is_eof = start == end;
-                if let Some(old_state_index) = old_state_lookup.get(state).and_then(|indices| {
-                    indices
-                        .iter()
-                        .rev()
-                        .copied()
-                        .find(|&index| !old_boundary_is_eof[index] || new_boundary_is_eof)
-                }) {
-                    convergence = Some((new_token_ids.len(), old_state_index + 1));
+                if let Some(old_state_index) = old_state_lookup
+                    .get(state)
+                    .and_then(|indices| indices.iter().rev().copied().next())
+                {
+                    convergence = Some((new_occurrences.len(), old_state_index + 1));
                     return false;
                 }
             }
             true
         })?;
+        if convergence.is_none() && final_state.offset >= new_change_end {
+            if let Some(old_state_index) = old_state_lookup
+                .get(&final_state)
+                .and_then(|indices| indices.iter().rev().copied().next())
+            {
+                convergence = Some((new_occurrences.len(), old_state_index + 1));
+            }
+        }
         let replay_elapsed = replay_start.elapsed();
 
         let (new_prefix_len, old_suffix_start_index) =
-            convergence.unwrap_or_else(|| (new_token_ids.len(), old_tokens.len()));
+            convergence.unwrap_or_else(|| (new_occurrences.len(), old_occurrences.len()));
 
         let state_splice_start = Instant::now();
         {
@@ -255,17 +232,12 @@ where
                 .state_instances
                 .get_mut(&uri)
                 .ok_or(LexInterrupt::MissingState)?;
-            let tokens = snapshot_state
-                .token_instances
-                .get_mut(&uri)
-                .ok_or(LexInterrupt::MissingState)?;
-            let ranges = snapshot_state
-                .token_ranges
+            let occurrences = snapshot_state
+                .occurrences
                 .get_mut(&uri)
                 .ok_or(LexInterrupt::MissingState)?;
             debug_assert_eq!(states.len(), restart_state_pos + 1);
-            debug_assert_eq!(tokens.len(), restart_token_pos);
-            debug_assert_eq!(tokens.len(), ranges.len());
+            debug_assert_eq!(occurrences.len(), restart_token_pos);
 
             states.extend(new_states.iter().take(new_prefix_len).cloned());
             states.extend(
@@ -275,19 +247,16 @@ where
                     .map(|state| shift_state(state, net_shift)),
             );
 
-            tokens.extend(new_token_ids.iter().take(new_prefix_len).copied());
-            tokens.extend(old_tokens.iter().skip(old_suffix_start_index).copied());
-            ranges.extend(new_ranges.iter().take(new_prefix_len).copied());
-            ranges.extend(
-                old_ranges
+            occurrences.extend(new_occurrences.iter().take(new_prefix_len).copied());
+            occurrences.extend(
+                old_occurrences
                     .iter()
                     .skip(old_suffix_start_index)
                     .copied()
-                    .map(|range| shift_range(range, net_shift)),
+                    .map(|occurrence| shift_occurrence(occurrence, net_shift)),
             );
 
-            debug_assert_eq!(states.len(), tokens.len() + 1);
-            debug_assert_eq!(tokens.len(), ranges.len());
+            debug_assert_eq!(states.len(), occurrences.len() + 1);
         }
         let state_splice_elapsed = state_splice_start.elapsed();
 
@@ -325,7 +294,7 @@ where
             new_change_end,
             net_shift,
             new_prefix_len,
-            old_tokens.len().saturating_sub(old_suffix_start_index),
+            old_occurrences.len().saturating_sub(old_suffix_start_index),
             old_visible_len,
             new_visible_len,
             prefix_len,
@@ -346,140 +315,60 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         start_state: LexerState,
         input_str: String,
         mut cont: impl FnMut(usize, &LexerState, usize, usize) -> bool,
-    ) -> Result<(), LexInterrupt> {
+    ) -> Result<LexerState, LexInterrupt> {
         let mut input = Input::new(input_str.as_bytes());
         let mut state = start_state;
-        let mut unexpected_input: Vec<u8> = Vec::new();
+        let mut unexpected_start: Option<usize> = None;
 
         while state.offset < input.end() {
-            if let Some(boundary_match) = self.boundary_match(&state, &mut input) {
-                if !unexpected_input.is_empty() {
-                    let taken = std::mem::take(&mut unexpected_input);
-                    let start = state.offset - taken.len();
-                    let end = state.offset;
-                    if !self.emit_state_error(
-                        &state,
-                        LexErrorInfo {
-                            kind: LexErrorKind::UnexpectedInput,
-                            start,
-                            end,
-                        },
-                        false,
-                        &mut cont,
-                    )? {
-                        return Ok(());
-                    }
-                }
-                let is_skip = state
-                    .parent_state()
-                    .and_then(|parent| self.tokens_in_state(parent))
-                    .and_then(|tokens| tokens.get(boundary_match.token_index))
-                    .is_some_and(|t| t.skip);
-                state.apply_action(StateAction::Leave);
-                let token = self.next_token(&mut state, &boundary_match, &mut input)?;
-                if !is_skip {
-                    let length = boundary_match.end - boundary_match.start;
-                    let token_id = self.alloc(Entry::Token {
-                        length,
-                        terminal: token.terminal,
-                        value: token.value,
-                    });
-                    if !cont(token_id, &state, boundary_match.start, boundary_match.end) {
-                        return Ok(());
-                    }
-                }
-                continue;
-            }
-            let MatchReport { best, .. } = self.select_best_match(&state, &mut input);
-            match best {
-                Some(best_match) => {
-                    if !unexpected_input.is_empty() {
-                        let taken = std::mem::take(&mut unexpected_input);
-                        let start = state.offset - taken.len();
-                        let end = state.offset;
+            match self.select_step(&state, &mut input)? {
+                Some(step) => {
+                    let start = step.start;
+                    let end = step.end;
+                    if let Some(start) = unexpected_start.take() {
                         if !self.emit_state_error(
                             &state,
                             LexErrorInfo {
                                 kind: LexErrorKind::UnexpectedInput,
                                 start,
-                                end,
+                                end: state.offset,
                             },
                             false,
                             &mut cont,
                         )? {
-                            return Ok(());
+                            return Ok(state);
                         }
                     }
-                    let is_skip = state
-                        .current_state()
-                        .ok()
-                        .and_then(|s| self.tokens_in_state(s))
-                        .and_then(|tokens| tokens.get(best_match.token_index))
-                        .is_some_and(|t| t.skip);
-                    match self.next_token(&mut state, &best_match, &mut input) {
-                        Ok(token) => {
-                            if is_skip {
-                                continue;
-                            }
-                            let length = best_match.end - best_match.start;
-                            let token_id = self.alloc(Entry::Token {
-                                length,
-                                terminal: token.terminal,
-                                value: token.value,
-                            });
-                            if !cont(token_id, &state, best_match.start, best_match.end) {
-                                return Ok(());
-                            }
+
+                    if let Some(token_id) = self.commit_match(&mut state, step)? {
+                        if !cont(token_id, &state, start, end) {
+                            return Ok(state);
                         }
-                        Err(LexInterrupt::ParseError(err, lexeme)) => {
-                            let current_state = state.current_state()?;
-                            let token = &self.tokens[current_state.id][best_match.token_index];
-                            return Err(LexInterrupt::TokenParseError {
-                                token: token.label,
-                                lexeme,
-                                err,
-                            });
-                        }
-                        Err(LexInterrupt::InternalError(err)) => {
-                            return Err(LexInterrupt::TokenParseError {
-                                token: "<internal>",
-                                lexeme: String::new(),
-                                err,
-                            });
-                        }
-                        Err(other) => return Err(other),
                     }
                 }
                 None => {
-                    unexpected_input.push(input.haystack()[state.offset]);
+                    unexpected_start.get_or_insert(state.offset);
                     state.offset += 1;
                 }
             }
         }
 
-        if !unexpected_input.is_empty() {
-            let taken = std::mem::take(&mut unexpected_input);
-            let start = state.offset - taken.len();
-            let end = state.offset;
+        if let Some(start) = unexpected_start.take() {
             if !self.emit_state_error(
                 &state,
                 LexErrorInfo {
                     kind: LexErrorKind::UnexpectedInput,
                     start,
-                    end,
+                    end: state.offset,
                 },
                 false,
                 &mut cont,
             )? {
-                return Ok(());
+                return Ok(state);
             }
         }
 
-        if state
-            .current_state()
-            .ok()
-            .and_then(|current| self.state_boundary(current))
-            .is_some()
+        if state.parent_state().is_some()
             && !self.emit_state_error(
                 &state,
                 LexErrorInfo {
@@ -491,15 +380,10 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                 &mut cont,
             )?
         {
-            return Ok(());
+            return Ok(state);
         }
 
-        let eof = self.alloc(Entry::EOF);
-        if !cont(eof, &state, state.offset, state.offset) {
-            return Ok(());
-        }
-
-        Ok(())
+        Ok(state)
     }
 
     fn emit_state_error(
@@ -518,247 +402,263 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         .ok_or(LexInterrupt::MissingState)?
         .clone();
         let value = builder(info)?;
-        let token_id = self.alloc(Entry::Error {
-            length: info.end.saturating_sub(info.start),
-            info,
+        let token_id = self.alloc_token(
+            info.start,
+            info.end.saturating_sub(info.start),
+            None,
+            Some(info),
             value,
-        });
+        );
         Ok(cont(token_id, state, info.start, info.end))
     }
 
-    fn boundary_match(
+    fn select_step(
         &self,
         state: &LexerState,
         input: &mut Input,
-    ) -> Option<BestMatch> {
-        let Some(current) = state.current_state().ok() else {
-            return None;
-        };
-        let Some(boundary) = self.state_boundary(current) else {
-            return None;
-        };
-        let Some(parent) = state.parent_state() else {
-            return None;
-        };
-
-        self.find_token_match_in_state(
-            parent,
-            boundary.target_terminal,
-            input,
-            state.offset,
-            state.parent_context(),
-        )
+    ) -> Result<Option<TokenMatch<Root>>, LexInterrupt> {
+        let current = state.current_state()?;
+        self.scan_state(current, input.haystack(), state.offset, state.current_key())
     }
 
-    fn find_token_match_in_state(
+    fn scan_state(
         &self,
         state: State,
-        target_terminal: crate::component::parse::grammar::TerminalId,
-        input: &mut Input,
+        haystack: &[u8],
         offset: usize,
-        context: Option<&str>,
-    ) -> Option<BestMatch> {
-        let Some(matcher) = self.state_matcher(state.clone()) else {
-            return None;
-        };
-        let Some(tokens) = self.tokens_in_state(state) else {
-            return None;
-        };
+        key: Option<&str>,
+    ) -> Result<Option<TokenMatch<Root>>, LexInterrupt> {
+        let current_state = state.clone();
+        let matcher = self
+            .state_matcher(state.clone())
+            .ok_or(LexInterrupt::MissingState)?;
+        let tokens = self.tokens_in_state(state).ok_or(LexInterrupt::MissingState)?;
+        let raw_match_ends = collect_raw_match_ends(
+            &matcher.dfa,
+            &matcher.token_index_by_pattern,
+            tokens,
+            haystack,
+            offset,
+            key,
+            None,
+        );
 
-        input.set_range(offset..input.end());
-        input.set_anchored(Anchored::Yes);
-
-        let haystack = input.haystack();
-        let search_start = input.start();
-        let search_end = input.end();
-        let Ok(mut dfa_state) = matcher.dfa.start_state_forward(input) else {
-            return None;
-        };
-        let mut best: Option<BestMatch> = None;
-
-        for (offset_delta, &byte) in haystack[search_start..search_end].iter().enumerate() {
-            dfa_state = matcher.dfa.next_state(dfa_state, byte);
-            if matcher.dfa.is_special_state(dfa_state) {
-                let match_end = search_start + offset_delta + 1;
-                record_terminal_match(
-                    &matcher.dfa,
-                    &matcher.token_index_by_pattern,
-                    dfa_state,
-                    match_end,
-                    tokens,
+        let mut best: Option<(u8, usize, usize, TokenMatch<Root>)> = None;
+        for (token_index, match_ends) in raw_match_ends.into_iter().enumerate() {
+            let Some(token) = tokens.get(token_index) else {
+                continue;
+            };
+            for raw_end in match_ends {
+                let Some(end) = self.recover_match_end(
+                    current_state.clone(),
                     haystack,
-                    search_start,
-                    context,
-                    target_terminal,
-                    &mut best,
-                );
-                if matcher.dfa.is_dead_state(dfa_state) || matcher.dfa.is_quit_state(dfa_state) {
-                    return best;
+                    token_index,
+                    raw_end,
+                    key,
+                ) else {
+                    continue;
+                };
+                let Ok(lexeme) = std::str::from_utf8(&haystack[offset..end]) else {
+                    continue;
+                };
+                let value = token.build(lexeme)?;
+                let (rank, transition) = match &token.action {
+                    TokenAction::None => (2u8, StateAction::None),
+                    TokenAction::Enter { next, key: enter_key } => {
+                        let Some(next_key) = enter_key(&value) else {
+                            continue;
+                        };
+                        (1u8, StateAction::Enter(State::with_key(next.id, next_key)))
+                    }
+                    TokenAction::Leave { matches } => {
+                        let Some(active_key) = key else {
+                            continue;
+                        };
+                        if !matches(&value, active_key) {
+                            continue;
+                        }
+                        (0u8, StateAction::Leave)
+                    }
+                };
+
+                let candidate = TokenMatch {
+                    token_index,
+                    start: offset,
+                    end,
+                    value,
+                    transition,
+                };
+                let should_replace = match &best {
+                    None => true,
+                    Some((best_rank, best_end, best_token_index, _)) => {
+                        rank < *best_rank
+                            || (rank == *best_rank
+                                && (end > *best_end
+                                    || (end == *best_end && token_index < *best_token_index)))
+                    }
+                };
+                if should_replace {
+                    best = Some((rank, end, token_index, candidate));
                 }
             }
         }
 
-        let dfa_state = matcher.dfa.next_eoi_state(dfa_state);
-        record_terminal_match(
-            &matcher.dfa,
-            &matcher.token_index_by_pattern,
-            dfa_state,
-            search_end,
-            tokens,
-            haystack,
-            search_start,
-            context,
-            target_terminal,
-            &mut best,
-        );
-        best
+        Ok(best.map(|(_, _, _, candidate)| candidate))
     }
 
-    pub(crate) fn next_token(
+    fn recover_match_end(
         &self,
+        state: State,
+        haystack: &[u8],
+        token_index: usize,
+        raw_end: usize,
+        key: Option<&str>,
+    ) -> Option<usize> {
+        let token = self
+            .tokens_in_state(state.clone())
+            .and_then(|tokens| tokens.get(token_index))?;
+        let Some(recover_when) = token.recover_when.as_ref() else {
+            return Some(raw_end);
+        };
+
+        let mut last_success_end = raw_end;
+        loop {
+            let rest = std::str::from_utf8(&haystack[last_success_end..]).ok()?;
+            let recover_chars = recover_when(rest, key);
+            if recover_chars == 0 {
+                return Some(last_success_end);
+            }
+
+            let recovered_bytes = char_len_to_byte_len(rest, recover_chars);
+            if recovered_bytes == 0 {
+                return Some(last_success_end);
+            }
+
+            let resume_offset = last_success_end.saturating_add(recovered_bytes);
+            let resumed_end =
+                self.raw_match_end_for_token(state.clone(), haystack, resume_offset, token_index, key);
+            let Some(resumed_end) = resumed_end else {
+                return Some(last_success_end);
+            };
+            if resumed_end <= resume_offset {
+                return Some(last_success_end);
+            }
+
+            last_success_end = resumed_end;
+        }
+    }
+
+    fn raw_match_end_for_token(
+        &self,
+        state: State,
+        haystack: &[u8],
+        offset: usize,
+        token_index: usize,
+        key: Option<&str>,
+    ) -> Option<usize> {
+        let matcher = self.state_matcher(state.clone())?;
+        let tokens = self.tokens_in_state(state)?;
+        collect_raw_match_ends(
+            &matcher.dfa,
+            &matcher.token_index_by_pattern,
+            tokens,
+            haystack,
+            offset,
+            key,
+            Some(token_index),
+        )
+        .into_iter()
+        .nth(token_index)
+        .and_then(|match_ends| match_ends.into_iter().last())
+    }
+
+    fn commit_match(
+        &mut self,
         state: &mut LexerState,
-        BestMatch {
-            token_index,
-            start,
-            end,
-        }: &BestMatch,
-        input: &mut Input,
-    ) -> Result<LexedToken<Root>, LexInterrupt> {
-        let current = state.current_state()?;
+        step: TokenMatch<Root>,
+    ) -> Result<Option<usize>, LexInterrupt> {
         let Some(token) = self
-            .tokens_in_state(current)
-            .and_then(|tokens| tokens.get(*token_index))
+            .tokens_in_state(state.current_state()?)
+            .and_then(|tokens| tokens.get(step.token_index))
         else {
             return Err(LexInterrupt::NoCandidate);
         };
+        state.offset = step.end;
+        state.apply_action(step.transition);
 
-        let Ok(lexeme) = std::str::from_utf8(&input.haystack()[*start..*end]) else {
-            return Err(LexInterrupt::InternalError(
-                "Invalid UTF-8 in input".to_string(),
-            ));
-        };
-
-        let action = match &token.action {
-            StateAction::Enter(s) if token.captures_context => {
-                StateAction::Enter(State::with_context(s.id, lexeme))
-            }
-            other => other.clone(),
-        };
-
-        state.offset = *end;
-        state.apply_action(action);
-
-        token
-            .build(lexeme)
-            .map(|value| LexedToken {
-                terminal: token.terminal,
-                value,
-            })
-            .map_err(|e| LexInterrupt::ParseError(e.to_string(), lexeme.to_string()))
-    }
-
-    pub(crate) fn select_best_match(
-        &self,
-        last_state: &LexerState,
-        input: &mut Input,
-    ) -> MatchReport {
-        let Some(current) = last_state.current_state().ok() else {
-            return MatchReport {
-                best: None,
-                stop_offset: last_state.offset,
-                stop_reason: LexInterrupt::MissingState,
-            };
-        };
-        let Some(matcher) = self.state_matcher(current.clone()) else {
-            return MatchReport {
-                best: None,
-                stop_offset: last_state.offset,
-                stop_reason: LexInterrupt::MissingState,
-            };
-        };
-        let Some(tokens) = self.tokens_in_state(current) else {
-            return MatchReport {
-                best: None,
-                stop_offset: last_state.offset,
-                stop_reason: LexInterrupt::MissingState,
-            };
-        };
-
-        input.set_range(last_state.offset..input.end());
-        input.set_anchored(Anchored::Yes);
-
-        let haystack = input.haystack();
-        let search_start = input.start();
-        let search_end = input.end();
-        let Ok(mut dfa_state) = matcher.dfa.start_state_forward(input) else {
-            return MatchReport {
-                best: None,
-                stop_offset: last_state.offset,
-                stop_reason: LexInterrupt::UnsupportedSearch,
-            };
-        };
-        let mut best: Option<(usize, usize)> = None;
-        let mut stop_offset = search_end;
-        let mut stop_reason = LexInterrupt::EndOfInput;
-
-        let capture: Option<&[u8]> = last_state.current_context().map(|s| s.as_bytes());
-
-        for (offset, &byte) in haystack[search_start..search_end].iter().enumerate() {
-            dfa_state = matcher.dfa.next_state(dfa_state, byte);
-            if matcher.dfa.is_special_state(dfa_state) {
-                let absolute_offset = search_start + offset;
-                record_best_match(
-                    &matcher.dfa,
-                    &matcher.token_index_by_pattern,
-                    dfa_state,
-                    absolute_offset,
-                    tokens,
-                    haystack,
-                    search_start,
-                    capture,
-                    &mut best,
-                );
-                if matcher.dfa.is_dead_state(dfa_state) {
-                    stop_offset = absolute_offset + 1;
-                    stop_reason = LexInterrupt::DeadState;
-                    break;
-                }
-                if matcher.dfa.is_quit_state(dfa_state) {
-                    stop_offset = absolute_offset + 1;
-                    stop_reason = LexInterrupt::QuitState;
-                    break;
-                }
-            }
+        if token.skip {
+            return Ok(None);
         }
 
-        if matches!(stop_reason, LexInterrupt::EndOfInput) {
-            dfa_state = matcher.dfa.next_eoi_state(dfa_state);
-            record_best_match(
-                &matcher.dfa,
-                &matcher.token_index_by_pattern,
+        Ok(Some(self.alloc_token(
+            step.start,
+            step.end.saturating_sub(step.start),
+            Some(token.terminal),
+            None,
+            step.value,
+        )))
+    }
+}
+
+fn collect_raw_match_ends<A: Automaton, R>(
+    dfa: &A,
+    token_index_by_pattern: &[usize],
+    tokens: &[crate::component::lex::ResolvedToken<R>],
+    haystack: &[u8],
+    search_start: usize,
+    key: Option<&str>,
+    target_token: Option<usize>,
+) -> Vec<Vec<usize>> {
+    let mut input = Input::new(haystack);
+    input.set_range(search_start..haystack.len());
+    input.set_anchored(Anchored::Yes);
+
+    let search_end = input.end();
+    let Ok(mut dfa_state) = dfa.start_state_forward(&input) else {
+        return vec![Vec::new(); tokens.len()];
+    };
+    let mut best_ends = vec![Vec::new(); tokens.len()];
+
+    for (offset_delta, &byte) in haystack[search_start..search_end].iter().enumerate() {
+        dfa_state = dfa.next_state(dfa_state, byte);
+        if dfa.is_special_state(dfa_state) {
+            let match_end = search_start + offset_delta;
+            record_match_ends(
+                dfa,
+                token_index_by_pattern,
                 dfa_state,
-                search_end,
+                match_end,
                 tokens,
                 haystack,
                 search_start,
-                capture,
-                &mut best,
+                key,
+                target_token,
+                &mut best_ends,
             );
-        }
-
-        MatchReport {
-            best: best.map(|(token_index, match_end)| BestMatch {
-                token_index,
-                start: last_state.offset,
-                end: match_end,
-            }),
-            stop_offset,
-            stop_reason,
+            if dfa.is_dead_state(dfa_state) || dfa.is_quit_state(dfa_state) {
+                return best_ends;
+            }
         }
     }
+
+    let dfa_state = dfa.next_eoi_state(dfa_state);
+    record_match_ends(
+        dfa,
+        token_index_by_pattern,
+        dfa_state,
+        search_end,
+        tokens,
+        haystack,
+        search_start,
+        key,
+        target_token,
+        &mut best_ends,
+    );
+
+    best_ends
 }
 
-fn record_best_match<A: Automaton, R>(
+fn record_match_ends<A: Automaton, R>(
     dfa: &A,
     token_index_by_pattern: &[usize],
     dfa_state: regex_automata::util::primitives::StateID,
@@ -766,54 +666,9 @@ fn record_best_match<A: Automaton, R>(
     tokens: &[crate::component::lex::ResolvedToken<R>],
     haystack: &[u8],
     search_start: usize,
-    capture: Option<&[u8]>,
-    best: &mut Option<(usize, usize)>,
-) {
-    if !dfa.is_match_state(dfa_state) {
-        return;
-    }
-
-    let ctx = capture.and_then(|b| std::str::from_utf8(b).ok());
-    let lexeme_end = match_end;
-
-    for pattern_index in 0..dfa.match_len(dfa_state) {
-        let token_index = token_index_by_pattern[dfa.match_pattern(dfa_state, pattern_index)];
-
-        if let Some(token) = tokens.get(token_index) {
-            if let Some(validate) = &token.validate {
-                if let Ok(lexeme) = std::str::from_utf8(&haystack[search_start..lexeme_end]) {
-                    if !validate(lexeme, ctx) {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            }
-        }
-
-        let should_replace = match *best {
-            None => true,
-            Some((best_token_index, best_end)) => {
-                match_end > best_end || (match_end == best_end && token_index < best_token_index)
-            }
-        };
-        if should_replace {
-            *best = Some((token_index, match_end));
-        }
-    }
-}
-
-fn record_terminal_match<A: Automaton, R>(
-    dfa: &A,
-    token_index_by_pattern: &[usize],
-    dfa_state: regex_automata::util::primitives::StateID,
-    match_end: usize,
-    tokens: &[crate::component::lex::ResolvedToken<R>],
-    haystack: &[u8],
-    search_start: usize,
-    context: Option<&str>,
-    target_terminal: crate::component::parse::grammar::TerminalId,
-    best: &mut Option<BestMatch>,
+    key: Option<&str>,
+    target_token: Option<usize>,
+    best_ends: &mut [Vec<usize>],
 ) {
     if !dfa.is_match_state(dfa_state) {
         return;
@@ -821,32 +676,36 @@ fn record_terminal_match<A: Automaton, R>(
 
     for pattern_index in 0..dfa.match_len(dfa_state) {
         let token_index = token_index_by_pattern[dfa.match_pattern(dfa_state, pattern_index)];
+        if target_token.is_some_and(|target| target != token_index) {
+            continue;
+        }
         let Some(token) = tokens.get(token_index) else {
             continue;
         };
-        if token.terminal != target_terminal {
-            continue;
-        }
 
-        if let Some(validate) = &token.validate {
+        if let Some(when) = &token.when {
             let Ok(lexeme) = std::str::from_utf8(&haystack[search_start..match_end]) else {
                 continue;
             };
-            if !validate(lexeme, context) {
+            if !when(lexeme, key) {
                 continue;
             }
         }
 
-        let should_replace = match best {
-            None => true,
-            Some(current) => match_end > current.end || (match_end == current.end && token_index < current.token_index),
-        };
-        if should_replace {
-            *best = Some(BestMatch {
-                token_index,
-                start: search_start,
-                end: match_end,
-            });
+        let ends = &mut best_ends[token_index];
+        if ends.last().copied() != Some(match_end) {
+            ends.push(match_end);
         }
     }
+}
+
+fn char_len_to_byte_len(rest: &str, char_len: usize) -> usize {
+    if char_len == 0 {
+        return 0;
+    }
+
+    rest.char_indices()
+        .nth(char_len)
+        .map(|(offset, _)| offset)
+        .unwrap_or(rest.len())
 }

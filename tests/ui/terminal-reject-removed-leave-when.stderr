@@ -1,0 +1,5 @@
+error: token-level #[leave_when(...)] was removed; use enum-level #[scopes(...)] exit(...) entries instead
+ --> tests/ui/terminal-reject-removed-leave-when.rs:6:5
+  |
+6 |     #[leave_when(always)]
+  |     ^

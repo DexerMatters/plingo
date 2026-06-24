@@ -1,17 +1,24 @@
-use plingo::{Terminal, component::lex::LexErrorInfo};
+use plingo::{Terminal, component::lex::{LexErrorInfo, LexerRoot, WhenCx, WithCx}};
 
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
 #[scopes(
     root {
-        QuoteRun => enter(string, quote_key),
+        QuoteStart,
     },
     string {
-        QuoteRun => exit(quote_matches),
+        QuoteEnd,
     },
 )]
 enum Tokens {
     #[regex(r#""+"#)]
-    QuoteRun(String),
+    #[enter(string)]
+    #[with(quote_key)]
+    QuoteStart(String),
+
+    #[regex(r#""+"#)]
+    #[exit]
+    #[when(quote_matches)]
+    QuoteEnd(String),
 
     #[regex(r#"[^"]+"#)]
     StringText(String),
@@ -20,15 +27,11 @@ enum Tokens {
     Error(LexErrorInfo),
 }
 
-fn quote_key(token: &Tokens) -> Option<String> {
-    match token {
-        Tokens::QuoteRun(value) => Some(value.clone()),
-        _ => None,
-    }
+fn quote_key<T: LexerRoot>(_: &mut WithCx<T>) {
 }
 
-fn quote_matches(token: &Tokens, key: &str) -> bool {
-    matches!(token, Tokens::QuoteRun(value) if value == key)
+fn quote_matches<T: LexerRoot>(_: &WhenCx<T>) -> bool {
+    true
 }
 
 fn main() {}

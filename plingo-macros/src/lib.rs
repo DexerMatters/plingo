@@ -27,7 +27,7 @@ pub fn generate(input: TokenStream) -> TokenStream {
     generate::expand_generate(input)
 }
 
-#[proc_macro_derive(Terminal, attributes(scopes, regex, one_of, enter, leave, leave_when, recover_when, when, skip, parse, error))]
+#[proc_macro_derive(Terminal, attributes(scope_slots, scopes, regex, empty, one_of, enter, exit, with, leave, leave_when, recover_when, when, skip, parse, error))]
 pub fn derive_terminal(item: TokenStream) -> TokenStream {
     match terminal::expand_terminal_derive(parse_macro_input!(item as ItemEnum)) {
         Ok(tokens) => tokens,

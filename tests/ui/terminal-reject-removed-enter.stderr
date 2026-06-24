@@ -1,5 +1,0 @@
-error: token-level #[enter(...)] was removed; use enum-level #[scopes(...)] entries instead
- --> tests/ui/terminal-reject-removed-enter.rs:6:5
-  |
-6 |     #[enter(string)]
-  |     ^

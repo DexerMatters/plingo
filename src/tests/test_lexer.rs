@@ -1,6 +1,12 @@
+use std::fmt::Display;
+
+use color_print::cwrite;
 use plingo_macros::Terminal;
 
-use crate::component::lex::{LexErrorInfo, LexToken, Lexer, LexerState};
+use crate::{
+    component::lex::{LexErrorInfo, LexToken, Lexer, LexerState, WhenCx, WithCx},
+    utils::PrettyDisplay,
+};
 
 fn collect_entries<Root>(lexer: &mut Lexer<Root>, input: &str) -> Vec<LexToken<Root>>
 where
@@ -31,54 +37,79 @@ where
 #[scopes(
     root {
         Number,
-        StringStart => enter(string, string_start_key),
+        StringStart,
     },
     string {
         StringContent,
-        StringEnd => exit(string_end_matches),
+        StringEnd,
     },
 )]
 enum Tokens {
-    #[regex(r#"\d+"#)]  Number(usize),
-    #[regex(r#""+"#)]   StringStart(String),
-    #[regex(r#""+"#)]   StringEnd(String),
+    #[regex(r#"\d+"#)]
+    Number(usize),
+    #[regex(r#""+"#)]
+    #[enter(string)]
+    #[with(string_start_key)]
+    StringStart,
+    #[regex(r#""+"#)]
+    #[exit]
+    #[when(string_end_matches)]
+    StringEnd,
     #[regex(r#"[^"]+"#)]
     #[recover_when(string_end_recover)]
-                        StringContent(String),
+    StringContent(String),
 
-    #[error]            Error(LexErrorInfo),
+    #[error]
+    Error(LexErrorInfo),
 }
 
-fn string_start_key(token: &Tokens) -> Option<String> {
-    match token {
-        Tokens::StringStart(value) => Some(value.clone()),
-        _ => None,
+impl Display for Tokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Tokens::Number(n) => cwrite!(f, "Number(<blue>{}</blue>)", n),
+            Tokens::StringStart => cwrite!(f, "StringStart"),
+            Tokens::StringContent(s) => cwrite!(f, "StringContent(<blue>{}</blue>)", s),
+            Tokens::StringEnd => cwrite!(f, "StringEnd"),
+            Tokens::Error(e) => cwrite!(f, "Error(<red>{:?}</red>)", e),
+        }
     }
 }
 
-fn string_end_matches(token: &Tokens, key: &str) -> bool {
-    matches!(token, Tokens::StringEnd(value) if value == key)
+fn string_start_key(cx: &mut WithCx<Tokens>) {
+    cx.set(Tokens::scope_key, cx.lexeme().to_string());
+}
+
+fn string_end_matches(cx: &WhenCx<Tokens>) -> bool {
+    cx.get(Tokens::scope_key)
+        .is_some_and(|key| key == cx.lexeme())
 }
 
 fn string_end_recover(rest: &str, key: Option<&str>) -> usize {
     let quotes = rest.chars().take_while(|c| *c == '"').count();
     let needed = key.map(str::len).unwrap_or(0);
-    if quotes < needed {
-        quotes
-    } else {
-        0
-    }
+    if quotes < needed { quotes } else { 0 }
 }
 
 #[test]
 fn test_lexer() {
     let mut lexer = Lexer::<Tokens>::new().unwrap();
 
-    let input = r#"""ad""""jac"ent"""#;
+    let input = r#"""ad""""jac"ent""1234"""func(""hello"")""""#;
     let tokens = collect_entries(&mut lexer, input);
-
-    let values = tokens.into_iter().map(|token| token.value).collect::<Vec<_>>();
-    for value in values {
-        println!("{:?}", value);
+    for token in &tokens {
+        println!("{}", token.pretty(&lexer));
     }
+}
+
+#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
+enum Tokens2 {
+    #[regex(r#"\d+"#)]
+    Number(usize),
+    #[regex(r#"[a-zA-Z_]\w*"#)]
+    Identifier(String),
+    #[error]
+    Error(LexErrorInfo),
+    #[regex(r#"\s+"#)]
+    #[skip]
+    Whitespace,
 }

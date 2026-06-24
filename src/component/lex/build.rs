@@ -7,41 +7,52 @@ use regex_automata::{
 use regex_syntax::hir::{Hir, HirKind, Look};
 
 use super::{
-    LexerCreationError, ResolvedToken, State, StateMatcher, TokenAction,
-    __macro_private::{ScopeDirective, TokenSpec},
+    __macro_private::{ScopeDirective, TokenMatcher, TokenSpec},
+    LexerCreationError, LexerRoot, ResolvedToken, State, StateMatcher, TokenAction,
 };
 
-pub(super) fn resolve_token<Root>(
+pub(super) fn resolve_token<Root: LexerRoot>(
     spec: TokenSpec<Root>,
-    state_ids: &HashMap<String, State>,
+    state_ids: &HashMap<String, State<Root>>,
 ) -> Result<ResolvedToken<Root>, LexerCreationError> {
-    let hir = regex_syntax::parse(spec.regex).map_err(|error| {
-        LexerCreationError::RegexParsingError(spec.regex.to_string(), spec.label.to_string(), error)
-    })?;
+    let (empty, minimum_length, maximum_length) = match spec.matcher {
+        TokenMatcher::Empty => (true, 0, 0),
+        TokenMatcher::Regex(regex) => {
+            let hir = regex_syntax::parse(regex).map_err(|error| {
+                LexerCreationError::RegexParsingError(
+                    regex.to_string(),
+                    spec.label.to_string(),
+                    error,
+                )
+            })?;
 
-    if let Some(kind) = find_unsupported_regex_features(&hir) {
-        return Err(LexerCreationError::UnsupportedRegexFeature(
-            spec.label.to_string(),
-            spec.regex.to_string(),
-            kind,
-        ));
-    }
+            if let Some(kind) = find_unsupported_regex_features(&hir) {
+                return Err(LexerCreationError::UnsupportedRegexFeature(
+                    spec.label.to_string(),
+                    regex.to_string(),
+                    kind,
+                ));
+            }
 
-    let minimum_length = hir.properties().minimum_len().ok_or_else(|| {
-        LexerCreationError::ImpossibleToken(spec.label.to_string(), spec.regex.to_string())
-    })?;
-    if minimum_length == 0 {
-        return Err(LexerCreationError::EmptyMatchToken(
-            spec.label.to_string(),
-            spec.regex.to_string(),
-        ));
-    }
-    let maximum_length = hir.properties().maximum_len().unwrap_or(usize::MAX);
+            let minimum_length = hir.properties().minimum_len().ok_or_else(|| {
+                LexerCreationError::ImpossibleToken(spec.label.to_string(), regex.to_string())
+            })?;
+            if minimum_length == 0 {
+                return Err(LexerCreationError::EmptyMatchToken(
+                    spec.label.to_string(),
+                    regex.to_string(),
+                ));
+            }
+            let maximum_length = hir.properties().maximum_len().unwrap_or(usize::MAX);
+            (false, minimum_length, maximum_length)
+        }
+    };
 
     Ok(ResolvedToken {
         terminal: spec.terminal,
         precedence: spec.precedence,
         label: spec.label,
+        empty,
         action: resolve_state_action(spec.action, state_ids)?,
         skip: spec.skip,
         build: spec.build,
@@ -49,12 +60,14 @@ pub(super) fn resolve_token<Root>(
         maximum_length,
         when: spec.when,
         recover_when: spec.recover_when,
+        with_hook: spec.with,
     })
 }
 
 pub(super) fn build_state_matcher(
     state: &str,
     patterns: &[&'static str],
+    token_index_by_pattern: Vec<usize>,
 ) -> Result<StateMatcher, LexerCreationError> {
     let dfa = DFA::builder()
         .configure(
@@ -67,25 +80,24 @@ pub(super) fn build_state_matcher(
             state: state.to_string(),
             source,
         })?;
-    let token_index_by_pattern = (0..patterns.len()).collect();
     Ok(StateMatcher {
         dfa,
         token_index_by_pattern,
     })
 }
 
-fn resolve_state_action<Root>(
-    action: ScopeDirective<Root>,
-    state_ids: &HashMap<String, State>,
+fn resolve_state_action<Root: LexerRoot>(
+    action: ScopeDirective,
+    state_ids: &HashMap<String, State<Root>>,
 ) -> Result<TokenAction<Root>, LexerCreationError> {
     match action {
         ScopeDirective::None => Ok(TokenAction::None),
-        ScopeDirective::Enter { target, key } => state_ids
+        ScopeDirective::Enter { target } => state_ids
             .get(&target)
             .cloned()
-            .map(|next| TokenAction::Enter { next, key })
+            .map(|next| TokenAction::Enter { next })
             .ok_or(LexerCreationError::UnknownState(target)),
-        ScopeDirective::Leave { matches } => Ok(TokenAction::Leave { matches }),
+        ScopeDirective::Exit => Ok(TokenAction::Exit),
     }
 }
 

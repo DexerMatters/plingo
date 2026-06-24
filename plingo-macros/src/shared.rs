@@ -3,17 +3,25 @@ use syn::{Expr, Field, Meta, spanned::Spanned};
 
 pub struct VariantConfig {
     pub regex: Option<syn::LitStr>,
+    pub empty: bool,
     pub skip: bool,
     pub when: Option<syn::Expr>,
     pub recover_when: Option<syn::Expr>,
+    pub enter: Option<syn::Ident>,
+    pub exit: bool,
+    pub with: Option<syn::Expr>,
     pub error: bool,
 }
 
 pub fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig> {
     let mut regex = None;
+    let mut empty = false;
     let mut skip = false;
     let mut when = None;
     let mut recover_when = None;
+    let mut enter = None;
+    let mut exit = false;
+    let mut with = None;
     let mut error = false;
 
     for attr in &variant.attrs {
@@ -26,6 +34,18 @@ pub fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig
                     ));
                 }
                 regex = Some(attr.parse_args::<syn::LitStr>()?);
+            }
+            Meta::Path(path) if path.is_ident("empty") => {
+                if empty {
+                    return Err(syn::Error::new(attr.span(), "duplicate #[empty] attribute"));
+                }
+                empty = true;
+            }
+            Meta::List(meta) if meta.path.is_ident("empty") => {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "#[empty] takes no arguments",
+                ));
             }
             Meta::List(meta) if meta.path.is_ident("when") => {
                 if when.is_some() {
@@ -45,6 +65,36 @@ pub fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig
                 }
                 recover_when = Some(attr.parse_args::<syn::Expr>()?);
             }
+            Meta::List(meta) if meta.path.is_ident("enter") => {
+                if enter.is_some() {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "duplicate #[enter(...)] attribute",
+                    ));
+                }
+                enter = Some(attr.parse_args::<syn::Ident>()?);
+            }
+            Meta::Path(path) if path.is_ident("exit") => {
+                if exit {
+                    return Err(syn::Error::new(attr.span(), "duplicate #[exit] attribute"));
+                }
+                exit = true;
+            }
+            Meta::List(meta) if meta.path.is_ident("exit") => {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "#[exit] takes no arguments; use #[exit] and optionally #[when(...)]",
+                ));
+            }
+            Meta::List(meta) if meta.path.is_ident("with") => {
+                if with.is_some() {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "duplicate #[with(...)] attribute",
+                    ));
+                }
+                with = Some(attr.parse_args::<syn::Expr>()?);
+            }
             Meta::Path(path) if path.is_ident("skip") => {
                 if skip {
                     return Err(syn::Error::new(attr.span(), "duplicate #[skip] attribute"));
@@ -63,42 +113,91 @@ pub fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig
                     "#[one_of(...)] was removed; use enum-level #[scopes(...)] entries instead",
                 ));
             }
-            Meta::List(meta) if meta.path.is_ident("enter") => {
-                return Err(syn::Error::new(
-                    attr.span(),
-                    "token-level #[enter(...)] was removed; use enum-level #[scopes(...)] entries instead",
-                ));
-            }
             Meta::Path(path) if path.is_ident("leave") => {
                 return Err(syn::Error::new(
                     attr.span(),
-                    "token-level #[leave] was removed; use enum-level #[scopes(...)] exit(...) entries instead",
+                    "#[leave] was removed; use #[exit]",
                 ));
             }
             Meta::List(meta) if meta.path.is_ident("leave_when") => {
                 return Err(syn::Error::new(
                     attr.span(),
-                    "token-level #[leave_when(...)] was removed; use enum-level #[scopes(...)] exit(...) entries instead",
+                    "#[leave_when(...)] was removed; use #[exit] with #[when(...)]",
                 ));
             }
             _ => {}
         }
     }
 
-    match (regex.is_some(), error) {
-        (true, true) => Err(syn::Error::new(
+    if enter.is_some() && exit {
+        return Err(syn::Error::new(
             variant.span(),
-            "#[error] variants cannot also define #[regex(...)]",
-        )),
-        (false, false) => Err(syn::Error::new(
+            "token variants cannot use both #[enter(...)] and #[exit]",
+        ));
+    }
+
+    let matcher_count = usize::from(regex.is_some()) + usize::from(empty);
+    if empty {
+        if when.is_none() {
+            return Err(syn::Error::new(
+                variant.span(),
+                "#[empty] variants require #[when(...)]",
+            ));
+        }
+        if !(enter.is_some() || exit || with.is_some()) {
+            return Err(syn::Error::new(
+                variant.span(),
+                "#[empty] variants must change lexer state with #[enter(...)], #[exit], or #[with(...)]",
+            ));
+        }
+        if skip {
+            return Err(syn::Error::new(
+                variant.span(),
+                "#[empty] variants cannot use #[skip]",
+            ));
+        }
+        if recover_when.is_some() {
+            return Err(syn::Error::new(
+                variant.span(),
+                "#[empty] variants cannot use #[recover_when(...)]",
+            ));
+        }
+        if !matches!(variant.fields, syn::Fields::Unit) {
+            return Err(syn::Error::new(
+                variant.span(),
+                "#[empty] variants cannot have payload fields",
+            ));
+        }
+    }
+
+    match (matcher_count, error) {
+        (_, true) if matcher_count != 0 => Err(syn::Error::new(
             variant.span(),
-            "token variants require #[regex(...)] unless they are marked #[error]",
+            "#[error] variants cannot also define matcher attributes",
         )),
+        (0, false) => Err(syn::Error::new(
+            variant.span(),
+            "token variants require exactly one matcher: #[regex(...)] or #[empty]",
+        )),
+        (2.., false) => Err(syn::Error::new(
+            variant.span(),
+            "token variants cannot use both #[regex(...)] and #[empty]",
+        )),
+        _ if error && (when.is_some() || recover_when.is_some() || enter.is_some() || exit || with.is_some() || skip) => {
+            Err(syn::Error::new(
+                variant.span(),
+                "#[error] variants cannot also define matcher, scope, skip, or recovery attributes",
+            ))
+        }
         _ => Ok(VariantConfig {
             regex,
+            empty,
             skip,
             when,
             recover_when,
+            enter,
+            exit,
+            with,
             error,
         }),
     }

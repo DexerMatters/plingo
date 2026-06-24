@@ -1,6 +1,5 @@
 use crate::{
-    NonTerminal,
-    Terminal,
+    NonTerminal, Terminal,
     component::{
         debug::DebugSink,
         lex::{LexErrorInfo, LexToken, Lexer, LexerState},
@@ -439,10 +438,7 @@ fn json_runtime_cases() -> Vec<EditCase> {
     ]
 }
 
-fn collect_entries(
-    lexer: &mut Lexer<JsonToken>,
-    input: &str,
-) -> Vec<LexToken<JsonToken>> {
+fn collect_entries(lexer: &mut Lexer<JsonToken>, input: &str) -> Vec<LexToken<JsonToken>> {
     let token_ids: Vec<usize> = {
         let mut ids = Vec::new();
         lexer

@@ -1,10 +1,13 @@
 use plingo::{Terminal, component::lex::LexErrorInfo};
 
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
-enum RootToken {
-    #[regex(r#"""#)]
-    #[enter(string)]
-    Start,
+enum Tokens {
+    #[empty]
+    #[enter(block)]
+    ScopeStart,
+
+    #[regex("[a-z]+")]
+    Word(String),
 
     #[error]
     Error(LexErrorInfo),

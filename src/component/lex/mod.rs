@@ -37,7 +37,7 @@ use crate::{
 };
 
 use self::__macro_private::{
-    BuildErrorToken, BuildToken, EnterScopeKey, ExitScopeGuard, ScopeRegistration,
+    BuildErrorToken, BuildToken, ScopeRegistration, TokenMatcher, WithHook,
 };
 
 pub trait TokenState: Send + Sync + 'static {
@@ -46,7 +46,11 @@ pub trait TokenState: Send + Sync + 'static {
 }
 
 pub trait LexerRoot: TokenState + Hash + Eq + PartialEq + Sized + Send + Sync + 'static {
+    type SlotValue: Clone + Eq + Hash + Send + Sync + 'static;
+
     fn state_registrations() -> Vec<ScopeRegistration<Self>>;
+    fn slot_count() -> usize;
+    fn recover_key(slots: &SlotStore<Self>) -> Option<&str>;
 }
 
 pub trait FromLexeme: Sized {
@@ -55,25 +59,324 @@ pub trait FromLexeme: Sized {
     fn from_lexeme(lexeme: &str) -> Result<Self, Self::Error>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LexMoment {
+    Normal,
+    Eof,
+}
+
+pub struct Slot<Root, T>
+where
+    Root: LexerRoot,
+    T: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    index: usize,
+    pack: fn(T) -> Root::SlotValue,
+    as_ref: for<'a> fn(&'a Root::SlotValue) -> Option<&'a T>,
+    _root: PhantomData<fn() -> Root>,
+}
+
+impl<Root, T> Copy for Slot<Root, T>
+where
+    Root: LexerRoot,
+    T: Clone + Eq + Hash + Send + Sync + 'static,
+{
+}
+
+impl<Root, T> Clone for Slot<Root, T>
+where
+    Root: LexerRoot,
+    T: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Root, T> Slot<Root, T>
+where
+    Root: LexerRoot,
+    T: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    pub const fn new(
+        index: usize,
+        pack: fn(T) -> Root::SlotValue,
+        as_ref: for<'a> fn(&'a Root::SlotValue) -> Option<&'a T>,
+    ) -> Self {
+        Self {
+            index,
+            pack,
+            as_ref,
+            _root: PhantomData,
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        self.index
+    }
+}
+
+pub struct SlotStore<Root>
+where
+    Root: LexerRoot,
+{
+    values: Vec<Option<Root::SlotValue>>,
+}
+
+impl<Root> Clone for SlotStore<Root>
+where
+    Root: LexerRoot,
+{
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+        }
+    }
+}
+
+impl<Root> PartialEq for SlotStore<Root>
+where
+    Root: LexerRoot,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+
+impl<Root> Eq for SlotStore<Root> where Root: LexerRoot {}
+
+impl<Root> Hash for SlotStore<Root>
+where
+    Root: LexerRoot,
+{
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.values.hash(state);
+    }
+}
+
+impl<Root> fmt::Debug for SlotStore<Root>
+where
+    Root: LexerRoot,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlotStore")
+            .field("len", &self.values.len())
+            .finish()
+    }
+}
+
+impl<Root> Default for SlotStore<Root>
+where
+    Root: LexerRoot,
+{
+    fn default() -> Self {
+        Self {
+            values: (0..Root::slot_count()).map(|_| None).collect(),
+        }
+    }
+}
+
+impl<Root> SlotStore<Root>
+where
+    Root: LexerRoot,
+{
+    pub fn get<T>(&self, slot: Slot<Root, T>) -> Option<&T>
+    where
+        T: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        self.values
+            .get(slot.index)
+            .and_then(|value| value.as_ref())
+            .and_then(|value| (slot.as_ref)(value))
+    }
+
+    pub fn set<T>(&mut self, slot: Slot<Root, T>, value: T)
+    where
+        T: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        if let Some(entry) = self.values.get_mut(slot.index) {
+            *entry = Some((slot.pack)(value));
+        }
+    }
+
+    pub fn remove<T>(&mut self, slot: Slot<Root, T>)
+    where
+        T: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        if let Some(entry) = self.values.get_mut(slot.index) {
+            *entry = None;
+        }
+    }
+}
+
+pub struct WhenCx<'a, Root>
+where
+    Root: LexerRoot,
+{
+    lexeme: &'a str,
+    moment: LexMoment,
+    depth: usize,
+    current: &'a SlotStore<Root>,
+    parent: Option<&'a SlotStore<Root>>,
+}
+
+impl<'a, Root> WhenCx<'a, Root>
+where
+    Root: LexerRoot,
+{
+    pub fn new(
+        lexeme: &'a str,
+        moment: LexMoment,
+        depth: usize,
+        current: &'a SlotStore<Root>,
+        parent: Option<&'a SlotStore<Root>>,
+    ) -> Self {
+        Self {
+            lexeme,
+            moment,
+            depth,
+            current,
+            parent,
+        }
+    }
+
+    pub fn lexeme(&self) -> &str {
+        self.lexeme
+    }
+
+    pub fn moment(&self) -> LexMoment {
+        self.moment
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    pub fn get<T>(&self, slot: Slot<Root, T>) -> Option<&T>
+    where
+        T: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        self.current.get(slot)
+    }
+
+    pub fn parent_get<T>(&self, slot: Slot<Root, T>) -> Option<&T>
+    where
+        T: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        self.parent.and_then(|parent| parent.get(slot))
+    }
+}
+
+pub struct WithCx<'a, Root>
+where
+    Root: LexerRoot,
+{
+    lexeme: &'a str,
+    moment: LexMoment,
+    depth: usize,
+    target: &'a mut SlotStore<Root>,
+    source: SlotStore<Root>,
+    parent: Option<SlotStore<Root>>,
+}
+
+impl<'a, Root> WithCx<'a, Root>
+where
+    Root: LexerRoot,
+{
+    pub fn new(
+        lexeme: &'a str,
+        moment: LexMoment,
+        depth: usize,
+        target: &'a mut SlotStore<Root>,
+        source: SlotStore<Root>,
+        parent: Option<SlotStore<Root>>,
+    ) -> Self {
+        Self {
+            lexeme,
+            moment,
+            depth,
+            target,
+            source,
+            parent,
+        }
+    }
+
+    pub fn lexeme(&self) -> &str {
+        self.lexeme
+    }
+
+    pub fn moment(&self) -> LexMoment {
+        self.moment
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    pub fn get<T>(&self, slot: Slot<Root, T>) -> Option<&T>
+    where
+        T: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        self.target.get(slot)
+    }
+
+    pub fn set<T>(&mut self, slot: Slot<Root, T>, value: T)
+    where
+        T: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        self.target.set(slot, value);
+    }
+
+    pub fn remove<T>(&mut self, slot: Slot<Root, T>)
+    where
+        T: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        self.target.remove(slot);
+    }
+
+    pub fn source_get<T>(&self, slot: Slot<Root, T>) -> Option<&T>
+    where
+        T: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        self.source.get(slot)
+    }
+
+    pub fn parent_get<T>(&self, slot: Slot<Root, T>) -> Option<&T>
+    where
+        T: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        self.parent.as_ref().and_then(|parent| parent.get(slot))
+    }
+}
+
 #[derive(Clone)]
-pub struct ResolvedToken<Root> {
+pub struct ResolvedToken<Root>
+where
+    Root: LexerRoot,
+{
     pub terminal: TerminalId,
     pub precedence: usize,
     pub label: &'static str,
+    pub empty: bool,
     pub action: TokenAction<Root>,
     pub skip: bool,
     pub(crate) build: BuildToken<Root>,
     pub(crate) minimum_length: usize,
     pub(crate) maximum_length: usize,
-    pub(crate) when: Option<self::__macro_private::WhenGuard>,
+    pub(crate) when: Option<self::__macro_private::WhenGuard<Root>>,
     pub(crate) recover_when: Option<self::__macro_private::RecoverWhen>,
+    pub(crate) with_hook: Option<WithHook<Root>>,
 }
 
-impl<Root> fmt::Debug for ResolvedToken<Root> {
+impl<Root> fmt::Debug for ResolvedToken<Root>
+where
+    Root: LexerRoot,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ResolvedToken")
             .field("precedence", &self.precedence)
             .field("label", &self.label)
+            .field("empty", &self.empty)
             .field("action", &self.action)
             .field("skip", &self.skip)
             .field("minimum_length", &self.minimum_length)
@@ -82,7 +385,10 @@ impl<Root> fmt::Debug for ResolvedToken<Root> {
     }
 }
 
-impl<Root> ResolvedToken<Root> {
+impl<Root> ResolvedToken<Root>
+where
+    Root: LexerRoot,
+{
     pub fn minimum_length(&self) -> usize {
         self.minimum_length
     }
@@ -97,23 +403,24 @@ impl<Root> ResolvedToken<Root> {
 }
 
 #[derive(Clone)]
-pub enum TokenAction<Root> {
+pub enum TokenAction<Root>
+where
+    Root: LexerRoot,
+{
     None,
-    Enter {
-        next: State,
-        key: EnterScopeKey<Root>,
-    },
-    Leave {
-        matches: ExitScopeGuard<Root>,
-    },
+    Enter { next: State<Root> },
+    Exit,
 }
 
-impl<Root> fmt::Debug for TokenAction<Root> {
+impl<Root> fmt::Debug for TokenAction<Root>
+where
+    Root: LexerRoot,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::None => f.write_str("None"),
             Self::Enter { next, .. } => f.debug_struct("Enter").field("next", next).finish(),
-            Self::Leave { .. } => f.write_str("Leave"),
+            Self::Exit => f.write_str("Exit"),
         }
     }
 }
@@ -132,12 +439,17 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TokenMatch<Root> {
+pub(crate) struct TokenMatch<Root>
+where
+    Root: LexerRoot,
+{
     pub token_index: usize,
     pub start: usize,
     pub end: usize,
+    pub lexeme: String,
+    pub moment: LexMoment,
     pub value: Root,
-    pub transition: StateAction,
+    pub transition: StateAction<Root>,
 }
 
 #[derive(Debug, Error, Clone)]
@@ -208,6 +520,8 @@ pub enum GenerateError {
     },
     #[error("generate! does not support #[when(...)] variant {token}")]
     UnsupportedWhenVariant { token: &'static str },
+    #[error("generate! does not support #[empty] variant {token}")]
+    UnsupportedEmptyVariant { token: &'static str },
     #[error("failed to write generated token")]
     Write(#[source] fmt::Error),
 }
@@ -219,8 +533,7 @@ pub(crate) struct StateMatcher {
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct TokenOccurrence
-{
+pub(crate) struct TokenOccurrence {
     pub id: usize,
     pub start: usize,
     pub end: usize,
@@ -301,7 +614,7 @@ pub struct LexerSnapshotState<Root>
 where
     Root: LexerRoot,
 {
-    state_instances: HashMap<Uri<&'static str>, Vec<LexerState>>,
+    state_instances: HashMap<Uri<&'static str>, Vec<LexerState<Root>>>,
     occurrences: HashMap<Uri<&'static str>, Vec<TokenOccurrence>>,
     _root: PhantomData<Root>,
 }
@@ -338,7 +651,7 @@ where
     Root: LexerRoot,
 {
     compiled_states: Vec<CompiledState<Root>>,
-    state_ids: HashMap<String, State>,
+    state_ids: HashMap<String, State<Root>>,
     skip_terminals: HashSet<TerminalId>,
 
     #[snapshot]
@@ -348,10 +661,7 @@ where
 }
 
 impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
-    fn materialize_token(
-        &self,
-        occurrence: TokenOccurrence,
-    ) -> Option<LexToken<Root>>
+    fn materialize_token(&self, occurrence: TokenOccurrence) -> Option<LexToken<Root>>
     where
         Root: Clone,
     {
@@ -412,10 +722,12 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             });
         }
 
-        let eof_start = occurrences.last().map(|occurrence| occurrence.end).unwrap_or(0);
-        let include_eof = span.is_none_or(|span| {
-            eof_start >= span.range.start() && eof_start <= span.range.end()
-        });
+        let eof_start = occurrences
+            .last()
+            .map(|occurrence| occurrence.end)
+            .unwrap_or(0);
+        let include_eof = span
+            .is_none_or(|span| eof_start >= span.range.start() && eof_start <= span.range.end());
         if include_eof {
             out.push(TokenData {
                 id: SYNTHETIC_EOF_ID,
@@ -487,15 +799,27 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         for registration in &registrations {
             let mut state_tokens = Vec::new();
             let mut patterns = Vec::new();
+            let mut token_index_by_pattern = Vec::new();
             for spec in (registration.rules)() {
-                patterns.push(spec.regex);
+                let regex = match spec.matcher {
+                    TokenMatcher::Regex(regex) => Some(regex),
+                    TokenMatcher::Empty => None,
+                };
                 let resolved = build::resolve_token(spec, &state_ids)?;
+                if let Some(regex) = regex {
+                    patterns.push(regex);
+                    token_index_by_pattern.push(state_tokens.len());
+                }
                 if resolved.skip {
                     skip_terminals.insert(resolved.terminal);
                 }
                 state_tokens.push(resolved);
             }
-            let matcher = build::build_state_matcher(registration.display_name, &patterns)?;
+            let matcher = build::build_state_matcher(
+                registration.display_name,
+                &patterns,
+                token_index_by_pattern,
+            )?;
             compiled_states.push(CompiledState {
                 info: StateInfo {
                     name: registration.display_name,
@@ -524,15 +848,21 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
     }
 
     pub fn resolved_tokens(&self) -> impl ExactSizeIterator<Item = &[ResolvedToken<Root>]> {
-        self.compiled_states.iter().map(|state| state.tokens.as_slice())
+        self.compiled_states
+            .iter()
+            .map(|state| state.tokens.as_slice())
     }
 
-    pub fn tokens_in_state(&self, state: State) -> Option<&[ResolvedToken<Root>]> {
-        self.compiled_states.get(state.id).map(|state| state.tokens.as_slice())
+    pub fn tokens_in_state(&self, state: State<Root>) -> Option<&[ResolvedToken<Root>]> {
+        self.compiled_states
+            .get(state.id)
+            .map(|state| state.tokens.as_slice())
     }
 
-    pub(crate) fn state_matcher(&self, state: State) -> Option<&StateMatcher> {
-        self.compiled_states.get(state.id).map(|state| &state.matcher)
+    pub(crate) fn state_matcher(&self, state: State<Root>) -> Option<&StateMatcher> {
+        self.compiled_states
+            .get(state.id)
+            .map(|state| &state.matcher)
     }
 
     pub fn alloc_token(
@@ -560,7 +890,8 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
     }
 
     pub fn terminal_of(&self, index: usize) -> Option<TerminalId> {
-        self.token(index).and_then(|token| token.error.is_none().then_some(token.terminal).flatten())
+        self.token(index)
+            .and_then(|token| token.error.is_none().then_some(token.terminal).flatten())
     }
 
     pub(crate) fn snapshot_state(&self, snapshot: Option<SnapshotId>) -> &LexerSnapshotState<Root> {
@@ -616,16 +947,26 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         self.skip_terminals.contains(&terminal)
     }
 
-    pub fn state_id_of<S: TokenState>(&self) -> Option<State> {
+    pub fn state_id_of<S: TokenState>(&self) -> Option<State<Root>> {
         self.state_ids.get(S::state_key()).cloned()
     }
 
-    pub(crate) fn recovery_error_builder(&self, state: State) -> Option<&BuildErrorToken<Root>> {
-        self.compiled_states.get(state.id).map(|state| &state.recovery_error)
+    pub(crate) fn recovery_error_builder(
+        &self,
+        state: State<Root>,
+    ) -> Option<&BuildErrorToken<Root>> {
+        self.compiled_states
+            .get(state.id)
+            .map(|state| &state.recovery_error)
     }
 
-    pub(crate) fn boundary_error_builder(&self, state: State) -> Option<&BuildErrorToken<Root>> {
-        self.compiled_states.get(state.id).map(|state| &state.boundary_error)
+    pub(crate) fn boundary_error_builder(
+        &self,
+        state: State<Root>,
+    ) -> Option<&BuildErrorToken<Root>> {
+        self.compiled_states
+            .get(state.id)
+            .map(|state| &state.boundary_error)
     }
 }
 
@@ -693,7 +1034,6 @@ pub enum LexerCreationError {
     #[error("State {0} is referenced but not registered")]
     UnknownState(String),
 }
-
 
 #[derive(Debug)]
 pub struct UnsupportedDefaultParseError {

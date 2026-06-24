@@ -1,5 +1,5 @@
 error: every non-error variant must be assigned to at least one scope
-  --> tests/ui/terminal-reject-scope-unassigned-variant.rs:17:5
+  --> tests/ui/terminal-reject-scope-unassigned-variant.rs:24:5
    |
-17 |     StringText(String),
+24 |     StringText(String),
    |     ^^^^^^^^^^

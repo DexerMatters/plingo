@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use quote::{format_ident, quote};
 use syn::{
-    Fields, ItemEnum, Token, Variant,
+    Fields, ItemEnum, Token, Type, Variant,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
     spanned::Spanned,
@@ -14,13 +14,6 @@ use crate::shared::{
 
 struct ScopeEntryConfig {
     variant: syn::Ident,
-    role: ScopeRoleConfig,
-}
-
-enum ScopeRoleConfig {
-    Member,
-    Enter { child: syn::Ident, key_fn: syn::Expr },
-    Exit { guard: syn::Expr },
 }
 
 struct ScopeConfig {
@@ -30,6 +23,15 @@ struct ScopeConfig {
 
 struct ScopesConfig {
     scopes: Vec<ScopeConfig>,
+}
+
+struct ScopeSlotConfig {
+    name: syn::Ident,
+    ty: Type,
+}
+
+struct ScopeSlotsConfig {
+    slots: Vec<ScopeSlotConfig>,
 }
 
 impl Parse for ScopesConfig {
@@ -56,38 +58,30 @@ impl Parse for ScopeConfig {
 impl Parse for ScopeEntryConfig {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let variant = input.parse::<syn::Ident>()?;
-        if !input.peek(Token![=>]) {
-            return Ok(Self {
-                variant,
-                role: ScopeRoleConfig::Member,
-            });
-        }
-
-        input.parse::<Token![=>]>()?;
-        let role_name = input.parse::<syn::Ident>()?;
-        let content;
-        syn::parenthesized!(content in input);
-
-        let role = if role_name == "enter" {
-            let child = content.parse::<syn::Ident>()?;
-            content.parse::<Token![,]>()?;
-            let key_fn = content.parse::<syn::Expr>()?;
-            ScopeRoleConfig::Enter { child, key_fn }
-        } else if role_name == "exit" {
-            let guard = content.parse::<syn::Expr>()?;
-            ScopeRoleConfig::Exit { guard }
-        } else {
-            return Err(syn::Error::new(
-                role_name.span(),
-                "scope entry roles must be enter(...) or exit(...)",
+        if input.peek(Token![=>]) {
+            return Err(input.error(
+                "scope entries only declare membership; move enter/exit onto the variant attributes",
             ));
-        };
-
-        if !content.is_empty() {
-            return Err(content.error("unexpected tokens in scope entry"));
         }
+        Ok(Self { variant })
+    }
+}
 
-        Ok(Self { variant, role })
+impl Parse for ScopeSlotsConfig {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let slots = Punctuated::<ScopeSlotConfig, Token![,]>::parse_terminated(input)?
+            .into_iter()
+            .collect();
+        Ok(Self { slots })
+    }
+}
+
+impl Parse for ScopeSlotConfig {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let name = input.parse::<syn::Ident>()?;
+        input.parse::<Token![:]>()?;
+        let ty = input.parse::<Type>()?;
+        Ok(Self { name, ty })
     }
 }
 
@@ -120,6 +114,7 @@ pub fn expand_terminal_derive(item: ItemEnum) -> syn::Result<proc_macro::TokenSt
     let error_variant = error_variants[0];
 
     let scopes = parse_enum_scopes(&item, &variants, &configs)?;
+    let (scope_slots, implicit_scope_key) = parse_scope_slots(&item)?;
 
     let mut builder_tokens = Vec::new();
     let mut builder_idents = BTreeMap::new();
@@ -142,6 +137,11 @@ pub fn expand_terminal_derive(item: ItemEnum) -> syn::Result<proc_macro::TokenSt
         .iter()
         .map(|scope| build_scope_registration(&enum_ident, scope, &error_builder_ident))
         .collect::<Vec<_>>();
+    let slot_support = build_slot_support(&enum_ident, &scope_slots, implicit_scope_key)?;
+    let slot_tokens = slot_support.tokens;
+    let slot_value = slot_support.slot_value;
+    let slot_count = slot_support.count;
+    let recover_key = slot_support.recover_key;
 
     let generate_impl = build_generate_impl(&enum_ident, &variants, &configs)?;
     let parser_terminal_impl = build_parser_terminal_impl(&enum_ident, &variants, &configs)?;
@@ -158,6 +158,8 @@ pub fn expand_terminal_derive(item: ItemEnum) -> syn::Result<proc_macro::TokenSt
         }
 
         impl ::plingo::component::lex::LexerRoot for #enum_ident {
+            type SlotValue = #slot_value;
+
             fn state_registrations() -> ::std::vec::Vec<::plingo::component::lex::__macro_private::ScopeRegistration<Self>> {
                 let error_builder = ::std::sync::Arc::new(#error_builder_ident)
                     as ::plingo::component::lex::__macro_private::BuildErrorToken<Self>;
@@ -165,8 +167,19 @@ pub fn expand_terminal_derive(item: ItemEnum) -> syn::Result<proc_macro::TokenSt
                 #(#scope_regs)*
                 registrations
             }
+
+            fn slot_count() -> usize {
+                #slot_count
+            }
+
+            fn recover_key(
+                slots: &::plingo::component::lex::SlotStore<Self>,
+            ) -> ::std::option::Option<&str> {
+                #recover_key
+            }
         }
 
+        #slot_tokens
         #(#builder_tokens)*
         #error_builder_fn
         #(#scope_specs)*
@@ -174,6 +187,119 @@ pub fn expand_terminal_derive(item: ItemEnum) -> syn::Result<proc_macro::TokenSt
         #parser_terminal_impl
     }
     .into())
+}
+
+fn parse_scope_slots(item: &ItemEnum) -> syn::Result<(Vec<ScopeSlotConfig>, bool)> {
+    let mut parsed = None;
+    for attr in &item.attrs {
+        let syn::Meta::List(meta) = &attr.meta else {
+            continue;
+        };
+        if !meta.path.is_ident("scope_slots") {
+            continue;
+        }
+        if parsed.is_some() {
+            return Err(syn::Error::new(
+                attr.span(),
+                "duplicate #[scope_slots(...)] attribute",
+            ));
+        }
+        parsed = Some(attr.parse_args::<ScopeSlotsConfig>()?);
+    }
+
+    let implicit_scope_key = parsed.is_none();
+    let mut slots = parsed.map(|config| config.slots).unwrap_or_default();
+    if implicit_scope_key {
+        slots.push(ScopeSlotConfig {
+            name: format_ident!("scope_key"),
+            ty: syn::parse_quote!(String),
+        });
+    }
+
+    let mut seen = BTreeSet::new();
+    for slot in &slots {
+        if !seen.insert(slot.name.to_string()) {
+            return Err(syn::Error::new(slot.name.span(), "duplicate scope slot name"));
+        }
+    }
+
+    Ok((slots, implicit_scope_key))
+}
+
+struct SlotSupport {
+    tokens: proc_macro2::TokenStream,
+    slot_value: proc_macro2::TokenStream,
+    count: proc_macro2::TokenStream,
+    recover_key: proc_macro2::TokenStream,
+}
+
+fn build_slot_support(
+    root_ident: &syn::Ident,
+    scope_slots: &[ScopeSlotConfig],
+    implicit_scope_key: bool,
+) -> syn::Result<SlotSupport> {
+    let slot_value_ident = format_ident!("__PlingoSlotValue_{}", root_ident);
+    let slot_count = scope_slots.len();
+    let mut slot_variants = Vec::new();
+    let mut slot_fns = Vec::new();
+    let mut slot_consts = Vec::new();
+
+    for (index, slot) in scope_slots.iter().enumerate() {
+        let variant_ident = format_ident!("Slot{}", index);
+        let pack_ident = format_ident!("__plingo_slot_pack_{}_{}", root_ident, slot.name);
+        let ref_ident = format_ident!("__plingo_slot_ref_{}_{}", root_ident, slot.name);
+        let slot_name = &slot.name;
+        let slot_ty = &slot.ty;
+
+        slot_variants.push(quote! { #variant_ident(#slot_ty) });
+        slot_fns.push(quote! {
+            #[allow(non_snake_case)]
+            fn #pack_ident(value: #slot_ty) -> #slot_value_ident {
+                #slot_value_ident::#variant_ident(value)
+            }
+
+            #[allow(non_snake_case)]
+            fn #ref_ident(value: &#slot_value_ident) -> ::std::option::Option<&#slot_ty> {
+                match value {
+                    #slot_value_ident::#variant_ident(inner) => ::std::option::Option::Some(inner),
+                    _ => ::std::option::Option::None,
+                }
+            }
+        });
+        slot_consts.push(quote! {
+            #[allow(non_upper_case_globals)]
+            pub const #slot_name: ::plingo::component::lex::Slot<Self, #slot_ty> =
+                ::plingo::component::lex::Slot::new(#index, #pack_ident, #ref_ident);
+        });
+    }
+
+    let tokens = quote! {
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        pub enum #slot_value_ident {
+            #(#slot_variants),*
+        }
+
+        #(#slot_fns)*
+
+        impl #root_ident {
+            #(#slot_consts)*
+        }
+    };
+
+    let recover_key = if implicit_scope_key {
+        quote! { slots.get(#root_ident::scope_key).map(|value| value.as_str()) }
+    } else {
+        quote! { ::std::option::Option::None }
+    };
+
+    Ok(SlotSupport {
+        tokens,
+        slot_value: quote! { #slot_value_ident },
+        count: quote! { #slot_count },
+        recover_key,
+    })
 }
 
 fn parse_enum_scopes(
@@ -209,7 +335,6 @@ fn parse_enum_scopes(
                     let (_, config) = configs.get(&variant.ident).unwrap();
                     (!config.error).then_some(ScopeEntryConfig {
                         variant: variant.ident.clone(),
-                        role: ScopeRoleConfig::Member,
                     })
                 })
                 .collect(),
@@ -261,17 +386,11 @@ fn parse_enum_scopes(
                     "duplicate variant entry in the same scope",
                 ));
             }
-            if config.skip && !matches!(entry.role, ScopeRoleConfig::Member) {
-                return Err(syn::Error::new(
-                    entry.variant.span(),
-                    "#[skip] variants can only appear as plain scope members",
-                ));
-            }
-            if let ScopeRoleConfig::Enter { child, .. } = &entry.role {
+            if let Some(child) = &config.enter {
                 if !known_scopes.contains(&child.to_string()) {
                     return Err(syn::Error::new(
                         child.span(),
-                        "unknown child scope in enter(...)",
+                        "unknown child scope in #[enter(...)]",
                     ));
                 }
             }
@@ -385,7 +504,6 @@ fn build_scope_specs_fn(
             *index,
             config,
             builder_ident,
-            &entry.role,
         )?;
         spec_statements.push(quote! { specs.push(#spec); });
     }
@@ -435,46 +553,39 @@ fn build_scope_token_spec(
     index: usize,
     config: &VariantConfig,
     builder_ident: &syn::Ident,
-    role: &ScopeRoleConfig,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let regex = config.regex.as_ref().ok_or_else(|| {
-        syn::Error::new(
+    let matcher = if let Some(regex) = &config.regex {
+        quote! { ::plingo::component::lex::__macro_private::TokenMatcher::Regex(#regex) }
+    } else if config.empty {
+        quote! { ::plingo::component::lex::__macro_private::TokenMatcher::Empty }
+    } else {
+        return Err(syn::Error::new(
             variant.span(),
-            "only #[regex(...)] variants can appear in scopes",
-        )
-    })?;
+            "scope variants require #[regex(...)] or #[empty]",
+        ));
+    };
     let label = format!("{}::{}", root_ident, variant.ident);
-    let when = guard_expr(&config.when);
+    let when = guard_expr(root_ident, &config.when);
     let recover_when = recover_expr(&config.recover_when);
+    let with = with_expr(root_ident, &config.with);
     let terminal = terminal_id_expr(root_ident, index);
     let skip = config.skip;
-    let action = match role {
-        ScopeRoleConfig::Member => {
-            quote! { ::plingo::component::lex::__macro_private::ScopeDirective::None }
-        }
-        ScopeRoleConfig::Enter { child, key_fn } => {
-            let child_state_key = scope_state_key_expr(root_ident, child);
-            quote! {
-                ::plingo::component::lex::__macro_private::ScopeDirective::Enter {
-                    target: #child_state_key.to_string(),
-                    key: ::std::sync::Arc::new(#key_fn as fn(&#root_ident) -> ::std::option::Option<::std::string::String>)
-                        as ::plingo::component::lex::__macro_private::EnterScopeKey<#root_ident>,
-                }
+    let action = if let Some(child) = &config.enter {
+        let child_state_key = scope_state_key_expr(root_ident, child);
+        quote! {
+            ::plingo::component::lex::__macro_private::ScopeDirective::Enter {
+                target: #child_state_key.to_string(),
             }
         }
-        ScopeRoleConfig::Exit { guard } => {
-            quote! {
-                ::plingo::component::lex::__macro_private::ScopeDirective::Leave {
-                    matches: ::std::sync::Arc::new(#guard as fn(&#root_ident, &str) -> bool)
-                        as ::plingo::component::lex::__macro_private::ExitScopeGuard<#root_ident>,
-                }
-            }
-        }
+    } else if config.exit {
+        quote! { ::plingo::component::lex::__macro_private::ScopeDirective::Exit }
+    } else {
+        quote! { ::plingo::component::lex::__macro_private::ScopeDirective::None }
     };
 
     Ok(quote! {
         ::plingo::component::lex::__macro_private::TokenSpec {
-            regex: #regex,
+            matcher: #matcher,
             terminal: #terminal,
             precedence: #index,
             label: #label,
@@ -483,6 +594,7 @@ fn build_scope_token_spec(
             build: ::std::sync::Arc::new(#builder_ident),
             when: #when,
             recover_when: #recover_when,
+            with: #with,
         }
     })
 }
@@ -586,8 +698,16 @@ fn build_generate_arm(
     let generator_ident = format_ident!("__PLINGO_GENERATOR_{}_{}", root_ident, index);
     let variant_ident = &variant.ident;
     let label = format!("{}::{}", root_ident, variant_ident);
-    let regex = config.regex.as_ref().expect("non-error variants have #[regex(...)]");
 
+    let Some(regex) = config.regex.as_ref() else {
+        return Ok(quote! {
+            stringify!(#variant_ident) => ::std::result::Result::Err(
+                ::plingo::component::lex::GenerateError::UnsupportedEmptyVariant {
+                    token: #label,
+                },
+            )
+        });
+    };
     if config.when.is_some() {
         return Ok(quote! {
             stringify!(#variant_ident) => ::std::result::Result::Err(
@@ -712,12 +832,16 @@ fn scope_state_key_expr(
     }
 }
 
-fn guard_expr(predicate: &Option<syn::Expr>) -> proc_macro2::TokenStream {
+fn guard_expr(root_ident: &syn::Ident, predicate: &Option<syn::Expr>) -> proc_macro2::TokenStream {
     match predicate {
         Some(predicate) => quote! {
             ::std::option::Option::Some(
-                ::std::sync::Arc::new(#predicate as fn(&str, ::std::option::Option<&str>) -> bool)
-                    as ::plingo::component::lex::__macro_private::WhenGuard
+                ::std::sync::Arc::new(
+                    #predicate as fn(
+                        &::plingo::component::lex::WhenCx<#root_ident>
+                    ) -> bool
+                )
+                    as ::plingo::component::lex::__macro_private::WhenGuard<#root_ident>
             )
         },
         None => quote! { ::std::option::Option::None },
@@ -730,6 +854,20 @@ fn recover_expr(predicate: &Option<syn::Expr>) -> proc_macro2::TokenStream {
             ::std::option::Option::Some(
                 ::std::sync::Arc::new(#predicate as fn(&str, ::std::option::Option<&str>) -> usize)
                     as ::plingo::component::lex::__macro_private::RecoverWhen
+            )
+        },
+        None => quote! { ::std::option::Option::None },
+    }
+}
+
+fn with_expr(root_ident: &syn::Ident, mapper: &Option<syn::Expr>) -> proc_macro2::TokenStream {
+    match mapper {
+        Some(mapper) => quote! {
+            ::std::option::Option::Some(
+                ::std::sync::Arc::new(
+                    #mapper as fn(&mut ::plingo::component::lex::WithCx<#root_ident>)
+                )
+                    as ::plingo::component::lex::__macro_private::WithHook<#root_ident>
             )
         },
         None => quote! { ::std::option::Option::None },

@@ -1,6 +1,5 @@
 use crate::{
-    NonTerminal,
-    Terminal,
+    NonTerminal, Terminal,
     component::{
         debug::DebugSink,
         lex::{LexErrorInfo, Lexer},

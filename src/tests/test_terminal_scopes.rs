@@ -1,6 +1,6 @@
 use crate::{
     Terminal,
-    component::lex::{LexErrorInfo, LexToken, Lexer, LexerState},
+    component::lex::{LexErrorInfo, LexToken, Lexer, LexerState, WhenCx, WithCx},
 };
 
 fn collect_entries<Root>(lexer: &mut Lexer<Root>, input: &str) -> Vec<LexToken<Root>>
@@ -31,17 +31,24 @@ where
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
 #[scopes(
     root {
-        QuoteRun => enter(string, quote_key),
+        QuoteStart,
         Number,
     },
     string {
-        QuoteRun => exit(quote_matches),
+        QuoteEnd,
         StringText,
     },
 )]
 enum ScopedTokens {
     #[regex(r#""+"#)]
-    QuoteRun(String),
+    #[enter(string)]
+    #[with(quote_key)]
+    QuoteStart(String),
+
+    #[regex(r#""+"#)]
+    #[exit]
+    #[when(quote_matches)]
+    QuoteEnd(String),
 
     #[regex(r#"[^"]+"#)]
     StringText(String),
@@ -53,15 +60,13 @@ enum ScopedTokens {
     Error(LexErrorInfo),
 }
 
-fn quote_key(token: &ScopedTokens) -> Option<String> {
-    match token {
-        ScopedTokens::QuoteRun(value) => Some(value.clone()),
-        _ => None,
-    }
+fn quote_key(cx: &mut WithCx<ScopedTokens>) {
+    cx.set(ScopedTokens::scope_key, cx.lexeme().to_string());
 }
 
-fn quote_matches(token: &ScopedTokens, key: &str) -> bool {
-    matches!(token, ScopedTokens::QuoteRun(value) if value == key)
+fn quote_matches(cx: &WhenCx<ScopedTokens>) -> bool {
+    cx.get(ScopedTokens::scope_key)
+        .is_some_and(|key| key == cx.lexeme())
 }
 
 #[test]
@@ -69,17 +74,20 @@ fn scope_terminal_splits_adjacent_quote_runs_into_close_then_open() {
     let mut lexer = Lexer::<ScopedTokens>::new().unwrap();
     let entries = collect_entries(&mut lexer, r#"12""hello""""world"""#);
 
-    let values = entries.into_iter().map(|token| token.value).collect::<Vec<_>>();
+    let values = entries
+        .into_iter()
+        .map(|token| token.value)
+        .collect::<Vec<_>>();
     assert_eq!(
         values,
         vec![
             ScopedTokens::Number(12),
-            ScopedTokens::QuoteRun("\"\"".to_string()),
+            ScopedTokens::QuoteStart("\"\"".to_string()),
             ScopedTokens::StringText("hello".to_string()),
-            ScopedTokens::QuoteRun("\"\"".to_string()),
-            ScopedTokens::QuoteRun("\"\"".to_string()),
+            ScopedTokens::QuoteEnd("\"\"".to_string()),
+            ScopedTokens::QuoteStart("\"\"".to_string()),
             ScopedTokens::StringText("world".to_string()),
-            ScopedTokens::QuoteRun("\"\"".to_string()),
+            ScopedTokens::QuoteEnd("\"\"".to_string()),
         ]
     );
 }

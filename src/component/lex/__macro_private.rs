@@ -7,47 +7,53 @@ use rand::{SeedableRng, distr::Distribution, rngs::StdRng};
 
 use crate::component::parse::grammar::TerminalId;
 
-use super::{GenerateError, LexErrorInfo, LexInterrupt};
+use super::{GenerateError, LexErrorInfo, LexInterrupt, LexerRoot, WhenCx, WithCx};
 
 pub type BuildToken<Root> = Arc<dyn Fn(&str) -> Result<Root, LexInterrupt> + Send + Sync>;
 pub type BuildErrorToken<Root> =
     Arc<dyn Fn(LexErrorInfo) -> Result<Root, LexInterrupt> + Send + Sync>;
-pub type WhenGuard =
-    Arc<dyn for<'a, 'b> Fn(&'a str, Option<&'b str>) -> bool + Send + Sync>;
-pub type RecoverWhen =
-    Arc<dyn for<'a, 'b> Fn(&'a str, Option<&'b str>) -> usize + Send + Sync>;
-pub type EnterScopeKey<Root> = Arc<dyn Fn(&Root) -> Option<String> + Send + Sync>;
-pub type ExitScopeGuard<Root> = Arc<dyn Fn(&Root, &str) -> bool + Send + Sync>;
+pub type WhenGuard<Root> =
+    Arc<dyn for<'a> Fn(&'a WhenCx<'a, Root>) -> bool + Send + Sync>;
+pub type RecoverWhen = Arc<dyn for<'a, 'b> Fn(&'a str, Option<&'b str>) -> usize + Send + Sync>;
+pub type WithHook<Root> = Arc<dyn for<'a> Fn(&'a mut WithCx<'a, Root>) + Send + Sync>;
 
 use std::error::Error;
 
 #[derive(Clone)]
-pub enum ScopeDirective<Root> {
+pub enum ScopeDirective {
     None,
-    Enter {
-        target: String,
-        key: EnterScopeKey<Root>,
-    },
-    Leave {
-        matches: ExitScopeGuard<Root>,
-    },
+    Enter { target: String },
+    Exit,
 }
 
 #[derive(Clone)]
-pub struct TokenSpec<Root> {
-    pub regex: &'static str,
+pub enum TokenMatcher {
+    Regex(&'static str),
+    Empty,
+}
+
+#[derive(Clone)]
+pub struct TokenSpec<Root>
+where
+    Root: LexerRoot,
+{
+    pub matcher: TokenMatcher,
     pub terminal: TerminalId,
     pub precedence: usize,
     pub label: &'static str,
-    pub action: ScopeDirective<Root>,
+    pub action: ScopeDirective,
     pub skip: bool,
     pub build: BuildToken<Root>,
-    pub when: Option<WhenGuard>,
+    pub when: Option<WhenGuard<Root>>,
     pub recover_when: Option<RecoverWhen>,
+    pub with: Option<WithHook<Root>>,
 }
 
 #[derive(Clone)]
-pub struct ScopeRegistration<Root> {
+pub struct ScopeRegistration<Root>
+where
+    Root: LexerRoot,
+{
     pub display_name: &'static str,
     pub type_name: String,
     pub rules: Arc<dyn Fn() -> Vec<TokenSpec<Root>> + Send + Sync>,
@@ -55,7 +61,10 @@ pub struct ScopeRegistration<Root> {
     pub boundary_error_builder: BuildErrorToken<Root>,
 }
 
-impl<Root> ScopeRegistration<Root> {
+impl<Root> ScopeRegistration<Root>
+where
+    Root: LexerRoot,
+{
     pub fn new(
         display_name: &'static str,
         type_name: impl Into<String>,

@@ -3,9 +3,8 @@ use core::fmt;
 use enum_iterator::Sequence;
 
 use crate::{
-    NonTerminal,
-    Terminal,
-    component::lex::{LexErrorInfo, LexToken, Lexer, LexerState},
+    NonTerminal, Terminal,
+    component::lex::{LexErrorInfo, LexToken, Lexer, LexerState, WhenCx, WithCx},
     component::parse::{
         AstToken, ErrorKind, ParseAddress, ParseChange, ParseErrorInfo, ParseUnit, ParserConfig,
         TokenData,
@@ -25,6 +24,7 @@ use crate::{
 
 //mod test_runtime;
 
+mod test_empty_layout;
 mod test_parser;
 mod test_parser_comprehensive;
 mod test_terminal_scopes;
@@ -32,7 +32,6 @@ mod test_terminal_scopes;
 #[cfg(test)]
 mod fs_watch;
 mod scheme;
-
 
 mod test_lexer;
 
@@ -74,10 +73,7 @@ fn token_data_from_entries(entries: &[LexToken<RootTokens>]) -> Vec<TokenData> {
     data
 }
 
-fn collect_entries(
-    lexer: &mut Lexer<RootTokens>,
-    input: &str,
-) -> Vec<LexToken<RootTokens>> {
+fn collect_entries(lexer: &mut Lexer<RootTokens>, input: &str) -> Vec<LexToken<RootTokens>> {
     let token_ids: Vec<usize> = {
         let mut ids = Vec::new();
         lexer
@@ -202,22 +198,26 @@ impl fmt::Display for RootTokens {
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
 #[scopes(
     root {
-        QuoteStart => enter(string, fixed_quote_key),
+        QuoteStart,
         Number,
     },
     string {
         StringLiteral,
-        QuoteEnd => exit(fixed_quote_end_matches),
+        QuoteEnd,
     },
 )]
 enum NestedRootTokens {
     #[regex(r#"""#)]
+    #[enter(string)]
+    #[with(fixed_quote_key)]
     QuoteStart,
 
     #[regex(r#"[^"]+"#)]
     StringLiteral(String),
 
     #[regex(r#"""#)]
+    #[exit]
+    #[when(fixed_quote_end_matches)]
     QuoteEnd,
 
     #[regex(r"[0-9]+")]
@@ -239,12 +239,13 @@ impl fmt::Display for NestedRootTokens {
     }
 }
 
-fn fixed_quote_key(token: &NestedRootTokens) -> Option<String> {
-    matches!(token, NestedRootTokens::QuoteStart).then(|| "\"".to_string())
+fn fixed_quote_key(cx: &mut WithCx<NestedRootTokens>) {
+    cx.set(NestedRootTokens::scope_key, cx.lexeme().to_string());
 }
 
-fn fixed_quote_end_matches(token: &NestedRootTokens, key: &str) -> bool {
-    matches!(token, NestedRootTokens::QuoteEnd) && key == "\""
+fn fixed_quote_end_matches(cx: &WhenCx<NestedRootTokens>) -> bool {
+    cx.get(NestedRootTokens::scope_key)
+        .is_some_and(|key| key == cx.lexeme())
 }
 
 fn raw_delimiter(lexeme: &str) -> &str {
@@ -252,12 +253,12 @@ fn raw_delimiter(lexeme: &str) -> &str {
     after_r.strip_suffix('"').unwrap_or(after_r)
 }
 
-fn raw_end_matches(lexeme: &str, key: Option<&str>) -> bool {
-    let Some(ctx) = key else {
+fn raw_end_matches(cx: &WhenCx<RawRoot>) -> bool {
+    let Some(ctx) = cx.get(RawRoot::scope_key) else {
         return false;
     };
     let delim = raw_delimiter(ctx);
-    lexeme == delimiter_closer(delim)
+    cx.lexeme() == delimiter_closer(delim)
 }
 
 fn delimiter_closer(hashes: &str) -> String {
@@ -267,17 +268,19 @@ fn delimiter_closer(hashes: &str) -> String {
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
 #[scopes(
     root {
-        RawStart => enter(raw, raw_scope_key),
+        RawStart,
         RawWs,
     },
     raw {
         RawContent,
         EmbeddedQuote,
-        RawEnd => exit(raw_end_matches_token),
+        RawEnd,
     },
 )]
 enum RawRoot {
     #[regex("r#*\"")]
+    #[enter(raw)]
+    #[with(raw_scope_key)]
     RawStart(String),
 
     #[regex("[^\"]+")]
@@ -287,6 +290,7 @@ enum RawRoot {
     EmbeddedQuote,
 
     #[regex("\"#*")]
+    #[exit]
     #[when(raw_end_matches)]
     RawEnd(String),
 
@@ -311,16 +315,8 @@ impl fmt::Display for RawRoot {
     }
 }
 
-fn raw_scope_key(token: &RawRoot) -> Option<String> {
-    match token {
-        RawRoot::RawStart(value) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn raw_end_matches_token(token: &RawRoot, key: &str) -> bool {
-    let delim = raw_delimiter(key);
-    matches!(token, RawRoot::RawEnd(value) if value == &delimiter_closer(delim))
+fn raw_scope_key(cx: &mut WithCx<RawRoot>) {
+    cx.set(RawRoot::scope_key, cx.lexeme().to_string());
 }
 
 #[allow(dead_code)]
@@ -485,7 +481,7 @@ fn token_generate_rejects_context_sensitive_when_tokens() {
 #[test]
 fn token_generate_unit_variant_from_external_path() {
     let mut out = String::new();
-    crate::generate!(NestedRootTokens::QuoteEnd, 23, &mut out).unwrap();
+    crate::generate!(NestedRootTokens::QuoteStart, 23, &mut out).unwrap();
 
     assert_eq!(out, "\"");
 }

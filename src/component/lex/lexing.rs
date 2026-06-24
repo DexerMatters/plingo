@@ -8,8 +8,9 @@ use regex_automata::{Anchored, Input, dfa::Automaton};
 use crate::{
     component::{
         lex::{
-            LexErrorInfo, LexErrorKind, LexInterrupt, Lexer, LexerRoot, LexerSnapshotState,
-            LexerState, State, StateAction, TokenAction, TokenChange, TokenMatch, TokenOccurrence,
+            LexErrorInfo, LexErrorKind, LexInterrupt, LexMoment, Lexer, LexerRoot,
+            LexerSnapshotState, LexerState, State, StateAction, TokenAction, TokenChange,
+            TokenMatch, TokenOccurrence, WhenCx, WithCx,
         },
         source::{Source, TextChange},
     },
@@ -36,7 +37,7 @@ fn shift_occurrence(occurrence: TokenOccurrence, shift: isize) -> TokenOccurrenc
     }
 }
 
-fn shift_state(state: &LexerState, shift: isize) -> LexerState {
+fn shift_state<Root: LexerRoot>(state: &LexerState<Root>, shift: isize) -> LexerState<Root> {
     let mut shifted = state.clone();
     shifted.offset = shift_offset(shifted.offset, shift);
     shifted
@@ -184,7 +185,7 @@ where
         let mut new_occurrences = Vec::new();
         let mut new_states = Vec::new();
         let lookup_build_start = Instant::now();
-        let mut old_state_lookup: HashMap<LexerState, Vec<usize>> = HashMap::new();
+        let mut old_state_lookup: HashMap<LexerState<Root>, Vec<usize>> = HashMap::new();
         for (index, state) in old_states.iter().enumerate() {
             old_state_lookup
                 .entry(shift_state(state, net_shift))
@@ -312,16 +313,16 @@ where
 impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
     pub(crate) fn lex_cont(
         &mut self,
-        start_state: LexerState,
+        start_state: LexerState<Root>,
         input_str: String,
-        mut cont: impl FnMut(usize, &LexerState, usize, usize) -> bool,
-    ) -> Result<LexerState, LexInterrupt> {
+        mut cont: impl FnMut(usize, &LexerState<Root>, usize, usize) -> bool,
+    ) -> Result<LexerState<Root>, LexInterrupt> {
         let mut input = Input::new(input_str.as_bytes());
         let mut state = start_state;
         let mut unexpected_start: Option<usize> = None;
 
         while state.offset < input.end() {
-            match self.select_step(&state, &mut input)? {
+            match self.select_step(&state, &mut input, LexMoment::Normal)? {
                 Some(step) => {
                     let start = step.start;
                     let end = step.end;
@@ -368,6 +369,16 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             }
         }
 
+        while let Some(step) = self.select_step(&state, &mut input, LexMoment::Eof)? {
+            let start = step.start;
+            let end = step.end;
+            if let Some(token_id) = self.commit_match(&mut state, step)? {
+                if !cont(token_id, &state, start, end) {
+                    return Ok(state);
+                }
+            }
+        }
+
         if state.parent_state().is_some()
             && !self.emit_state_error(
                 &state,
@@ -388,10 +399,10 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
 
     fn emit_state_error(
         &mut self,
-        state: &LexerState,
+        state: &LexerState<Root>,
         info: LexErrorInfo,
         boundary: bool,
-        cont: &mut impl FnMut(usize, &LexerState, usize, usize) -> bool,
+        cont: &mut impl FnMut(usize, &LexerState<Root>, usize, usize) -> bool,
     ) -> Result<bool, LexInterrupt> {
         let current = state.current_state()?;
         let builder = if boundary {
@@ -414,32 +425,105 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
 
     fn select_step(
         &self,
-        state: &LexerState,
+        state: &LexerState<Root>,
         input: &mut Input,
+        moment: LexMoment,
     ) -> Result<Option<TokenMatch<Root>>, LexInterrupt> {
         let current = state.current_state()?;
-        self.scan_state(current, input.haystack(), state.offset, state.current_key())
+        if let Some(step) = self.scan_empty_state(state, current.clone(), moment)? {
+            return Ok(Some(step));
+        }
+        if moment == LexMoment::Eof {
+            return Ok(None);
+        }
+        self.scan_regex_state(state, current, input.haystack(), state.offset)
     }
 
-    fn scan_state(
+    fn scan_empty_state(
         &self,
-        state: State,
+        lexer_state: &LexerState<Root>,
+        state: State<Root>,
+        moment: LexMoment,
+    ) -> Result<Option<TokenMatch<Root>>, LexInterrupt> {
+        let root_state = self
+            .state_id_of::<Root>()
+            .ok_or(LexInterrupt::MissingState)?;
+        let tokens = self
+            .tokens_in_state(state.clone())
+            .ok_or(LexInterrupt::MissingState)?;
+        let mut best: Option<(u8, usize, TokenMatch<Root>)> = None;
+
+        for (token_index, token) in tokens.iter().enumerate() {
+            if !token.empty {
+                continue;
+            }
+            let current_slots = lexer_state.current_slots()?;
+            let when_cx = WhenCx::new(
+                "",
+                moment,
+                lexer_state.depth(),
+                current_slots,
+                lexer_state.parent_slots(),
+            );
+            if token.when.as_ref().is_some_and(|when| !when(&when_cx)) {
+                continue;
+            }
+
+            let (rank, transition) = match &token.action {
+                TokenAction::None => (2u8, StateAction::None),
+                TokenAction::Enter { next } => (1u8, StateAction::Enter(State::new(next.id))),
+                TokenAction::Exit => {
+                    if state.id == root_state.id {
+                        continue;
+                    }
+                    (0u8, StateAction::Exit)
+                }
+            };
+            let candidate = TokenMatch {
+                token_index,
+                start: lexer_state.offset,
+                end: lexer_state.offset,
+                lexeme: String::new(),
+                moment,
+                value: token.build("")?,
+                transition,
+            };
+            let should_replace = match &best {
+                None => true,
+                Some((best_rank, best_token_index, _)) => {
+                    rank < *best_rank || (rank == *best_rank && token_index < *best_token_index)
+                }
+            };
+            if should_replace {
+                best = Some((rank, token_index, candidate));
+            }
+        }
+
+        Ok(best.map(|(_, _, candidate)| candidate))
+    }
+
+    fn scan_regex_state(
+        &self,
+        lexer_state: &LexerState<Root>,
+        state: State<Root>,
         haystack: &[u8],
         offset: usize,
-        key: Option<&str>,
     ) -> Result<Option<TokenMatch<Root>>, LexInterrupt> {
         let current_state = state.clone();
         let matcher = self
             .state_matcher(state.clone())
             .ok_or(LexInterrupt::MissingState)?;
-        let tokens = self.tokens_in_state(state).ok_or(LexInterrupt::MissingState)?;
+        let tokens = self
+            .tokens_in_state(state)
+            .ok_or(LexInterrupt::MissingState)?;
         let raw_match_ends = collect_raw_match_ends(
             &matcher.dfa,
             &matcher.token_index_by_pattern,
             tokens,
             haystack,
             offset,
-            key,
+            lexer_state,
+            LexMoment::Normal,
             None,
         );
 
@@ -454,7 +538,7 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                     haystack,
                     token_index,
                     raw_end,
-                    key,
+                    lexer_state,
                 ) else {
                     continue;
                 };
@@ -464,20 +548,17 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                 let value = token.build(lexeme)?;
                 let (rank, transition) = match &token.action {
                     TokenAction::None => (2u8, StateAction::None),
-                    TokenAction::Enter { next, key: enter_key } => {
-                        let Some(next_key) = enter_key(&value) else {
-                            continue;
-                        };
-                        (1u8, StateAction::Enter(State::with_key(next.id, next_key)))
-                    }
-                    TokenAction::Leave { matches } => {
-                        let Some(active_key) = key else {
-                            continue;
-                        };
-                        if !matches(&value, active_key) {
+                    TokenAction::Enter { next } => (1u8, StateAction::Enter(State::new(next.id))),
+                    TokenAction::Exit => {
+                        if current_state.id
+                            == self
+                                .state_id_of::<Root>()
+                                .ok_or(LexInterrupt::MissingState)?
+                                .id
+                        {
                             continue;
                         }
-                        (0u8, StateAction::Leave)
+                        (0u8, StateAction::Exit)
                     }
                 };
 
@@ -485,6 +566,8 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                     token_index,
                     start: offset,
                     end,
+                    lexeme: lexeme.to_string(),
+                    moment: LexMoment::Normal,
                     value,
                     transition,
                 };
@@ -508,11 +591,11 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
 
     fn recover_match_end(
         &self,
-        state: State,
+        state: State<Root>,
         haystack: &[u8],
         token_index: usize,
         raw_end: usize,
-        key: Option<&str>,
+        lexer_state: &LexerState<Root>,
     ) -> Option<usize> {
         let token = self
             .tokens_in_state(state.clone())
@@ -524,7 +607,7 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         let mut last_success_end = raw_end;
         loop {
             let rest = std::str::from_utf8(&haystack[last_success_end..]).ok()?;
-            let recover_chars = recover_when(rest, key);
+            let recover_chars = recover_when(rest, lexer_state.current_key());
             if recover_chars == 0 {
                 return Some(last_success_end);
             }
@@ -535,8 +618,13 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             }
 
             let resume_offset = last_success_end.saturating_add(recovered_bytes);
-            let resumed_end =
-                self.raw_match_end_for_token(state.clone(), haystack, resume_offset, token_index, key);
+            let resumed_end = self.raw_match_end_for_token(
+                state.clone(),
+                haystack,
+                resume_offset,
+                token_index,
+                lexer_state,
+            );
             let Some(resumed_end) = resumed_end else {
                 return Some(last_success_end);
             };
@@ -550,11 +638,11 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
 
     fn raw_match_end_for_token(
         &self,
-        state: State,
+        state: State<Root>,
         haystack: &[u8],
         offset: usize,
         token_index: usize,
-        key: Option<&str>,
+        lexer_state: &LexerState<Root>,
     ) -> Option<usize> {
         let matcher = self.state_matcher(state.clone())?;
         let tokens = self.tokens_in_state(state)?;
@@ -564,7 +652,8 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             tokens,
             haystack,
             offset,
-            key,
+            lexer_state,
+            LexMoment::Normal,
             Some(token_index),
         )
         .into_iter()
@@ -574,7 +663,7 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
 
     fn commit_match(
         &mut self,
-        state: &mut LexerState,
+        state: &mut LexerState<Root>,
         step: TokenMatch<Root>,
     ) -> Result<Option<usize>, LexInterrupt> {
         let Some(token) = self
@@ -583,30 +672,57 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         else {
             return Err(LexInterrupt::NoCandidate);
         };
+        let old_state = state.clone();
+        let skip = token.skip;
+        let terminal = token.terminal;
+        let label = token.label;
+        let with_hook = token.with_hook.clone();
+        let source_slots = old_state.current_slots()?.clone();
+        let parent_slots = old_state.parent_slots_cloned();
         state.offset = step.end;
         state.apply_action(step.transition);
+        if let Some(with_hook) = with_hook {
+            let depth = state.depth();
+            let target_slots = state.current_slots_mut()?;
+            let mut cx = WithCx::new(
+                &step.lexeme,
+                step.moment,
+                depth,
+                target_slots,
+                source_slots,
+                parent_slots,
+            );
+            with_hook(&mut cx);
+        }
 
-        if token.skip {
+        if step.start == step.end && *state == old_state {
+            return Err(LexInterrupt::InternalError(format!(
+                "empty token {label} did not change lexer state",
+            )));
+        }
+
+        if skip {
             return Ok(None);
         }
 
         Ok(Some(self.alloc_token(
             step.start,
             step.end.saturating_sub(step.start),
-            Some(token.terminal),
+            Some(terminal),
             None,
             step.value,
         )))
     }
 }
 
-fn collect_raw_match_ends<A: Automaton, R>(
+fn collect_raw_match_ends<A: Automaton, R: LexerRoot>(
     dfa: &A,
     token_index_by_pattern: &[usize],
     tokens: &[crate::component::lex::ResolvedToken<R>],
     haystack: &[u8],
     search_start: usize,
-    key: Option<&str>,
+    lexer_state: &LexerState<R>,
+    moment: LexMoment,
     target_token: Option<usize>,
 ) -> Vec<Vec<usize>> {
     let mut input = Input::new(haystack);
@@ -631,7 +747,8 @@ fn collect_raw_match_ends<A: Automaton, R>(
                 tokens,
                 haystack,
                 search_start,
-                key,
+                lexer_state,
+                moment,
                 target_token,
                 &mut best_ends,
             );
@@ -650,7 +767,8 @@ fn collect_raw_match_ends<A: Automaton, R>(
         tokens,
         haystack,
         search_start,
-        key,
+        lexer_state,
+        moment,
         target_token,
         &mut best_ends,
     );
@@ -658,7 +776,7 @@ fn collect_raw_match_ends<A: Automaton, R>(
     best_ends
 }
 
-fn record_match_ends<A: Automaton, R>(
+fn record_match_ends<A: Automaton, R: LexerRoot>(
     dfa: &A,
     token_index_by_pattern: &[usize],
     dfa_state: regex_automata::util::primitives::StateID,
@@ -666,7 +784,8 @@ fn record_match_ends<A: Automaton, R>(
     tokens: &[crate::component::lex::ResolvedToken<R>],
     haystack: &[u8],
     search_start: usize,
-    key: Option<&str>,
+    lexer_state: &LexerState<R>,
+    moment: LexMoment,
     target_token: Option<usize>,
     best_ends: &mut [Vec<usize>],
 ) {
@@ -687,7 +806,18 @@ fn record_match_ends<A: Automaton, R>(
             let Ok(lexeme) = std::str::from_utf8(&haystack[search_start..match_end]) else {
                 continue;
             };
-            if !when(lexeme, key) {
+            let current_slots = match lexer_state.current_slots() {
+                Ok(slots) => slots,
+                Err(_) => continue,
+            };
+            let when_cx = WhenCx::new(
+                lexeme,
+                moment,
+                lexer_state.depth(),
+                current_slots,
+                lexer_state.parent_slots(),
+            );
+            if !when(&when_cx) {
                 continue;
             }
         }

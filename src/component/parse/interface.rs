@@ -113,10 +113,7 @@ where
 
         let mut span: Option<Span> = None;
         for entry in entries {
-            let next = match ctx
-                .call(Lexer::<Root, Self>::span_of_token, entry)
-                .await
-            {
+            let next = match ctx.call(Lexer::<Root, Self>::span_of_token, entry).await {
                 Ok(span) => span,
                 Err(_) => {
                     return CallOutcome::fail(super::ParseError::Build(

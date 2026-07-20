@@ -161,7 +161,7 @@ impl SessionContext<'_> {
         column.retain_accepted(best);
     }
 
-    fn reduce_cached(
+    pub(super) fn reduce_cached(
         &mut self,
         production: u32,
         children: &[ProductId],
@@ -357,6 +357,8 @@ impl SessionContext<'_> {
                     }
                 } else {
                     if !self.state.token_products.contains_key(&token.column) {
+                        // One source token can shift through multiple GSS paths;
+                        // every path must share its single token product.
                         let mut cx = self.build_cx();
                         let product = cx.alloc_token(
                             token.length,

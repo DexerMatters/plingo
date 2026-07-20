@@ -12,8 +12,7 @@ use super::{GenerateError, LexErrorInfo, LexInterrupt, LexerRoot, WhenCx, WithCx
 pub type BuildToken<Root> = Arc<dyn Fn(&str) -> Result<Root, LexInterrupt> + Send + Sync>;
 pub type BuildErrorToken<Root> =
     Arc<dyn Fn(LexErrorInfo) -> Result<Root, LexInterrupt> + Send + Sync>;
-pub type WhenGuard<Root> =
-    Arc<dyn for<'a> Fn(&'a WhenCx<'a, Root>) -> bool + Send + Sync>;
+pub type WhenGuard<Root> = Arc<dyn for<'a> Fn(&'a WhenCx<'a, Root>) -> bool + Send + Sync>;
 pub type RecoverWhen = Arc<dyn for<'a, 'b> Fn(&'a str, Option<&'b str>) -> usize + Send + Sync>;
 pub type WithHook<Root> = Arc<dyn for<'a> Fn(&'a mut WithCx<'a, Root>) + Send + Sync>;
 

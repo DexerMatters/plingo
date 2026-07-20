@@ -25,18 +25,16 @@ pub(super) async fn transition_continuation(
 ) -> ContinuationTransition {
     match continuation.effect {
         ContinuationEffect::Propagate {
-            payload,
+            envelope,
             completion,
         } => {
-            let snapshot = demand
-                .snapshot
-                .unwrap_or_else(|| context.allocate_snapshot());
+            let snapshot = envelope.payload.revision().target;
             let demand = Demand {
                 snapshot: Some(snapshot),
                 ..demand
             };
             ContinuationTransition::Propagate {
-                envelope: DeltaEnvelope { snapshot, payload },
+                envelope,
                 demand,
                 completion,
             }
@@ -251,7 +249,7 @@ pub(super) async fn forward_delta_down_to(
     lower_type: TypeId,
     upper_name: &str,
     context: &Context,
-    delta: DeltaEnvelope,
+    mut delta: DeltaEnvelope,
 ) -> Result<(), DeltaFlowError> {
     let lower_name = context
         .registry
@@ -267,12 +265,19 @@ pub(super) async fn forward_delta_down_to(
         .ok_or_else(|| DeltaFlowError::MissingLowerSender {
             layer: upper_name.to_string(),
         })?;
+    let (completion, received) = oneshot::channel();
+    delta.completion = Some(completion);
     lower_sender
         .send(WorkerMessage::Delta(delta))
         .await
         .map_err(|_| DeltaFlowError::LowerSenderClosed {
             layer: lower_name.to_string(),
-        })
+        })?;
+    received
+        .await
+        .map_err(|_| DeltaFlowError::LowerSenderClosed {
+            layer: lower_name.to_string(),
+        })?
 }
 
 async fn forward_barrier_down_to(

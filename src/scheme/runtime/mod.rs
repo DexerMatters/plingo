@@ -1,9 +1,9 @@
 use std::{
     any::{TypeId, type_name},
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     marker::PhantomData,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -34,6 +34,7 @@ pub(crate) struct LayerRegistry {
     pub(crate) lower_by_upper: HashMap<TypeId, TypeId>,
     pub(crate) layer_names: HashMap<TypeId, &'static str>,
     pub(crate) next_snapshot: AtomicU64,
+    pub(crate) snapshot_parents: Mutex<BTreeMap<u64, u64>>,
     pub(crate) panicked: AtomicBool,
 }
 
@@ -170,6 +171,7 @@ impl Runtime<Sealed> {
             lower_by_upper: self.inner.lower_by_upper.clone(),
             layer_names: self.inner.layer_names.clone(),
             next_snapshot: AtomicU64::new(1),
+            snapshot_parents: Mutex::new(BTreeMap::new()),
             panicked: AtomicBool::new(false),
         });
         self.context = Context {

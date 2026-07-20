@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::scheme::{
     __macro_private,
+    change::{ChangeSet, FlowUnit, Revision},
     context::{Context, SnapshotId},
     error::ActionError,
 };
@@ -20,8 +21,36 @@ pub(crate) enum WorkerMessage {
 }
 
 pub(crate) struct DeltaEnvelope {
-    pub snapshot: SnapshotId,
-    pub payload: Box<dyn Any + Send + Sync>,
+    pub payload: Box<dyn ErasedChanges>,
+    pub completion: Option<oneshot::Sender<Result<(), crate::scheme::error::DeltaFlowError>>>,
+}
+
+impl DeltaEnvelope {
+    pub(crate) fn new(payload: Box<dyn ErasedChanges>) -> Self {
+        Self {
+            payload,
+            completion: None,
+        }
+    }
+}
+
+pub(crate) trait ErasedChanges: Any + Send + Sync {
+    fn revision(&self) -> Revision;
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync>;
+}
+
+impl<Address, Unit> ErasedChanges for ChangeSet<Address, Unit>
+where
+    Address: Send + Sync + 'static,
+    Unit: FlowUnit,
+{
+    fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> {
+        self
+    }
 }
 
 pub(crate) struct Demand {

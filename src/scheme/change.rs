@@ -1,96 +1,116 @@
-use std::{ops::Range, sync::OnceLock};
+use std::{collections::HashSet, fmt, hash::Hash, ops::Range, sync::Arc};
 
-use crate::scheme::layer::NonTopLayer;
+use crate::scheme::{context::SnapshotId, layer::NonTopLayer};
 
-pub trait LayerChange: Send + Sync + 'static {
-    type Address: Send + Sync + 'static;
-    type Unit: Send + Sync + 'static;
+pub trait FlowUnit: Send + Sync + 'static {
+    fn extent(&self) -> usize;
+}
 
-    fn address(&self) -> &Self::Address;
-
-    fn batch(&self) -> &ReplacementBatch<Self::Unit>;
-
-    fn is_changed(&self) -> bool {
-        self.batch().is_changed()
+impl FlowUnit for () {
+    fn extent(&self) -> usize {
+        1
     }
 }
 
-impl LayerChange for () {
-    type Address = ();
-    type Unit = ();
-
-    fn address(&self) -> &Self::Address {
-        self
-    }
-
-    fn batch(&self) -> &ReplacementBatch<Self::Unit> {
-        static BATCH: OnceLock<ReplacementBatch<()>> = OnceLock::new();
-        BATCH.get_or_init(|| ReplacementBatch {
-            old_units: Vec::new(),
-            new_units: Vec::new(),
-            prefix_len: 0,
-            suffix_len: 0,
-            old_changed_range: 0..0,
-            new_changed_range: 0..0,
-        })
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Revision {
+    pub base: SnapshotId,
+    pub target: SnapshotId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplacementBatch<Unit> {
-    pub old_units: Vec<Unit>,
-    pub new_units: Vec<Unit>,
-    pub prefix_len: usize,
-    pub suffix_len: usize,
-    pub old_changed_range: Range<usize>,
-    pub new_changed_range: Range<usize>,
-}
-
-impl<Unit> ReplacementBatch<Unit> {
-    pub fn is_changed(&self) -> bool {
-        self.old_changed_range.start != self.old_changed_range.end
-            || self.new_changed_range.start != self.new_changed_range.end
-    }
+pub struct Splice<Unit> {
+    pub old_range: Range<usize>,
+    pub new_range: Range<usize>,
+    pub removed: Arc<[Unit]>,
+    pub inserted: Arc<[Unit]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplacementChange<Address, Unit> {
+pub struct AddressChange<Address, Unit> {
     pub address: Address,
-    pub batch: ReplacementBatch<Unit>,
+    pub old_extent: usize,
+    pub new_extent: usize,
+    pub splices: Vec<Splice<Unit>>,
 }
 
-impl<Address, Unit> ReplacementChange<Address, Unit> {
-    pub fn new(address: Address, batch: ReplacementBatch<Unit>) -> Self {
-        Self { address, batch }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeSet<Address, Unit> {
+    pub revision: Revision,
+    pub changes: Vec<AddressChange<Address, Unit>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidChangeSet(pub String);
+
+impl fmt::Display for InvalidChangeSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
-impl<Address, Unit> LayerChange for ReplacementChange<Address, Unit>
-where
-    Address: Send + Sync + 'static,
-    Unit: Send + Sync + 'static,
-{
-    type Address = Address;
-    type Unit = Unit;
+impl std::error::Error for InvalidChangeSet {}
 
-    fn address(&self) -> &Self::Address {
-        &self.address
+impl<Address: Eq + Hash, Unit: FlowUnit> ChangeSet<Address, Unit> {
+    pub fn empty(revision: Revision) -> Self {
+        Self {
+            revision,
+            changes: Vec::new(),
+        }
     }
 
-    fn batch(&self) -> &ReplacementBatch<Self::Unit> {
-        &self.batch
+    pub fn validate(&self) -> Result<(), InvalidChangeSet> {
+        if self.revision.target <= self.revision.base {
+            return Err(InvalidChangeSet(
+                "transaction revision does not advance".into(),
+            ));
+        }
+        let mut addresses = HashSet::with_capacity(self.changes.len());
+        for change in &self.changes {
+            if !addresses.insert(&change.address) {
+                return Err(InvalidChangeSet("address appears more than once".into()));
+            }
+            let mut old_end = 0;
+            let mut new_end = 0;
+            for splice in &change.splices {
+                if splice.old_range.start > splice.old_range.end
+                    || splice.new_range.start > splice.new_range.end
+                    || splice.old_range.end > change.old_extent
+                    || splice.new_range.end > change.new_extent
+                {
+                    return Err(InvalidChangeSet("splice range exceeds its extent".into()));
+                }
+                if splice.old_range.is_empty() && splice.new_range.is_empty() {
+                    return Err(InvalidChangeSet("splice is empty".into()));
+                }
+                if splice.old_range.start < old_end || splice.new_range.start < new_end {
+                    return Err(InvalidChangeSet("splices overlap or are not sorted".into()));
+                }
+                if splice.old_range.start - old_end != splice.new_range.start - new_end {
+                    return Err(InvalidChangeSet("unchanged gap extents differ".into()));
+                }
+                let removed = splice.removed.iter().map(FlowUnit::extent).sum::<usize>();
+                let inserted = splice.inserted.iter().map(FlowUnit::extent).sum::<usize>();
+                if removed != splice.old_range.len() || inserted != splice.new_range.len() {
+                    return Err(InvalidChangeSet(
+                        "splice payload extent disagrees with range".into(),
+                    ));
+                }
+                old_end = splice.old_range.end;
+                new_end = splice.new_range.end;
+            }
+            if old_end > change.old_extent
+                || new_end > change.new_extent
+                || change.old_extent - old_end != change.new_extent - new_end
+            {
+                return Err(InvalidChangeSet("unchanged suffix extents differ".into()));
+            }
+            if change.splices.is_empty() {
+                return Err(InvalidChangeSet("address change is empty".into()));
+            }
+        }
+        Ok(())
     }
 }
 
-pub type LayerChanges<L> = Vec<<L as NonTopLayer>::Change>;
-
-pub struct EmittedChanges<L: NonTopLayer> {
-    pub snapshot: crate::scheme::context::SnapshotId,
-    pub changes: LayerChanges<L>,
-}
-
-impl<L: NonTopLayer> EmittedChanges<L> {
-    pub fn new(snapshot: crate::scheme::context::SnapshotId, changes: LayerChanges<L>) -> Self {
-        Self { snapshot, changes }
-    }
-}
+pub type LayerChanges<L> = ChangeSet<<L as NonTopLayer>::Address, <L as NonTopLayer>::Unit>;

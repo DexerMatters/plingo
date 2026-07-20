@@ -10,6 +10,7 @@ use crate::scheme::{
     change::LayerChanges,
     context::Context,
     layer::{FallibleLayer, NonTopLayer, TopLayer},
+    runtime::message::DeltaEnvelope,
 };
 
 pub type LayerCallFuture<'a, L, O> = Pin<Box<dyn Future<Output = CallOutcome<L, O>> + Send + 'a>>;
@@ -55,7 +56,7 @@ pub(crate) struct Continuation {
 
 pub(crate) enum ContinuationEffect {
     Propagate {
-        payload: Box<dyn Any + Send + Sync>,
+        envelope: DeltaEnvelope,
         completion: PropagationCompletion,
     },
     Await(AwaitPlan),
@@ -67,26 +68,22 @@ pub(crate) enum PropagationCompletion {
 }
 
 impl Continuation {
-    fn propagate<Payload>(payload: Payload) -> Self
-    where
-        Payload: Send + Sync + 'static,
-    {
+    fn propagate<L: NonTopLayer>(changes: LayerChanges<L>) -> Self {
         Self {
             effect: ContinuationEffect::Propagate {
-                payload: Box::new(payload),
+                envelope: DeltaEnvelope::new(Box::new(changes)),
                 completion: PropagationCompletion::Retry,
             },
         }
     }
 
-    fn propagate_resolved<Payload, Output>(payload: Payload, output: Output) -> Self
+    fn propagate_resolved<L: NonTopLayer, Output>(changes: LayerChanges<L>, output: Output) -> Self
     where
-        Payload: Send + Sync + 'static,
         Output: Send + Sync + 'static,
     {
         Self {
             effect: ContinuationEffect::Propagate {
-                payload: Box::new(payload),
+                envelope: DeltaEnvelope::new(Box::new(changes)),
                 completion: PropagationCompletion::Resolve(Box::new(output)),
             },
         }
@@ -128,7 +125,9 @@ impl<L: FallibleLayer, O> CallOutcome<L, O> {
 
 impl<L: NonTopLayer, O> CallOutcome<L, O> {
     pub fn update(changes: LayerChanges<L>) -> Self {
-        Self(CallOutcomeKind::Continue(Continuation::propagate(changes)))
+        Self(CallOutcomeKind::Continue(Continuation::propagate::<L>(
+            changes,
+        )))
     }
 
     pub fn expect<Target, Args, Awaited>(
@@ -150,9 +149,8 @@ impl<L: NonTopLayer, O> CallOutcome<L, O> {
 
 impl<L: TopLayer> CallOutcome<L, ()> {
     pub fn emit(changes: LayerChanges<L::Lower>) -> Self {
-        Self(CallOutcomeKind::Continue(Continuation::propagate_resolved(
-            changes,
-            (),
-        )))
+        Self(CallOutcomeKind::Continue(
+            Continuation::propagate_resolved::<L::Lower, _>(changes, ()),
+        ))
     }
 }

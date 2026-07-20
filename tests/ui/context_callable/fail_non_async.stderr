@@ -1,7 +1,7 @@
 error: #[context_callable] requires an inherent async method
-  --> tests/ui/context_callable/fail_non_async.rs:34:9
+  --> tests/ui/context_callable/fail_non_async.rs:35:9
    |
-34 |     pub fn invalid<'a>(
+35 |     pub fn invalid<'a>(
    |         ^^
 
 warning: unused imports: `call::CallOutcome` and `context::Context`

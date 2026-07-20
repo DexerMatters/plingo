@@ -2,10 +2,9 @@ use std::{collections::HashMap, fmt, time::Duration};
 
 use indexmap::IndexSet;
 
-use crate::component::parse::{TokenOccurrenceId, recovery};
+use crate::component::parse::{TokenData, TokenOccurrenceId, recovery};
 use crate::component::parse::{
     build::ActionSet,
-    checkpoint::ColumnCheckpointCache,
     data::{
         ast::{AstArena, TokenEntryId},
         green::{ParseErrorInfo, TreeArena},
@@ -16,9 +15,12 @@ use crate::component::parse::{
     identity::TokenFingerprint,
 };
 
+mod checkpoint;
 mod incremental;
 mod session;
 mod state;
+
+use checkpoint::ColumnCheckpointCache;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ParseToken {
@@ -45,6 +47,7 @@ struct ReductionKey {
 
 #[derive(Debug)]
 pub enum ParseError {
+    MissingSnapshot(crate::scheme::context::SnapshotId),
     MissingGoto { state: usize, non_terminal: u32 },
     NoActiveStacks { column: Option<TokenOccurrenceId> },
     MissingGssNode { node: GssNodeId },
@@ -70,6 +73,7 @@ impl From<recovery::RecoveryError> for ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingSnapshot(snapshot) => write!(f, "snapshot {snapshot} is unavailable"),
             Self::MissingGoto {
                 state,
                 non_terminal,
@@ -130,33 +134,57 @@ pub(crate) struct SessionContext<'a> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReplayPlan {
-    pub batch: crate::component::lex::TokenBatch,
+    pub old_units: Vec<TokenData>,
+    pub new_units: Vec<TokenData>,
+    pub prefix_len: usize,
+    pub suffix_len: usize,
     pub restart_boundary: usize,
     pub old_reuse_start: usize,
     pub new_reuse_start: usize,
 }
 
 impl ReplayPlan {
-    pub(crate) fn from_batch(batch: crate::component::lex::TokenBatch) -> Self {
-        let restart_boundary = batch.prefix_len;
-        let old_reuse_start = batch.old_units.len().saturating_sub(batch.suffix_len);
-        let new_reuse_start = batch.new_units.len().saturating_sub(batch.suffix_len);
+    pub(crate) fn from_change(
+        change: &crate::scheme::change::AddressChange<fluent_uri::Uri<&'static str>, TokenData>,
+        mut old_units: Vec<TokenData>,
+    ) -> Self {
+        if old_units.is_empty() && change.old_extent == 1 {
+            old_units.push(TokenData {
+                id: usize::MAX,
+                terminal: None,
+                start: 0,
+                length: 0,
+                column: usize::MAX,
+                fingerprint: crate::component::parse::identity::eof_fingerprint(),
+            });
+        }
+        debug_assert_eq!(old_units.len(), change.old_extent);
+        let mut new_units = old_units.clone();
+        for splice in change.splices.iter().rev() {
+            new_units.splice(splice.old_range.clone(), splice.inserted.iter().copied());
+        }
+        let prefix_len = change
+            .splices
+            .first()
+            .map_or(change.old_extent, |splice| splice.old_range.start);
+        let old_reuse_start = change
+            .splices
+            .last()
+            .map_or(change.old_extent, |splice| splice.old_range.end);
+        let new_reuse_start = change
+            .splices
+            .last()
+            .map_or(change.new_extent, |splice| splice.new_range.end);
+        let suffix_len = change.old_extent.saturating_sub(old_reuse_start);
+        let restart_boundary = prefix_len;
         Self {
-            batch,
+            old_units,
+            new_units,
+            prefix_len,
+            suffix_len,
             restart_boundary,
             old_reuse_start,
             new_reuse_start,
         }
-    }
-
-    pub(crate) fn replay_tokens(&self) -> &[super::TokenData] {
-        &self.batch.new_units[self.restart_boundary.min(self.batch.new_units.len())..]
-    }
-
-    pub(crate) fn translated_old_boundary(&self, current_new_boundary: usize) -> Option<usize> {
-        if current_new_boundary < self.new_reuse_start {
-            return None;
-        }
-        Some(self.old_reuse_start + (current_new_boundary - self.new_reuse_start))
     }
 }

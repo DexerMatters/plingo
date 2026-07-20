@@ -4,8 +4,8 @@ use crate::{
         debug::DebugSink,
         lex::{LexErrorInfo, Lexer},
         parse::{
-            AstToken, ParseChange, ParseErrorInfo, ParsePath, Parser, data::ast::AstBox,
-            grammar::Grammar,
+            AstToken, ParseAddress, ParseChange, ParseChanges, ParseErrorInfo, ParsePath,
+            ParseUnit, Parser, data::ast::AstBox, grammar::Grammar,
         },
         source::{Source, SourceEdit},
     },
@@ -123,7 +123,7 @@ enum JsonElements {
     Error(#[from(0)] ParseErrorInfo),
 }
 
-type JsonSink = DebugSink<ParseChange>;
+type JsonSink = DebugSink<ParseAddress, ParseUnit>;
 type Jp = Parser<JsonToken, JsonSink>;
 
 macro_rules! deref {
@@ -385,10 +385,10 @@ async fn json_runtime_parse_output() -> anyhow::Result<()> {
     let (sender, receiver) = mpsc::channel(256);
 
     let debug_sink = debug_sink!(|ctx, deltas| async move {
-        let _: &Vec<ParseChange> = &deltas;
+        let _: &ParseChanges = &deltas;
         cprintln!("<dim>---------Received---------</dim>");
 
-        let Some(first) = deltas.first() else {
+        let Some(first) = deltas.changes.first() else {
             return Ok(());
         };
         let uri = first.address.uri;
@@ -409,16 +409,16 @@ async fn json_runtime_parse_output() -> anyhow::Result<()> {
                 print_parse_error("", &info);
             }
         }
-        for change in &deltas {
+        for change in &deltas.changes {
             let key = ParsePath {
                 uri: change.address.uri,
                 path: change.address.parent_path.clone(),
                 range: RangeOrPoint::from_range(
-                    change.batch.old_changed_range.start,
-                    change.batch.old_changed_range.end,
+                    change.splices[0].old_range.start,
+                    change.splices[0].old_range.end,
                 ),
             };
-            if !change.batch.old_units.is_empty() {
+            if !change.splices[0].removed.is_empty() {
                 let prev = ctx.last_snapshot();
                 let mut names = Vec::new();
                 if let Ok(pids) = prev.call(Jp::get_node, key.clone()).await {
@@ -437,13 +437,13 @@ async fn json_runtime_parse_output() -> anyhow::Result<()> {
                 };
                 cprintln!("<red>Deleted {key}{desc}</red>");
             }
-            if !change.batch.new_units.is_empty() {
+            if !change.splices[0].inserted.is_empty() {
                 cprintln!(
                     "<green>Inserted: +{} root(s) at {key}</green>",
-                    change.batch.new_units.len()
+                    change.splices[0].inserted.len()
                 );
                 let mut names = Vec::new();
-                for unit in &change.batch.new_units {
+                for unit in change.splices[0].inserted.iter() {
                     if let Ok(desc) = ctx
                         .call(Jp::describe_product, (key.uri, unit.product))
                         .await
@@ -458,7 +458,7 @@ async fn json_runtime_parse_output() -> anyhow::Result<()> {
                 };
                 cprintln!(
                     "<green>  + {} subtree(s) at {key}{desc}</green>",
-                    change.batch.new_units.len(),
+                    change.splices[0].inserted.len(),
                 );
             }
         }
@@ -491,21 +491,21 @@ async fn json_runtime_four_member_object_is_accepted() -> anyhow::Result<()> {
 }
 
 async fn recv_non_empty_parse_batch(
-    rx: &mut mpsc::Receiver<Vec<ParseChange>>,
+    rx: &mut mpsc::Receiver<ParseChanges>,
 ) -> anyhow::Result<Vec<ParseChange>> {
     let batch = timeout(Duration::from_secs(2), rx.recv())
         .await?
         .ok_or_else(|| anyhow::anyhow!("parse sink channel closed"))?;
-    Ok(batch)
+    Ok(batch.changes)
 }
 
 async fn recv_parse_batches_until_quiet(
-    rx: &mut mpsc::Receiver<Vec<ParseChange>>,
+    rx: &mut mpsc::Receiver<ParseChanges>,
 ) -> anyhow::Result<Vec<Vec<ParseChange>>> {
     let mut batches = vec![recv_non_empty_parse_batch(rx).await?];
     loop {
         match timeout(Duration::from_millis(500), rx.recv()).await {
-            Ok(Some(batch)) => batches.push(batch),
+            Ok(Some(batch)) => batches.push(batch.changes),
             Ok(None) | Err(_) => break,
         }
     }
@@ -743,6 +743,20 @@ async fn parser_layer_can_return_on_demand_spans_for_ast_handles() -> anyhow::Re
         Span::new_uri(uri, 7, 11)?
     );
 
+    source_tx.try_send(SourceEdit::Delete {
+        key: Span::new_uri(uri, 8, 10)?,
+    })?;
+    source_tx.try_send(SourceEdit::Insert {
+        key: Span::new_uri(uri, 8, 8)?,
+        value: "bc".to_string(),
+    })?;
+    assert!(recv_non_empty_parse_batch(&mut sink_rx).await?.is_empty());
+    assert_eq!(
+        ctx.call(Jp::span_of_ast_token::<JsonToken>, shifted_key)
+            .await?,
+        Span::new_uri(uri, 7, 11)?
+    );
+
     runtime.shutdown().await;
     Ok(())
 }
@@ -929,9 +943,11 @@ async fn json_incremental_runtime_emits_deltas_for_conv_cases() -> anyhow::Resul
     )
     .await?;
     assert_eq!(string_len[1].len(), 1);
-    assert_eq!(string_len[1][0].batch.old_units.len(), 1);
-    assert_eq!(string_len[1][0].batch.new_units.len(), 1);
-    assert!(string_len_stats[0].converged);
+    assert_eq!(string_len[1][0].splices[0].removed.len(), 1);
+    assert_eq!(string_len[1][0].splices[0].inserted.len(), 1);
+    assert!(string_len_stats[0].frontier_converged);
+    assert!(string_len_stats[0].reconverged_new_boundary.is_some());
+    assert!(string_len_stats[0].reused > 0);
 
     let (string_shorten, string_shorten_stats) = run_json_incremental_case(
         r#"{"he":"101"}"#,
@@ -941,9 +957,11 @@ async fn json_incremental_runtime_emits_deltas_for_conv_cases() -> anyhow::Resul
     )
     .await?;
     assert_eq!(string_shorten[1].len(), 1);
-    assert_eq!(string_shorten[1][0].batch.old_units.len(), 1);
-    assert_eq!(string_shorten[1][0].batch.new_units.len(), 1);
-    assert!(string_shorten_stats[0].converged);
+    assert_eq!(string_shorten[1][0].splices[0].removed.len(), 1);
+    assert_eq!(string_shorten[1][0].splices[0].inserted.len(), 1);
+    assert!(string_shorten_stats[0].frontier_converged);
+    assert!(string_shorten_stats[0].reconverged_new_boundary.is_some());
+    assert!(string_shorten_stats[0].reused > 0);
 
     let (repeated_child, repeated_child_stats) = run_json_incremental_case(
         r#"[1,1,1]"#,
@@ -981,9 +999,29 @@ async fn json_runtime_name_change_emits_one_replacement_batch() -> anyhow::Resul
     .await?;
 
     assert_eq!(batches[1].len(), 1);
-    assert_eq!(batches[1][0].batch.old_units.len(), 1);
-    assert_eq!(batches[1][0].batch.new_units.len(), 1);
-    assert!(stats[0].converged);
+    assert_eq!(batches[1][0].splices[0].removed.len(), 1);
+    assert_eq!(batches[1][0].splices[0].inserted.len(), 1);
+    assert!(stats[0].frontier_converged);
+    Ok(())
+}
+
+#[tokio::test]
+async fn json_string_edit_rebases_long_suffix() -> anyhow::Result<()> {
+    let source = include_str!("../../test_data/test.txt");
+    let uri = Span::new("test://json-incremental", 0, 0)?.uri;
+    let insert_at = source.find("Main St").expect("fixture address") + 4;
+    let (_, stats) = run_json_incremental_case(
+        source,
+        vec![SourceEdit::Insert {
+            key: Span::new_uri(uri, insert_at, insert_at)?,
+            value: "X".to_string(),
+        }],
+    )
+    .await?;
+
+    assert_eq!(stats[0].reparsed, 1);
+    assert!(stats[0].reused > 20);
+    assert!(stats[0].reconverged_new_boundary.is_some());
     Ok(())
 }
 
@@ -1006,6 +1044,32 @@ async fn json_runtime_whitespace_only_edit_is_ignored() -> anyhow::Result<()> {
         batches[1].is_empty(),
         "whitespace-only edit should not emit parse deltas"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn json_edit_after_skipped_whitespace_reuses_suffix() -> anyhow::Result<()> {
+    let source = r#"{"a":1,"b":"two","c":3,"d":4}"#;
+    let whitespace_at = source.find(",\"b\"").unwrap() + 1;
+    let string_at = source.find("two").unwrap() + 1;
+    let uri = Span::new("test://json-incremental", 0, 0)?.uri;
+    let (_, stats) = run_json_incremental_case(
+        source,
+        vec![
+            SourceEdit::Insert {
+                key: Span::new_uri(uri, whitespace_at, whitespace_at)?,
+                value: " ".to_string(),
+            },
+            SourceEdit::Insert {
+                key: Span::new_uri(uri, string_at + 1, string_at + 1)?,
+                value: "X".to_string(),
+            },
+        ],
+    )
+    .await?;
+
+    assert_eq!(stats[1].reparsed, 1);
+    assert!(stats[1].reused > 4);
     Ok(())
 }
 

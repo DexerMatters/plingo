@@ -42,12 +42,9 @@ pub fn expand_generate(input: TokenStream) -> TokenStream {
     variant_path.segments.pop_punct();
 
     if variant_path.segments.is_empty() {
-        return syn::Error::new_spanned(
-            &variant_path,
-            "generate! requires `EnumPath::Variant`",
-        )
-        .to_compile_error()
-        .into();
+        return syn::Error::new_spanned(&variant_path, "generate! requires `EnumPath::Variant`")
+            .to_compile_error()
+            .into();
     }
 
     let variant_ident: Ident = variant_segment.into_value().ident;

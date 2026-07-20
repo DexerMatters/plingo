@@ -4,14 +4,32 @@
   "email": "jane.doe@example.com",
   "isActive": true,
   "roles": ["Admin", "Editor"],
+  "roles": ["Admin", "Editor"],
   "address": {
-    "street": "123 Main St",
+    "street": "13 Main St",
     "city": "Metropolis",
     "zipCode": "10001"
   },
   "hobbies": ["Reading", "Traveling", "Cooking"],
   "preferences": {
-    "theme": "dark",
-    "notifications": null
-  }
+    "theme": "daek",
+    "notifications": null,
+    "heelo":12
+  },
+  "preferences": {
+    "theme": "daek",
+    "notifications": null,
+    "heelo":12
+  },
+  "preferences": {
+    "theme": "daek",
+    "notifications": null,
+    "heelo":12
+  },
+  "preferences": {
+    "theme": "daek",
+    "notifications": null,
+    "heelo":12
+  },
+  "roles": ["Admin", "Editor"]
 }

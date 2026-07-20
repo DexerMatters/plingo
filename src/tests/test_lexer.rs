@@ -100,16 +100,3 @@ fn test_lexer() {
         println!("{}", token.pretty(&lexer));
     }
 }
-
-#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
-enum Tokens2 {
-    #[regex(r#"\d+"#)]
-    Number(usize),
-    #[regex(r#"[a-zA-Z_]\w*"#)]
-    Identifier(String),
-    #[error]
-    Error(LexErrorInfo),
-    #[regex(r#"\s+"#)]
-    #[skip]
-    Whitespace,
-}

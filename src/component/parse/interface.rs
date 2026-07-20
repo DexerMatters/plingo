@@ -1,4 +1,4 @@
-use std::{any::TypeId, collections::HashSet};
+use std::any::TypeId;
 
 use fluent_uri::Uri;
 
@@ -6,27 +6,25 @@ use crate::{
     component::{
         lex::{Lexer, LexerRoot},
         parse::{
-            AstToken, IncrementalParseStats, ParseChange, ParsePath, Parser, ParserSessionState,
+            AstToken, IncrementalParseStats, ParseAddress, ParsePath, ParseUnit, Parser,
             data::{
                 ast::AstBox,
-                green::{ParseErrorInfo, TreeData},
+                green::ParseErrorInfo,
                 product::{ProductData, ProductId},
             },
+            diagnostics::collect_parse_diagnostics,
+            types::SessionArenas,
         },
     },
     context_callable,
-    scheme::{
-        call::CallOutcome,
-        context::Context,
-        layer::{NonTopLayer, SnapshotLayer},
-    },
+    scheme::{call::CallOutcome, context::Context, layer::NonTopLayer},
     utils::Span,
 };
 
 impl<Root, Lower> Parser<Root, Lower>
 where
     Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<Change = ParseChange> + Send + Sync + 'static,
+    Lower: NonTopLayer<Address = ParseAddress, Unit = ParseUnit> + Send + Sync + 'static,
 {
     #[context_callable]
     pub async fn get_node<'a>(
@@ -34,19 +32,24 @@ where
         ctx: &'a Context,
         path: &'a ParsePath,
     ) -> CallOutcome<Self, Vec<ProductId>> {
-        let state = self.state(ctx.snapshot()).unwrap_or(self.latest_state());
-        CallOutcome::ok(self.products_at_path(state, path))
+        match self.snapshot_state(ctx.snapshot()) {
+            Ok(state) => CallOutcome::ok(self.products_at_path(state, path)),
+            Err(err) => CallOutcome::fail(err),
+        }
     }
 
     #[context_callable]
     pub async fn deref_ast_box<'a, T>(
         &'a mut self,
-        _ctx: &'a Context,
+        ctx: &'a Context,
         ast_box: &'a AstBox<T>,
     ) -> CallOutcome<Self, T>
     where
         T: Clone + Send + Sync + 'static,
     {
+        if let Err(err) = self.snapshot_state(ctx.snapshot()) {
+            return CallOutcome::fail(err);
+        }
         let Some(arenas) = self.session_arenas.get(&ast_box.uri) else {
             return CallOutcome::fail(super::ParseError::Build(
                 super::grammar::BuildError::MissingProduct(0),
@@ -69,7 +72,9 @@ where
     where
         T: Clone + Send + Sync + 'static,
     {
-        let _ = self;
+        if let Err(err) = self.snapshot_state(ctx.snapshot()) {
+            return CallOutcome::fail(err);
+        }
         let id = token.id;
         match ctx.call(Lexer::<Root, Self>::token_by_id::<T>, id).await {
             Ok(value) => CallOutcome::ok(value),
@@ -88,6 +93,9 @@ where
     where
         T: Send + Sync + 'static,
     {
+        if let Err(err) = self.snapshot_state(ctx.snapshot()) {
+            return CallOutcome::fail(err);
+        }
         let Some(arenas) = self.session_arenas.get(&ast_box.uri) else {
             return CallOutcome::fail(super::ParseError::Build(
                 super::grammar::BuildError::MissingAst(ast_box.id),
@@ -163,8 +171,10 @@ where
     where
         T: Send + Sync + 'static,
     {
-        let state = self.state(ctx.snapshot()).unwrap_or(self.latest_state());
-        CallOutcome::ok(self.ast_boxes_at_path::<T>(state, path))
+        match self.snapshot_state(ctx.snapshot()) {
+            Ok(state) => CallOutcome::ok(self.ast_boxes_at_path::<T>(state, path)),
+            Err(err) => CallOutcome::fail(err),
+        }
     }
 
     #[context_callable]
@@ -176,8 +186,10 @@ where
     where
         T: Send + Sync + 'static,
     {
-        let state = self.state(ctx.snapshot()).unwrap_or(self.latest_state());
-        CallOutcome::ok(self.ast_tokens_at_path::<T>(state, path))
+        match self.snapshot_state(ctx.snapshot()) {
+            Ok(state) => CallOutcome::ok(self.ast_tokens_at_path::<T>(state, path)),
+            Err(err) => CallOutcome::fail(err),
+        }
     }
 
     #[context_callable]
@@ -189,7 +201,10 @@ where
     where
         T: Send + Sync + 'static,
     {
-        let state = self.state(ctx.snapshot()).unwrap_or(self.latest_state());
+        let state = match self.snapshot_state(ctx.snapshot()) {
+            Ok(state) => state,
+            Err(err) => return CallOutcome::fail(err),
+        };
         let Some(roots) = state.roots.get(uri) else {
             return CallOutcome::ok(Vec::new());
         };
@@ -213,9 +228,12 @@ where
     #[context_callable]
     pub async fn describe_product<'a>(
         &'a mut self,
-        _ctx: &'a Context,
+        ctx: &'a Context,
         product: &'a (Uri<&'static str>, ProductId),
     ) -> CallOutcome<Self, String> {
+        if let Err(err) = self.snapshot_state(ctx.snapshot()) {
+            return CallOutcome::fail(err);
+        }
         let Some(arenas) = self.session_arenas.get(&product.0) else {
             return CallOutcome::ok("(missing)".to_string());
         };
@@ -248,10 +266,13 @@ where
     #[context_callable]
     pub async fn incremental_stats_for<'a>(
         &'a mut self,
-        _ctx: &'a Context,
+        ctx: &'a Context,
         uri: &'a Uri<&'static str>,
     ) -> CallOutcome<Self, Option<IncrementalParseStats>> {
-        CallOutcome::ok(self.incremental_stats(*uri))
+        match self.snapshot_state(ctx.snapshot()) {
+            Ok(state) => CallOutcome::ok(state.incremental_stats.get(uri).copied()),
+            Err(err) => CallOutcome::fail(err),
+        }
     }
 
     #[context_callable]
@@ -260,18 +281,25 @@ where
         ctx: &'a Context,
         uri: &'a Uri<&'static str>,
     ) -> CallOutcome<Self, Vec<ParseErrorInfo>> {
-        let state = self.state(ctx.snapshot()).unwrap_or(self.latest_state());
+        let state = match self.snapshot_state(ctx.snapshot()) {
+            Ok(state) => state,
+            Err(err) => return CallOutcome::fail(err),
+        };
         let Some(session) = state.sessions.get(uri) else {
             return CallOutcome::ok(Vec::new());
         };
-        let roots = state.roots.get(uri).map(Vec::as_slice).unwrap_or(&[]);
+        let roots = state
+            .roots
+            .get(uri)
+            .map(|roots| roots.as_slice())
+            .unwrap_or(&[]);
         let diagnostics = collect_parse_diagnostics(session, self.session_arenas.get(uri), roots);
         CallOutcome::ok(diagnostics)
     }
 
     fn collect_product_token_entries(
         &self,
-        arenas: &super::SessionArenas,
+        arenas: &SessionArenas,
         product_id: ProductId,
         entries: &mut Vec<usize>,
     ) -> Result<(), super::grammar::BuildError> {
@@ -292,7 +320,7 @@ where
     fn product_fallback_span(
         &self,
         uri: Uri<&'static str>,
-        arenas: &super::SessionArenas,
+        arenas: &SessionArenas,
         product_id: ProductId,
     ) -> Result<Span, super::grammar::BuildError> {
         let product = arenas
@@ -305,96 +333,5 @@ where
             .map_or(0, |tree| tree.length);
         Span::new_uri(uri, 0, length)
             .map_err(|_| super::grammar::BuildError::MissingProduct(product_id))
-    }
-}
-
-pub(crate) fn collect_parse_diagnostics(
-    state: &ParserSessionState,
-    arenas: Option<&super::SessionArenas>,
-    roots: &[ProductId],
-) -> Vec<ParseErrorInfo> {
-    let mut diagnostics = Vec::new();
-    let mut seen_diagnostics = HashSet::new();
-
-    for info in &state.diagnostics {
-        if seen_diagnostics.insert(info.clone()) {
-            diagnostics.push(info.clone());
-        }
-    }
-
-    let Some(arenas) = arenas else {
-        return diagnostics;
-    };
-
-    let mut seen_products = HashSet::new();
-    for &pid in roots {
-        collect_ast_parse_diagnostics(
-            pid,
-            arenas,
-            &mut seen_products,
-            &mut seen_diagnostics,
-            &mut diagnostics,
-        );
-    }
-
-    diagnostics
-}
-
-fn collect_ast_parse_diagnostics(
-    product_id: ProductId,
-    arenas: &super::SessionArenas,
-    seen_products: &mut HashSet<ProductId>,
-    seen_diagnostics: &mut HashSet<ParseErrorInfo>,
-    diagnostics: &mut Vec<ParseErrorInfo>,
-) {
-    if !seen_products.insert(product_id) {
-        return;
-    }
-    let Some(product) = arenas.products.get(product_id) else {
-        return;
-    };
-
-    match &product.data {
-        ProductData::Error { .. } => {
-            let Some(tree) = arenas.trees.get(product.green) else {
-                return;
-            };
-            let TreeData::Error {
-                kind,
-                node,
-                unexpected,
-                expected,
-                recovered,
-                location,
-                ..
-            } = &tree.data
-            else {
-                return;
-            };
-            let info = ParseErrorInfo {
-                kind: kind.clone(),
-                node: *node,
-                length: tree.length,
-                unexpected: *unexpected,
-                expected: *expected,
-                recovered: *recovered,
-                location: *location,
-            };
-            if seen_diagnostics.insert(info.clone()) {
-                diagnostics.push(info);
-            }
-        }
-        ProductData::Node { children, .. } => {
-            for child in children.iter().copied() {
-                collect_ast_parse_diagnostics(
-                    child,
-                    arenas,
-                    seen_products,
-                    seen_diagnostics,
-                    diagnostics,
-                );
-            }
-        }
-        ProductData::Token { .. } => {}
     }
 }

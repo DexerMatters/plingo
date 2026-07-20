@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 
 use crate::scheme::{
     call::Continuation,
-    change::{EmittedChanges, LayerChanges},
+    change::LayerChanges,
     context::Context,
     error::{ActionError, DeltaFlowError},
     layer::{BottomLayer, FallibleLayer, MiddleLayer, NonTopLayer, TopLayer},
@@ -37,8 +37,9 @@ where
     T: TopLayer,
 {
     tokio::spawn(async move {
+        layer.initialize_snapshots();
         enum TopEvent<TLower: NonTopLayer, TError> {
-            Emit(Result<Option<EmittedChanges<TLower>>, TError>),
+            Emit(Result<Option<LayerChanges<TLower>>, TError>),
             Message(Option<WorkerMessage>),
         }
 
@@ -63,7 +64,7 @@ where
                 break;
             }
 
-            let event = {
+            let event: TopEvent<T::Lower, T::Error> = {
                 let emit_ctx = context.with_current_layer(layer_type);
                 let next_emit = layer.emit(&emit_ctx);
                 tokio::pin!(next_emit);
@@ -76,17 +77,21 @@ where
 
             match event {
                 TopEvent::Emit(Ok(Some(emitted))) => {
+                    if let Err(err) = emitted.validate() {
+                        layer.rollback_transaction(emitted.revision);
+                        eprintln!("invalid top-layer transaction from {layer_name}: {err}");
+                        continue;
+                    }
+                    let revision = emitted.revision;
                     if let Err(err) = forward_delta_down(
                         layer_type,
                         layer_name,
                         &context,
-                        DeltaEnvelope {
-                            snapshot: emitted.snapshot,
-                            payload: Box::new(emitted.changes),
-                        },
+                        DeltaEnvelope::new(Box::new(emitted)),
                     )
                     .await
                     {
+                        layer.rollback_transaction(revision);
                         eprintln!("{err}");
                     }
                 }
@@ -148,9 +153,11 @@ async fn handle_any_message_top<T>(
                         demand,
                         completion,
                     } => {
+                        let revision = envelope.payload.revision();
                         if let Err(err) =
                             forward_delta_down(layer_type, layer_name, context, envelope).await
                         {
+                            layer.rollback_transaction(revision);
                             eprintln!("{err}");
                             let _ = demand.response_tx.send(Err(ActionError::ErrorFromLayer {
                                 action: demand.action_name.to_string(),
@@ -178,12 +185,15 @@ async fn handle_any_message_top<T>(
     }
 }
 
-fn downcast_layer_changes<L>(layer_name: &'static str, delta: DeltaEnvelope) -> LayerChanges<L>
+fn downcast_layer_changes<L>(
+    layer_name: &'static str,
+    payload: Box<dyn crate::scheme::runtime::message::ErasedChanges>,
+) -> LayerChanges<L>
 where
     L: NonTopLayer,
 {
-    delta
-        .payload
+    payload
+        .into_any()
         .downcast::<LayerChanges<L>>()
         .map(|typed| *typed)
         .unwrap_or_else(|_| {
@@ -206,6 +216,8 @@ where
     M: MiddleLayer,
 {
     tokio::spawn(async move {
+        layer.initialize_snapshots();
+        let mut revision = 0;
         while let Some(message) = receiver.recv().await {
             match message {
                 WorkerMessage::Demand(demand) => {
@@ -234,7 +246,12 @@ where
                                 completion,
                             } => {
                                 if let Err(err) = apply_middle_delta::<M>(
-                                    layer_type, layer_name, &context, &mut layer, envelope,
+                                    layer_type,
+                                    layer_name,
+                                    &context,
+                                    &mut layer,
+                                    &mut revision,
+                                    envelope.payload,
                                 )
                                 .await
                                 {
@@ -253,12 +270,21 @@ where
                     }
                 }
                 WorkerMessage::Delta(delta_box) => {
+                    let completion = delta_box.completion;
                     if let Err(err) = apply_middle_delta::<M>(
-                        layer_type, layer_name, &context, &mut layer, delta_box,
+                        layer_type,
+                        layer_name,
+                        &context,
+                        &mut layer,
+                        &mut revision,
+                        delta_box.payload,
                     )
                     .await
                     {
                         eprintln!("{err}");
+                        let _ = completion.map(|completion| completion.send(Err(err)));
+                    } else if let Some(completion) = completion {
+                        let _ = completion.send(Ok(()));
                     }
                 }
                 WorkerMessage::Barrier(barrier) => {
@@ -274,45 +300,79 @@ async fn apply_middle_delta<M>(
     layer_name: &'static str,
     context: &Context,
     layer: &mut M,
-    delta: DeltaEnvelope,
+    current_revision: &mut u64,
+    payload: Box<dyn crate::scheme::runtime::message::ErasedChanges>,
 ) -> Result<(), DeltaFlowError>
 where
     M: MiddleLayer,
 {
-    let snapshot = delta.snapshot;
-    let typed = downcast_layer_changes::<M>(layer_name, delta);
+    let input_revision = payload.revision();
+    if input_revision.base != *current_revision {
+        return Err(DeltaFlowError::RevisionMismatch {
+            layer: layer_name.to_string(),
+            expected: *current_revision,
+            base: input_revision.base,
+            target: input_revision.target,
+        });
+    }
+    let typed = downcast_layer_changes::<M>(layer_name, payload);
+    typed
+        .validate()
+        .map_err(|err| DeltaFlowError::InvalidTransaction {
+            layer: layer_name.to_string(),
+            reason: err.to_string(),
+        })?;
     let delta_ctx = context
-        .with_snapshot(Some(snapshot))
+        // A pass prepares target state from its committed base; target is not visible yet.
+        .with_snapshot(Some(input_revision.base))
         .with_current_layer(layer_type);
 
-    let out =
-        layer
-            .pass(&delta_ctx, typed)
-            .await
-            .map_err(|err| DeltaFlowError::MiddlePassFailed {
+    let out = match layer.pass(&delta_ctx, typed).await {
+        Ok(out) => out,
+        Err(err) => {
+            layer.rollback_state(input_revision);
+            return Err(DeltaFlowError::MiddlePassFailed {
                 layer: layer_name.to_string(),
                 reason: err.to_string(),
-            })?;
-
-    let lower_type = context
-        .registry
-        .lower_by_upper
-        .get(&layer_type)
-        .copied()
-        .ok_or_else(|| DeltaFlowError::MissingLowerSender {
+            });
+        }
+    };
+    if out.revision != input_revision {
+        layer.rollback_state(input_revision);
+        return Err(DeltaFlowError::RevisionChanged {
             layer: layer_name.to_string(),
-        })?;
+        });
+    }
+    if let Err(err) = out.validate() {
+        layer.rollback_state(input_revision);
+        return Err(DeltaFlowError::InvalidTransaction {
+            layer: layer_name.to_string(),
+            reason: err.to_string(),
+        });
+    }
+    let lower_type = match context.registry.lower_by_upper.get(&layer_type).copied() {
+        Some(lower_type) => lower_type,
+        None => {
+            layer.rollback_state(input_revision);
+            return Err(DeltaFlowError::MissingLowerSender {
+                layer: layer_name.to_string(),
+            });
+        }
+    };
 
-    forward_delta_down_to(
+    if let Err(err) = forward_delta_down_to(
         lower_type,
         layer_name,
         context,
-        DeltaEnvelope {
-            snapshot,
-            payload: Box::new(out),
-        },
+        DeltaEnvelope::new(Box::new(out)),
     )
-    .await?;
+    .await
+    {
+        layer.rollback_state(input_revision);
+        return Err(err);
+    }
+
+    *current_revision = input_revision.target;
 
     Ok(())
 }
@@ -328,6 +388,7 @@ where
     B: BottomLayer,
 {
     tokio::spawn(async move {
+        let mut revision = 0;
         while let Some(message) = receiver.recv().await {
             match message {
                 WorkerMessage::Demand(demand) => {
@@ -355,10 +416,33 @@ where
                                 demand,
                                 completion,
                             } => {
-                                let snapshot = envelope.snapshot;
-                                let typed = downcast_layer_changes::<B>(layer_name, envelope);
+                                let incoming = envelope.payload.revision();
+                                if incoming.base != revision {
+                                    eprintln!(
+                                        "{}",
+                                        DeltaFlowError::RevisionMismatch {
+                                            layer: layer_name.to_string(),
+                                            expected: revision,
+                                            base: incoming.base,
+                                            target: incoming.target,
+                                        }
+                                    );
+                                    continue;
+                                }
+                                let typed =
+                                    downcast_layer_changes::<B>(layer_name, envelope.payload);
+                                if let Err(err) = typed.validate() {
+                                    eprintln!(
+                                        "{}",
+                                        DeltaFlowError::InvalidTransaction {
+                                            layer: layer_name.to_string(),
+                                            reason: err.to_string(),
+                                        }
+                                    );
+                                    continue;
+                                }
                                 let delta_ctx = context
-                                    .with_snapshot(Some(snapshot))
+                                    .with_snapshot(Some(incoming.target))
                                     .with_current_layer(TypeId::of::<B>());
                                 if let Err(err) = layer.consume(&delta_ctx, typed).await {
                                     eprintln!(
@@ -376,25 +460,54 @@ where
                                         }));
                                     continue;
                                 }
+                                revision = incoming.target;
                                 complete_propagated_demand(&context, demand, completion).await;
                             }
                         },
                     }
                 }
                 WorkerMessage::Delta(delta_box) => {
-                    let snapshot = delta_box.snapshot;
-                    let typed = downcast_layer_changes::<B>(layer_name, delta_box);
+                    let DeltaEnvelope {
+                        payload,
+                        completion,
+                    } = delta_box;
+                    let incoming = payload.revision();
+                    if incoming.base != revision {
+                        let err = DeltaFlowError::RevisionMismatch {
+                            layer: layer_name.to_string(),
+                            expected: revision,
+                            base: incoming.base,
+                            target: incoming.target,
+                        };
+                        eprintln!("{err}");
+                        let _ = completion.map(|completion| completion.send(Err(err)));
+                        continue;
+                    }
+                    let typed = downcast_layer_changes::<B>(layer_name, payload);
+                    if let Err(err) = typed.validate() {
+                        let err = DeltaFlowError::InvalidTransaction {
+                            layer: layer_name.to_string(),
+                            reason: err.to_string(),
+                        };
+                        eprintln!("{err}");
+                        let _ = completion.map(|completion| completion.send(Err(err)));
+                        continue;
+                    }
                     let delta_ctx = context
-                        .with_snapshot(Some(snapshot))
+                        .with_snapshot(Some(incoming.target))
                         .with_current_layer(TypeId::of::<B>());
                     if let Err(err) = layer.consume(&delta_ctx, typed).await {
-                        eprintln!(
-                            "{}",
-                            DeltaFlowError::BottomConsumeFailed {
-                                layer: layer_name.to_string(),
-                                reason: err.to_string(),
-                            }
-                        );
+                        let err = DeltaFlowError::BottomConsumeFailed {
+                            layer: layer_name.to_string(),
+                            reason: err.to_string(),
+                        };
+                        eprintln!("{err}");
+                        let _ = completion.map(|completion| completion.send(Err(err)));
+                    } else {
+                        revision = incoming.target;
+                        if let Some(completion) = completion {
+                            let _ = completion.send(Ok(()));
+                        }
                     }
                 }
                 WorkerMessage::Barrier(barrier) => {

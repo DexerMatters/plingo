@@ -55,11 +55,29 @@ impl Context {
     }
 
     pub fn last_snapshot(&self) -> Context {
-        self.with_snapshot(self.snapshot.map(|n| n.saturating_sub(1)))
+        self.with_snapshot(self.snapshot.map(|snapshot| {
+            self.registry
+                .snapshot_parents
+                .lock()
+                .expect("snapshot parent registry poisoned")
+                .get(&snapshot)
+                .copied()
+                .unwrap_or(snapshot)
+        }))
     }
 
-    pub(crate) fn allocate_snapshot(&self) -> SnapshotId {
-        self.registry.next_snapshot.fetch_add(1, Ordering::Relaxed)
+    pub(crate) fn allocate_snapshot(&self, base: SnapshotId) -> SnapshotId {
+        let target = self.registry.next_snapshot.fetch_add(1, Ordering::Relaxed);
+        let mut parents = self
+            .registry
+            .snapshot_parents
+            .lock()
+            .expect("snapshot parent registry poisoned");
+        parents.insert(target, base);
+        while parents.len() > 64 {
+            parents.pop_first();
+        }
+        target
     }
 
     pub(crate) fn with_current_layer(&self, current_layer_type: TypeId) -> Self {

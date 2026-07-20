@@ -52,3 +52,13 @@ async fn context_call_rejects_recursive_layer_cycles() {
     let err = ctx.call(stub_method, ()).await.unwrap_err();
     assert!(matches!(err, ActionError::LayerCallCycle { .. }));
 }
+
+#[test]
+fn last_snapshot_uses_transaction_parent_not_numeric_predecessor() {
+    let ctx = Context::default();
+    let target = ctx.allocate_snapshot(7);
+    assert_eq!(
+        ctx.with_snapshot(Some(target)).last_snapshot().snapshot(),
+        Some(7)
+    );
+}

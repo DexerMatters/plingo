@@ -1,0 +1,5 @@
+error: #[empty] variants cannot use #[skip]
+ --> tests/ui/terminal-reject-empty-with-skip.rs:5:5
+  |
+5 |     #[empty]
+  |     ^

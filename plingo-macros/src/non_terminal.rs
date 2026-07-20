@@ -305,7 +305,7 @@ impl<'a> LowerCtx<'a> {
                                 cx,
                                 production,
                                 children,
-                                ::std::vec::Vec::<#item_type>::new(),
+                                ::plingo::component::parse::__macro_private::repeat_empty::<#item_type>(),
                             )
                         }
                     });
@@ -332,16 +332,14 @@ impl<'a> LowerCtx<'a> {
                                 format_ident!(
                                     "__plingo_rep_item_symbol_{}_{}_{}",
                                     self.variant_index,
-                                0usize,
+                                    0usize,
                                     rule_index
                                 )
                             })
                             .collect::<Vec<_>>();
-                        let tail_seq: Vec<_> = sep_symbols
-                            .iter()
-                            .cloned()
+                        let tail_seq: Vec<_> = ::std::iter::once(quote! { tail_lhs })
+                            .chain(sep_symbols.iter().cloned())
                             .chain(inner_symbols.iter().cloned())
-                            .chain(::std::iter::once(quote! { tail_lhs }))
                             .collect();
                         let tail_bindings = tail_seq
                             .iter()
@@ -350,7 +348,7 @@ impl<'a> LowerCtx<'a> {
                                 let ident = format_ident!(
                                     "__plingo_rep_tail_symbol_{}_{}_{}",
                                     self.variant_index,
-                                        0usize,
+                                    0usize,
                                     rule_index
                                 );
                                 quote! { let #ident = #expr; }
@@ -367,8 +365,8 @@ impl<'a> LowerCtx<'a> {
                             })
                             .collect::<Vec<_>>();
                         let item_extract = self.repeat_item_extract_expr(&item_kind, 0);
-                        let tail_extract = self.repeat_item_extract_expr(&item_kind, sep_symbols.len());
-                        let tail_len = sep_symbols.len() + item_stride;
+                        let tail_extract =
+                            self.repeat_item_extract_expr(&item_kind, 1 + sep_symbols.len());
                         builders.push(quote! {
                             fn #builder_item(
                                 cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
@@ -376,12 +374,10 @@ impl<'a> LowerCtx<'a> {
                                 children: &[::plingo::component::parse::data::ProductId],
                             ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
                                 let item: #item_type = #item_extract;
-                                let tail: ::std::vec::Vec<#item_type> = cx.expect_value(
+                                let tail: ::plingo::component::parse::__macro_private::Repeat<#item_type> = cx.expect_value(
                                     ::plingo::component::parse::__macro_private::production_child(children, #item_stride)?,
                                 )?;
-                                let mut value = ::std::vec::Vec::with_capacity(1 + tail.len());
-                                value.push(item);
-                                value.extend(tail);
+                                let value = ::plingo::component::parse::__macro_private::repeat_prepend(item, tail);
                                 ::plingo::component::parse::__macro_private::production_node(cx, production, children, value)
                             }
                         });
@@ -391,13 +387,10 @@ impl<'a> LowerCtx<'a> {
                                 production: ::plingo::component::parse::grammar::ProductionId,
                                 children: &[::plingo::component::parse::data::ProductId],
                             ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
-                                let item: #item_type = #tail_extract;
-                                let tail: ::std::vec::Vec<#item_type> = cx.expect_value(
-                                    ::plingo::component::parse::__macro_private::production_child(children, #tail_len)?,
+                                let value: ::plingo::component::parse::__macro_private::Repeat<#item_type> = cx.expect_value(
+                                    ::plingo::component::parse::__macro_private::production_child(children, 0)?,
                                 )?;
-                                let mut value = ::std::vec::Vec::with_capacity(1 + tail.len());
-                                value.push(item);
-                                value.extend(tail);
+                                let value = ::plingo::component::parse::__macro_private::repeat_push(value, #tail_extract);
                                 ::plingo::component::parse::__macro_private::production_node(cx, production, children, value)
                             }
                         });
@@ -418,7 +411,7 @@ impl<'a> LowerCtx<'a> {
                                 let ident = format_ident!(
                                     "__plingo_rep_item_symbol_{}_{}_{}",
                                     self.variant_index,
-                                0usize,
+                                    0usize,
                                     rule_index
                                 );
                                 quote! { let #ident = #expr; }
@@ -434,7 +427,7 @@ impl<'a> LowerCtx<'a> {
                                 )
                             })
                             .collect::<Vec<_>>();
-                        let item_extract = self.repeat_item_extract_expr(&item_kind, 0);
+                        let item_extract = self.repeat_item_extract_expr(&item_kind, 1);
                         let builder_item = self.synthetic_builder("rep_item");
                         builders.push(quote! {
                             fn #builder_item(
@@ -442,27 +435,26 @@ impl<'a> LowerCtx<'a> {
                                 production: ::plingo::component::parse::grammar::ProductionId,
                                 children: &[::plingo::component::parse::data::ProductId],
                             ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
-                                let item: #item_type = #item_extract;
-                                let tail: ::std::vec::Vec<#item_type> = cx.expect_value(
-                                    ::plingo::component::parse::__macro_private::production_child(children, #item_stride)?,
+                                let value: ::plingo::component::parse::__macro_private::Repeat<#item_type> = cx.expect_value(
+                                    ::plingo::component::parse::__macro_private::production_child(children, 0)?,
                                 )?;
-                                let mut value = ::std::vec::Vec::with_capacity(1 + tail.len());
-                                value.push(item);
-                                value.extend(tail);
+                                let value = ::plingo::component::parse::__macro_private::repeat_push(value, #item_extract);
                                 ::plingo::component::parse::__macro_private::production_node(cx, production, children, value)
                             }
                         });
                         registrations.push(quote! {
                             let rep_lhs = grammar.begin_internal_non_terminal(#synthetic);
                             #(#item_bindings)*
-                            grammar.rule(#synthetic, rep_lhs, ::std::vec![#(#item_idents),*, rep_lhs], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
+                            grammar.rule(#synthetic, rep_lhs, ::std::vec![rep_lhs, #(#item_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
                             grammar.rule(#synthetic, rep_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
                         });
                     }
 
                     return Ok(LoweredExpr {
-                        symbol_exprs: vec![quote! { grammar.begin_internal_non_terminal(#synthetic) }],
-                        value_kind: ValueKind::Vec(Box::new(item_kind)),
+                        symbol_exprs: vec![
+                            quote! { grammar.begin_internal_non_terminal(#synthetic) },
+                        ],
+                        value_kind: ValueKind::Repeat(Box::new(item_kind)),
                         name: capture_name,
                         captures,
                     });
@@ -780,6 +772,7 @@ enum ValueKind {
     Token(Type),
     Option(Box<ValueKind>),
     Vec(Box<ValueKind>),
+    Repeat(Box<ValueKind>),
     Either(Box<ValueKind>, Box<ValueKind>),
     Tuple(Vec<ValueKind>),
     Error,
@@ -799,6 +792,10 @@ impl ValueKind {
                 let inner = inner.ty_tokens();
                 quote! { ::std::vec::Vec<#inner> }
             }
+            Self::Repeat(inner) => {
+                let inner = inner.ty_tokens();
+                quote! { ::std::vec::Vec<#inner> }
+            }
             Self::Either(left, right) => {
                 let left = left.ty_tokens();
                 let right = right.ty_tokens();
@@ -815,6 +812,12 @@ impl ValueKind {
     fn extract_expr(&self, child: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
         match self {
             Self::Unit => quote! { () },
+            Self::Repeat(inner) => {
+                let inner = inner.ty_tokens();
+                quote! {
+                    ::plingo::component::parse::__macro_private::repeat_from_product::<#inner>(cx, #child)?
+                }
+            }
             Self::Node(_) | Self::Option(_) | Self::Vec(_) | Self::Either(_, _) | Self::Error => {
                 let ty = self.ty_tokens();
                 quote! {

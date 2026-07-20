@@ -1,14 +1,8 @@
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
+use std::collections::HashMap;
 
 use indexmap::IndexSet;
 
-use crate::component::parse::{
-    build::LRStateId,
-    data::product::{Product, ProductArena, ProductId},
-};
+use crate::component::parse::{build::LRStateId, data::product::ProductId};
 
 pub(crate) type GssNodeId = usize;
 pub(crate) type GssEdgeId = usize;
@@ -49,36 +43,11 @@ impl GssEdge {
     }
 }
 
-#[derive(Clone, Default)]
-struct CachedNodeHash {
-    value: u64,
-    outgoing_len: usize,
-    dependency_key: u64,
-}
-
-#[derive(Clone, Default)]
-struct GssNodeHashCache {
-    frontier: Option<CachedNodeHash>,
-    frontier_revision: u64,
-    semantic: Option<CachedNodeHash>,
-    semantic_revision: u64,
-}
-
-impl GssNodeHashCache {
-    fn invalidate(&mut self) {
-        self.frontier = None;
-        self.semantic = None;
-        self.frontier_revision = next_revision(self.frontier_revision);
-        self.semantic_revision = next_revision(self.semantic_revision);
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct GssArena {
     nodes: IndexSet<GssNode>,
     edges: IndexSet<GssEdge>,
     edges_out: Vec<Vec<GssEdgeId>>,
-    node_hashes: Vec<GssNodeHashCache>,
 }
 
 impl GssArena {
@@ -87,7 +56,6 @@ impl GssArena {
             nodes: IndexSet::new(),
             edges: IndexSet::new(),
             edges_out: Vec::new(),
-            node_hashes: Vec::new(),
         }
     }
 
@@ -114,9 +82,6 @@ impl GssArena {
 
         if inserted {
             self.edges_out[from].push(edge_id);
-            if let Some(cache) = self.node_hashes.get_mut(from) {
-                cache.invalidate();
-            }
         }
 
         inserted
@@ -141,131 +106,252 @@ impl GssArena {
             .filter_map(|&edge_id| self.get_edge(edge_id))
     }
 
-    pub(crate) fn frontier_hash(&mut self, id: GssNodeId) -> u64 {
-        self.frontier_hash_with_revision(id).0
-    }
+    pub(crate) fn match_frontiers(
+        &self,
+        old_sets: (&[GssNodeId], &[GssNodeId]),
+        new_sets: (&[GssNodeId], &[GssNodeId]),
+    ) -> Option<(
+        HashMap<GssNodeId, GssNodeId>,
+        HashMap<ProductId, ProductId>,
+        bool,
+    )> {
+        #[derive(Default)]
+        struct Mapping {
+            nodes: HashMap<GssNodeId, GssNodeId>,
+            nodes_rev: HashMap<GssNodeId, GssNodeId>,
+            products: HashMap<ProductId, ProductId>,
+            products_rev: HashMap<ProductId, ProductId>,
+            node_log: Vec<(GssNodeId, GssNodeId)>,
+            product_log: Vec<(ProductId, ProductId)>,
+            shared_prefixes: usize,
+        }
 
-    pub(crate) fn frontier_semantic_hash(&mut self, id: GssNodeId, products: &ProductArena) -> u64 {
-        self.frontier_semantic_hash_with_revision(id, products).0
+        impl Mapping {
+            fn mark(&self) -> (usize, usize, usize) {
+                (
+                    self.node_log.len(),
+                    self.product_log.len(),
+                    self.shared_prefixes,
+                )
+            }
+
+            fn rollback(&mut self, mark: (usize, usize, usize)) {
+                while self.node_log.len() > mark.0 {
+                    let (old, new) = self.node_log.pop().expect("node mapping log");
+                    self.nodes.remove(&old);
+                    self.nodes_rev.remove(&new);
+                }
+                while self.product_log.len() > mark.1 {
+                    let (old, new) = self.product_log.pop().expect("product mapping log");
+                    self.products.remove(&old);
+                    self.products_rev.remove(&new);
+                }
+                self.shared_prefixes = mark.2;
+            }
+
+            fn bind_node(&mut self, old: GssNodeId, new: GssNodeId) -> bool {
+                if self.nodes.get(&old).is_some_and(|&mapped| mapped != new)
+                    || self
+                        .nodes_rev
+                        .get(&new)
+                        .is_some_and(|&mapped| mapped != old)
+                {
+                    return false;
+                }
+                if !self.nodes.contains_key(&old) {
+                    self.nodes.insert(old, new);
+                    self.nodes_rev.insert(new, old);
+                    self.node_log.push((old, new));
+                }
+                true
+            }
+
+            fn bind_product(&mut self, old: ProductId, new: ProductId) -> bool {
+                if self.products.get(&old).is_some_and(|&mapped| mapped != new)
+                    || self
+                        .products_rev
+                        .get(&new)
+                        .is_some_and(|&mapped| mapped != old)
+                {
+                    return false;
+                }
+                if !self.products.contains_key(&old) {
+                    self.products.insert(old, new);
+                    self.products_rev.insert(new, old);
+                    self.product_log.push((old, new));
+                }
+                true
+            }
+        }
+
+        fn match_node(
+            arena: &GssArena,
+            old: GssNodeId,
+            new: GssNodeId,
+            mapping: &mut Mapping,
+        ) -> bool {
+            if let Some(&mapped) = mapping.nodes.get(&old) {
+                return mapped == new;
+            }
+            if old == new {
+                mapping.shared_prefixes += 1;
+                return mapping.bind_node(old, new);
+            }
+            let Some((old_node, new_node)) = arena.get_node(old).zip(arena.get_node(new)) else {
+                return false;
+            };
+            if old_node.state != new_node.state
+                || mapping
+                    .nodes_rev
+                    .get(&new)
+                    .is_some_and(|&mapped| mapped != old)
+            {
+                return false;
+            }
+            let old_edges = arena.outgoing_edges(old).copied().collect::<Vec<_>>();
+            let new_edges = arena.outgoing_edges(new).copied().collect::<Vec<_>>();
+            if old_edges.len() != new_edges.len() {
+                return false;
+            }
+
+            let mark = mapping.mark();
+            mapping.bind_node(old, new);
+
+            fn match_edges(
+                arena: &GssArena,
+                old: &[GssEdge],
+                new: &[GssEdge],
+                index: usize,
+                used: &mut [bool],
+                mapping: &mut Mapping,
+            ) -> bool {
+                if index == old.len() {
+                    return true;
+                }
+                let shared = new.iter().position(|edge| {
+                    edge.to == old[index].to && edge.product == old[index].product
+                });
+                for (order, candidate) in shared.into_iter().chain(0..new.len()).enumerate() {
+                    if order > 0 && shared == Some(candidate) {
+                        continue;
+                    }
+                    if used[candidate] {
+                        continue;
+                    }
+                    let mark = mapping.mark();
+                    if !mapping.bind_product(old[index].product, new[candidate].product)
+                        || !match_node(arena, old[index].to, new[candidate].to, mapping)
+                    {
+                        mapping.rollback(mark);
+                        continue;
+                    }
+                    used[candidate] = true;
+                    if match_edges(arena, old, new, index + 1, used, mapping) {
+                        return true;
+                    }
+                    used[candidate] = false;
+                    mapping.rollback(mark);
+                }
+                false
+            }
+
+            if match_edges(
+                arena,
+                &old_edges,
+                &new_edges,
+                0,
+                &mut vec![false; new_edges.len()],
+                mapping,
+            ) {
+                true
+            } else {
+                mapping.rollback(mark);
+                false
+            }
+        }
+
+        fn match_set(
+            arena: &GssArena,
+            old: &[GssNodeId],
+            new: &[GssNodeId],
+            index: usize,
+            used: &mut [bool],
+            mapping: &mut Mapping,
+        ) -> bool {
+            if old.len() != new.len() {
+                return false;
+            }
+            if index == old.len() {
+                return true;
+            }
+            for candidate in 0..new.len() {
+                if used[candidate] {
+                    continue;
+                }
+                let mark = mapping.mark();
+                if !match_node(arena, old[index], new[candidate], mapping) {
+                    mapping.rollback(mark);
+                    continue;
+                }
+                used[candidate] = true;
+                if match_set(arena, old, new, index + 1, used, mapping) {
+                    return true;
+                }
+                used[candidate] = false;
+                mapping.rollback(mark);
+            }
+            false
+        }
+
+        let mut mapping = Mapping::default();
+        if !match_set(
+            self,
+            old_sets.0,
+            new_sets.0,
+            0,
+            &mut vec![false; new_sets.0.len()],
+            &mut mapping,
+        ) || !match_set(
+            self,
+            old_sets.1,
+            new_sets.1,
+            0,
+            &mut vec![false; new_sets.1.len()],
+            &mut mapping,
+        ) {
+            return None;
+        }
+        Some((mapping.nodes, mapping.products, mapping.shared_prefixes > 0))
     }
 
     fn resize_edge_grid(&mut self, rows: usize) {
         if self.edges_out.len() < rows {
             self.edges_out.resize_with(rows, Vec::new);
         }
-        if self.node_hashes.len() < rows {
-            self.node_hashes
-                .resize_with(rows, GssNodeHashCache::default);
-        }
-    }
-
-    fn frontier_hash_with_revision(&mut self, id: GssNodeId) -> (u64, u64) {
-        let Some(node) = self.get_node(id).cloned() else {
-            return (hash_value(&("missing-gss-node", id)), 1);
-        };
-        let edge_ids = self
-            .outgoing_edge_ids(id)
-            .map_or_else(Vec::new, |edges| edges.to_vec());
-        let mut parents = Vec::with_capacity(edge_ids.len());
-        for edge_id in edge_ids {
-            let Some(edge) = self.get_edge(edge_id).copied() else {
-                continue;
-            };
-            let (parent_hash, parent_revision) = self.frontier_hash_with_revision(edge.to);
-            parents.push((parent_hash, parent_revision));
-        }
-        parents.sort_unstable();
-        let dependency_key = hash_value(
-            &parents
-                .iter()
-                .map(|(_, revision)| *revision)
-                .collect::<Vec<_>>(),
-        );
-        if let Some(cache) = self.node_hashes.get(id) {
-            if let Some(cached) = &cache.frontier {
-                if cached.outgoing_len == parents.len() && cached.dependency_key == dependency_key {
-                    return (cached.value, cache.frontier_revision.max(1));
-                }
-            }
-        }
-
-        let value = hash_value(&(
-            node.state,
-            parents.iter().map(|(hash, _)| *hash).collect::<Vec<_>>(),
-        ));
-        let cache = &mut self.node_hashes[id];
-        cache.frontier_revision = next_revision(cache.frontier_revision);
-        cache.frontier = Some(CachedNodeHash {
-            value,
-            outgoing_len: parents.len(),
-            dependency_key,
-        });
-        (value, cache.frontier_revision)
-    }
-
-    fn frontier_semantic_hash_with_revision(
-        &mut self,
-        id: GssNodeId,
-        products: &ProductArena,
-    ) -> (u64, u64) {
-        let Some(node) = self.get_node(id).cloned() else {
-            return (hash_value(&("missing-gss-node", id)), 1);
-        };
-        let edge_ids = self
-            .outgoing_edge_ids(id)
-            .map_or_else(Vec::new, |edges| edges.to_vec());
-        let mut parents = Vec::with_capacity(edge_ids.len());
-        for edge_id in edge_ids {
-            let Some(edge) = self.get_edge(edge_id).copied() else {
-                continue;
-            };
-            let (parent_hash, parent_revision) =
-                self.frontier_semantic_hash_with_revision(edge.to, products);
-            let product_hash = products.get(edge.product).map_or_else(
-                || hash_value(&("missing-product", edge.product)),
-                Product::semantic_hash,
-            );
-            parents.push((product_hash, parent_hash, parent_revision));
-        }
-        parents.sort_unstable();
-        let dependency_key = hash_value(
-            &parents
-                .iter()
-                .map(|(product_hash, _, revision)| (*product_hash, *revision))
-                .collect::<Vec<_>>(),
-        );
-        if let Some(cache) = self.node_hashes.get(id) {
-            if let Some(cached) = &cache.semantic {
-                if cached.outgoing_len == parents.len() && cached.dependency_key == dependency_key {
-                    return (cached.value, cache.semantic_revision.max(1));
-                }
-            }
-        }
-
-        let value = hash_value(&(
-            node.state,
-            parents
-                .iter()
-                .map(|(product_hash, hash, _)| (*product_hash, *hash))
-                .collect::<Vec<_>>(),
-        ));
-        let cache = &mut self.node_hashes[id];
-        cache.semantic_revision = next_revision(cache.semantic_revision);
-        cache.semantic = Some(CachedNodeHash {
-            value,
-            outgoing_len: parents.len(),
-            dependency_key,
-        });
-        (value, cache.semantic_revision)
     }
 }
 
-fn hash_value<T: Hash + ?Sized>(value: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
+#[cfg(test)]
+mod tests {
+    use super::GssArena;
+    use crate::component::parse::data::product::{Product, ProductArena};
 
-fn next_revision(current: u64) -> u64 {
-    current.wrapping_add(1).max(1)
+    #[test]
+    fn cyclic_frontiers_compare_exactly() {
+        let mut products = ProductArena::new();
+        let old_product = products.insert(Product::token(1, 2, 3));
+        let new_product = products.insert(Product::token(1, 4, 5));
+        let mut arena = GssArena::new();
+        let (a, b) = (arena.node(1, 0, 0), arena.node(2, 0, 0));
+        let (c, d) = (arena.node(1, 4, 1), arena.node(2, 4, 1));
+        arena.add_edge(a, b, old_product, 0);
+        arena.add_edge(b, a, old_product, 0);
+        arena.add_edge(c, d, new_product, 1);
+        arena.add_edge(d, c, new_product, 1);
+
+        let (_, product_mapping, _) = arena
+            .match_frontiers((&[a], &[a]), (&[c], &[c]))
+            .expect("control-equivalent cyclic frontiers");
+        assert_eq!(product_mapping[&old_product], new_product);
+    }
 }

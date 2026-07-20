@@ -8,7 +8,8 @@ use regex_syntax::hir::{Hir, HirKind, Look};
 
 use super::{
     __macro_private::{ScopeDirective, TokenMatcher, TokenSpec},
-    LexerCreationError, LexerRoot, ResolvedToken, State, StateMatcher, TokenAction,
+    LexerCreationError, LexerRoot, ResolvedToken, State, TokenAction,
+    token::StateMatcher,
 };
 
 pub(super) fn resolve_token<Root: LexerRoot>(

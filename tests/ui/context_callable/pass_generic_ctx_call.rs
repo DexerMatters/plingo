@@ -26,7 +26,8 @@ impl FallibleLayer for Target {
 
 impl NonTopLayer for Target {
     type _Error = DummyError;
-    type Change = ();
+    type Address = ();
+    type Unit = ();
 }
 
 struct Caller;
@@ -37,7 +38,8 @@ impl FallibleLayer for Caller {
 
 impl NonTopLayer for Caller {
     type _Error = DummyError;
-    type Change = ();
+    type Address = ();
+    type Unit = ();
 }
 
 impl Target {

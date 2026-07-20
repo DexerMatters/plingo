@@ -2,3 +2,4 @@
 .vscode
 /docs/superpowers
 **/*.stderr
+!tests/ui/*.stderr

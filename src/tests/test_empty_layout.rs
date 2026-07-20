@@ -1,6 +1,6 @@
 use crate::{
     Terminal,
-    component::lex::{LexErrorInfo, LexMoment, LexToken, Lexer, LexerState, WhenCx, WithCx},
+    component::lex::{LexErrorInfo, LexMoment, Lexer, LexerState, WhenCx, WithCx},
 };
 
 fn collect_values<Root>(lexer: &mut Lexer<Root>, input: &str) -> Vec<Root>
@@ -22,6 +22,40 @@ where
     ids.into_iter()
         .map(|id| lexer.token(id).unwrap().value.clone())
         .collect()
+}
+
+#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
+#[scopes(root { EnterLoop }, loop_state { ExitLoop })]
+enum EmptyCycleToken {
+    #[empty]
+    #[enter(loop_state)]
+    #[when(always)]
+    EnterLoop,
+
+    #[empty]
+    #[exit]
+    #[when(always)]
+    ExitLoop,
+
+    #[error]
+    Error(LexErrorInfo),
+}
+
+fn always(_: &WhenCx<EmptyCycleToken>) -> bool {
+    true
+}
+
+#[test]
+fn empty_transition_cycles_are_rejected() {
+    let mut lexer = Lexer::<EmptyCycleToken>::new().unwrap();
+    let error = lexer
+        .lex_cont(
+            LexerState::new(lexer.state_id_of::<EmptyCycleToken>().unwrap()),
+            String::new(),
+            |_, _, _, _| true,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("empty token cycle"));
 }
 
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
@@ -99,7 +133,10 @@ fn should_dedent(cx: &WhenCx<LayoutToken>) -> bool {
     if cx.moment() == LexMoment::Eof {
         return true;
     }
-    let pending = cx.get(LayoutToken::pending_indent).copied().unwrap_or(current);
+    let pending = cx
+        .get(LayoutToken::pending_indent)
+        .copied()
+        .unwrap_or(current);
     pending < current
 }
 
@@ -112,12 +149,13 @@ fn sync_parent_indent(cx: &mut WithCx<LayoutToken>) {
 #[test]
 fn empty_scope_tokens_represent_simple_indentation() {
     let mut lexer = Lexer::<LayoutToken>::new().unwrap();
-    let values = collect_values(&mut lexer, 
-    r#"
+    let values = collect_values(
+        &mut lexer,
+        r#"
     a
         aa
         aaa
-    "#
+    "#,
     );
 
     for value in &values {
@@ -157,6 +195,3 @@ fn same_indentation_emits_no_empty_scope_tokens() {
         ]
     );
 }
-
-#[allow(dead_code)]
-fn _assert_lex_token_is_imported(_: LexToken<LayoutToken>) {}

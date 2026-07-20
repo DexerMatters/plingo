@@ -25,7 +25,8 @@ impl FallibleLayer for Layer {
 
 impl NonTopLayer for Layer {
     type _Error = DummyError;
-    type Change = ();
+    type Address = ();
+    type Unit = ();
 }
 
 impl Layer {

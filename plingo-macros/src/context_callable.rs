@@ -48,7 +48,8 @@ pub fn expand_context_callable(item: TokenStream) -> TokenStream {
     };
 
     method.sig.asyncness = None;
-    method.sig.output = syn::parse_quote!(-> ::plingo::scheme::call::LayerCallFuture<#lifetime, Self, #output>);
+    method.sig.output =
+        syn::parse_quote!(-> ::plingo::scheme::call::LayerCallFuture<#lifetime, Self, #output>);
 
     let block = method.block;
     method.block = syn::parse_quote!({

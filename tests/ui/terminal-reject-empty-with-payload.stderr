@@ -1,0 +1,5 @@
+error: #[empty] variants cannot have payload fields
+ --> tests/ui/terminal-reject-empty-with-payload.rs:5:5
+  |
+5 |     #[empty]
+  |     ^

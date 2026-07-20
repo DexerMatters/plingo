@@ -1,21 +1,20 @@
-use std::{convert::Infallible, marker::PhantomData, pin::Pin};
+use std::{convert::Infallible, hash::Hash, marker::PhantomData, pin::Pin};
 
 use plingo_macros::layer;
 
 use crate::scheme::{
-    change::{LayerChange, LayerChanges},
+    change::{FlowUnit, LayerChanges},
     context::Context,
-    layer::{BottomLayer, MiddleLayer, NonTopLayer},
+    layer::BottomLayer,
 };
 
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
 #[layer]
-pub struct DebugSink<C>
+pub struct DebugSink<Address, Unit>
 where
-    C: LayerChange,
+    Address: Eq + Hash + Send + Sync + 'static,
+    Unit: FlowUnit,
 {
-    _marker: PhantomData<fn() -> C>,
+    _marker: PhantomData<fn() -> (Address, Unit)>,
     consume_fn: Box<
         dyn for<'a> Fn(
                 &'a Context,
@@ -27,13 +26,18 @@ where
     >,
 }
 
-impl<C> DebugSink<C>
+impl<Address, Unit> DebugSink<Address, Unit>
 where
-    C: LayerChange,
+    Address: Eq + Hash + Send + Sync + 'static,
+    Unit: FlowUnit,
 {
     pub fn new<ConsumeFn>(consume_fn: ConsumeFn) -> Self
     where
-        ConsumeFn: for<'a> Fn(&'a Context, LayerChanges<Self>) -> BoxFuture<'a, Result<(), Infallible>>
+        ConsumeFn: for<'a> Fn(
+                &'a Context,
+                LayerChanges<Self>,
+            )
+                -> Pin<Box<dyn Future<Output = Result<(), Infallible>> + Send + 'a>>
             + Send
             + Sync
             + 'static,
@@ -46,12 +50,14 @@ where
 }
 
 #[layer(bottom)]
-impl<C> BottomLayer for DebugSink<C>
+impl<Address, Unit> BottomLayer for DebugSink<Address, Unit>
 where
-    C: LayerChange,
+    Address: Eq + Hash + Send + Sync + 'static,
+    Unit: FlowUnit,
 {
     type Error = Infallible;
-    type Change = C;
+    type Address = Address;
+    type Unit = Unit;
 
     fn consume(
         &mut self,
@@ -59,51 +65,5 @@ where
         changes: LayerChanges<Self>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         (self.consume_fn)(ctx, changes)
-    }
-}
-
-#[layer]
-pub struct DebugRelay<C, Lower>
-where
-    C: LayerChange,
-    Lower: NonTopLayer<Change = C> + Send + Sync + 'static,
-{
-    _marker: PhantomData<fn() -> (C, Lower)>,
-    investigate_fn: Box<dyn for<'a> Fn(&'a Context, &'a LayerChanges<Self>) + Send + Sync>,
-}
-
-impl<C, Lower> DebugRelay<C, Lower>
-where
-    C: LayerChange,
-    Lower: NonTopLayer<Change = C> + Send + Sync + 'static,
-{
-    pub fn new<InvestigateFn>(investigate_fn: InvestigateFn) -> Self
-    where
-        InvestigateFn: for<'a> Fn(&'a Context, &'a LayerChanges<Self>) + Send + Sync + 'static,
-    {
-        Self {
-            _marker: PhantomData,
-            investigate_fn: Box::new(investigate_fn),
-        }
-    }
-}
-
-#[layer(middle)]
-impl<C, Lower> MiddleLayer for DebugRelay<C, Lower>
-where
-    C: LayerChange,
-    Lower: NonTopLayer<Change = C> + Send + Sync + 'static,
-{
-    type Lower = Lower;
-    type Error = Infallible;
-    type Change = C;
-
-    async fn pass(
-        &mut self,
-        ctx: &Context,
-        changes: LayerChanges<Self>,
-    ) -> Result<LayerChanges<Self::Lower>, Self::Error> {
-        (self.investigate_fn)(ctx, &changes);
-        Ok(changes)
     }
 }

@@ -1,0 +1,5 @@
+error: #[empty] variants require #[when(...)]
+ --> tests/ui/terminal-reject-empty-without-when.rs:5:5
+  |
+5 |     #[empty]
+  |     ^

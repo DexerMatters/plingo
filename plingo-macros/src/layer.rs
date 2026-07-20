@@ -1,6 +1,9 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{Fields, ItemImpl, ItemStruct, Type, parse::Parse, parse::ParseStream, parse_macro_input, parse_quote, spanned::Spanned};
+use syn::{
+    Fields, GenericArgument, ItemImpl, ItemStruct, PathArguments, Type, parse::Parse,
+    parse::ParseStream, parse_macro_input, parse_quote, spanned::Spanned,
+};
 
 pub enum LayerRole {
     Top,
@@ -58,7 +61,42 @@ pub fn expand_layer_struct(item: TokenStream) -> TokenStream {
                         .to_compile_error()
                         .into();
                 };
-                snapshot_ty = Some(field.ty.clone());
+                let Type::Path(path) = &field.ty else {
+                    return syn::Error::new(
+                        field.ty.span(),
+                        "#[snapshot] field must be Arc<State>",
+                    )
+                    .to_compile_error()
+                    .into();
+                };
+                let Some(segment) = path.path.segments.last() else {
+                    unreachable!()
+                };
+                let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                    return syn::Error::new(
+                        field.ty.span(),
+                        "#[snapshot] field must be Arc<State>",
+                    )
+                    .to_compile_error()
+                    .into();
+                };
+                let Some(GenericArgument::Type(state)) = arguments.args.first() else {
+                    return syn::Error::new(
+                        field.ty.span(),
+                        "#[snapshot] field must be Arc<State>",
+                    )
+                    .to_compile_error()
+                    .into();
+                };
+                if segment.ident != "Arc" {
+                    return syn::Error::new(
+                        field.ty.span(),
+                        "#[snapshot] field must be Arc<State>",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                snapshot_ty = Some(state.clone());
                 snapshot_field_ident = Some(field_ident);
             } else {
                 keep_attrs.push(attr);
@@ -67,10 +105,12 @@ pub fn expand_layer_struct(item: TokenStream) -> TokenStream {
         field.attrs = keep_attrs;
     }
 
-    if fields
-        .iter()
-        .any(|field| field.ident.as_ref().is_some_and(|ident| ident == "_snapshot"))
-    {
+    if fields.iter().any(|field| {
+        field
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident == "_snapshot")
+    }) {
         return syn::Error::new(
             item_struct.span(),
             "layer structs cannot define a field named _snapshot",
@@ -81,7 +121,7 @@ pub fn expand_layer_struct(item: TokenStream) -> TokenStream {
 
     if let Some(ref snapshot_ty) = snapshot_ty {
         fields.push(parse_quote! {
-            _snapshot: ::std::collections::HashMap<::plingo::scheme::context::SnapshotId, #snapshot_ty>
+            pub(crate) _snapshot: ::plingo::scheme::snapshot::SnapshotStore<#snapshot_ty>
         });
     }
 
@@ -90,8 +130,20 @@ pub fn expand_layer_struct(item: TokenStream) -> TokenStream {
             impl #impl_generics ::plingo::scheme::layer::SnapshotLayer for #self_ident #ty_generics #where_clause {
                 type State = #snapshot_ty;
 
+                fn initialize_snapshots(&mut self) {
+                    self._snapshot.initialize(::std::sync::Arc::clone(&self.#field_ident));
+                }
+
                 fn push_state(&mut self, snapshot: ::plingo::scheme::context::SnapshotId) {
-                    self._snapshot.insert(snapshot, self.#field_ident.clone());
+                    self._snapshot.insert(snapshot, ::std::sync::Arc::clone(&self.#field_ident));
+                }
+
+                fn rollback_state(&mut self, revision: ::plingo::scheme::change::Revision) -> bool {
+                    let Some(state) = self._snapshot.rollback(revision) else {
+                        return false;
+                    };
+                    self.#field_ident = state;
+                    true
                 }
 
                 fn state(
@@ -99,17 +151,25 @@ pub fn expand_layer_struct(item: TokenStream) -> TokenStream {
                     snapshot: ::std::option::Option<::plingo::scheme::context::SnapshotId>,
                 ) -> ::std::option::Option<&Self::State> {
                     match snapshot {
-                        Some(snapshot) => self._snapshot.get(&snapshot),
-                        None => Some(&self.#field_ident),
+                        Some(snapshot) => self._snapshot.get(snapshot),
+                        None => Some(self.#field_ident.as_ref()),
                     }
                 }
 
                 fn latest_state(&self) -> &Self::State {
-                    &self.#field_ident
+                    self.#field_ident.as_ref()
                 }
 
                 fn latest_state_mut(&mut self) -> &mut Self::State {
-                    &mut self.#field_ident
+                    ::std::sync::Arc::make_mut(&mut self.#field_ident)
+                }
+
+                fn set_snapshot_retention(&mut self, retention: ::plingo::scheme::snapshot::SnapshotRetention) {
+                    self._snapshot.set_retention(retention);
+                }
+
+                fn snapshot_retention(&self) -> ::plingo::scheme::snapshot::SnapshotRetention {
+                    self._snapshot.retention()
                 }
             }
         },
@@ -177,7 +237,8 @@ pub fn expand_layer_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             impl #impl_generics ::plingo::scheme::layer::NonTopLayer for #self_type #where_clause {
                 type _Error = <Self as ::plingo::scheme::layer::MiddleLayer>::Error;
-                type Change = <Self as ::plingo::scheme::layer::MiddleLayer>::Change;
+                type Address = <Self as ::plingo::scheme::layer::MiddleLayer>::Address;
+                type Unit = <Self as ::plingo::scheme::layer::MiddleLayer>::Unit;
             }
         },
         LayerRole::Bottom => quote! {
@@ -186,7 +247,8 @@ pub fn expand_layer_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             impl #impl_generics ::plingo::scheme::layer::NonTopLayer for #self_type #where_clause {
                 type _Error = <Self as ::plingo::scheme::layer::BottomLayer>::Error;
-                type Change = <Self as ::plingo::scheme::layer::BottomLayer>::Change;
+                type Address = <Self as ::plingo::scheme::layer::BottomLayer>::Address;
+                type Unit = <Self as ::plingo::scheme::layer::BottomLayer>::Unit;
             }
         },
     };

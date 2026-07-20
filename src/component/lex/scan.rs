@@ -1,333 +1,34 @@
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-};
+//! DFA scanning and token commitment. This code never decides transaction shape;
+//! incremental replay supplies the restart state and owns convergence.
+
+use std::collections::HashSet;
 
 use regex_automata::{Anchored, Input, dfa::Automaton};
 
-use crate::{
-    component::{
-        lex::{
-            LexErrorInfo, LexErrorKind, LexInterrupt, LexMoment, Lexer, LexerRoot,
-            LexerSnapshotState, LexerState, State, StateAction, TokenAction, TokenChange,
-            TokenMatch, TokenOccurrence, WhenCx, WithCx,
-        },
-        source::{Source, TextChange},
-    },
-    scheme::{
-        change::{LayerChange, LayerChanges, ReplacementChange},
-        layer::{MiddleLayer, NonTopLayer},
-    },
-    utils::{RangeOrPoint, Span},
+use super::{
+    LexErrorInfo, LexErrorKind, LexInterrupt, LexMoment, Lexer, LexerRoot, LexerState, State,
+    StateAction, TokenAction, WhenCx, WithCx, token::TokenMatch,
 };
-
-fn shift_offset(offset: usize, shift: isize) -> usize {
-    if shift >= 0 {
-        offset.saturating_add(shift as usize)
-    } else {
-        offset.saturating_sub((-shift) as usize)
-    }
-}
-
-fn shift_occurrence(occurrence: TokenOccurrence, shift: isize) -> TokenOccurrence {
-    TokenOccurrence {
-        id: occurrence.id,
-        start: shift_offset(occurrence.start, shift),
-        end: shift_offset(occurrence.end, shift),
-    }
-}
-
-fn shift_state<Root: LexerRoot>(state: &LexerState<Root>, shift: isize) -> LexerState<Root> {
-    let mut shifted = state.clone();
-    shifted.offset = shift_offset(shifted.offset, shift);
-    shifted
-}
-
-impl<Root, Lower> Lexer<Root, Lower>
-where
-    Root: LexerRoot,
-    Lower: NonTopLayer<Change = TokenChange> + Send + Sync + 'static,
-{
-    #[allow(dead_code)]
-    pub(crate) fn lex_change<'a>(
-        &'a mut self,
-        ctx: &'a crate::scheme::context::Context,
-        state: &'a mut LexerSnapshotState<Root>,
-        change: TextChange,
-    ) -> impl Future<
-        Output = Result<LayerChanges<<Lexer<Root, Lower> as MiddleLayer>::Lower>, LexInterrupt>,
-    > + Send
-    + 'a {
-        async move {
-            self.lex_changes(ctx, state, std::slice::from_ref(&change))
-                .await
-        }
-    }
-
-    pub(crate) fn lex_changes<'a>(
-        &'a mut self,
-        ctx: &'a crate::scheme::context::Context,
-        state: &'a mut LexerSnapshotState<Root>,
-        changes: &'a [TextChange],
-    ) -> impl Future<
-        Output = Result<LayerChanges<<Lexer<Root, Lower> as MiddleLayer>::Lower>, LexInterrupt>,
-    > + Send
-    + 'a {
-        async move {
-            let Some(first) = changes.first() else {
-                return Ok(Vec::new());
-            };
-            let uri = *first.address();
-            let total_start = Instant::now();
-            let fetch_source_start = Instant::now();
-            let snapshot = ctx
-                .call(
-                    Source::<Lexer<Root, Lower>>::read_span,
-                    Span {
-                        uri,
-                        range: RangeOrPoint::Range(0, usize::MAX),
-                    },
-                )
-                .await
-                .map_err(LexInterrupt::ActionError)?;
-            let fetch_source_elapsed = fetch_source_start.elapsed();
-            self.apply_deltas(
-                state,
-                uri,
-                snapshot.to_string(),
-                changes,
-                total_start,
-                fetch_source_elapsed,
-            )
-        }
-    }
-
-    fn apply_deltas(
-        &mut self,
-        snapshot_state: &mut LexerSnapshotState<Root>,
-        uri: fluent_uri::Uri<&'static str>,
-        snapshot: String,
-        changes: &[TextChange],
-        total_start: Instant,
-        fetch_source_elapsed: Duration,
-    ) -> Result<LayerChanges<<Lexer<Root, Lower> as MiddleLayer>::Lower>, LexInterrupt> {
-        let root_state = self
-            .state_id_of::<Root>()
-            .ok_or(LexInterrupt::MissingState)?;
-
-        snapshot_state
-            .state_instances
-            .entry(uri)
-            .or_insert_with(|| vec![LexerState::new(root_state)]);
-        snapshot_state.occurrences.entry(uri).or_default();
-
-        let old_visible_start = Instant::now();
-        let old_visible_tokens = self.token_data_for_uri(snapshot_state, uri);
-        let old_visible_elapsed = old_visible_start.elapsed();
-
-        let delta_scan_start = Instant::now();
-        let restart_point = changes
-            .iter()
-            .map(|change| change.batch.old_changed_range.start)
-            .min()
-            .unwrap_or(0);
-        let net_shift: isize = changes
-            .iter()
-            .map(|change| {
-                change.batch.new_changed_range.len() as isize
-                    - change.batch.old_changed_range.len() as isize
-            })
-            .sum();
-        let new_change_end = changes
-            .iter()
-            .map(|change| change.batch.new_changed_range.end)
-            .max()
-            .unwrap_or(restart_point);
-        let delta_scan_elapsed = delta_scan_start.elapsed();
-
-        let restart_lookup_start = Instant::now();
-        let restart_token_pos = {
-            let states = &snapshot_state.state_instances[&uri];
-            let occurrences = &snapshot_state.occurrences[&uri];
-            debug_assert_eq!(states.len(), occurrences.len() + 1);
-            states
-                .windows(2)
-                .position(|window| restart_point <= window[1].offset)
-                .unwrap_or(occurrences.len())
-        };
-        let restart_lookup_elapsed = restart_lookup_start.elapsed();
-
-        let restart_state_pos = restart_token_pos;
-
-        let old_suffix_snapshot_start = Instant::now();
-        let (start_state, old_states, old_occurrences) = {
-            let states = snapshot_state
-                .state_instances
-                .get_mut(&uri)
-                .ok_or(LexInterrupt::MissingState)?;
-            let occurrences = snapshot_state
-                .occurrences
-                .get_mut(&uri)
-                .ok_or(LexInterrupt::MissingState)?;
-            debug_assert_eq!(states.len(), occurrences.len() + 1);
-
-            let start_state = states[restart_state_pos].clone();
-            let old_states = states[restart_state_pos + 1..].to_vec();
-            let old_occurrences = occurrences[restart_token_pos..].to_vec();
-
-            states.truncate(restart_state_pos + 1);
-            occurrences.truncate(restart_token_pos);
-
-            (start_state, old_states, old_occurrences)
-        };
-        let old_suffix_snapshot_elapsed = old_suffix_snapshot_start.elapsed();
-
-        let mut new_occurrences = Vec::new();
-        let mut new_states = Vec::new();
-        let lookup_build_start = Instant::now();
-        let mut old_state_lookup: HashMap<LexerState<Root>, Vec<usize>> = HashMap::new();
-        for (index, state) in old_states.iter().enumerate() {
-            old_state_lookup
-                .entry(shift_state(state, net_shift))
-                .or_default()
-                .push(index);
-        }
-        let lookup_build_elapsed = lookup_build_start.elapsed();
-
-        let mut convergence: Option<(usize, usize)> = None;
-        let replay_start = Instant::now();
-        let final_state = self.lex_cont(start_state, snapshot, |token_id, state, start, end| {
-            new_occurrences.push(TokenOccurrence {
-                id: token_id,
-                start,
-                end,
-            });
-            new_states.push(state.clone());
-            if state.offset >= new_change_end {
-                if let Some(old_state_index) = old_state_lookup
-                    .get(state)
-                    .and_then(|indices| indices.iter().rev().copied().next())
-                {
-                    convergence = Some((new_occurrences.len(), old_state_index + 1));
-                    return false;
-                }
-            }
-            true
-        })?;
-        if convergence.is_none() && final_state.offset >= new_change_end {
-            if let Some(old_state_index) = old_state_lookup
-                .get(&final_state)
-                .and_then(|indices| indices.iter().rev().copied().next())
-            {
-                convergence = Some((new_occurrences.len(), old_state_index + 1));
-            }
-        }
-        let replay_elapsed = replay_start.elapsed();
-
-        let (new_prefix_len, old_suffix_start_index) =
-            convergence.unwrap_or_else(|| (new_occurrences.len(), old_occurrences.len()));
-
-        let state_splice_start = Instant::now();
-        {
-            let states = snapshot_state
-                .state_instances
-                .get_mut(&uri)
-                .ok_or(LexInterrupt::MissingState)?;
-            let occurrences = snapshot_state
-                .occurrences
-                .get_mut(&uri)
-                .ok_or(LexInterrupt::MissingState)?;
-            debug_assert_eq!(states.len(), restart_state_pos + 1);
-            debug_assert_eq!(occurrences.len(), restart_token_pos);
-
-            states.extend(new_states.iter().take(new_prefix_len).cloned());
-            states.extend(
-                old_states
-                    .iter()
-                    .skip(old_suffix_start_index)
-                    .map(|state| shift_state(state, net_shift)),
-            );
-
-            occurrences.extend(new_occurrences.iter().take(new_prefix_len).copied());
-            occurrences.extend(
-                old_occurrences
-                    .iter()
-                    .skip(old_suffix_start_index)
-                    .copied()
-                    .map(|occurrence| shift_occurrence(occurrence, net_shift)),
-            );
-
-            debug_assert_eq!(states.len(), occurrences.len() + 1);
-        }
-        let state_splice_elapsed = state_splice_start.elapsed();
-
-        let new_visible_start = Instant::now();
-        let new_visible_tokens = self.token_data_for_uri(snapshot_state, uri);
-        let new_visible_elapsed = new_visible_start.elapsed();
-        let batch_diff_start = Instant::now();
-        let token_batch = Self::build_visible_batch(old_visible_tokens, new_visible_tokens);
-        let changed = token_batch.is_changed();
-        let old_visible_len = token_batch.old_units.len();
-        let new_visible_len = token_batch.new_units.len();
-        let prefix_len = token_batch.prefix_len;
-        let suffix_len = token_batch.suffix_len;
-        let batch_diff_elapsed = batch_diff_start.elapsed();
-        let total_elapsed = total_start.elapsed();
-
-        log::debug!(
-            target: "Measure",
-            "lex {} total={:?} fetch_source={:?} old_visible={:?} delta_scan={:?} restart_lookup={:?} old_suffix={:?} lookup_build={:?} replay={:?} splice={:?} new_visible={:?} batch_diff={:?} changed={} restart={} restart_token={} change_end={} net_shift={} new_prefix={} reused_suffix={} old_tokens={} new_tokens={} prefix={} suffix={}",
-            uri,
-            total_elapsed,
-            fetch_source_elapsed,
-            old_visible_elapsed,
-            delta_scan_elapsed,
-            restart_lookup_elapsed,
-            old_suffix_snapshot_elapsed,
-            lookup_build_elapsed,
-            replay_elapsed,
-            state_splice_elapsed,
-            new_visible_elapsed,
-            batch_diff_elapsed,
-            changed,
-            restart_point,
-            restart_token_pos,
-            new_change_end,
-            net_shift,
-            new_prefix_len,
-            old_occurrences.len().saturating_sub(old_suffix_start_index),
-            old_visible_len,
-            new_visible_len,
-            prefix_len,
-            suffix_len,
-        );
-
-        if changed {
-            Ok(vec![ReplacementChange::new(uri, token_batch)])
-        } else {
-            Ok(Vec::new())
-        }
-    }
-}
 
 impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
     pub(crate) fn lex_cont(
         &mut self,
         start_state: LexerState<Root>,
-        input_str: String,
+        input_str: impl AsRef<str>,
         mut cont: impl FnMut(usize, &LexerState<Root>, usize, usize) -> bool,
     ) -> Result<LexerState<Root>, LexInterrupt> {
-        let mut input = Input::new(input_str.as_bytes());
+        let mut input = Input::new(input_str.as_ref().as_bytes());
         let mut state = start_state;
         let mut unexpected_start: Option<usize> = None;
+        let mut zero_progress = HashSet::from([state.clone()]);
 
         while state.offset < input.end() {
             match self.select_step(&state, &mut input, LexMoment::Normal)? {
                 Some(step) => {
                     let start = step.start;
                     let end = step.end;
-                    if let Some(start) = unexpected_start.take() {
-                        if !self.emit_state_error(
+                    if let Some(start) = unexpected_start.take()
+                        && !self.emit_state_error(
                             &state,
                             LexErrorInfo {
                                 kind: LexErrorKind::UnexpectedInput,
@@ -336,26 +37,39 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                             },
                             false,
                             &mut cont,
-                        )? {
-                            return Ok(state);
-                        }
+                        )?
+                    {
+                        return Ok(state);
                     }
 
-                    if let Some(token_id) = self.commit_match(&mut state, step)? {
-                        if !cont(token_id, &state, start, end) {
-                            return Ok(state);
+                    if let Some(token_id) = self.commit_match(&mut state, step)?
+                        && !cont(token_id, &state, start, end)
+                    {
+                        return Ok(state);
+                    }
+                    if start == end {
+                        if !zero_progress.insert(state.clone()) {
+                            return Err(LexInterrupt::InternalError(format!(
+                                "empty token cycle at byte {}",
+                                state.offset
+                            )));
                         }
+                    } else {
+                        zero_progress.clear();
+                        zero_progress.insert(state.clone());
                     }
                 }
                 None => {
                     unexpected_start.get_or_insert(state.offset);
                     state.offset += 1;
+                    zero_progress.clear();
+                    zero_progress.insert(state.clone());
                 }
             }
         }
 
-        if let Some(start) = unexpected_start.take() {
-            if !self.emit_state_error(
+        if let Some(start) = unexpected_start.take()
+            && !self.emit_state_error(
                 &state,
                 LexErrorInfo {
                     kind: LexErrorKind::UnexpectedInput,
@@ -364,18 +78,24 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                 },
                 false,
                 &mut cont,
-            )? {
-                return Ok(state);
-            }
+            )?
+        {
+            return Ok(state);
         }
 
         while let Some(step) = self.select_step(&state, &mut input, LexMoment::Eof)? {
             let start = step.start;
             let end = step.end;
-            if let Some(token_id) = self.commit_match(&mut state, step)? {
-                if !cont(token_id, &state, start, end) {
-                    return Ok(state);
-                }
+            if let Some(token_id) = self.commit_match(&mut state, step)?
+                && !cont(token_id, &state, start, end)
+            {
+                return Ok(state);
+            }
+            if !zero_progress.insert(state.clone()) {
+                return Err(LexInterrupt::InternalError(format!(
+                    "empty token cycle at byte {}",
+                    state.offset
+                )));
             }
         }
 
@@ -430,6 +150,8 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         moment: LexMoment,
     ) -> Result<Option<TokenMatch<Root>>, LexInterrupt> {
         let current = state.current_state()?;
+        // Empty transitions are checked first so scope exits and boundary actions
+        // happen at the byte where they become valid.
         if let Some(step) = self.scan_empty_state(state, current.clone(), moment)? {
             return Ok(Some(step));
         }
@@ -479,6 +201,8 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                     (0u8, StateAction::Exit)
                 }
             };
+            // Exit, enter, then ordinary actions give nested scopes a stable
+            // precedence; declaration order breaks remaining ties.
             let candidate = TokenMatch {
                 token_index,
                 start: lexer_state.offset,

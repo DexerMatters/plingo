@@ -1,4 +1,4 @@
-use std::any::TypeId;
+use std::{any::TypeId, sync::Arc};
 
 use crate::component::parse::{
     data::{
@@ -24,6 +24,60 @@ pub trait BuildField: Sized {
 
 pub trait TokenField: Sized {
     fn from_token_entry(cx: &BuildCx<'_>, entry: TokenEntryId) -> Result<Self, BuildError>;
+}
+
+/// Persistent repetition values avoid copying an already-built prefix on each
+/// grammar reduction; public `Vec` values are materialized only at extraction.
+pub struct Repeat<T>(Arc<RepeatNode<T>>);
+
+enum RepeatNode<T> {
+    Empty,
+    One(T),
+    Concat(Repeat<T>, Repeat<T>),
+}
+
+impl<T> Clone for Repeat<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+pub fn repeat_empty<T>() -> Repeat<T> {
+    Repeat(Arc::new(RepeatNode::Empty))
+}
+
+pub fn repeat_push<T>(values: Repeat<T>, value: T) -> Repeat<T> {
+    Repeat(Arc::new(RepeatNode::Concat(
+        values,
+        Repeat(Arc::new(RepeatNode::One(value))),
+    )))
+}
+
+pub fn repeat_prepend<T>(value: T, values: Repeat<T>) -> Repeat<T> {
+    Repeat(Arc::new(RepeatNode::Concat(
+        Repeat(Arc::new(RepeatNode::One(value))),
+        values,
+    )))
+}
+
+pub fn repeat_from_product<T>(cx: &BuildCx<'_>, product: ProductId) -> Result<Vec<T>, BuildError>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let values = cx.expect_value::<Repeat<T>>(product)?;
+    let mut result = Vec::new();
+    let mut pending = vec![values.0.as_ref()];
+    while let Some(node) = pending.pop() {
+        match node {
+            RepeatNode::Empty => {}
+            RepeatNode::One(value) => result.push(value.clone()),
+            RepeatNode::Concat(left, right) => {
+                pending.push(right.0.as_ref());
+                pending.push(left.0.as_ref());
+            }
+        }
+    }
+    Ok(result)
 }
 
 impl<T> BuildField for AstBox<T>
@@ -121,7 +175,11 @@ where
     T: Clone + Send + Sync + 'static,
 {
     fn from_product(cx: &BuildCx<'_>, product: ProductId) -> Result<Self, BuildError> {
-        cx.expect_value(product)
+        match cx.expect_value(product) {
+            Ok(value) => Ok(value),
+            Err(BuildError::TypeMismatch { .. }) => repeat_from_product(cx, product),
+            Err(error) => Err(error),
+        }
     }
 }
 

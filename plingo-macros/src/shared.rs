@@ -42,10 +42,7 @@ pub fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig
                 empty = true;
             }
             Meta::List(meta) if meta.path.is_ident("empty") => {
-                return Err(syn::Error::new(
-                    attr.span(),
-                    "#[empty] takes no arguments",
-                ));
+                return Err(syn::Error::new(attr.span(), "#[empty] takes no arguments"));
             }
             Meta::List(meta) if meta.path.is_ident("when") => {
                 if when.is_some() {
@@ -183,7 +180,14 @@ pub fn parse_variant_config(variant: &syn::Variant) -> syn::Result<VariantConfig
             variant.span(),
             "token variants cannot use both #[regex(...)] and #[empty]",
         )),
-        _ if error && (when.is_some() || recover_when.is_some() || enter.is_some() || exit || with.is_some() || skip) => {
+        _ if error
+            && (when.is_some()
+                || recover_when.is_some()
+                || enter.is_some()
+                || exit
+                || with.is_some()
+                || skip) =>
+        {
             Err(syn::Error::new(
                 variant.span(),
                 "#[error] variants cannot also define matcher, scope, skip, or recovery attributes",

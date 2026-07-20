@@ -1,0 +1,5 @@
+error: #[empty] variants must change lexer state with #[enter(...)], #[exit], or #[with(...)]
+ --> tests/ui/terminal-reject-empty-without-state-change.rs:5:5
+  |
+5 |     #[empty]
+  |     ^

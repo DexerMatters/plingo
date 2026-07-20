@@ -55,4 +55,15 @@ pub(crate) enum DeltaFlowError {
     MiddlePassFailed { layer: String, reason: String },
     #[error("Bottom layer {layer} failed while consuming delta: {reason}")]
     BottomConsumeFailed { layer: String, reason: String },
+    #[error("Layer {layer} received revision {base}->{target}, expected base {expected}")]
+    RevisionMismatch {
+        layer: String,
+        expected: u64,
+        base: u64,
+        target: u64,
+    },
+    #[error("Layer {layer} emitted a different revision than it received")]
+    RevisionChanged { layer: String },
+    #[error("Layer {layer} received an invalid transaction: {reason}")]
+    InvalidTransaction { layer: String, reason: String },
 }

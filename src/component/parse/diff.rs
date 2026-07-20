@@ -1,15 +1,18 @@
+//! Public parse output is compared structurally. Cost is ordered by affected tree
+//! weight first and edit count second, which keeps equivalent diffs deterministic.
+
 use std::{any::TypeId, cmp::Ordering, collections::HashMap};
 
 use fluent_uri::Uri;
 
 use super::{
-    ParseAddress, ParseChange, ParseUnit, ProductId,
+    ParseAddress, ParseChange, ParseUnit,
     data::{
         green::{GreenId, TreeArena, TreeData},
-        product::{ProductArena, ProductData},
+        product::{ProductArena, ProductData, ProductId},
     },
 };
-use crate::scheme::change::{ReplacementBatch, ReplacementChange};
+use crate::scheme::change::{AddressChange, Splice};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Cost {
@@ -65,11 +68,11 @@ enum ShapeKey {
     Node {
         green: GreenId,
         ty: TypeId,
-        child_hashes: Vec<u64>,
+        children: Vec<ProductId>,
     },
     Token {
         green: GreenId,
-        fingerprint: u64,
+        entry: usize,
         ty: TypeId,
     },
     Error {
@@ -146,36 +149,8 @@ pub(crate) fn diff_trees(
 ) -> Vec<ParseChange> {
     let mut cx = DiffCx::new(products, trees);
     let mut deltas = Vec::new();
-    cx.diff_sequence(old_roots, new_roots, &[], 0, uri, &mut deltas);
+    cx.diff_sequence(old_roots, new_roots, &[], uri, &mut deltas);
     deltas
-}
-
-fn replace_node(
-    old_pid: ProductId,
-    new_pid: ProductId,
-    path: &[usize],
-    uri: Uri<&'static str>,
-    deltas: &mut Vec<ParseChange>,
-) {
-    let (parent_path, slot) = parent_slot(path);
-    deltas.push(ReplacementChange::new(
-        ParseAddress { uri, parent_path },
-        ReplacementBatch {
-            old_units: vec![ParseUnit { product: old_pid }],
-            new_units: vec![ParseUnit { product: new_pid }],
-            prefix_len: slot,
-            suffix_len: 0,
-            old_changed_range: slot..slot + 1,
-            new_changed_range: slot..slot + 1,
-        },
-    ));
-}
-
-fn parent_slot(path: &[usize]) -> (Vec<usize>, usize) {
-    match path.split_last() {
-        Some((&slot, parent_path)) => (parent_path.to_vec(), slot),
-        None => (Vec::new(), 0),
-    }
 }
 
 struct DiffCx<'a> {
@@ -205,15 +180,6 @@ impl<'a> DiffCx<'a> {
         let summary = match self.products.get(product_id) {
             Some(product) => match &product.data {
                 ProductData::Node { children, ty, .. } => {
-                    let child_hashes = children
-                        .iter()
-                        .copied()
-                        .map(|child| {
-                            self.products
-                                .get(child)
-                                .map_or(0, |product| product.semantic_hash())
-                        })
-                        .collect::<Vec<_>>();
                     let weight = 1usize.saturating_add(
                         children
                             .iter()
@@ -225,17 +191,15 @@ impl<'a> DiffCx<'a> {
                         shape: ShapeKey::Node {
                             green: product.green,
                             ty: *ty,
-                            child_hashes,
+                            children: children.clone(),
                         },
                         weight,
                     }
                 }
-                ProductData::Token {
-                    fingerprint, ty, ..
-                } => Summary {
+                ProductData::Token { entry, ty, .. } => Summary {
                     shape: ShapeKey::Token {
                         green: product.green,
-                        fingerprint: *fingerprint,
+                        entry: *entry,
                         ty: *ty,
                     },
                     weight: 1,
@@ -323,8 +287,7 @@ impl<'a> DiffCx<'a> {
                 Some(crate::component::parse::data::product::Product {
                     data:
                         ProductData::Token {
-                            fingerprint: old_fingerprint,
-                            ..
+                            entry: old_entry, ..
                         },
                     green: old_green,
                     ..
@@ -332,8 +295,7 @@ impl<'a> DiffCx<'a> {
                 Some(crate::component::parse::data::product::Product {
                     data:
                         ProductData::Token {
-                            fingerprint: new_fingerprint,
-                            ..
+                            entry: new_entry, ..
                         },
                     green: new_green,
                     ..
@@ -341,7 +303,7 @@ impl<'a> DiffCx<'a> {
             ) => match (self.trees.get(*old_green), self.trees.get(*new_green)) {
                 (Some(old_tree), Some(new_tree)) => match (&old_tree.data, &new_tree.data) {
                     (TreeData::Leaf { id: old_id }, TreeData::Leaf { id: new_id })
-                        if old_id == new_id && old_fingerprint == new_fingerprint =>
+                        if old_id == new_id && old_entry == new_entry =>
                     {
                         Cost::ZERO
                     }
@@ -447,6 +409,8 @@ impl<'a> DiffCx<'a> {
         {
             prefix += 1;
         }
+        // Matching outer structure is already reusable, so the dynamic program
+        // only pays for the list region whose public shape actually changed.
         while prefix < old_end
             && prefix < new_end
             && self.same_public_shape(old[old_end - 1], new[new_end - 1])
@@ -484,23 +448,20 @@ impl<'a> DiffCx<'a> {
 
         let rows = old_mid.len();
         let cols = new_mid.len();
-        let mut costs = vec![vec![Cost::ZERO; cols + 1]; rows + 1];
         let mut steps = vec![vec![Step::Pair; cols]; rows];
-
-        for i in (0..rows).rev() {
-            costs[i][cols] = Cost::delete(self.weight(old_mid[i])).add(costs[i + 1][cols]);
-        }
+        // Backtracking needs every decision, but costs need only two rows.
+        let mut next = vec![Cost::ZERO; cols + 1];
+        let mut current = vec![Cost::ZERO; cols + 1];
         for j in (0..cols).rev() {
-            costs[rows][j] = Cost::insert(self.weight(new_mid[j])).add(costs[rows][j + 1]);
+            next[j] = Cost::insert(self.weight(new_mid[j])).add(next[j + 1]);
         }
 
         for i in (0..rows).rev() {
+            current[cols] = Cost::delete(self.weight(old_mid[i])).add(next[cols]);
             for j in (0..cols).rev() {
-                let delete = Cost::delete(self.weight(old_mid[i])).add(costs[i + 1][j]);
-                let insert = Cost::insert(self.weight(new_mid[j])).add(costs[i][j + 1]);
-                let pair = self
-                    .diff_cost(old_mid[i], new_mid[j])
-                    .add(costs[i + 1][j + 1]);
+                let delete = Cost::delete(self.weight(old_mid[i])).add(next[j]);
+                let insert = Cost::insert(self.weight(new_mid[j])).add(current[j + 1]);
+                let pair = self.diff_cost(old_mid[i], new_mid[j]).add(next[j + 1]);
 
                 let mut best = (pair, Step::Pair);
                 for candidate in [(delete, Step::Delete), (insert, Step::Insert)] {
@@ -511,94 +472,43 @@ impl<'a> DiffCx<'a> {
                     }
                 }
 
-                costs[i][j] = best.0;
+                // Stable ranks make equal-cost alignments deterministic.
+                current[j] = best.0;
                 steps[i][j] = best.1;
             }
+            std::mem::swap(&mut current, &mut next);
         }
 
-        let cost = costs[0][0];
+        let cost = next[0];
         self.sequence_cost_cache.insert(key, cost);
         SequencePlan { cost, steps }
-    }
-
-    fn emit_delete(
-        &self,
-        parent_path: &[usize],
-        slot: usize,
-        old_pid: ProductId,
-        uri: Uri<&'static str>,
-        deltas: &mut Vec<ParseChange>,
-    ) {
-        deltas.push(ReplacementChange::new(
-            ParseAddress {
-                uri,
-                parent_path: parent_path.to_vec(),
-            },
-            ReplacementBatch {
-                old_units: vec![ParseUnit { product: old_pid }],
-                new_units: Vec::new(),
-                prefix_len: slot,
-                suffix_len: 0,
-                old_changed_range: slot..slot + 1,
-                new_changed_range: slot..slot,
-            },
-        ));
-    }
-
-    fn emit_insert(
-        &self,
-        parent_path: &[usize],
-        slot: usize,
-        new_pid: ProductId,
-        uri: Uri<&'static str>,
-        deltas: &mut Vec<ParseChange>,
-    ) {
-        deltas.push(ReplacementChange::new(
-            ParseAddress {
-                uri,
-                parent_path: parent_path.to_vec(),
-            },
-            ReplacementBatch {
-                old_units: Vec::new(),
-                new_units: vec![ParseUnit { product: new_pid }],
-                prefix_len: slot,
-                suffix_len: 0,
-                old_changed_range: slot..slot,
-                new_changed_range: slot..slot + 1,
-            },
-        ));
     }
 
     fn diff_product(
         &mut self,
         old_pid: ProductId,
         new_pid: ProductId,
-        path: &[usize],
+        old_slot: usize,
+        new_slot: usize,
+        parent_path: &[usize],
         uri: Uri<&'static str>,
         deltas: &mut Vec<ParseChange>,
-    ) {
-        if old_pid == new_pid {
-            return;
-        }
-        if self.same_public_shape(old_pid, new_pid) {
-            return;
+    ) -> bool {
+        if old_pid == new_pid || self.same_public_shape(old_pid, new_pid) {
+            return false;
         }
 
         let Some(old_product) = self.products.get(old_pid) else {
-            replace_node(old_pid, new_pid, path, uri, deltas);
-            return;
+            return true;
         };
         let Some(new_product) = self.products.get(new_pid) else {
-            replace_node(old_pid, new_pid, path, uri, deltas);
-            return;
+            return true;
         };
         let Some(old_tree) = self.trees.get(old_product.green) else {
-            replace_node(old_pid, new_pid, path, uri, deltas);
-            return;
+            return true;
         };
         let Some(new_tree) = self.trees.get(new_product.green) else {
-            replace_node(old_pid, new_pid, path, uri, deltas);
-            return;
+            return true;
         };
 
         match (
@@ -618,26 +528,17 @@ impl<'a> DiffCx<'a> {
                 },
                 TreeData::Node { id: old_id, .. },
                 TreeData::Node { id: new_id, .. },
-            ) if old_id == new_id => {
-                self.diff_sequence(old_children, new_children, path, 0, uri, deltas);
+            ) if old_id == new_id && old_slot == new_slot => {
+                self.diff_sequence(
+                    old_children,
+                    new_children,
+                    &path_at(parent_path, old_slot),
+                    uri,
+                    deltas,
+                );
+                false
             }
-            (
-                ProductData::Token { .. },
-                ProductData::Token { .. },
-                TreeData::Leaf { id: old_id },
-                TreeData::Leaf { id: new_id },
-            ) if old_id == new_id => {
-                replace_node(old_pid, new_pid, path, uri, deltas);
-            }
-            (
-                ProductData::Error { .. },
-                ProductData::Error { .. },
-                TreeData::Error { .. },
-                TreeData::Error { .. },
-            ) => {
-                replace_node(old_pid, new_pid, path, uri, deltas);
-            }
-            _ => replace_node(old_pid, new_pid, path, uri, deltas),
+            _ => true,
         }
     }
 
@@ -646,7 +547,6 @@ impl<'a> DiffCx<'a> {
         old: &[ProductId],
         new: &[ProductId],
         parent_path: &[usize],
-        prefix_offset: usize,
         uri: Uri<&'static str>,
         deltas: &mut Vec<ParseChange>,
     ) {
@@ -676,80 +576,135 @@ impl<'a> DiffCx<'a> {
             return;
         }
 
-        if old_mid.is_empty() {
-            for (index, &pid) in new_mid.iter().enumerate() {
-                self.emit_insert(
-                    parent_path,
-                    prefix_offset + old_start + index,
-                    pid,
-                    uri.clone(),
-                    deltas,
-                );
-            }
-            return;
-        }
-
-        if new_mid.is_empty() {
-            for (index, &old_pid) in old_mid.iter().enumerate() {
-                self.emit_delete(
-                    parent_path,
-                    prefix_offset + old_start + index,
-                    old_pid,
-                    uri.clone(),
-                    deltas,
-                );
-            }
-            return;
-        }
-
-        let plan = self.sequence_alignment(old_mid, new_mid);
+        let plan = (!old_mid.is_empty() && !new_mid.is_empty())
+            .then(|| self.sequence_alignment(old_mid, new_mid));
         let mut i = 0usize;
         let mut j = 0usize;
-        let mut shift: isize = 0;
+        let mut splices: Vec<(
+            std::ops::Range<usize>,
+            std::ops::Range<usize>,
+            Vec<ParseUnit>,
+            Vec<ParseUnit>,
+        )> = Vec::new();
+
+        // Adjacent edit decisions form one base/final-coordinate splice.
+        let mut record = |old_range: std::ops::Range<usize>,
+                          new_range: std::ops::Range<usize>,
+                          removed: Option<ProductId>,
+                          inserted: Option<ProductId>| {
+            if let Some(last) = splices.last_mut()
+                && last.0.end == old_range.start
+                && last.1.end == new_range.start
+            {
+                last.0.end = old_range.end;
+                last.1.end = new_range.end;
+                last.2.extend(removed.map(|product| ParseUnit { product }));
+                last.3.extend(inserted.map(|product| ParseUnit { product }));
+            } else {
+                splices.push((
+                    old_range,
+                    new_range,
+                    removed
+                        .map(|product| ParseUnit { product })
+                        .into_iter()
+                        .collect(),
+                    inserted
+                        .map(|product| ParseUnit { product })
+                        .into_iter()
+                        .collect(),
+                ));
+            }
+        };
 
         while i < old_mid.len() || j < new_mid.len() {
-            let slot = (prefix_offset as isize + old_start as isize + i as isize + shift) as usize;
             if i == old_mid.len() {
-                self.emit_insert(parent_path, slot, new_mid[j], uri.clone(), deltas);
+                let new_slot = new_start + j;
+                record(
+                    old_start + i..old_start + i,
+                    new_slot..new_slot + 1,
+                    None,
+                    Some(new_mid[j]),
+                );
                 j += 1;
-                shift += 1;
                 continue;
             }
             if j == new_mid.len() {
-                self.emit_delete(parent_path, slot, old_mid[i], uri.clone(), deltas);
+                let old_slot = old_start + i;
+                record(
+                    old_slot..old_slot + 1,
+                    new_start + j..new_start + j,
+                    Some(old_mid[i]),
+                    None,
+                );
                 i += 1;
-                shift -= 1;
                 continue;
             }
 
-            let step = plan.steps[i][j];
+            let step = plan.as_ref().expect("non-empty alignment").steps[i][j];
             match step {
                 Step::Pair => {
-                    self.diff_product(
+                    let old_slot = old_start + i;
+                    let new_slot = new_start + j;
+                    if self.diff_product(
                         old_mid[i],
                         new_mid[j],
-                        &path_at(parent_path, slot),
-                        uri.clone(),
+                        old_slot,
+                        new_slot,
+                        parent_path,
+                        uri,
                         deltas,
-                    );
+                    ) {
+                        record(
+                            old_slot..old_slot + 1,
+                            new_slot..new_slot + 1,
+                            Some(old_mid[i]),
+                            Some(new_mid[j]),
+                        );
+                    }
                     i += 1;
                     j += 1;
                 }
                 Step::Delete => {
-                    self.emit_delete(parent_path, slot, old_mid[i], uri.clone(), deltas);
+                    let old_slot = old_start + i;
+                    record(
+                        old_slot..old_slot + 1,
+                        new_start + j..new_start + j,
+                        Some(old_mid[i]),
+                        None,
+                    );
                     i += 1;
-                    shift -= 1;
                 }
                 Step::Insert => {
-                    self.emit_insert(parent_path, slot, new_mid[j], uri.clone(), deltas);
+                    let new_slot = new_start + j;
+                    record(
+                        old_start + i..old_start + i,
+                        new_slot..new_slot + 1,
+                        None,
+                        Some(new_mid[j]),
+                    );
                     j += 1;
-                    shift += 1;
                 }
             }
         }
-    }
-}
 
-pub(crate) fn compact(deltas: Vec<ParseChange>) -> Vec<ParseChange> {
-    deltas
+        if !splices.is_empty() {
+            deltas.push(AddressChange {
+                address: ParseAddress {
+                    uri,
+                    parent_path: parent_path.to_vec(),
+                },
+                old_extent: old.len(),
+                new_extent: new.len(),
+                splices: splices
+                    .into_iter()
+                    .map(|(old_range, new_range, removed, inserted)| Splice {
+                        old_range,
+                        new_range,
+                        removed: removed.into(),
+                        inserted: inserted.into(),
+                    })
+                    .collect(),
+            });
+        }
+    }
 }

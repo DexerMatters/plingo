@@ -219,7 +219,10 @@ fn parse_scope_slots(item: &ItemEnum) -> syn::Result<(Vec<ScopeSlotConfig>, bool
     let mut seen = BTreeSet::new();
     for slot in &slots {
         if !seen.insert(slot.name.to_string()) {
-            return Err(syn::Error::new(slot.name.span(), "duplicate scope slot name"));
+            return Err(syn::Error::new(
+                slot.name.span(),
+                "duplicate scope slot name",
+            ));
         }
     }
 
@@ -480,11 +483,7 @@ fn build_scope_specs_fn(
     configs: &BTreeMap<syn::Ident, (usize, VariantConfig)>,
     builder_idents: &BTreeMap<syn::Ident, syn::Ident>,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let specs_fn_ident = format_ident!(
-        "__plingo_token_specs_for_{}_{}",
-        root_ident,
-        scope.name
-    );
+    let specs_fn_ident = format_ident!("__plingo_token_specs_for_{}_{}", root_ident, scope.name);
     let mut spec_statements = Vec::new();
 
     for entry in &scope.entries {
@@ -498,13 +497,7 @@ fn build_scope_specs_fn(
         let builder_ident = builder_idents
             .get(&entry.variant)
             .expect("every non-error variant has a builder");
-        let spec = build_scope_token_spec(
-            root_ident,
-            variant,
-            *index,
-            config,
-            builder_ident,
-        )?;
+        let spec = build_scope_token_spec(root_ident, variant, *index, config, builder_ident)?;
         spec_statements.push(quote! { specs.push(#spec); });
     }
 
@@ -523,11 +516,7 @@ fn build_scope_registration(
     scope: &ScopeConfig,
     _error_builder_ident: &syn::Ident,
 ) -> proc_macro2::TokenStream {
-    let specs_fn_ident = format_ident!(
-        "__plingo_token_specs_for_{}_{}",
-        root_ident,
-        scope.name
-    );
+    let specs_fn_ident = format_ident!("__plingo_token_specs_for_{}_{}", root_ident, scope.name);
     let scope_name = &scope.name;
     let type_name = if scope.name == "root" {
         quote! { <#root_ident as ::plingo::component::lex::TokenState>::state_key() }

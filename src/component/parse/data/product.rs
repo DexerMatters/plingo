@@ -1,8 +1,4 @@
-use std::{
-    any::TypeId,
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
+use std::any::TypeId;
 
 use crate::component::parse::{
     data::{
@@ -18,16 +14,11 @@ pub type ProductId = usize;
 pub struct Product {
     pub green: GreenId,
     pub data: ProductData,
-    semantic_hash: u64,
 }
 
 impl Product {
     pub fn new(green: GreenId, data: ProductData) -> Self {
-        Self {
-            green,
-            data,
-            semantic_hash: 0,
-        }
+        Self { green, data }
     }
 
     pub fn error(green: GreenId) -> Self {
@@ -82,10 +73,6 @@ impl Product {
             },
         )
     }
-
-    pub(crate) fn semantic_hash(&self) -> u64 {
-        self.semantic_hash
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -127,9 +114,8 @@ impl ProductArena {
         }
     }
 
-    pub fn insert(&mut self, mut product: Product) -> ProductId {
+    pub fn insert(&mut self, product: Product) -> ProductId {
         let id = self.products.len();
-        product.semantic_hash = product_semantic_hash(&product, &self.products);
         self.products.push(product);
         id
     }
@@ -137,45 +123,4 @@ impl ProductArena {
     pub fn get(&self, id: ProductId) -> Option<&Product> {
         self.products.get(id)
     }
-}
-
-fn product_semantic_hash(product: &Product, products: &[Product]) -> u64 {
-    match &product.data {
-        ProductData::Error { children } => hash_value(&(
-            "err",
-            product.green,
-            children
-                .iter()
-                .map(|&child| {
-                    products.get(child).map_or_else(
-                        || hash_value(&("missing-child-product", child)),
-                        Product::semantic_hash,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )),
-        ProductData::Token {
-            fingerprint, ty, ..
-        } => hash_value(&("tok", product.green, fingerprint, ty)),
-        ProductData::Node { children, ty, .. } => hash_value(&(
-            "node",
-            product.green,
-            ty,
-            children
-                .iter()
-                .map(|&child| {
-                    products.get(child).map_or_else(
-                        || hash_value(&("missing-child-product", child)),
-                        Product::semantic_hash,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )),
-    }
-}
-
-fn hash_value<T: Hash + ?Sized>(value: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
 }

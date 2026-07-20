@@ -4,8 +4,8 @@ use crate::{
         debug::DebugSink,
         lex::{LexErrorInfo, LexToken, Lexer, LexerState},
         parse::{
-            AstToken, IncrementalParseStats, ParseChange, ParseErrorInfo, ParsePath, Parser,
-            ParserConfig, TokenData,
+            AstToken, IncrementalParseStats, ParseAddress, ParseChange, ParseChanges,
+            ParseErrorInfo, ParsePath, ParseUnit, Parser, ParserConfig, TokenData,
             data::{
                 ast::{AstArena, AstBox},
                 product::ProductData,
@@ -140,7 +140,7 @@ enum JsonElements {
     Error(#[from(0)] ParseErrorInfo),
 }
 
-type JsonSink = DebugSink<ParseChange>;
+type JsonSink = DebugSink<ParseAddress, ParseUnit>;
 type JsonDirectParser = Parser<JsonToken>;
 type JsonRuntimeParser = Parser<JsonToken, JsonSink>;
 
@@ -566,14 +566,13 @@ fn apply_edit(
     }
 }
 
-fn token_data_shape(data: &[TokenData]) -> Vec<(Option<u32>, usize, usize, usize)> {
+fn token_data_shape(data: &[TokenData]) -> Vec<(Option<u32>, usize, usize)> {
     data.iter()
         .map(|token| {
             (
                 token.terminal.map(|t| t.token_id),
                 token.start,
                 token.length,
-                token.column,
             )
         })
         .collect()
@@ -743,21 +742,21 @@ async fn runtime_summary(ctx: &Context, root: AstBox<JsonValue>) -> anyhow::Resu
 }
 
 async fn recv_non_empty_parse_batch(
-    rx: &mut mpsc::Receiver<Vec<ParseChange>>,
+    rx: &mut mpsc::Receiver<ParseChanges>,
 ) -> anyhow::Result<Vec<ParseChange>> {
     let batch = timeout(Duration::from_secs(2), rx.recv())
         .await?
         .ok_or_else(|| anyhow::anyhow!("parse sink channel closed"))?;
-    Ok(batch)
+    Ok(batch.changes)
 }
 
 async fn recv_parse_batches_until_quiet(
-    rx: &mut mpsc::Receiver<Vec<ParseChange>>,
+    rx: &mut mpsc::Receiver<ParseChanges>,
 ) -> anyhow::Result<Vec<Vec<ParseChange>>> {
     let mut batches = vec![recv_non_empty_parse_batch(rx).await?];
     loop {
         match timeout(Duration::from_millis(500), rx.recv()).await {
-            Ok(Some(batch)) => batches.push(batch),
+            Ok(Some(batch)) => batches.push(batch.changes),
             Ok(None) | Err(_) => break,
         }
     }
@@ -968,7 +967,7 @@ async fn run_runtime_summary_case(
     let debug_sink = debug_sink!(|_ctx, deltas| {
         let sink_tx = sink_tx.clone();
         async move {
-            let _: &Vec<ParseChange> = &deltas;
+            let _: &ParseChanges = &deltas;
             let _ = sink_tx.send(deltas.clone()).await;
             Ok(())
         }
@@ -1382,7 +1381,7 @@ async fn json_runtime_comprehensive_edit_matrix() -> anyhow::Result<()> {
             case.name
         );
         assert!(
-            !case.requires_convergence || stats.iter().all(|stat| stat.converged),
+            !case.requires_convergence || stats.iter().all(|stat| stat.frontier_converged),
             "case {} did not converge for every incremental edit",
             case.name
         );
@@ -1492,6 +1491,123 @@ async fn json_runtime_measure_profile_summary() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn json_runtime_large_edit_stress_matrix() -> anyhow::Result<()> {
+    let logger = measure_logger();
+    let initial = format!(
+        "{{{}}}",
+        (0..400)
+            .map(|i| format!(r#""k{i:04}":"value{i:04}""#))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let locate = |needle: &str| {
+        initial
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing stress-test marker {needle}"))
+    };
+    let first = locate("value0001") + 6;
+    let middle = locate("value0200") + 6;
+    let last = locate("value0398") + 6;
+    let insert = locate(r#""k0200""#);
+    let large_start = locate(r#""k0100""#);
+    let large_end = locate(r#""k0300""#);
+    let cases = [
+        ("replace-first-byte", first..first + 1, "X", 1, 1_500),
+        ("replace-middle-byte", middle..middle + 1, "X", 1, 700),
+        ("replace-last-byte", last..last + 1, "X", 1, 5),
+        (
+            "insert-middle-member",
+            insert..insert,
+            r#""added":{"nested":[1,2,3]},"#,
+            16,
+            790,
+        ),
+        (
+            "append-member",
+            initial.len() - 1..initial.len() - 1,
+            r#","added":{"nested":[1,2,3]}"#,
+            16,
+            1,
+        ),
+        (
+            "replace-half-document",
+            large_start..large_end,
+            r#""bulk":{"changed":true},"#,
+            10,
+            390,
+        ),
+    ];
+
+    for (name, range, replacement, max_reparsed, min_reused) in cases {
+        let (source_tx, source_rx) = mpsc::channel(8);
+        let (sink_tx, mut sink_rx) = mpsc::channel(8);
+        let sink = debug_sink!(|_ctx, changes| {
+            let sink_tx = sink_tx.clone();
+            async move {
+                let _ = sink_tx.send(changes.clone()).await;
+                Ok(())
+            }
+        });
+        let parser = Grammar::from_spec::<JsonValue>().build_lr1::<JsonToken, JsonSink>();
+        let mut runtime = Runtime::new()
+            .with(Source::new(source_rx))
+            .with(Lexer::<JsonToken, JsonRuntimeParser>::new()?)
+            .with(parser)
+            .finish(sink);
+        runtime.run().await?;
+        let uri = Span::new(format!("test://json-stress/{name}"), 0, 0)?.uri;
+        source_tx
+            .send(SourceEdit::Insert {
+                key: Span::new_uri(uri, 0, 0)?,
+                value: initial.clone(),
+            })
+            .await?;
+        recv_non_empty_parse_batch(&mut sink_rx).await?;
+        logger.clear();
+
+        source_tx.try_send(SourceEdit::Delete {
+            key: Span::new_uri(uri, range.start, range.end)?,
+        })?;
+        if !replacement.is_empty() {
+            source_tx.try_send(SourceEdit::Insert {
+                key: Span::new_uri(uri, range.start, range.start)?,
+                value: replacement.to_string(),
+            })?;
+        }
+        recv_non_empty_parse_batch(&mut sink_rx).await?;
+        let stats = runtime
+            .context()
+            .call(JsonRuntimeParser::incremental_stats_for, uri)
+            .await?
+            .expect("incremental parser stats");
+        type StressLexer = Lexer<JsonToken, JsonRuntimeParser>;
+        let lexer_stats = runtime
+            .context()
+            .call(StressLexer::incremental_stats_for, uri)
+            .await?
+            .expect("incremental lexer stats");
+        assert!(
+            !lexer_stats.fallback
+                && lexer_stats.reused >= min_reused
+                && stats.frontier_converged
+                && stats.reparsed <= max_reparsed
+                && stats.reused >= min_reused,
+            "{name}: insufficient exact reuse: lexer={lexer_stats:?}, parser={stats:?}"
+        );
+        let mut final_source = initial.clone();
+        final_source.replace_range(range, replacement);
+        assert_runtime_matches_fresh_parse(&runtime.context(), uri, &final_source, name).await?;
+        let lines = logger.snapshot();
+        eprintln!("{name}: lexer={lexer_stats:?} parser={stats:?}");
+        for line in lines {
+            eprintln!("  {line}");
+        }
+        runtime.shutdown().await;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn json_runtime_batched_large_append_matrix() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -1559,6 +1675,35 @@ async fn json_runtime_batched_large_append_matrix() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn json_runtime_batched_edits_in_reverse_coordinate_order() -> anyhow::Result<()> {
+    let case = EditCase {
+        name: "runtime_reverse_coordinate_batch",
+        initial: "[0,1,2]",
+        ops: &[
+            EditOp::InsertBefore {
+                locate: Locate::Last("]"),
+                text: ",3",
+            },
+            EditOp::InsertBefore {
+                locate: Locate::First("["),
+                text: "                                                                ",
+            },
+        ],
+        expected_keys: &[],
+        min_errors: 0,
+        requires_convergence: true,
+        expect_reparse: true,
+    };
+
+    let (summary, _, _, final_source, token_count, first_eof) =
+        run_runtime_batched_case(case.name, case.initial, case.ops).await?;
+    assert_summary(&case, &summary);
+    assert_eq!(first_eof + 1, token_count);
+    assert_eq!(final_source.trim(), "[0,1,2,3]");
+    Ok(())
+}
+
+#[tokio::test]
 async fn json_runtime_invalid_edits_recover() -> anyhow::Result<()> {
     let case = EditCase {
         name: "invalid_extra_comma_recovers",
@@ -1575,6 +1720,29 @@ async fn json_runtime_invalid_edits_recover() -> anyhow::Result<()> {
 
     let (summary, _, _, _) = run_runtime_case(case.name, case.initial, case.ops).await?;
     assert_summary(&case, &summary);
+    Ok(())
+}
+
+#[tokio::test]
+async fn json_runtime_edit_after_insert_recovery_restarts_locally() -> anyhow::Result<()> {
+    let case = EditCase {
+        name: "edit_after_insert_recovery",
+        initial: r#"{"a":1 "b":2,"c":3}"#,
+        ops: &[EditOp::InsertAfter {
+            locate: Locate::First("\"b"),
+            text: "b",
+        }],
+        expected_keys: &["a", "bb", "c"],
+        min_errors: 1,
+        requires_convergence: false,
+        expect_reparse: true,
+    };
+
+    let (summary, _, stats, final_source) =
+        run_runtime_case(case.name, case.initial, case.ops).await?;
+    assert_summary(&case, &summary);
+    assert!(stats[0].restart_boundary > 0);
+    assert_eq!(final_source, r#"{"a":1 "bb":2,"c":3}"#);
     Ok(())
 }
 

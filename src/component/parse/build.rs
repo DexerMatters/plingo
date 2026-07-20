@@ -119,8 +119,7 @@ impl Grammar {
             states,
             session_arenas: HashMap::new(),
             config,
-            latest: ParserSnapshotState::default(),
-            latest_incremental_stats: HashMap::new(),
+            latest: ParserSnapshotState::default().into(),
             _lower: PhantomData,
             _snapshot: Default::default(),
         };

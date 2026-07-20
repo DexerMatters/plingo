@@ -1,7 +1,7 @@
 error: #[context_callable] requires signature `(&'a mut self, &'a Context, &'a Args)`
-  --> tests/ui/context_callable/fail_missing_context.rs:34:9
+  --> tests/ui/context_callable/fail_missing_context.rs:35:9
    |
-34 |         &'a mut self,
+35 |         &'a mut self,
    |         ^
 
 warning: unused import: `call::CallOutcome`

@@ -1,3 +1,6 @@
+//! Recovery searches repairs in score order and prunes only configurations whose
+//! stack/input state has already reached a strictly better recovery score.
+
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
@@ -67,6 +70,7 @@ struct SearchScore {
 
 impl SearchScore {
     fn dominates(self, other: Self) -> bool {
+        // Tie handling below preserves deterministic repair preference.
         self.error_shifts > other.error_shifts
             || (self.error_shifts == other.error_shifts && self.shifts > other.shifts)
             || (self.error_shifts == other.error_shifts
@@ -183,6 +187,8 @@ pub(crate) fn find_recovery(
             });
         }
         if solution_cost.is_some_and(|best| item.cost > best) {
+            // The queue is cost ordered, so later candidates cannot improve this
+            // repair. Equal-cost candidates remain for deterministic tie-breaking.
             break;
         }
 
@@ -203,6 +209,8 @@ pub(crate) fn find_recovery(
             lookahead,
             &mut cache,
         );
+        // Reductions do not consume source input; explore recovery actions from
+        // every stack that is reachable under the current lookahead first.
         if is_viable_completion(
             ctx,
             tokens,
@@ -555,7 +563,7 @@ fn key(config: &SearchConfig) -> SearchKey {
 }
 
 fn active_stack_paths(ctx: &SessionContext<'_>, column: usize) -> Vec<Vec<usize>> {
-    let Some(column) = ctx.state.column(column) else {
+    let Some(column) = ctx.state.columns.get(column) else {
         return Vec::new();
     };
 

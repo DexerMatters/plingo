@@ -1,4 +1,5 @@
 use core::fmt;
+use std::sync::Arc;
 
 use enum_iterator::Sequence;
 
@@ -6,8 +7,7 @@ use crate::{
     NonTerminal, Terminal,
     component::lex::{LexErrorInfo, LexToken, Lexer, LexerState, WhenCx, WithCx},
     component::parse::{
-        AstToken, ErrorKind, ParseAddress, ParseChange, ParseErrorInfo, ParseUnit, ParserConfig,
-        TokenData,
+        AstToken, ErrorKind, ParseErrorInfo, ParserConfig, TokenData,
         build::Action,
         data::{
             ast::{AstArena, AstBox},
@@ -18,11 +18,8 @@ use crate::{
         grammar::{ERROR_TERMINAL, Grammar, Symbol},
         identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
     },
-    scheme::change::ReplacementBatch,
     utils::{PrettyDisplay, Span},
 };
-
-//mod test_runtime;
 
 mod test_empty_layout;
 mod test_parser;
@@ -118,55 +115,56 @@ fn scheme_submodules_are_reachable() {
     let ctx = crate::scheme::context::Context::default();
     assert!(ctx.snapshot().is_none());
 
-    let batch = crate::scheme::change::ReplacementBatch {
-        old_units: vec![1usize],
-        new_units: vec![2usize],
-        prefix_len: 0,
-        suffix_len: 0,
-        old_changed_range: 0..1,
-        new_changed_range: 0..1,
+    let changes = crate::scheme::change::ChangeSet {
+        revision: crate::scheme::change::Revision { base: 0, target: 1 },
+        changes: vec![crate::scheme::change::AddressChange {
+            address: (),
+            old_extent: 1,
+            new_extent: 1,
+            splices: vec![crate::scheme::change::Splice {
+                old_range: 0..1,
+                new_range: 0..1,
+                removed: Arc::from([()]),
+                inserted: Arc::from([()]),
+            }],
+        }],
     };
-    assert!(batch.is_changed());
+    assert!(changes.validate().is_ok());
 }
 
 #[test]
 fn parse_replay_plan_lives_under_parsing_module() {
-    let batch = crate::component::lex::TokenBatch {
-        old_units: vec![crate::component::parse::TokenData {
-            id: 1,
-            terminal: None,
-            start: 0,
-            length: 1,
-            column: 0,
-            fingerprint: 11,
+    let old = crate::component::parse::TokenData {
+        id: 1,
+        terminal: None,
+        start: 0,
+        length: 1,
+        column: 0,
+        fingerprint: 11,
+    };
+    let inserted = crate::component::parse::TokenData {
+        id: 2,
+        terminal: None,
+        start: 1,
+        length: 1,
+        column: 1,
+        fingerprint: 22,
+    };
+    let change = crate::scheme::change::AddressChange {
+        address: Span::new("test://replay-plan", 0, 0).unwrap().uri,
+        old_extent: 1,
+        new_extent: 2,
+        splices: vec![crate::scheme::change::Splice {
+            old_range: 1..1,
+            new_range: 1..2,
+            removed: Arc::from([]),
+            inserted: Arc::from([inserted]),
         }],
-        new_units: vec![
-            crate::component::parse::TokenData {
-                id: 1,
-                terminal: None,
-                start: 0,
-                length: 1,
-                column: 0,
-                fingerprint: 11,
-            },
-            crate::component::parse::TokenData {
-                id: 2,
-                terminal: None,
-                start: 1,
-                length: 1,
-                column: 1,
-                fingerprint: 22,
-            },
-        ],
-        prefix_len: 1,
-        suffix_len: 0,
-        old_changed_range: 1..1,
-        new_changed_range: 1..2,
     };
 
-    let plan = crate::component::parse::parsing::ReplayPlan::from_batch(batch);
+    let plan = crate::component::parse::parsing::ReplayPlan::from_change(&change, vec![old]);
     assert_eq!(plan.restart_boundary, 1);
-    assert_eq!(plan.replay_tokens().len(), 1);
+    assert_eq!(plan.new_units.len() - plan.restart_boundary, 1);
 }
 
 fn parse_usize(text: &str) -> Result<usize, std::num::ParseIntError> {
@@ -806,47 +804,6 @@ fn test_incremental_reparse_keeps_valid_frontier_for_token_length_change() {
 }
 
 #[test]
-fn test_diff_compact_keeps_replacement_deltas() {
-    let uri = Span::new("test://diff-compact", 0, 0).unwrap().uri;
-    let path = vec![0, 1];
-    let deltas = vec![
-        ParseChange::new(
-            ParseAddress {
-                uri,
-                parent_path: path.clone(),
-            },
-            ReplacementBatch {
-                old_units: vec![ParseUnit { product: 0 }],
-                new_units: Vec::new(),
-                prefix_len: 0,
-                suffix_len: 0,
-                old_changed_range: 0..1,
-                new_changed_range: 0..0,
-            },
-        ),
-        ParseChange::new(
-            ParseAddress {
-                uri,
-                parent_path: path,
-            },
-            ReplacementBatch {
-                old_units: Vec::new(),
-                new_units: vec![ParseUnit { product: 1 }],
-                prefix_len: 0,
-                suffix_len: 0,
-                old_changed_range: 0..0,
-                new_changed_range: 0..1,
-            },
-        ),
-    ];
-
-    let compacted = diff::compact(deltas);
-    assert_eq!(compacted.len(), 2);
-    assert_eq!(compacted[0].batch.old_units[0].product, 0);
-    assert_eq!(compacted[1].batch.new_units[0].product, 1);
-}
-
-#[test]
 fn test_diff_trees_replaces_same_green_different_product() {
     let uri = Span::new("test://diff-same-green", 0, 0).unwrap().uri;
     let mut trees = TreeArena::new();
@@ -861,10 +818,10 @@ fn test_diff_trees_replaces_same_green_different_product() {
     assert_eq!(deltas.len(), 1);
     assert_eq!(deltas[0].address.uri, uri);
     assert_eq!(deltas[0].address.parent_path, Vec::<usize>::new());
-    assert_eq!(deltas[0].batch.old_changed_range, 0..1);
-    assert_eq!(deltas[0].batch.new_changed_range, 0..1);
-    assert_eq!(deltas[0].batch.old_units.len(), 1);
-    assert_eq!(deltas[0].batch.new_units[0].product, new);
+    assert_eq!(deltas[0].splices[0].old_range, 0..1);
+    assert_eq!(deltas[0].splices[0].new_range, 0..1);
+    assert_eq!(deltas[0].splices[0].removed.len(), 1);
+    assert_eq!(deltas[0].splices[0].inserted[0].product, new);
 }
 
 #[test]
@@ -899,10 +856,10 @@ fn test_diff_trees_handles_repeated_identical_children_exactly() {
 
     assert_eq!(deltas.len(), 1);
     assert_eq!(deltas[0].address.parent_path, vec![0]);
-    assert_eq!(deltas[0].batch.old_changed_range, 1..2);
-    assert_eq!(deltas[0].batch.new_changed_range, 1..2);
-    assert_eq!(deltas[0].batch.old_units[0].product, child_b);
-    assert_eq!(deltas[0].batch.new_units[0].product, child_c);
+    assert_eq!(deltas[0].splices[0].old_range, 1..2);
+    assert_eq!(deltas[0].splices[0].new_range, 1..2);
+    assert_eq!(deltas[0].splices[0].removed[0].product, child_b);
+    assert_eq!(deltas[0].splices[0].inserted[0].product, child_c);
 }
 
 #[test]
@@ -936,10 +893,10 @@ fn test_diff_trees_aligns_middle_insert_without_cascade() {
 
     assert_eq!(deltas.len(), 1);
     assert_eq!(deltas[0].address.parent_path, vec![0]);
-    assert_eq!(deltas[0].batch.old_changed_range, 1..1);
-    assert_eq!(deltas[0].batch.new_changed_range, 1..2);
-    assert!(deltas[0].batch.old_units.is_empty());
-    assert_eq!(deltas[0].batch.new_units[0].product, child_b);
+    assert_eq!(deltas[0].splices[0].old_range, 1..1);
+    assert_eq!(deltas[0].splices[0].new_range, 1..2);
+    assert!(deltas[0].splices[0].removed.is_empty());
+    assert_eq!(deltas[0].splices[0].inserted[0].product, child_b);
 }
 
 #[test]
@@ -973,10 +930,10 @@ fn test_diff_trees_aligns_middle_delete_without_cascade() {
 
     assert_eq!(deltas.len(), 1);
     assert_eq!(deltas[0].address.parent_path, vec![0]);
-    assert_eq!(deltas[0].batch.old_changed_range, 1..2);
-    assert_eq!(deltas[0].batch.new_changed_range, 1..1);
-    assert_eq!(deltas[0].batch.old_units[0].product, child_b);
-    assert!(deltas[0].batch.new_units.is_empty());
+    assert_eq!(deltas[0].splices[0].old_range, 1..2);
+    assert_eq!(deltas[0].splices[0].new_range, 1..1);
+    assert_eq!(deltas[0].splices[0].removed[0].product, child_b);
+    assert!(deltas[0].splices[0].inserted.is_empty());
 }
 
 #[test]

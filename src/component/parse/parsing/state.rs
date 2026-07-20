@@ -1,9 +1,8 @@
 use indexmap::IndexSet;
 
-use super::{ParseColumn, ParserSessionState};
+use super::{ParseColumn, ParserSessionState, checkpoint::FrontierCheckpoint};
 use crate::component::parse::{
     TokenOccurrenceId,
-    checkpoint::{BoundaryCheckpoint, FrontierCheckpoint},
     data::{gss::GssNodeId, product::ProductId},
 };
 
@@ -83,15 +82,7 @@ impl ParseColumn {
     }
 
     pub(crate) fn cache_frontier_checkpoint(&mut self, checkpoint: FrontierCheckpoint) {
-        self.checkpoint_cache.store_frontier(checkpoint);
-    }
-
-    pub(crate) fn cached_boundary_checkpoint(&self) -> Option<&BoundaryCheckpoint> {
-        self.checkpoint_cache.boundary()
-    }
-
-    pub(crate) fn cache_boundary_checkpoint(&mut self, checkpoint: BoundaryCheckpoint) {
-        self.checkpoint_cache.store_boundary(checkpoint);
+        self.checkpoint_cache.store(checkpoint);
     }
 
     fn invalidate_checkpoint_cache(&mut self) {
@@ -129,13 +120,9 @@ impl ParserSessionState {
         self.diagnostics
             .retain(|info| info.location.is_some_and(|loc| loc < column));
 
-        self.token_columns.retain(|_, c| *c < column);
+        self.token_columns.retain(|_, c| *c <= column);
         self.token_products
             .retain(|token, _| self.token_columns.contains_key(token));
-    }
-
-    pub(crate) fn columns_from(&self, start: usize) -> Vec<ParseColumn> {
-        self.columns.get(start..).unwrap_or_default().to_vec()
     }
 
     pub(crate) fn append_reused_columns(&mut self, columns: impl IntoIterator<Item = ParseColumn>) {
@@ -143,10 +130,10 @@ impl ParserSessionState {
             let index = self.columns.len();
             if let Some(token) = column.token {
                 self.token_columns.insert(token, index);
-                if !column.error_derived {
-                    if let Some(&product) = column.products.first() {
-                        self.token_products.insert(token, product);
-                    }
+                if !column.error_derived
+                    && let Some(&product) = column.products.first()
+                {
+                    self.token_products.insert(token, product);
                 }
             }
             for diagnostic in &column.diagnostics {
@@ -156,23 +143,5 @@ impl ParserSessionState {
             }
             self.columns.push(column);
         }
-    }
-
-    pub(crate) fn column(&self, index: usize) -> Option<&ParseColumn> {
-        self.columns.get(index)
-    }
-
-    pub(crate) fn column_mut(&mut self, index: usize) -> Option<&mut ParseColumn> {
-        self.columns.get_mut(index)
-    }
-
-    pub(crate) fn discard_columns_from(&mut self, start: usize) {
-        if start >= self.columns.len() {
-            return;
-        }
-        self.columns.truncate(start);
-        self.token_columns.retain(|_, c| *c < start);
-        self.token_products
-            .retain(|token, _| self.token_columns.contains_key(token));
     }
 }

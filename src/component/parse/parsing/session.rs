@@ -621,15 +621,14 @@ impl SessionContext<'_> {
                 self.compact_accepted_roots();
                 return Ok(());
             }
-            if token.terminal == self.grammar.error_terminal && self.error_recovery {
-                if let Some(next) = self.recover_tokens(i, &tokens)? {
+            if token.terminal == self.grammar.error_terminal && self.error_recovery
+                && let Some(next) = self.recover_tokens(i, &tokens)? {
                     if next == i {
                         continue;
                     }
                     i = next;
                     continue;
                 }
-            }
             if let Err(ParseError::NoActiveStacks { .. }) = self.shift_parse_token(column, token) {
                 if let Some(next) = self.recover_tokens(i, &tokens)? {
                     if next == i {

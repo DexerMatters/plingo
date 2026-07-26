@@ -23,6 +23,8 @@ pub enum ActionError {
     ChannelClosed { action: String, layer: String },
     #[error("Retry limit reached while resolving action {action} in layer {layer}")]
     RetryLimitReached { action: String, layer: String },
+    #[error("Read-only action {action} in layer {layer} attempted to emit or await")]
+    ReadOnlyActionContinued { action: String, layer: String },
     #[error(
         "Layer call cycle while resolving action {action}: layer {layer} cannot synchronously call layer {target}"
     )]

@@ -268,8 +268,8 @@ impl Span {
         if start > end {
             return Err(SpanError::IllegalSpan { start, end });
         }
-        let uri = Uri::parse(uri.to_string().leak() as &'static str)
-            .map_err(|e| SpanError::InvalidUri(e))?;
+        let uri =
+            Uri::parse(uri.to_string().leak() as &'static str).map_err(SpanError::InvalidUri)?;
         Ok(Span {
             uri,
             range: RangeOrPoint::Range(start, end),

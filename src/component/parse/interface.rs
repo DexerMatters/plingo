@@ -6,7 +6,7 @@ use crate::{
     component::{
         lex::{Lexer, LexerRoot},
         parse::{
-            AstToken, IncrementalParseStats, ParseAddress, ParsePath, ParseUnit, Parser,
+            AstToken, AstView, IncrementalParseStats, ParseAddress, ParsePath, ParseUnit, Parser,
             data::{
                 ast::AstBox,
                 green::ParseErrorInfo,
@@ -36,6 +36,30 @@ where
             Ok(state) => CallOutcome::ok(self.products_at_path(state, path)),
             Err(err) => CallOutcome::fail(err),
         }
+    }
+
+    /// Returns the parser product that owns an AST value.
+    ///
+    /// This read-only query lets downstream incremental layers associate an
+    /// AST traversal frame with the exact parser product reported in a
+    /// [`ParseChanges`](super::ParseChanges) transaction.
+    #[context_callable]
+    pub async fn product_of_ast_box<'a, T>(
+        &'a mut self,
+        ctx: &'a Context,
+        ast_box: &'a AstBox<T>,
+    ) -> CallOutcome<Self, Option<super::data::product::ProductId>>
+    where
+        T: Send + Sync + 'static,
+    {
+        if let Err(error) = self.snapshot_state(ctx.snapshot()) {
+            return CallOutcome::fail(error);
+        }
+        let product = self
+            .session_arenas
+            .get(&ast_box.uri)
+            .and_then(|arenas| arenas.ast.product_of(ast_box.id));
+        CallOutcome::ok(product)
     }
 
     #[context_callable]
@@ -188,6 +212,27 @@ where
     {
         match self.snapshot_state(ctx.snapshot()) {
             Ok(state) => CallOutcome::ok(self.ast_tokens_at_path::<T>(state, path)),
+            Err(err) => CallOutcome::fail(err),
+        }
+    }
+
+    /// Returns an immutable typed AST view for exactly the revision selected by
+    /// `ctx` and the products reachable from that revision's URI roots.
+    #[context_callable]
+    pub async fn get_ast_view<'a, T>(
+        &'a mut self,
+        ctx: &'a Context,
+        uri: &'a Uri<&'static str>,
+    ) -> CallOutcome<Self, AstView<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        let state = match self.snapshot_state(ctx.snapshot()) {
+            Ok(state) => state,
+            Err(err) => return CallOutcome::fail(err),
+        };
+        match self.ast_view(state, *uri) {
+            Ok(view) => CallOutcome::ok(view),
             Err(err) => CallOutcome::fail(err),
         }
     }

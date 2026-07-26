@@ -140,6 +140,12 @@ pub struct TreeArena {
     pub trees: indexmap::IndexSet<GreenTree>,
 }
 
+impl Default for TreeArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TreeArena {
     pub fn new() -> TreeArena {
         TreeArena {

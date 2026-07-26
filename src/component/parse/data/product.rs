@@ -107,6 +107,12 @@ pub struct ProductArena {
     pub products: Vec<Product>,
 }
 
+impl Default for ProductArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProductArena {
     pub fn new() -> Self {
         Self {

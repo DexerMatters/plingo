@@ -63,6 +63,12 @@ pub struct Runtime<S = NeedsTop> {
     _state: PhantomData<fn() -> S>,
 }
 
+impl Default for Runtime<NeedsTop> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Runtime<NeedsTop> {
     pub fn new() -> Self {
         Self {
@@ -202,11 +208,10 @@ impl Runtime<Sealed> {
         self.context = Context::default();
         for worker in self.inner.workers.drain(..) {
             if worker.is_finished() {
-                if let Err(e) = worker.await {
-                    if e.is_panic() {
+                if let Err(e) = worker.await
+                    && e.is_panic() {
                         registry.panicked.store(true, Ordering::SeqCst);
                     }
-                }
             } else {
                 worker.abort();
                 let _ = worker.await;

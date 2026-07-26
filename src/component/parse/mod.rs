@@ -24,6 +24,7 @@ pub use identity::TokenFingerprint;
 pub use parser::Parser;
 pub use parsing::ParseError;
 pub use types::{
-    IncrementalParseStats, ParseAddress, ParseChange, ParseChanges, ParseForest, ParsePath,
-    ParseUnit, ParserConfig, ParserSnapshotState, TokenData, TokenOccurrenceId,
+    AstView, AstViewEntry, IncrementalParseStats, ParseAddress, ParseChange, ParseChanges,
+    ParseForest, ParsePath, ParseUnit, ParserConfig, ParserSnapshotState, TokenData,
+    TokenOccurrenceId,
 };

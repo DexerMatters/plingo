@@ -85,6 +85,14 @@ pub trait MiddleLayer: NonTopLayer<_Error = Self::Error> + SnapshotLayer {
         ctx: &Context,
         changes: LayerChanges<Self>,
     ) -> impl Future<Output = Result<LayerChanges<Self::Lower>, Self::Error>> + Send;
+
+    /// Called after every lower layer has accepted the transaction.
+    fn commit_transaction(&mut self, _ctx: &Context, _revision: Revision) {}
+
+    /// Discards provisional snapshot state and non-snapshot transaction data.
+    fn rollback_transaction(&mut self, revision: Revision) -> bool {
+        self.rollback_state(revision)
+    }
 }
 
 pub trait BottomLayer: NonTopLayer<_Error = Self::Error> {

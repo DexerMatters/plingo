@@ -158,8 +158,8 @@ impl GssArena {
                 {
                     return false;
                 }
-                if !self.nodes.contains_key(&old) {
-                    self.nodes.insert(old, new);
+                if let std::collections::hash_map::Entry::Vacant(e) = self.nodes.entry(old) {
+                    e.insert(new);
                     self.nodes_rev.insert(new, old);
                     self.node_log.push((old, new));
                 }
@@ -175,8 +175,8 @@ impl GssArena {
                 {
                     return false;
                 }
-                if !self.products.contains_key(&old) {
-                    self.products.insert(old, new);
+                if let std::collections::hash_map::Entry::Vacant(e) = self.products.entry(old) {
+                    e.insert(new);
                     self.products_rev.insert(new, old);
                     self.product_log.push((old, new));
                 }

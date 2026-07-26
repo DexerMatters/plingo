@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use rand::{SeedableRng, distr::Distribution, rngs::StdRng};
+use rand::{distr::Distribution, rngs::StdRng, SeedableRng};
 
 use crate::component::parse::grammar::TerminalId;
 
@@ -107,6 +107,12 @@ where
 }
 
 pub struct GeneratorCache(OnceLock<Result<rand_regex::Regex, rand_regex::Error>>);
+
+impl Default for GeneratorCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl GeneratorCache {
     pub const fn new() -> Self {

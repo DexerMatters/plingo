@@ -122,6 +122,7 @@ async fn top_worker_services_queued_messages_before_polling_emit() {
         requester_layer_type: layer_type,
         snapshot: None,
         remaining_retries: DEFAULT_DEMAND_RETRY_BUDGET,
+        read_only: false,
         dispatch: __macro_private::dispatch_call::<ProbeTop, (), ()>,
         call_stack: Vec::new(),
         response_tx,
@@ -161,6 +162,130 @@ async fn top_worker_services_queued_messages_before_polling_emit() {
     response_rx.await.unwrap().unwrap();
     worker.abort();
     let _ = worker.await;
+}
+
+#[plingo_macros::layer]
+struct ReentrantParent {
+    #[snapshot]
+    value: Arc<usize>,
+}
+
+impl ReentrantParent {
+    #[crate::context_callable]
+    async fn value_at<'a>(
+        &'a mut self,
+        ctx: &'a Context,
+        _: &'a (),
+    ) -> CallOutcome<Self, usize> {
+        let Some(value) = self.state(ctx.snapshot()) else {
+            unreachable!("the forwarding target snapshot is prepared before child pass")
+        };
+        CallOutcome::ok(*value)
+    }
+}
+
+#[plingo_macros::layer]
+struct ReentrantChild {
+    #[snapshot]
+    state: Arc<()>,
+    observed: mpsc::UnboundedSender<usize>,
+}
+
+#[plingo_macros::layer(middle)]
+impl MiddleLayer for ReentrantParent {
+    type Lower = ReentrantChild;
+    type Error = Infallible;
+    type Address = fluent_uri::Uri<&'static str>;
+    type Unit = TextChunk;
+
+    fn pass(
+        &mut self,
+        _ctx: &Context,
+        changes: LayerChanges<Self>,
+    ) -> impl Future<Output = Result<LayerChanges<Self::Lower>, Self::Error>> + Send {
+        async move {
+            let revision = changes.revision;
+            self.value = Arc::new(*self.value + 1);
+            self.push_state(revision.target);
+            Ok(ChangeSet {
+                revision,
+                changes: vec![crate::scheme::change::AddressChange {
+                    address: (),
+                    old_extent: 1,
+                    new_extent: 1,
+                    splices: vec![crate::scheme::change::Splice {
+                        old_range: 0..1,
+                        new_range: 0..1,
+                        removed: Arc::from([()]),
+                        inserted: Arc::from([()]),
+                    }],
+                }],
+            })
+        }
+    }
+}
+
+#[plingo_macros::layer(middle)]
+impl MiddleLayer for ReentrantChild {
+    type Lower = DebugSink<(), ()>;
+    type Error = crate::scheme::error::ActionError;
+    type Address = ();
+    type Unit = ();
+
+    fn pass(
+        &mut self,
+        ctx: &Context,
+        changes: LayerChanges<Self>,
+    ) -> impl Future<Output = Result<LayerChanges<Self::Lower>, Self::Error>> + Send {
+        async move {
+            let target = ctx.with_snapshot(Some(changes.revision.target));
+            let value = target.read(ReentrantParent::value_at, ()).await?;
+            let _ = self.observed.send(value);
+            self.push_state(changes.revision.target);
+            Ok(ChangeSet::empty(changes.revision))
+        }
+    }
+}
+
+#[tokio::test]
+async fn forwarding_middle_worker_services_reentrant_read_demands() {
+    let (source_tx, source_rx) = mpsc::channel(1);
+    let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+    let sink = DebugSink::<(), ()>::new(|_ctx, _changes| Box::pin(async { Ok(()) }));
+    let mut runtime = Runtime::new()
+        .with(Source::<ReentrantParent>::new(source_rx))
+        .with(ReentrantParent {
+            value: Arc::new(0),
+            _snapshot: Default::default(),
+        })
+        .with(ReentrantChild {
+            state: Arc::new(()),
+            observed: observed_tx,
+            _snapshot: Default::default(),
+        })
+        .finish(sink);
+    runtime.run().await.unwrap();
+
+    let uri = Span::new("test://reentrant-read", 0, 0).unwrap().uri;
+    source_tx
+        .send(SourceEdit::Insert {
+            key: Span::new_uri(uri, 0, 0).unwrap(),
+            value: "x".into(),
+        })
+        .await
+        .unwrap();
+
+    for _ in 0..1_000 {
+        if let Ok(value) = observed_rx.try_recv() {
+            assert_eq!(value, 1);
+            runtime.shutdown().await;
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    runtime.shutdown().await;
+    panic!("reentrant read demand was not serviced");
 }
 
 #[plingo_macros::layer]

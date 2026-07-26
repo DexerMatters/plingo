@@ -86,7 +86,7 @@ impl<Lower> Source<Lower> {
         }
     }
 
-    fn load(&mut self, uri: Uri<&'static str>) {
+    fn ensure_loaded(&mut self, uri: Uri<&'static str>) {
         Arc::make_mut(&mut self.sources)
             .entry(uri)
             .or_insert_with(|| Arc::new(Rope::new()));
@@ -111,7 +111,7 @@ impl<Lower> Source<Lower> {
             return Ok(OwnedRopeSlice::new(Arc::clone(source), start, end));
         }
 
-        self.load(uri);
+        self.ensure_loaded(uri);
         let source = &self.sources[&uri];
         let (start, end) = span.trim(source).range.into();
         Ok(OwnedRopeSlice::new(Arc::clone(source), start, end))
@@ -158,7 +158,7 @@ impl<Lower> Source<Lower> {
                 (
                     old,
                     (len > 0)
-                        .then(|| TextPiece::Base(0..len))
+                        .then_some(TextPiece::Base(0..len))
                         .into_iter()
                         .collect(),
                 )
@@ -253,8 +253,9 @@ impl<Lower> Source<Lower> {
             });
         }
         let changes = ChangeSet { revision, changes };
+        let loaded_new_source = new.keys().any(|uri| !self.sources.contains_key(uri));
         (
-            if changes.changes.is_empty() {
+            if changes.changes.is_empty() && !loaded_new_source {
                 Arc::clone(&self.sources)
             } else {
                 Arc::new(new)
@@ -276,6 +277,29 @@ impl<Lower> Source<Lower> {
             Ok(value) => CallOutcome::ok(value),
             Err(err) => CallOutcome::fail(err),
         }
+    }
+
+    /// Ensures that `uri` is present as an empty source document.
+    ///
+    /// This is the on-demand counterpart of [`Self::apply_edit`]. Producers
+    /// can later populate the document through ordinary [`SourceEdit`]s.
+    #[context_callable]
+    pub async fn load<'a>(
+        &'a mut self,
+        ctx: &'a Context,
+        uri: &'a Uri<&'static str>,
+    ) -> CallOutcome<Self, ()>
+    where
+        Lower: NonTopLayer<Address = Uri<&'static str>, Unit = TextChunk>,
+    {
+        if self.sources.contains_key(uri) {
+            return CallOutcome::ok(());
+        }
+        let edit = SourceEdit::Insert {
+            key: Span::point_uri(*uri, 0).expect("zero-length source span is valid"),
+            value: String::new(),
+        };
+        self.apply_edit(ctx, &edit).await
     }
 
     #[context_callable]
@@ -401,12 +425,29 @@ mod tests {
         assert!(payload * 100 < old.len());
     }
 
+    #[test]
+    fn empty_insert_materializes_a_source() {
+        let uri = Span::new("test://on-demand", 0, 0).unwrap().uri;
+        let (_tx, receiver) = tokio::sync::mpsc::channel(1);
+        let source = Source::<()>::new(receiver);
+        let (loaded, changes) = source.apply_batch(
+            Revision { base: 0, target: 1 },
+            &[SourceEdit::Insert {
+                key: Span::point_uri(uri, 0).unwrap(),
+                value: String::new(),
+            }],
+        );
+
+        assert!(loaded.contains_key(&uri));
+        assert!(changes.changes.is_empty());
+    }
+
     #[tokio::test]
     async fn historical_reads_do_not_fall_back_to_latest() {
         let uri = Span::new("test://strict-source", 0, 0).unwrap().uri;
         let (_tx, receiver) = tokio::sync::mpsc::channel(1);
         let mut source = Source::<()>::new(receiver);
-        source.load(uri);
+        source.ensure_loaded(uri);
         source.initialize_snapshots();
         Arc::make_mut(Arc::make_mut(&mut source.sources).get_mut(&uri).unwrap())
             .insert(0, "latest");

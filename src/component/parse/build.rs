@@ -5,8 +5,8 @@ use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 
 use crate::component::parse::{
-    Parser, ParserConfig, ParserSnapshotState,
     grammar::{Grammar, NonTerminalId, ProductionId, Symbol, TerminalId},
+    Parser, ParserConfig, ParserSnapshotState,
 };
 
 pub type LRStateId = usize;
@@ -133,8 +133,7 @@ impl Grammar {
     }
 
     pub fn suffix_after_dot(&self, item: &LR1Item) -> &[Symbol] {
-        &self
-            .production_rhs(item.production)
+        self.production_rhs(item.production)
             .get(item.dot + 1..)
             .unwrap_or_default()
     }

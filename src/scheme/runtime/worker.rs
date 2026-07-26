@@ -1,4 +1,7 @@
-use std::any::{TypeId, type_name};
+use std::{
+    any::{TypeId, type_name},
+    collections::VecDeque,
+};
 
 use tokio::sync::mpsc;
 
@@ -218,7 +221,17 @@ where
     tokio::spawn(async move {
         layer.initialize_snapshots();
         let mut revision = 0;
-        while let Some(message) = receiver.recv().await {
+        let mut queued = VecDeque::new();
+
+        loop {
+            let message = match queued.pop_front() {
+                Some(message) => Some(message),
+                None => receiver.recv().await,
+            };
+            let Some(message) = message else {
+                break;
+            };
+
             match message {
                 WorkerMessage::Demand(demand) => {
                     let resolve_ctx = context
@@ -251,6 +264,8 @@ where
                                     &context,
                                     &mut layer,
                                     &mut revision,
+                                    &mut receiver,
+                                    &mut queued,
                                     envelope.payload,
                                 )
                                 .await
@@ -277,6 +292,8 @@ where
                         &context,
                         &mut layer,
                         &mut revision,
+                        &mut receiver,
+                        &mut queued,
                         delta_box.payload,
                     )
                     .await
@@ -301,6 +318,8 @@ async fn apply_middle_delta<M>(
     context: &Context,
     layer: &mut M,
     current_revision: &mut u64,
+    receiver: &mut mpsc::Receiver<WorkerMessage>,
+    queued: &mut VecDeque<WorkerMessage>,
     payload: Box<dyn crate::scheme::runtime::message::ErasedChanges>,
 ) -> Result<(), DeltaFlowError>
 where
@@ -330,7 +349,7 @@ where
     let out = match layer.pass(&delta_ctx, typed).await {
         Ok(out) => out,
         Err(err) => {
-            layer.rollback_state(input_revision);
+            layer.rollback_transaction(input_revision);
             return Err(DeltaFlowError::MiddlePassFailed {
                 layer: layer_name.to_string(),
                 reason: err.to_string(),
@@ -338,13 +357,13 @@ where
         }
     };
     if out.revision != input_revision {
-        layer.rollback_state(input_revision);
+        layer.rollback_transaction(input_revision);
         return Err(DeltaFlowError::RevisionChanged {
             layer: layer_name.to_string(),
         });
     }
     if let Err(err) = out.validate() {
-        layer.rollback_state(input_revision);
+        layer.rollback_transaction(input_revision);
         return Err(DeltaFlowError::InvalidTransaction {
             layer: layer_name.to_string(),
             reason: err.to_string(),
@@ -353,28 +372,100 @@ where
     let lower_type = match context.registry.lower_by_upper.get(&layer_type).copied() {
         Some(lower_type) => lower_type,
         None => {
-            layer.rollback_state(input_revision);
+            layer.rollback_transaction(input_revision);
             return Err(DeltaFlowError::MissingLowerSender {
                 layer: layer_name.to_string(),
             });
         }
     };
 
-    if let Err(err) = forward_delta_down_to(
+    if let Err(err) = forward_middle_delta(
         lower_type,
         layer_name,
         context,
+        layer_type,
+        layer,
+        receiver,
+        queued,
         DeltaEnvelope::new(Box::new(out)),
     )
     .await
     {
-        layer.rollback_state(input_revision);
+        layer.rollback_transaction(input_revision);
         return Err(err);
     }
 
+    let commit_ctx = context
+        .with_snapshot(Some(input_revision.target))
+        .with_current_layer(layer_type);
+    layer.commit_transaction(&commit_ctx, input_revision);
     *current_revision = input_revision.target;
 
     Ok(())
+}
+
+async fn forward_middle_delta<M>(
+    lower_type: TypeId,
+    layer_name: &'static str,
+    context: &Context,
+    layer_type: TypeId,
+    layer: &mut M,
+    receiver: &mut mpsc::Receiver<WorkerMessage>,
+    queued: &mut VecDeque<WorkerMessage>,
+    delta: DeltaEnvelope,
+) -> Result<(), DeltaFlowError>
+where
+    M: MiddleLayer,
+{
+    let forward = forward_delta_down_to(lower_type, layer_name, context, delta);
+    tokio::pin!(forward);
+    let mut receiver_open = true;
+
+    loop {
+        tokio::select! {
+            result = &mut forward => return result,
+            message = receiver.recv(), if receiver_open => match message {
+                Some(WorkerMessage::Demand(demand)) if demand.read_only => {
+                    serve_read_only_demand(layer_type, context, layer, demand).await;
+                }
+                Some(message) => queued.push_back(message),
+                None => receiver_open = false,
+            },
+        }
+    }
+}
+
+async fn serve_read_only_demand<M>(
+    layer_type: TypeId,
+    context: &Context,
+    layer: &mut M,
+    demand: Demand,
+) where
+    M: MiddleLayer,
+{
+    let resolve_ctx = context
+        .with_snapshot(demand.snapshot)
+        .with_current_layer(layer_type)
+        .with_call_stack(demand.call_stack.clone());
+    let outcome = dispatch_registered_action(
+        layer,
+        &resolve_ctx,
+        demand.action_name,
+        demand.action.as_ref(),
+        demand.dispatch,
+    )
+    .await;
+
+    let action = demand.action_name.to_string();
+    let result = match outcome.inner {
+        ErasedOutcomeKind::Resolved(output) => Ok(output),
+        ErasedOutcomeKind::Failed(error) => Err(error),
+        ErasedOutcomeKind::Continue(_) => Err(ActionError::ReadOnlyActionContinued {
+            action,
+            layer: M::display(),
+        }),
+    };
+    let _ = demand.response_tx.send(result);
 }
 
 pub(crate) fn spawn_bottom_worker<B>(
@@ -525,10 +616,17 @@ where
     let result = match outcome.inner {
         ErasedOutcomeKind::Resolved(output) => Ok(output),
         ErasedOutcomeKind::Continue(continuation) => {
-            return PostDemand::Continue {
-                continuation,
-                demand,
-            };
+            if demand.read_only {
+                Err(ActionError::ReadOnlyActionContinued {
+                    action: demand.action_name.to_string(),
+                    layer: L::display(),
+                })
+            } else {
+                return PostDemand::Continue {
+                    continuation,
+                    demand,
+                };
+            }
         }
         ErasedOutcomeKind::Failed(err) => Err(err),
     };

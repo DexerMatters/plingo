@@ -1,6 +1,12 @@
 //! Parser ownership, direct parsing, and runtime layer integration.
 
-use std::{any::TypeId, collections::HashMap, future::Future, marker::PhantomData, sync::Arc};
+use std::{
+    any::TypeId,
+    collections::{HashMap, HashSet},
+    future::Future,
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use fluent_uri::Uri;
 use indexmap::{IndexMap, IndexSet};
@@ -18,11 +24,11 @@ use crate::{
                 product::{Product, ProductArena, ProductData, ProductId},
             },
             diagnostics,
-            grammar::{Grammar, Symbol},
+            grammar::{BuildError, Grammar, Symbol},
             parsing::{self, ParserSessionState, SessionContext},
             types::{
-                IncrementalParseStats, ParseAddress, ParsePath, ParseUnit, ParserConfig,
-                ParserSnapshotState, SessionArenas, TokenData,
+                AstView, AstViewEntry, IncrementalParseStats, ParseAddress, ParsePath, ParseUnit,
+                ParserConfig, ParserSnapshotState, SessionArenas, TokenData,
             },
         },
     },
@@ -173,11 +179,9 @@ impl<Root, Lower> Parser<Root, Lower> {
                     data: ProductData::Node { children, .. },
                     ..
                 }) = arenas.products.get(pid)
-                {
-                    if let Some(&child) = children.get(child_idx) {
+                    && let Some(&child) = children.get(child_idx) {
                         next.push(child);
                     }
-                }
             }
             current = next;
         }
@@ -222,6 +226,104 @@ impl<Root, Lower> Parser<Root, Lower> {
                 _ => None,
             })
             .collect()
+    }
+
+    pub(crate) fn ast_view<T>(
+        &self,
+        state: &ParserSnapshotState,
+        uri: Uri<&'static str>,
+    ) -> Result<AstView<T>, ParseError>
+    where
+        T: Send + Sync + 'static,
+    {
+        let Some(roots) = state.roots.get(&uri) else {
+            return Ok(AstView::empty(uri));
+        };
+        if roots.is_empty() {
+            return Ok(AstView::empty(uri));
+        }
+        let Some(arenas) = self.session_arenas.get(&uri) else {
+            return Err(BuildError::MissingProduct(roots[0]).into());
+        };
+
+        fn visit<T>(
+            arenas: &SessionArenas,
+            uri: Uri<&'static str>,
+            product_id: ProductId,
+            target: TypeId,
+            visited: &mut HashSet<ProductId>,
+            entries: &mut Vec<AstViewEntry<T>>,
+        ) -> Result<(), ParseError>
+        where
+            T: Send + Sync + 'static,
+        {
+            if !visited.insert(product_id) {
+                return Ok(());
+            }
+            let product = arenas
+                .products
+                .get(product_id)
+                .ok_or(BuildError::MissingProduct(product_id))?;
+            match &product.data {
+                ProductData::Node {
+                    ast,
+                    ty,
+                    children,
+                } => {
+                    if *ty == target {
+                        let value = match arenas.ast.cloned_arc::<T>(*ast) {
+                            Some(value) => value,
+                            None if arenas.ast.contains(*ast) => {
+                                return Err(BuildError::TypeMismatch {
+                                    product: product_id,
+                                }
+                                .into());
+                            }
+                            None => return Err(BuildError::MissingAst(*ast).into()),
+                        };
+                        entries.push(AstViewEntry {
+                            ast_box: AstBox::new(*ast, uri),
+                            product: product_id,
+                            value,
+                        });
+                    }
+                    for &child in children {
+                        visit(arenas, uri, child, target, visited, entries)?;
+                    }
+                }
+                ProductData::Error { children } => {
+                    for &child in children {
+                        visit(arenas, uri, child, target, visited, entries)?;
+                    }
+                }
+                ProductData::Token { .. } => {}
+            }
+            Ok(())
+        }
+
+        let target = TypeId::of::<T>();
+        let mut visited = HashSet::new();
+        let mut entries = Vec::new();
+        for &root in roots.iter() {
+            visit(
+                arenas,
+                uri,
+                root,
+                target,
+                &mut visited,
+                &mut entries,
+            )?;
+        }
+        let typed_roots = roots
+            .iter()
+            .filter_map(|root| {
+                entries
+                    .iter()
+                    .find(|entry| entry.product == *root)
+                    .map(|entry| entry.ast_box)
+            })
+            .collect();
+        Ok(AstView::new(uri, typed_roots, entries))
     }
 }
 

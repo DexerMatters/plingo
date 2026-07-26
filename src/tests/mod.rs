@@ -327,6 +327,7 @@ enum ExprAst {
     Pair(#[from(0)] AstBox<ExprAst>, #[from(2)] AstBox<ExprAst>),
 }
 
+#[allow(dead_code)]
 #[derive(NonTerminal, Debug)]
 enum NullableExprAst {
     #[rule()]
@@ -339,6 +340,7 @@ enum NullableExprAst {
     Error(#[from(0)] ParseErrorInfo),
 }
 
+#[allow(dead_code)]
 #[derive(NonTerminal, Debug)]
 enum TokenClassAst {
     #[rule(RootTokens::Number)]
@@ -362,6 +364,7 @@ enum ErrorOnlyAst {
     Error(#[from(0)] ParseErrorInfo),
 }
 
+#[allow(dead_code)]
 #[derive(NonTerminal, Debug)]
 enum EbnfExprAst {
     #[rule([$x(ExprAst)])]

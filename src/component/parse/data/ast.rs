@@ -95,6 +95,17 @@ impl AstArena {
         self.values.get(id)?.downcast_ref::<T>().cloned()
     }
 
+    pub(crate) fn cloned_arc<T>(&self, id: AstId) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        Arc::clone(self.values.get(id)?).downcast::<T>().ok()
+    }
+
+    pub(crate) fn contains(&self, id: AstId) -> bool {
+        self.values.get(id).is_some()
+    }
+
     pub fn bind_product(&mut self, id: AstId, product: ProductId) {
         if let Some(owner) = self.owners.get_mut(id) {
             *owner = Some(product);

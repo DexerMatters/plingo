@@ -98,10 +98,104 @@ impl Context {
         }
     }
 
+    /// Performs an ordinary layer action. The action may emit a transaction or
+    /// await another action.
     pub async fn call<L, Args, O>(
         &self,
         method: LayerMethod<L, Args, O>,
         args: Args,
+    ) -> Result<O, ActionError>
+    where
+        L: FallibleLayer + 'static,
+        Args: Send + Sync + 'static,
+        O: Send + Sync + 'static,
+    {
+        self.dispatch(method, args, false).await
+    }
+
+    /// Performs a read-only action.
+    ///
+    /// A target worker may service this demand while it is forwarding a
+    /// transaction to a lower layer. Read actions must therefore resolve
+    /// directly: emitting or awaiting from one is rejected by the runtime.
+    pub async fn read<L, Args, O>(
+        &self,
+        method: LayerMethod<L, Args, O>,
+        args: Args,
+    ) -> Result<O, ActionError>
+    where
+        L: FallibleLayer + 'static,
+        Args: Send + Sync + 'static,
+        O: Send + Sync + 'static,
+    {
+        self.dispatch(method, args, true).await
+    }
+
+    /// Queues an action without waiting for its result.
+    ///
+    /// This is intended for effects emitted by a successful terminal consumer.
+    /// The send itself is detached so an upstream worker that is still waiting
+    /// for the current transaction cannot deadlock a downstream consumer.
+    pub fn defer<L, Args, O>(
+        &self,
+        method: LayerMethod<L, Args, O>,
+        args: Args,
+    ) -> Result<(), ActionError>
+    where
+        L: FallibleLayer + 'static,
+        Args: Send + Sync + 'static,
+        O: Send + Sync + 'static,
+    {
+        let action_name = type_name::<Args>().to_string();
+        let layer_type = TypeId::of::<L>();
+        let layer_name = self
+            .registry
+            .layer_names
+            .get(&layer_type)
+            .copied()
+            .unwrap_or(type_name::<L>());
+        let sender = self
+            .registry
+            .senders
+            .get(&layer_type)
+            .cloned()
+            .ok_or_else(|| ActionError::MissingResource {
+                action: action_name,
+                layer: layer_name.to_string(),
+            })?;
+
+        let (response_tx, response_rx) = oneshot::channel();
+        drop(response_rx);
+        let mut call_stack = self.call_stack.clone();
+        if let Some(current_layer_type) = self.current_layer_type {
+            call_stack.push(current_layer_type);
+        }
+        let demand = Demand {
+            action: Arc::new(__macro_private::CallPayload::<L, Args, O> {
+                method,
+                args,
+                _marker: PhantomData,
+            }),
+            action_name: type_name::<Args>(),
+            requester_layer_type: layer_type,
+            snapshot: self.snapshot,
+            remaining_retries: DEFAULT_DEMAND_RETRY_BUDGET,
+            read_only: false,
+            dispatch: __macro_private::dispatch_call::<L, Args, O>,
+            call_stack,
+            response_tx,
+        };
+        tokio::spawn(async move {
+            let _ = sender.send(WorkerMessage::Demand(demand)).await;
+        });
+        Ok(())
+    }
+
+    async fn dispatch<L, Args, O>(
+        &self,
+        method: LayerMethod<L, Args, O>,
+        args: Args,
+        read_only: bool,
     ) -> Result<O, ActionError>
     where
         L: FallibleLayer + 'static,
@@ -116,20 +210,20 @@ impl Context {
             .get(&layer_type)
             .copied()
             .unwrap_or(type_name::<L>());
-        if let Some(current_layer_type) = self.current_layer_type {
-            if current_layer_type == layer_type || self.call_stack.contains(&layer_type) {
-                let current_layer_name = self
-                    .registry
-                    .layer_names
-                    .get(&current_layer_type)
-                    .copied()
-                    .unwrap_or("unknown");
-                return Err(ActionError::LayerCallCycle {
-                    action: action_name.clone(),
-                    layer: current_layer_name.to_string(),
-                    target: layer_name.to_string(),
-                });
-            }
+        if let Some(current_layer_type) = self.current_layer_type
+            && (current_layer_type == layer_type || self.call_stack.contains(&layer_type))
+        {
+            let current_layer_name = self
+                .registry
+                .layer_names
+                .get(&current_layer_type)
+                .copied()
+                .unwrap_or("unknown");
+            return Err(ActionError::LayerCallCycle {
+                action: action_name.clone(),
+                layer: current_layer_name.to_string(),
+                target: layer_name.to_string(),
+            });
         }
 
         let sender = self
@@ -157,6 +251,7 @@ impl Context {
             requester_layer_type: layer_type,
             snapshot: self.snapshot,
             remaining_retries: DEFAULT_DEMAND_RETRY_BUDGET,
+            read_only,
             dispatch: __macro_private::dispatch_call::<L, Args, O>,
             call_stack,
             response_tx,

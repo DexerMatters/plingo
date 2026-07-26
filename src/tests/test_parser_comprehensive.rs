@@ -67,6 +67,7 @@ fn parse_json_string(text: &str) -> Result<String, std::convert::Infallible> {
     Ok(text.trim_matches('"').to_string())
 }
 
+#[allow(dead_code)]
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonValue {
     #[rule(JsonToken::String)]
@@ -88,6 +89,7 @@ enum JsonValue {
     Error(#[from(0)] ParseErrorInfo),
 }
 
+#[allow(dead_code)]
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonObject {
     #[rule(JsonToken::LBrace, JsonToken::RBrace)]
@@ -99,6 +101,7 @@ enum JsonObject {
     Error(#[from(0)] ParseErrorInfo),
 }
 
+#[allow(dead_code)]
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonMembers {
     #[rule({$members(JsonMember)}{JsonToken::Comma})]
@@ -108,6 +111,7 @@ enum JsonMembers {
     Error(#[from(0)] ParseErrorInfo),
 }
 
+#[allow(dead_code)]
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonMember {
     #[rule($key(JsonToken::String), JsonToken::Colon, $val(JsonValue))]
@@ -120,6 +124,7 @@ enum JsonMember {
     Error(#[from(0)] ParseErrorInfo),
 }
 
+#[allow(dead_code)]
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonArray {
     #[rule(JsonToken::LBracket, JsonToken::RBracket)]
@@ -131,6 +136,7 @@ enum JsonArray {
     Error(#[from(0)] ParseErrorInfo),
 }
 
+#[allow(dead_code)]
 #[derive(NonTerminal, Debug, Clone)]
 enum JsonElements {
     #[rule({$elements(JsonValue)}{JsonToken::Comma})]

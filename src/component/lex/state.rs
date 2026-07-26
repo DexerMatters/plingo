@@ -173,11 +173,10 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             let Some(token) = self.arena.get(occurrence.id) else {
                 continue;
             };
-            if let Some(span) = span {
-                if occurrence.start >= span.range.end() || occurrence.end <= span.range.start() {
+            if let Some(span) = span
+                && (occurrence.start >= span.range.end() || occurrence.end <= span.range.start()) {
                     continue;
                 }
-            }
             if let Some(error) = token.error {
                 out.push(TokenData {
                     id: token.id,

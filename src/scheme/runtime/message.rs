@@ -59,6 +59,8 @@ pub(crate) struct Demand {
     pub requester_layer_type: TypeId,
     pub snapshot: Option<SnapshotId>,
     pub remaining_retries: u8,
+    /// Read-only demands may be serviced while a worker forwards a delta.
+    pub read_only: bool,
     pub dispatch: __macro_private::RegisteredDispatchFn,
     pub call_stack: Vec<TypeId>,
     pub response_tx: oneshot::Sender<Result<ErasedOutput, ActionError>>,

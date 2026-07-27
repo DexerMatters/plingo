@@ -448,7 +448,7 @@ impl GrammarBuilder {
         (Symbol::N(id), true)
     }
 
-    pub fn terminal_symbol(
+    pub(crate) fn terminal_symbol(
         &mut self,
         label: &'static str,
         id: TerminalId,

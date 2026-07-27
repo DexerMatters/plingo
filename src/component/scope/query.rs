@@ -1,13 +1,8 @@
-use std::{
-    collections::HashSet,
-    fmt,
-    hash::Hash,
-    sync::Arc,
-};
+use std::{collections::HashSet, hash::Hash, sync::Arc};
 
-use super::{Scope, data::ScopeSnapshot};
+use super::{Scope, ScopeDatum, ScopeEdge};
 
-/// A regular path language used by scope-graph queries.
+/// A regular path language used by scope-graph resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PathExpr<Label> {
     Empty,
@@ -84,64 +79,12 @@ where
                     first
                 }
             }
-            Self::Star(inner) => inner
-                .derivative(label)
-                .then(Self::Star(Arc::clone(inner))),
+            Self::Star(inner) => inner.derivative(label).then(Self::Star(Arc::clone(inner))),
         }
     }
 }
 
-/// A scope query. The predicate is supplied by application code and remains
-/// independent of graph storage and traversal.
-pub struct ScopeQuery<Label, Datum> {
-    pub start: Scope,
-    pub path: PathExpr<Label>,
-    accepts: Arc<dyn Fn(&Datum) -> bool + Send + Sync>,
-}
-
-impl<Label, Datum> Clone for ScopeQuery<Label, Datum>
-where
-    Label: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            start: self.start,
-            path: self.path.clone(),
-            accepts: Arc::clone(&self.accepts),
-        }
-    }
-}
-
-impl<Label, Datum> fmt::Debug for ScopeQuery<Label, Datum>
-where
-    Label: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ScopeQuery")
-            .field("start", &self.start)
-            .field("path", &self.path)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<Label, Datum> ScopeQuery<Label, Datum> {
-    pub fn new(
-        start: Scope,
-        path: PathExpr<Label>,
-        accepts: impl Fn(&Datum) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            start,
-            path,
-            accepts: Arc::new(accepts),
-        }
-    }
-
-    fn accepts(&self, datum: &Datum) -> bool {
-        (self.accepts)(datum)
-    }
-}
-
+/// One resolution witness materialized by [`super::ResolutionNode`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ResolutionPath<Label, Datum> {
     pub scopes: Arc<[Scope]>,
@@ -149,121 +92,90 @@ pub struct ResolutionPath<Label, Datum> {
     pub datum: Datum,
 }
 
-/// A query and the answer retained by an application analysis unit.
-#[derive(Clone, Debug)]
-pub struct RecordedQuery<Label, Datum> {
-    pub query: ScopeQuery<Label, Datum>,
-    pub answer: Arc<[ResolutionPath<Label, Datum>]>,
-}
-
-impl<Label, Datum> RecordedQuery<Label, Datum> {
-    pub fn new(
-        query: ScopeQuery<Label, Datum>,
-        answer: impl Into<Arc<[ResolutionPath<Label, Datum>]>>,
-    ) -> Self {
-        Self {
-            query,
-            answer: answer.into(),
-        }
-    }
-}
-
-/// Result of confirming a retained query against a newer graph snapshot.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QueryConfirmation<Label, Datum> {
-    pub unchanged: bool,
-    pub answer: Arc<[ResolutionPath<Label, Datum>]>,
-}
-
-impl<Anchor, Label, Datum, Reference, Request>
-    ScopeSnapshot<Anchor, Label, Datum, Reference, Request>
+/// Resolves a materialized query while observing only the edge and datum
+/// buckets reached by the traversal. The node runtime supplies bucket readers
+/// that record dependencies even for empty frontiers.
+///
+/// Resolution is a set: relation buckets are hash-backed and therefore have no
+/// meaningful traversal order. Returning a set prevents equivalent graph
+/// snapshots from publishing spurious updates merely because iteration order
+/// changed.
+pub(crate) fn resolve_indexed<Label, Datum, Accepts, Lookup>(
+    start: Scope,
+    path: PathExpr<Label>,
+    accepts: Accepts,
+    mut lookup: Lookup,
+) -> HashSet<ResolutionPath<Label, Datum>>
 where
     Label: Clone + Eq + Hash,
-    Datum: Clone,
+    Datum: Clone + Eq + Hash,
+    Accepts: Fn(&Datum) -> bool,
+    Lookup: FnMut(Scope, bool) -> (Vec<ScopeEdge<Label>>, Vec<ScopeDatum<Datum>>),
 {
-    pub(crate) fn resolve_query(
-        &self,
-        query: &ScopeQuery<Label, Datum>,
-    ) -> Vec<ResolutionPath<Label, Datum>> {
-        #[derive(Clone)]
-        struct Search<Label> {
-            scope: Scope,
-            expression: PathExpr<Label>,
-            scopes: Vec<Scope>,
-            labels: Vec<Label>,
-            states: HashSet<(Scope, PathExpr<Label>)>,
-        }
+    #[derive(Clone)]
+    struct Search<Label> {
+        scope: Scope,
+        expression: PathExpr<Label>,
+        scopes: Vec<Scope>,
+        labels: Vec<Label>,
+        states: HashSet<(Scope, PathExpr<Label>)>,
+    }
 
-        let initial = (query.start, query.path.clone());
-        let mut initial_states = HashSet::new();
-        initial_states.insert(initial.clone());
-        let mut pending = vec![Search {
-            scope: query.start,
-            expression: query.path.clone(),
-            scopes: vec![query.start],
-            labels: Vec::new(),
-            states: initial_states,
-        }];
-        let mut answers = Vec::new();
+    let initial = (start, path.clone());
+    let mut initial_states = HashSet::new();
+    initial_states.insert(initial);
+    let mut pending = vec![Search {
+        scope: start,
+        expression: path,
+        scopes: vec![start],
+        labels: Vec::new(),
+        states: initial_states,
+    }];
+    let mut answers = HashSet::new();
 
-        while let Some(search) = pending.pop() {
-            if search.expression.nullable()
-                && let Some((datum, _)) = self.graph.datums.get(&search.scope)
-                && query.accepts(datum)
+    while let Some(search) = pending.pop() {
+        let nullable = search.expression.nullable();
+        let (edges, datums) = lookup(search.scope, nullable);
+        if nullable {
+            for datum in datums
+                .into_iter()
+                .filter(|datum| datum.scope == search.scope)
+                .map(|datum| datum.datum)
+                .filter(|datum| accepts(datum))
             {
-                answers.push(ResolutionPath {
+                answers.insert(ResolutionPath {
                     scopes: search.scopes.clone().into(),
                     labels: search.labels.clone().into(),
-                    datum: datum.clone(),
+                    datum,
                 });
             }
+        }
 
-            for edge in self
-                .graph
-                .edges
-                .keys()
-                .filter(|edge| edge.source == search.scope)
-            {
-                let residual = search.expression.derivative(&edge.label);
-                if residual == PathExpr::Empty {
-                    continue;
-                }
-                let state = (edge.target, residual.clone());
-                if search.states.contains(&state) {
-                    continue;
-                }
-                let mut next = search.clone();
-                next.scope = edge.target;
-                next.expression = residual;
-                next.scopes.push(edge.target);
-                next.labels.push(edge.label.clone());
-                next.states.insert(state);
-                pending.push(next);
+        for edge in edges {
+            let residual = search.expression.derivative(&edge.label);
+            if residual == PathExpr::Empty {
+                continue;
             }
-        }
-        answers
-    }
-
-    pub(crate) fn confirm_query(
-        &self,
-        recorded: &RecordedQuery<Label, Datum>,
-    ) -> QueryConfirmation<Label, Datum>
-    where
-        Datum: Eq + Hash,
-    {
-        let answer = self.resolve_query(&recorded.query);
-        let old = recorded.answer.iter().cloned().collect::<HashSet<_>>();
-        let new = answer.iter().cloned().collect::<HashSet<_>>();
-        QueryConfirmation {
-            unchanged: old == new,
-            answer: answer.into(),
+            let state = (edge.target, residual.clone());
+            if search.states.contains(&state) {
+                continue;
+            }
+            let mut next = search.clone();
+            next.scope = edge.target;
+            next.expression = residual;
+            next.scopes.push(edge.target);
+            next.labels.push(edge.label);
+            next.states.insert(state);
+            pending.push(next);
         }
     }
+    answers
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PathExpr;
+    use super::{PathExpr, resolve_indexed};
+    use crate::component::scope::{Scope, ScopeDatum};
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     enum Label {
@@ -273,13 +185,37 @@ mod tests {
 
     #[test]
     fn derivatives_accept_expected_language() {
-        let expression = PathExpr::zero_or_more(Label::Lexical)
-            .then(PathExpr::label(Label::Declaration));
+        let expression =
+            PathExpr::zero_or_more(Label::Lexical).then(PathExpr::label(Label::Declaration));
         let after_lexical = expression.derivative(&Label::Lexical);
         assert!(!after_lexical.nullable());
-        assert!(after_lexical
-            .derivative(&Label::Declaration)
-            .nullable());
+        assert!(after_lexical.derivative(&Label::Declaration).nullable());
         assert!(expression.derivative(&Label::Declaration).nullable());
+    }
+
+    #[test]
+    fn resolution_returns_all_matching_datums_on_one_scope() {
+        let scope = Scope(0);
+        let answers = resolve_indexed(
+            scope,
+            PathExpr::<Label>::Epsilon,
+            |_| true,
+            |_, _| {
+                (
+                    Vec::new(),
+                    vec![
+                        ScopeDatum {
+                            scope,
+                            datum: 1usize,
+                        },
+                        ScopeDatum {
+                            scope,
+                            datum: 2usize,
+                        },
+                    ],
+                )
+            },
+        );
+        assert_eq!(answers.len(), 2);
     }
 }

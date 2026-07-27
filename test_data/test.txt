@@ -6,13 +6,13 @@
   "roles": ["Admin", "Editor"],
   "roles": ["Admin", "Editor"],
   "address": {
-    "street": "13 Main St",
+    "street": "1324 Main St",
     "city": "Metropolis",
     "zipCode": "10001"
   },
   "hobbies": ["Reading", "Traveling", "Cooking"],
   "preferences": {
-    "theme": "daek",
+    "theme": "dark",
     "notifications": null,
     "heelo":12
   },
@@ -27,9 +27,9 @@
     "heelo":12
   },
   "preferences": {
-    "theme": "daek",
+    "theme": "dark",
     "notifications": null,
     "heelo":12
   },
-  "roles": ["Admin", "Editor"]
+  "roles": ["Admin", "Editor", "hey"]
 }

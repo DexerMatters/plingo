@@ -1,59 +1,35 @@
 //! Public parser vocabulary and snapshot values shared by all parser subsystems.
 
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use fluent_uri::Uri;
 
-use crate::{
-    component::parse::{
-        data::{
-            ast::{AstBox, AstId, TokenEntryId},
-            green::TreeArena,
-            gss::GssArena,
-            product::{ProductArena, ProductId},
-        },
-        grammar::TerminalId,
-        identity::TokenFingerprint,
-        parsing::ParserSessionState,
+use crate::component::parse::{
+    data::{
+        ast::{AstBox, AstId, TokenEntryId},
+        green::TreeArena,
+        gss::GssArena,
+        product::{ProductArena, ProductId},
     },
-    scheme::change::{AddressChange, ChangeSet, FlowUnit},
-    utils::RangeOrPoint,
+    grammar::TerminalId,
+    identity::TokenFingerprint,
+    parsing::ParserSessionState,
 };
 
 use super::data::ast::AstArena;
 
 #[derive(Debug, Clone)]
 pub struct ParserConfig {
+    /// Recovery is part of normal incremental replay and publishes partial
+    /// error products plus diagnostics rather than triggering a rebuild.
     pub error_recovery: bool,
-    pub error_recovery_timeout: Duration,
-    /// Maximum planned replay tokens; `None` always reparses toward convergence.
-    pub incremental_reparse_limit: Option<usize>,
 }
 
 impl Default for ParserConfig {
     fn default() -> Self {
         Self {
             error_recovery: true,
-            error_recovery_timeout: Duration::from_millis(100),
-            incremental_reparse_limit: None,
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ParsePath {
-    pub uri: Uri<&'static str>,
-    pub path: Vec<usize>,
-    pub range: RangeOrPoint<usize>,
-}
-
-impl fmt::Display for ParsePath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:", self.uri)?;
-        for child in &self.path {
-            write!(f, "/{child}")?;
-        }
-        write!(f, "@{}", self.range)
     }
 }
 
@@ -184,26 +160,6 @@ impl<T> AstView<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ParseAddress {
-    pub uri: Uri<&'static str>,
-    pub parent_path: Vec<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseUnit {
-    pub product: ProductId,
-}
-
-impl FlowUnit for ParseUnit {
-    fn extent(&self) -> usize {
-        1
-    }
-}
-
-pub type ParseChange = AddressChange<ParseAddress, ParseUnit>;
-pub type ParseChanges = ChangeSet<ParseAddress, ParseUnit>;
-
 pub type TokenOccurrenceId = usize;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -237,12 +193,6 @@ pub struct TokenData {
     pub fingerprint: TokenFingerprint,
 }
 
-impl FlowUnit for TokenData {
-    fn extent(&self) -> usize {
-        1
-    }
-}
-
 #[derive(Clone, Default)]
 pub struct ParserSnapshotState {
     pub sessions: HashMap<Uri<&'static str>, Arc<ParserSessionState>>,
@@ -251,6 +201,7 @@ pub struct ParserSnapshotState {
     pub(crate) incremental_stats: HashMap<Uri<&'static str>, IncrementalParseStats>,
 }
 
+#[derive(Clone)]
 pub(crate) struct SessionArenas {
     pub trees: TreeArena,
     pub products: ProductArena,

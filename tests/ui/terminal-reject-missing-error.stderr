@@ -1,5 +1,0 @@
-error: terminal enums require exactly one #[error] variant
- --> tests/ui/terminal-reject-missing-error.rs:4:6
-  |
-4 | enum RootToken {
-  |      ^^^^^^^^^

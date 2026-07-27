@@ -6,9 +6,39 @@ use crate::component::parse::{
         green::{ParseErrorInfo, TreeData},
         product::{ProductData, ProductId},
     },
-    grammar::{BuildCx, BuildError, GrammarBuilder, ProductionId, Symbol},
+    grammar::{
+        BuildCx, BuildError, BuildFn, GrammarBuilder, Precedence, ProductionId, Symbol, TerminalId,
+    },
 };
 use crate::utils::Either;
+
+pub fn begin_non_terminal(grammar: &mut GrammarBuilder, label: &'static str) -> (Symbol, bool) {
+    grammar.begin_non_terminal(label)
+}
+
+pub fn begin_internal_non_terminal(grammar: &mut GrammarBuilder, label: &'static str) -> Symbol {
+    grammar.begin_internal_non_terminal(label)
+}
+
+pub fn terminal_symbol(
+    grammar: &mut GrammarBuilder,
+    label: &'static str,
+    id: TerminalId,
+    precedence: Option<Precedence>,
+) -> Symbol {
+    grammar.terminal_symbol(label, id, precedence)
+}
+
+pub fn rule(
+    grammar: &mut GrammarBuilder,
+    label: &'static str,
+    lhs: Symbol,
+    rhs: impl IntoIterator<Item = Symbol>,
+    precedence: Option<Precedence>,
+    build: Option<BuildFn>,
+) {
+    grammar.rule(label, lhs, rhs, precedence, build)
+}
 
 pub trait NonTerminalSpec: Sized + Send + Sync + 'static {
     fn register(grammar: &mut GrammarBuilder) -> Symbol;

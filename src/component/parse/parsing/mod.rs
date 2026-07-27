@@ -1,8 +1,8 @@
-use std::{collections::HashMap, fmt, time::Duration};
+use std::{collections::HashMap, fmt};
 
 use indexmap::IndexSet;
 
-use crate::component::parse::{TokenData, TokenOccurrenceId, recovery};
+use crate::component::parse::{TokenData, TokenOccurrenceId};
 use crate::component::parse::{
     build::ActionSet,
     data::{
@@ -47,12 +47,10 @@ struct ReductionKey {
 
 #[derive(Debug)]
 pub enum ParseError {
-    MissingSnapshot(crate::scheme::context::SnapshotId),
     MissingGoto { state: usize, non_terminal: u32 },
     NoActiveStacks { column: Option<TokenOccurrenceId> },
     MissingGssNode { node: GssNodeId },
     Build(BuildError),
-    RecoveryTimeout { elapsed: Duration },
     Recovered { product: ProductId },
 }
 
@@ -62,18 +60,9 @@ impl From<BuildError> for ParseError {
     }
 }
 
-impl From<recovery::RecoveryError> for ParseError {
-    fn from(value: recovery::RecoveryError) -> Self {
-        match value {
-            recovery::RecoveryError::Timeout { elapsed } => Self::RecoveryTimeout { elapsed },
-        }
-    }
-}
-
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingSnapshot(snapshot) => write!(f, "snapshot {snapshot} is unavailable"),
             Self::MissingGoto {
                 state,
                 non_terminal,
@@ -89,9 +78,6 @@ impl fmt::Display for ParseError {
             },
             Self::MissingGssNode { node } => write!(f, "missing GSS node {node}"),
             Self::Build(error) => write!(f, "build error: {error:?}"),
-            Self::RecoveryTimeout { elapsed } => {
-                write!(f, "recovery search timed out after {elapsed:?}")
-            }
             Self::Recovered { .. } => write!(f, "parse recovered with errors"),
         }
     }
@@ -129,7 +115,6 @@ pub(crate) struct SessionContext<'a> {
     pub(crate) actions: &'a [ActionSet],
     pub(crate) gotos: &'a [Option<usize>],
     pub(crate) error_recovery: bool,
-    pub(crate) error_recovery_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]

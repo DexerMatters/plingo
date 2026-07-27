@@ -1,21 +1,16 @@
-//! URI-free scope graphs constructed incrementally from parser deltas.
-//!
-//! Applications define the traversal rule with a closure passed to
-//! [`ScopeLayer::new`]. The layer owns graph snapshots, frame dependencies,
-//! exact fact ownership, and graph patches. It remains a middle layer.
+//! URI-free scope graph facts and node derivations.
 
 mod data;
 mod engine;
-mod layer;
+pub mod node;
 mod query;
 
 pub use data::{
-    Scope, ScopeDatum, ScopeEdge, ScopeError, ScopePatch, ScopeProperty, ScopeReference,
+    Scope, ScopeDatum, ScopeEdge, ScopeError, ScopeFrameKey, ScopeProperty, ScopeReference,
 };
-pub use layer::{ScopeCx, ScopeLayer, ScopeLayerError};
-pub use query::{
-    PathExpr, QueryConfirmation, RecordedQuery, ResolutionPath, ScopeQuery,
+pub use node::{
+    DatumSelector, ResolutionKey, ResolutionNode, ScopeCx, ScopeDatums, ScopeEdges, ScopeHandle,
+    ScopeKey, ScopeNode, ScopeReferences, ScopeResolution, ScopeStamp, ScopeTaskKey,
+    SourceRequirements,
 };
-
-#[cfg(test)]
-mod tests;
+pub use query::{PathExpr, ResolutionPath};

@@ -2,15 +2,11 @@
 
 use std::{error::Error, fmt, hash::Hash, str::FromStr};
 
-use fluent_uri::Uri;
 use regex_automata::dfa::dense::DFA;
 use regex_syntax::hir::HirKind;
 use thiserror::Error;
 
-use crate::{
-    component::parse::{TokenData, grammar::TerminalId},
-    scheme::{change::ChangeSet, error::ActionError},
-};
+use crate::component::parse::grammar::TerminalId;
 
 use super::{
     __macro_private::{self, BuildErrorToken, BuildToken, ScopeRegistration, WithHook},
@@ -37,11 +33,10 @@ pub trait FromLexeme: Sized {
     fn from_lexeme(lexeme: &str) -> Result<Self, Self::Error>;
 }
 
+/// Lexer configuration is retained as an extension point. Incremental replay
+/// has no budget-based fallback: it always runs to proven convergence or EOF.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LexerConfig {
-    /// Maximum emitted tokens before full-lex fallback; `None` always relexes to convergence.
-    pub incremental_relex_limit: Option<usize>,
-}
+pub struct LexerConfig;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IncrementalLexStats {
@@ -51,7 +46,6 @@ pub struct IncrementalLexStats {
     pub reused: usize,
     pub old_tokens: usize,
     pub new_tokens: usize,
-    pub fallback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -164,8 +158,6 @@ where
 
 #[derive(Debug, Error, Clone)]
 pub enum LexInterrupt {
-    #[error("Snapshot {0} is unavailable")]
-    MissingSnapshot(crate::scheme::context::SnapshotId),
     #[error("Failed to parse token {token} from lexeme {lexeme:?}: {err}")]
     TokenParseError {
         token: &'static str,
@@ -188,9 +180,6 @@ pub enum LexInterrupt {
     QuitState,
     #[error("End of input")]
     EndOfInput,
-
-    #[error("Action error: {0}")]
-    ActionError(ActionError),
 }
 
 impl LexInterrupt {
@@ -238,7 +227,7 @@ pub enum GenerateError {
     Write(#[source] fmt::Error),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct StateMatcher {
     pub(crate) dfa: DFA<Vec<u32>>,
     pub(crate) token_index_by_pattern: Vec<usize>,
@@ -252,6 +241,7 @@ pub(crate) struct TokenOccurrence {
     pub end: usize,
 }
 
+#[derive(Clone)]
 pub(crate) struct CompiledState<Root>
 where
     Root: LexerRoot,
@@ -262,8 +252,6 @@ where
     pub(crate) recovery_error: BuildErrorToken<Root>,
     pub(crate) boundary_error: BuildErrorToken<Root>,
 }
-
-pub type TokenChanges = ChangeSet<Uri<&'static str>, TokenData>;
 
 pub(super) const SYNTHETIC_EOF_ID: usize = usize::MAX;
 

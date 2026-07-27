@@ -1,5 +1,0 @@
-error: duplicate variant entry in the same scope
- --> tests/ui/terminal-reject-scope-duplicate-role.rs:7:9
-  |
-7 |         QuoteStart,
-  |         ^^^^^^^^^^

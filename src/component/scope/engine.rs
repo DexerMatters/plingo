@@ -3,11 +3,11 @@ use std::{collections::HashSet, hash::Hash};
 use fluent_uri::Uri;
 
 use super::{
-    data::{
-        AstOwner, FrameDraft, FrameKey, FrameRecord, PatchBuilder, Scope, ScopeDatum, ScopeEdge,
-        ScopeError, ScopeSnapshot,
-    },
     ScopeProperty,
+    data::{
+        AstOwner, FrameDraft, FrameRecord, PatchBuilder, Scope, ScopeDatum, ScopeEdge, ScopeError,
+        ScopeFrameKey, ScopeSnapshot,
+    },
 };
 
 impl<Anchor, Label, Datum, Reference, Request>
@@ -133,15 +133,12 @@ where
         datum: &ScopeDatum<Datum>,
         patch: &mut PatchBuilder<Label, Datum, Reference, Request>,
     ) {
-        let Some((stored, count)) = self.graph.datums.get_mut(&datum.scope) else {
+        let Some(count) = self.graph.datums.get_mut(datum) else {
             return;
         };
-        if stored != &datum.datum {
-            return;
-        }
         *count -= 1;
         if *count == 0 {
-            self.graph.datums.remove(&datum.scope);
+            self.graph.datums.remove(datum);
             patch.remove_datum(datum.clone());
         }
     }
@@ -175,20 +172,16 @@ where
 
     fn install_draft(
         &mut self,
+        owner: AstOwner,
         draft: FrameDraft<Label, Datum, Reference, Request>,
         patch: &mut PatchBuilder<Label, Datum, Reference, Request>,
     ) -> Result<FrameRecord<Label, Datum, Reference, Request>, ScopeError> {
         for datum in &draft.datums {
-            match self.graph.datums.get_mut(&datum.scope) {
-                Some((stored, count)) if stored == &datum.datum => *count += 1,
-                Some(_) => return Err(ScopeError::DuplicateDatum(datum.scope)),
-                None => {
-                    self.graph
-                        .datums
-                        .insert(datum.scope, (datum.datum.clone(), 1));
-                    patch.add_datum(datum.clone());
-                }
+            let count = self.graph.datums.entry(datum.clone()).or_default();
+            if *count == 0 {
+                patch.add_datum(datum.clone());
             }
+            *count += 1;
         }
         for edge in &draft.edges {
             self.add_edge(edge.clone(), patch)?;
@@ -209,6 +202,7 @@ where
             *count += 1;
         }
         Ok(FrameRecord {
+            owner,
             children: draft.children,
             edges: draft.edges,
             datums: draft.datums,
@@ -219,7 +213,8 @@ where
 
     pub(crate) fn replace_frame(
         &mut self,
-        key: FrameKey,
+        key: ScopeFrameKey,
+        owner: AstOwner,
         draft: FrameDraft<Label, Datum, Reference, Request>,
         patch: &mut PatchBuilder<Label, Datum, Reference, Request>,
     ) -> Result<(), ScopeError> {
@@ -239,7 +234,7 @@ where
                 .insert(key.clone());
         }
 
-        let record = self.install_draft(draft, patch)?;
+        let record = self.install_draft(owner, draft, patch)?;
         let new_children = record.children.clone();
         self.frames.insert(key.clone(), record);
         patch.rebuilt_frames += 1;
@@ -265,7 +260,7 @@ where
     pub(crate) fn replace_roots(
         &mut self,
         uri: Uri<&'static str>,
-        roots: HashSet<FrameKey>,
+        roots: HashSet<ScopeFrameKey>,
         patch: &mut PatchBuilder<Label, Datum, Reference, Request>,
     ) {
         let old = self.roots.insert(uri, roots.clone()).unwrap_or_default();
@@ -275,13 +270,76 @@ where
         self.collect_unreferenced_ast_scopes(patch);
     }
 
-    fn is_root(&self, key: &FrameKey) -> bool {
+    /// Releases cached scope-frame state after the node runtime has dropped a
+    /// frame task. Published facts are runtime-owned; this only keeps private
+    /// ownership counts and allocation maps from retaining stale frames.
+    pub(crate) fn forget_frame(
+        &mut self,
+        key: &ScopeFrameKey,
+        patch: &mut PatchBuilder<Label, Datum, Reference, Request>,
+    ) {
+        for roots in self.roots.values_mut() {
+            roots.remove(key);
+        }
+        self.forget_frame_record(key, patch);
+        self.collect_unreferenced_ast_scopes(patch);
+    }
+
+    /// Releases one document's root ownership while retaining contextual frame
+    /// records that still have an independently live graph task.
+    pub(crate) fn forget_root<F>(
+        &mut self,
+        uri: Uri<&'static str>,
+        mut frame_is_live: F,
+        patch: &mut PatchBuilder<Label, Datum, Reference, Request>,
+    ) where
+        F: FnMut(&ScopeFrameKey) -> bool,
+    {
+        let roots = self.roots.remove(&uri).unwrap_or_default();
+        for frame in roots {
+            if !frame_is_live(&frame) {
+                self.forget_frame_record(&frame, patch);
+            }
+        }
+        self.collect_unreferenced_ast_scopes(patch);
+    }
+
+    fn forget_frame_record(
+        &mut self,
+        key: &ScopeFrameKey,
+        patch: &mut PatchBuilder<Label, Datum, Reference, Request>,
+    ) {
+        let Some(record) = self.frames.remove(key) else {
+            return;
+        };
+        self.remove_record_facts(&record, patch);
+        patch.removed_frames += 1;
+
+        if let Some(parents) = self.parents.remove(key) {
+            for parent in parents {
+                if let Some(record) = self.frames.get_mut(&parent) {
+                    record.children.remove(key);
+                }
+            }
+        }
+        for child in record.children {
+            if let Some(parents) = self.parents.get_mut(&child) {
+                parents.remove(key);
+                if parents.is_empty() {
+                    self.parents.remove(&child);
+                }
+            }
+            self.retract_if_orphan(&child, patch);
+        }
+    }
+
+    fn is_root(&self, key: &ScopeFrameKey) -> bool {
         self.roots.values().any(|roots| roots.contains(key))
     }
 
     fn retract_if_orphan(
         &mut self,
-        key: &FrameKey,
+        key: &ScopeFrameKey,
         patch: &mut PatchBuilder<Label, Datum, Reference, Request>,
     ) {
         if self.is_root(key)
@@ -315,15 +373,15 @@ where
     ) {
         let live_owners = self
             .frames
-            .keys()
-            .map(|key| key.owner.clone())
+            .values()
+            .map(|frame| frame.owner.clone())
             .collect::<HashSet<_>>();
         let stale = self
             .ast_scopes
             .iter()
             .filter_map(|(owner, scope)| {
                 (!live_owners.contains(owner)
-                    && !self.graph.datums.contains_key(scope)
+                    && !self.graph.datums.keys().any(|datum| datum.scope == *scope)
                     && !self
                         .graph
                         .edges

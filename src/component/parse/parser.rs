@@ -3,13 +3,12 @@
 use std::{
     any::TypeId,
     collections::{HashMap, HashSet},
-    future::Future,
     marker::PhantomData,
     sync::Arc,
 };
 
 use fluent_uri::Uri;
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 
 use crate::{
     component::{
@@ -18,30 +17,24 @@ use crate::{
             ParseError,
             build::{ActionSet, Conflict, LR1State, LRStateId},
             data::{
-                ast::{AstArena, AstBox, AstToken},
-                green::{GreenTree, ParseErrorInfo, TreeArena},
-                gss::GssArena,
-                product::{Product, ProductArena, ProductData, ProductId},
+                ast::AstBox,
+                green::{GreenTree, ParseErrorInfo},
+                product::{Product, ProductData, ProductId},
             },
             diagnostics,
             grammar::{BuildError, Grammar, Symbol},
-            parsing::{self, ParserSessionState, SessionContext},
+            parsing::ParserSessionState,
             types::{
-                AstView, AstViewEntry, IncrementalParseStats, ParseAddress, ParsePath, ParseUnit,
-                ParserConfig, ParserSnapshotState, SessionArenas, TokenData,
+                AstView, AstViewEntry, IncrementalParseStats, ParserConfig, ParserSnapshotState,
+                SessionArenas, TokenData,
             },
         },
     },
-    layer,
-    scheme::{
-        change::{ChangeSet, LayerChanges},
-        context::Context,
-        layer::{MiddleLayer, NonTopLayer, SnapshotLayer},
-    },
+    scheme::change::AddressChange,
 };
 
-#[layer]
-pub struct Parser<Root = (), Lower = ()> {
+#[derive(Clone)]
+pub struct Parser<Root = ()> {
     pub grammar: Grammar,
     pub states: Vec<LR1State>,
     pub transitions: IndexMap<(LRStateId, Symbol), LRStateId>,
@@ -51,47 +44,46 @@ pub struct Parser<Root = (), Lower = ()> {
     pub(crate) session_arenas: HashMap<Uri<&'static str>, SessionArenas>,
     pub config: ParserConfig,
 
-    #[snapshot]
     pub latest: Arc<ParserSnapshotState>,
-    pub(crate) _lower: PhantomData<(Root, Lower)>,
+    pub(crate) _root: PhantomData<fn() -> Root>,
 }
 
-impl<Root, Lower> Parser<Root, Lower> {
-    pub fn parse_tokens_at(
+impl<Root> Parser<Root> {
+    /// Replays the lexer-authored token changes in order. A parser revision
+    /// never compares complete token manifests or synthesizes a replacement:
+    /// every replay starts from the exact token checkpoint supplied by lexer
+    /// convergence and runs until parser frontier convergence or EOF.
+    pub(crate) fn derive_changes(
         &mut self,
         uri: fluent_uri::Uri<&'static str>,
-        tokens: &[TokenData],
-    ) -> Result<(), ParseError> {
-        let arenas = self
-            .session_arenas
-            .entry(uri)
-            .or_insert_with(|| SessionArenas {
-                trees: TreeArena::new(),
-                products: ProductArena::new(),
-                ast: AstArena::new(uri),
-                gss: GssArena::new(),
-            });
-        let latest = Arc::make_mut(&mut self.latest);
-        let state = Arc::make_mut(latest.sessions.entry(uri).or_default());
-        if state.columns.is_empty() {
-            let start = arenas.gss.node(0, 0, 0);
-            state.columns = vec![parsing::ParseColumn::new(None, IndexSet::from([start]))];
+        changes: &[AddressChange<Uri<&'static str>, TokenData>],
+    ) -> Result<Vec<ProductId>, ParseError>
+    where
+        Root: LexerRoot + Clone,
+    {
+        if changes.is_empty() {
+            return Ok(self
+                .latest
+                .roots
+                .get(&uri)
+                .map(|roots| roots.as_ref().clone())
+                .unwrap_or_default());
         }
-        let mut ctx = SessionContext {
-            state,
-            trees: &mut arenas.trees,
-            products: &mut arenas.products,
-            ast: &mut arenas.ast,
-            gss: &mut arenas.gss,
-            grammar: &self.grammar,
-            actions: &self.actions,
-            gotos: &self.gotos,
-            error_recovery: self.config.error_recovery,
-            error_recovery_timeout: self.config.error_recovery_timeout,
-        };
-        ctx.parse_tokens(tokens)?;
-        latest.tokens.insert(uri, Arc::new(tokens.to_vec()));
-        Ok(())
+
+        let mut working = (*self.latest).clone();
+        for change in changes {
+            if change.address != uri {
+                return Err(ParseError::NoActiveStacks { column: None });
+            }
+            self.parse_delta_batch(&mut working, change.clone())?;
+        }
+        let roots = working
+            .roots
+            .get(&uri)
+            .map(|roots| roots.as_ref().clone())
+            .unwrap_or_default();
+        self.latest = Arc::new(working);
+        Ok(roots)
     }
 
     pub fn truncate_session(&mut self, uri: fluent_uri::Uri<&'static str>, column: usize) {
@@ -111,16 +103,18 @@ impl<Root, Lower> Parser<Root, Lower> {
         self.latest.incremental_stats.get(&uri).copied()
     }
 
-    pub(crate) fn snapshot_state(
-        &self,
-        snapshot: Option<crate::scheme::context::SnapshotId>,
-    ) -> Result<&ParserSnapshotState, ParseError> {
-        match snapshot {
-            Some(snapshot) => self
-                .state(Some(snapshot))
-                .ok_or(ParseError::MissingSnapshot(snapshot)),
-            None => Ok(self.latest_state()),
-        }
+    pub(crate) fn forget_document(&mut self, uri: fluent_uri::Uri<&'static str>) {
+        let latest = Arc::make_mut(&mut self.latest);
+        latest.sessions.remove(&uri);
+        latest.roots.remove(&uri);
+        latest.tokens.remove(&uri);
+        latest.incremental_stats.remove(&uri);
+        self.session_arenas.remove(&uri);
+    }
+
+    pub(crate) fn reset_documents(&mut self) {
+        self.latest = Arc::new(ParserSnapshotState::default());
+        self.session_arenas.clear();
     }
 
     pub fn latest_parse_diagnostics(
@@ -153,79 +147,6 @@ impl<Root, Lower> Parser<Root, Lower> {
         id: usize,
     ) -> Option<&GreenTree> {
         self.session_arenas.get(&uri)?.trees.get(id)
-    }
-
-    pub(crate) fn products_at_path(
-        &self,
-        state: &ParserSnapshotState,
-        path: &ParsePath,
-    ) -> Vec<ProductId> {
-        let Some(roots) = state.roots.get(&path.uri) else {
-            return Vec::new();
-        };
-        if path.path.is_empty() {
-            return roots.as_ref().clone();
-        }
-        let Some(arenas) = self.session_arenas.get(&path.uri) else {
-            return Vec::new();
-        };
-
-        let mut current = roots.as_ref().clone();
-
-        for &child_idx in &path.path {
-            let mut next = Vec::new();
-            for pid in current {
-                if let Some(Product {
-                    data: ProductData::Node { children, .. },
-                    ..
-                }) = arenas.products.get(pid)
-                    && let Some(&child) = children.get(child_idx) {
-                        next.push(child);
-                    }
-            }
-            current = next;
-        }
-        current
-    }
-
-    pub(crate) fn ast_boxes_at_path<T: 'static>(
-        &self,
-        state: &ParserSnapshotState,
-        path: &ParsePath,
-    ) -> Vec<AstBox<T>> {
-        let products = self.products_at_path(state, path);
-        let Some(arenas) = self.session_arenas.get(&path.uri) else {
-            return Vec::new();
-        };
-        let target = TypeId::of::<T>();
-        products
-            .iter()
-            .filter_map(|&pid| match arenas.products.get(pid)?.data {
-                ProductData::Node { ast, ty, .. } if ty == target => {
-                    Some(AstBox::new(ast, path.uri))
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub(crate) fn ast_tokens_at_path<T: 'static>(
-        &self,
-        state: &ParserSnapshotState,
-        path: &ParsePath,
-    ) -> Vec<AstToken<T>> {
-        let products = self.products_at_path(state, path);
-        let Some(arenas) = self.session_arenas.get(&path.uri) else {
-            return Vec::new();
-        };
-        let target = TypeId::of::<T>();
-        products
-            .iter()
-            .filter_map(|&pid| match arenas.products.get(pid)?.data {
-                ProductData::Token { entry, ty, .. } if ty == target => Some(AstToken::new(entry)),
-                _ => None,
-            })
-            .collect()
     }
 
     pub(crate) fn ast_view<T>(
@@ -265,11 +186,7 @@ impl<Root, Lower> Parser<Root, Lower> {
                 .get(product_id)
                 .ok_or(BuildError::MissingProduct(product_id))?;
             match &product.data {
-                ProductData::Node {
-                    ast,
-                    ty,
-                    children,
-                } => {
+                ProductData::Node { ast, ty, children } => {
                     if *ty == target {
                         let value = match arenas.ast.cloned_arc::<T>(*ast) {
                             Some(value) => value,
@@ -305,14 +222,7 @@ impl<Root, Lower> Parser<Root, Lower> {
         let mut visited = HashSet::new();
         let mut entries = Vec::new();
         for &root in roots.iter() {
-            visit(
-                arenas,
-                uri,
-                root,
-                target,
-                &mut visited,
-                &mut entries,
-            )?;
+            visit(arenas, uri, root, target, &mut visited, &mut entries)?;
         }
         let typed_roots = roots
             .iter()
@@ -324,44 +234,5 @@ impl<Root, Lower> Parser<Root, Lower> {
             })
             .collect();
         Ok(AstView::new(uri, typed_roots, entries))
-    }
-}
-
-#[layer(middle)]
-impl<Root, Lower> MiddleLayer for Parser<Root, Lower>
-where
-    Root: LexerRoot + Clone + 'static,
-    Lower: NonTopLayer<Address = ParseAddress, Unit = ParseUnit> + Send + Sync + 'static,
-{
-    type Lower = Lower;
-    type Error = ParseError;
-    type Address = Uri<&'static str>;
-    type Unit = TokenData;
-
-    fn pass(
-        &mut self,
-        _ctx: &Context,
-        changes: LayerChanges<Self>,
-    ) -> impl Future<Output = Result<LayerChanges<Self::Lower>, Self::Error>> + Send {
-        async move {
-            let revision = changes.revision;
-            if changes.changes.is_empty() {
-                self.push_state(revision.target);
-                return Ok(ChangeSet::empty(revision));
-            }
-            let mut working = (*self.latest).clone();
-            let mut lower_changes = Vec::new();
-
-            for change in changes.changes {
-                lower_changes.extend(self.parse_delta_batch(&mut working, change).await?);
-            }
-
-            self.latest = Arc::new(working);
-            self.push_state(revision.target);
-            Ok(ChangeSet {
-                revision,
-                changes: lower_changes,
-            })
-        }
     }
 }

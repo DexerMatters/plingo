@@ -1,5 +1,0 @@
-error: #[one_of(...)] was removed; use enum-level #[scopes(...)] entries instead
- --> tests/ui/terminal-reject-removed-one-of.rs:5:5
-  |
-5 |     #[one_of(InnerToken)]
-  |     ^

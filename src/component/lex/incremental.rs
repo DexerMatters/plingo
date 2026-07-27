@@ -8,13 +8,13 @@ use std::{
 };
 
 use crate::{
-    component::lex::{
-        IncrementalLexStats, LexInterrupt, Lexer, LexerRoot, LexerSnapshotState, LexerState,
+    component::{
+        lex::{
+            IncrementalLexStats, LexInterrupt, Lexer, LexerRoot, LexerSnapshotState, LexerState,
+        },
+        source::SourceSplice,
     },
-    scheme::{
-        change::{AddressChange, Splice},
-        layer::NonTopLayer,
-    },
+    scheme::change::{AddressChange, Splice},
 };
 
 use super::token::TokenOccurrence;
@@ -34,22 +34,16 @@ fn shift_state<Root: LexerRoot>(state: &LexerState<Root>, shift: isize) -> Lexer
     shifted
 }
 
-impl<Root, Lower> Lexer<Root, Lower>
+impl<Root> Lexer<Root>
 where
     Root: LexerRoot,
-    Lower: NonTopLayer<
-            Address = fluent_uri::Uri<&'static str>,
-            Unit = crate::component::parse::TokenData,
-        > + Send
-        + Sync
-        + 'static,
 {
     pub(crate) fn lex_uri(
         &mut self,
         state: &mut LexerSnapshotState<Root>,
         uri: fluent_uri::Uri<&'static str>,
         snapshot: String,
-        source_splices: &[Splice<crate::component::source::TextChunk>],
+        source_splices: &[SourceSplice],
     ) -> Result<
         Option<AddressChange<fluent_uri::Uri<&'static str>, crate::component::parse::TokenData>>,
         LexInterrupt,
@@ -70,7 +64,7 @@ where
         snapshot_state: &mut LexerSnapshotState<Root>,
         uri: fluent_uri::Uri<&'static str>,
         snapshot: String,
-        source_splices: &[Splice<crate::component::source::TextChunk>],
+        source_splices: &[SourceSplice],
         total_start: Instant,
         fetch_source_elapsed: Duration,
     ) -> Result<
@@ -101,44 +95,25 @@ where
         let old_visible_elapsed = old_visible_start.elapsed();
 
         let delta_scan_start = Instant::now();
-        // A queued edit batch uses evolving coordinates. Comparing the actual
-        // old/final texts condenses it into one exact replacement interval.
-        let mut restart_point = old_source
-            .as_bytes()
-            .iter()
-            .zip(snapshot.as_bytes())
-            .take_while(|(old, new)| old == new)
-            .count();
-        while restart_point > 0
-            && (!old_source.is_char_boundary(restart_point)
-                || !snapshot.is_char_boundary(restart_point))
-        {
-            restart_point -= 1;
-        }
-        let mut common_suffix = old_source
-            .len()
-            .saturating_sub(restart_point)
-            .min(snapshot.len().saturating_sub(restart_point));
-        common_suffix = old_source
-            .as_bytes()
-            .iter()
-            .rev()
-            .zip(snapshot.as_bytes().iter().rev())
-            .take(common_suffix)
-            .take_while(|(old, new)| old == new)
-            .count();
-        while common_suffix > 0
-            && (!old_source.is_char_boundary(old_source.len() - common_suffix)
-                || !snapshot.is_char_boundary(snapshot.len() - common_suffix))
-        {
-            common_suffix -= 1;
-        }
+        let Some(first_splice) = source_splices.first() else {
+            return Err(LexInterrupt::InternalError(
+                "changed source revision has no source delta".to_string(),
+            ));
+        };
+        let Some(last_splice) = source_splices.last() else {
+            unreachable!("first source splice implies a last splice");
+        };
+        // Source owns the exact ordered old/new coordinate map. Replay starts
+        // before the first changed byte and convergence is considered only
+        // beyond the final changed byte, retaining untouched islands between
+        // distant splices for token re-anchoring below.
+        let restart_point = first_splice.old_range.start;
+        let new_change_end = last_splice.new_range.end;
         let net_shift = snapshot.len() as isize - old_source.len() as isize;
-        let new_change_end = snapshot.len() - common_suffix;
         let delta_scan_elapsed = delta_scan_start.elapsed();
 
         let restart_lookup_start = Instant::now();
-        let mut restart_token_pos = {
+        let restart_token_pos = {
             let states = &snapshot_state.state_instances[&uri];
             let occurrences = &snapshot_state.occurrences[&uri];
             debug_assert_eq!(states.len(), occurrences.len() + 1);
@@ -149,7 +124,7 @@ where
         let restart_lookup_elapsed = restart_lookup_start.elapsed();
 
         let old_suffix_snapshot_start = Instant::now();
-        let (start_state, mut old_states, mut old_occurrences) = {
+        let (start_state, old_states, old_occurrences) = {
             let states = snapshot_state
                 .state_instances
                 .get(&uri)
@@ -170,17 +145,12 @@ where
 
         let mut new_occurrences = Vec::new();
         let mut new_states = Vec::new();
-        let mut old_suffix_is_clean = vec![true; old_occurrences.len() + 1];
-        for index in (0..old_occurrences.len()).rev() {
-            // Error tokens can depend on surrounding input and cannot prove that
-            // the remaining token stream is unchanged.
-            old_suffix_is_clean[index] = old_suffix_is_clean[index + 1]
-                && self.arena[old_occurrences[index].id].error.is_none();
-        }
+        // The exact source suffix and complete lexer state stack are the
+        // convergence proof. Error tokens are ordinary deterministic outputs
+        // of that state/input pair and may therefore be reused as well.
+        let old_suffix_is_clean = vec![true; old_occurrences.len() + 1];
 
         let mut convergence: Option<(usize, usize)> = None;
-        let mut budget_exceeded = false;
-        let arena_start = self.arena.len();
         let occurrence_start = snapshot_state
             .next_occurrence
             .get(&uri)
@@ -188,7 +158,6 @@ where
             .unwrap_or(0);
         let mut next_occurrence = occurrence_start;
         let mut occurrence_overflow = false;
-        let relex_limit = self.config.incremental_relex_limit;
         let replay_start = Instant::now();
         let final_state =
             self.lex_cont(start_state, &snapshot, |token_id, state, start, end| {
@@ -224,10 +193,6 @@ where
                         }
                     }
                 }
-                if relex_limit.is_some_and(|limit| new_occurrences.len() >= limit) {
-                    budget_exceeded = true;
-                    return false;
-                }
                 true
             })?;
         if occurrence_overflow {
@@ -253,44 +218,8 @@ where
             }
         }
 
-        let fallback = budget_exceeded && convergence.is_none();
-        if fallback {
-            // Limits are opt-in. With the default `None`, replay continues until
-            // exact convergence instead of falling back to a complete relex.
-            self.arena.truncate(arena_start);
-            restart_token_pos = 0;
-            let states = &snapshot_state.state_instances[&uri];
-            let occurrences = &snapshot_state.occurrences[&uri];
-            old_states = states[1..].to_vec();
-            old_occurrences = occurrences.as_ref().clone();
-            new_states.clear();
-            new_occurrences.clear();
-            next_occurrence = occurrence_start;
-            self.lex_cont(
-                states[0].clone(),
-                &snapshot,
-                |token_id, state, start, end| {
-                    if next_occurrence == usize::MAX {
-                        occurrence_overflow = true;
-                        return false;
-                    }
-                    new_occurrences.push(TokenOccurrence {
-                        id: token_id,
-                        column: next_occurrence,
-                        start,
-                        end,
-                    });
-                    next_occurrence += 1;
-                    new_states.push(state.clone());
-                    true
-                },
-            )?;
-            if occurrence_overflow {
-                return Err(LexInterrupt::InternalError(
-                    "token occurrence identity space exhausted".to_string(),
-                ));
-            }
-        }
+        // No convergence means replay reached EOF. This remains an exact
+        // incremental replay from the edit checkpoint.
         let replay_elapsed = replay_start.elapsed();
 
         let (new_prefix_len, old_suffix_start_index) =
@@ -445,14 +374,13 @@ where
                 reused: old_occurrences.len().saturating_sub(old_suffix_start_index),
                 old_tokens: old_visible_len,
                 new_tokens: new_visible_len,
-                fallback,
             },
         );
         let total_elapsed = total_start.elapsed();
 
         log::debug!(
             target: "Measure",
-            "lex {} total={:?} fetch_source={:?} old_visible={:?} delta_scan={:?} restart_lookup={:?} old_suffix={:?} replay={:?} splice={:?} new_visible={:?} batch_diff={:?} fallback={} changed={} restart={} restart_token={} change_end={} net_shift={} new_prefix={} reused_suffix={} old_tokens={} new_tokens={} prefix={} suffix={}",
+            "lex {} total={:?} fetch_source={:?} old_visible={:?} delta_scan={:?} restart_lookup={:?} old_suffix={:?} replay={:?} splice={:?} new_visible={:?} batch_diff={:?} changed={} restart={} restart_token={} change_end={} net_shift={} new_prefix={} reused_suffix={} old_tokens={} new_tokens={} prefix={} suffix={}",
             uri,
             total_elapsed,
             fetch_source_elapsed,
@@ -464,7 +392,6 @@ where
             state_splice_elapsed,
             new_visible_elapsed,
             batch_diff_elapsed,
-            fallback,
             changed,
             restart_point,
             restart_token_pos,

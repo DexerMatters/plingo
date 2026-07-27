@@ -18,7 +18,7 @@ use crate::component::parse::{
 impl SessionContext<'_> {
     pub(crate) fn resolve_terminal(&self, data: &TokenData) -> TerminalId {
         match data.terminal {
-            Some(t) => t,
+            Some(terminal) => terminal,
             None if data.fingerprint == eof_fingerprint() => self.grammar.eof,
             None => self.grammar.error_terminal,
         }
@@ -484,7 +484,7 @@ impl SessionContext<'_> {
         Ok(next_column)
     }
 
-    fn delete_parse_token(
+    pub(crate) fn delete_parse_token(
         &mut self,
         from_column: usize,
         token: &ParseToken,
@@ -531,15 +531,8 @@ impl SessionContext<'_> {
             return Ok(None);
         }
         let column = self.state.current_column();
-        let result = match recovery::find_recovery(
-            self,
-            column,
-            &tokens[start..],
-            self.error_recovery_timeout,
-        ) {
-            Ok(Some(result)) => result,
-            Ok(None) => return Ok(None),
-            Err(err) => return Err(ParseError::from(err)),
+        let Some(result) = recovery::find_recovery(self, column, &tokens[start..]) else {
+            return Ok(None);
         };
 
         if result.repairs.is_empty() {
@@ -597,57 +590,5 @@ impl SessionContext<'_> {
         }
 
         Ok(Some(index))
-    }
-
-    pub fn parse_tokens(&mut self, tokens: &[TokenData]) -> Result<(), ParseError> {
-        let tokens = tokens
-            .iter()
-            .map(|data| ParseToken {
-                entry: data.id,
-                column: data.column,
-                start: data.start,
-                terminal: self.resolve_terminal(data),
-                length: data.length,
-                fingerprint: data.fingerprint,
-                merge_source_terminal: None,
-            })
-            .collect::<Vec<_>>();
-        let mut i = 0usize;
-        while i < tokens.len() {
-            let token = &tokens[i];
-            let column = self.state.current_column();
-            self.reduce_until_stable(column, token.terminal)?;
-            if token.terminal == self.grammar.eof && !self.state.accepted().is_empty() {
-                self.compact_accepted_roots();
-                return Ok(());
-            }
-            if token.terminal == self.grammar.error_terminal && self.error_recovery
-                && let Some(next) = self.recover_tokens(i, &tokens)? {
-                    if next == i {
-                        continue;
-                    }
-                    i = next;
-                    continue;
-                }
-            if let Err(ParseError::NoActiveStacks { .. }) = self.shift_parse_token(column, token) {
-                if let Some(next) = self.recover_tokens(i, &tokens)? {
-                    if next == i {
-                        continue;
-                    }
-                    i = next;
-                    continue;
-                }
-                return Err(ParseError::NoActiveStacks {
-                    column: Some(token.column),
-                });
-            }
-            if token.terminal == self.grammar.eof {
-                let next_column = self.state.current_column();
-                self.reduce_until_stable(next_column, token.terminal)?;
-            }
-            i += 1;
-        }
-        self.compact_accepted_roots();
-        Ok(())
     }
 }

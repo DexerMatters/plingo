@@ -1,5 +1,0 @@
-error: #[error] payload must be LexErrorInfo
- --> tests/ui/terminal-reject-invalid-error-payload.rs:9:11
-  |
-9 |     Error(String),
-  |           ^^^^^^

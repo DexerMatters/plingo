@@ -1,5 +1,0 @@
-error: duplicate scope slot name
- --> tests/ui/terminal-reject-scope-slots-duplicate.rs:6:5
-  |
-6 |     indent: String,
-  |     ^^^^^^

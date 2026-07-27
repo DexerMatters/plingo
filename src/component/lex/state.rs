@@ -8,7 +8,6 @@ use std::{
 };
 
 use fluent_uri::Uri;
-use plingo_macros::layer;
 
 use crate::{
     component::{
@@ -17,15 +16,69 @@ use crate::{
             grammar::TerminalId,
             identity::{eof_fingerprint, error_fingerprint, token_fingerprint},
         },
-        source::TextChunk,
+        source::{SourceDelta, SourceSplice},
     },
-    scheme::{
-        change::{ChangeSet, LayerChanges},
-        context::{Context, SnapshotId},
-        layer::{MiddleLayer, NonTopLayer, SnapshotLayer},
-    },
+    scheme::change::AddressChange,
     utils::{PrettyDisplay, Span},
 };
+
+/// The lexer result for one committed source revision. `changes` is the exact
+/// sparse token delta between the adjacent token revisions.
+pub(crate) struct LexDocument {
+    pub tokens: Vec<TokenData>,
+    pub changes: Vec<AddressChange<Uri<&'static str>, TokenData>>,
+}
+
+fn validate_source_delta(
+    previous: &str,
+    next: &str,
+    splices: &[SourceSplice],
+) -> Result<(), LexInterrupt> {
+    let mut old_cursor = 0;
+    let mut new_cursor = 0;
+    for splice in splices {
+        if splice.old_range.start < old_cursor
+            || splice.new_range.start < new_cursor
+            || splice.old_range.start > splice.old_range.end
+            || splice.new_range.start > splice.new_range.end
+            || splice.old_range.end > previous.len()
+            || splice.new_range.end > next.len()
+            || !previous.is_char_boundary(splice.old_range.start)
+            || !previous.is_char_boundary(splice.old_range.end)
+            || !next.is_char_boundary(splice.new_range.start)
+            || !next.is_char_boundary(splice.new_range.end)
+            || previous[splice.old_range.clone()] != *splice.removed
+            || next[splice.new_range.clone()] != *splice.inserted
+        {
+            return Err(LexInterrupt::InternalError(
+                "source delta does not match adjacent source revisions".to_string(),
+            ));
+        }
+        old_cursor = splice.old_range.end;
+        new_cursor = splice.new_range.end;
+    }
+    Ok(())
+}
+
+fn apply_evolving_splice(snapshot: &mut String, splice: &SourceSplice) -> Result<(), LexInterrupt> {
+    if splice.old_range.end > snapshot.len()
+        || !snapshot.is_char_boundary(splice.old_range.start)
+        || !snapshot.is_char_boundary(splice.old_range.end)
+        || snapshot[splice.old_range.clone()] != *splice.removed
+    {
+        return Err(LexInterrupt::InternalError(
+            "source delta no longer matches the lexer snapshot".to_string(),
+        ));
+    }
+    snapshot.replace_range(splice.old_range.clone(), &splice.inserted);
+    Ok(())
+}
+
+fn translate_offset(offset: usize, shift: isize) -> Result<usize, LexInterrupt> {
+    offset.checked_add_signed(shift).ok_or_else(|| {
+        LexInterrupt::InternalError("source delta coordinate translation overflowed".to_string())
+    })
+}
 
 use super::{
     __macro_private::{BuildErrorToken, TokenMatcher},
@@ -35,11 +88,11 @@ use super::{
     token::{CompiledState, SYNTHETIC_EOF_ID, StateMatcher, TokenOccurrence},
 };
 
-impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> for LexToken<Root> {
+impl<Root: LexerRoot + fmt::Display> PrettyDisplay<Lexer<Root>> for LexToken<Root> {
     fn pretty_fmt(
         &self,
         f: &mut core::fmt::Formatter<'_>,
-        _context: &Lexer<Root, Lower>,
+        _context: &Lexer<Root>,
     ) -> core::fmt::Result {
         use color_print::cwrite;
         if self.error.is_some() {
@@ -60,11 +113,11 @@ impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> fo
     }
 }
 
-impl<Root: LexerRoot + fmt::Display, Lower> PrettyDisplay<Lexer<Root, Lower>> for usize {
+impl<Root: LexerRoot + fmt::Display> PrettyDisplay<Lexer<Root>> for usize {
     fn pretty_fmt(
         &self,
         f: &mut core::fmt::Formatter<'_>,
-        context: &Lexer<Root, Lower>,
+        context: &Lexer<Root>,
     ) -> core::fmt::Result {
         use color_print::cwrite;
         match context.token(*self) {
@@ -134,8 +187,8 @@ where
     }
 }
 
-#[layer]
-pub struct Lexer<Root, Lower = ()>
+#[derive(Clone)]
+pub struct Lexer<Root>
 where
     Root: LexerRoot,
 {
@@ -144,13 +197,11 @@ where
     skip_terminals: HashSet<TerminalId>,
     pub config: LexerConfig,
 
-    #[snapshot]
     latest: Arc<LexerSnapshotState<Root>>,
     pub(super) arena: Vec<LexToken<Root>>,
-    _lower: PhantomData<fn() -> Lower>,
 }
 
-impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
+impl<Root: LexerRoot> Lexer<Root> {
     fn materialize_token(&self, occurrence: TokenOccurrence) -> Option<LexToken<Root>>
     where
         Root: Clone,
@@ -174,9 +225,10 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
                 continue;
             };
             if let Some(span) = span
-                && (occurrence.start >= span.range.end() || occurrence.end <= span.range.start()) {
-                    continue;
-                }
+                && (occurrence.start >= span.range.end() || occurrence.end <= span.range.start())
+            {
+                continue;
+            }
             if let Some(error) = token.error {
                 out.push(TokenData {
                     id: token.id,
@@ -305,12 +357,109 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             compiled_states,
             state_ids,
             skip_terminals,
-            config: LexerConfig::default(),
+            config: LexerConfig,
             arena: Vec::new(),
             latest: Arc::new(LexerSnapshotState::default()),
-            _lower: PhantomData,
-            _snapshot: Default::default(),
         })
+    }
+
+    /// Incrementally materializes one document from its authoritative ordered
+    /// source edits. Each splice reuses lexer checkpoints before its own start;
+    /// multiple distant edits therefore retain their independent unchanged
+    /// islands instead of becoming one broad source replacement.
+    pub(crate) fn derive_document(
+        &mut self,
+        uri: Uri<&'static str>,
+        source: Arc<str>,
+        delta: &SourceDelta,
+    ) -> Result<LexDocument, LexInterrupt> {
+        let mut next = (*self.latest).clone();
+        let initializing = !next.sources.contains_key(&uri);
+        let previous = next
+            .sources
+            .get(&uri)
+            .cloned()
+            .unwrap_or_else(|| Arc::from(""));
+        if previous.as_ref() == source.as_ref() {
+            return Ok(LexDocument {
+                tokens: self.token_data_for_uri(&next, uri),
+                changes: Vec::new(),
+            });
+        }
+
+        let initial_splice = SourceSplice {
+            old_range: 0..0,
+            new_range: 0..source.len(),
+            removed: Arc::from(""),
+            inserted: Arc::clone(&source),
+        };
+        let splices = if initializing {
+            std::slice::from_ref(&initial_splice)
+        } else {
+            delta.splices.as_ref()
+        };
+        validate_source_delta(previous.as_ref(), source.as_ref(), splices)?;
+        let mut snapshot = previous.to_string();
+        let mut cumulative_shift = 0isize;
+        let mut changes = Vec::with_capacity(splices.len());
+        for splice in splices {
+            let start = translate_offset(splice.old_range.start, cumulative_shift)?;
+            let end = translate_offset(splice.old_range.end, cumulative_shift)?;
+            let evolving = SourceSplice {
+                old_range: start..end,
+                new_range: start..start + splice.inserted.len(),
+                removed: Arc::clone(&splice.removed),
+                inserted: Arc::clone(&splice.inserted),
+            };
+            apply_evolving_splice(&mut snapshot, &evolving)?;
+            if let Some(change) = self.lex_uri(
+                &mut next,
+                uri,
+                snapshot.clone(),
+                std::slice::from_ref(&evolving),
+            )? {
+                changes.push(change);
+            }
+            let inserted = isize::try_from(splice.inserted.len()).map_err(|_| {
+                LexInterrupt::InternalError("source insertion length overflows isize".to_string())
+            })?;
+            let removed = isize::try_from(splice.removed.len()).map_err(|_| {
+                LexInterrupt::InternalError("source removal length overflows isize".to_string())
+            })?;
+            cumulative_shift = cumulative_shift
+                .checked_add(inserted - removed)
+                .ok_or_else(|| {
+                    LexInterrupt::InternalError(
+                        "source delta cumulative shift overflows".to_string(),
+                    )
+                })?;
+        }
+        if snapshot != source.as_ref() {
+            return Err(LexInterrupt::InternalError(
+                "source delta did not produce the observed document text".to_string(),
+            ));
+        }
+        let tokens = self.token_data_for_uri(&next, uri);
+        self.latest = Arc::new(next);
+        Ok(LexDocument { tokens, changes })
+    }
+
+    pub fn incremental_stats(&self, uri: Uri<&'static str>) -> Option<IncrementalLexStats> {
+        self.latest.incremental_stats.get(&uri).copied()
+    }
+
+    pub(crate) fn forget_document(&mut self, uri: Uri<&'static str>) {
+        let latest = Arc::make_mut(&mut self.latest);
+        latest.state_instances.remove(&uri);
+        latest.occurrences.remove(&uri);
+        latest.next_occurrence.remove(&uri);
+        latest.sources.remove(&uri);
+        latest.incremental_stats.remove(&uri);
+    }
+
+    pub(crate) fn reset_documents(&mut self) {
+        self.latest = Arc::new(LexerSnapshotState::default());
+        self.arena.clear();
     }
 
     pub fn state_info(&self) -> impl ExactSizeIterator<Item = &StateInfo> {
@@ -364,65 +513,38 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
             .and_then(|token| token.error.is_none().then_some(token.terminal).flatten())
     }
 
-    pub(crate) fn snapshot_state(
-        &self,
-        snapshot: Option<SnapshotId>,
-    ) -> Result<&LexerSnapshotState<Root>, LexInterrupt> {
-        match snapshot {
-            Some(snapshot) => self
-                .state(Some(snapshot))
-                .ok_or(LexInterrupt::MissingSnapshot(snapshot)),
-            None => Ok(self.latest_state()),
-        }
-    }
-
-    pub(crate) fn token_span(
-        &self,
-        snapshot: Option<SnapshotId>,
-        id: usize,
-    ) -> Result<Option<Span>, LexInterrupt> {
-        let state = self.snapshot_state(snapshot)?;
-        for (&uri, occurrences) in &state.occurrences {
+    pub fn token_span(&self, id: usize) -> Option<Span> {
+        for (&uri, occurrences) in &self.latest.occurrences {
             for occurrence in occurrences.iter() {
                 if occurrence.id == id {
-                    return Ok(Span::new_uri(uri, occurrence.start, occurrence.end).ok());
+                    return Span::new_uri(uri, occurrence.start, occurrence.end).ok();
                 }
             }
         }
-        Ok(None)
+        None
     }
 
-    pub(crate) fn tokens_in_span_snapshot(
-        &self,
-        snapshot: Option<SnapshotId>,
-        span: Span,
-    ) -> Result<Vec<LexToken<Root>>, LexInterrupt>
+    pub fn tokens_in_span(&self, span: Span) -> Vec<LexToken<Root>>
     where
         Root: Clone,
     {
-        let state = self.snapshot_state(snapshot)?;
-        let Some(occurrences) = state.occurrences.get(&span.uri) else {
-            return Ok(Vec::new());
+        let Some(occurrences) = self.latest.occurrences.get(&span.uri) else {
+            return Vec::new();
         };
-        Ok(occurrences
+        occurrences
             .iter()
             .filter(|occurrence| {
                 occurrence.start < span.range.end() && occurrence.end > span.range.start()
             })
             .filter_map(|occurrence| self.materialize_token(*occurrence))
-            .collect())
+            .collect()
     }
 
-    pub(crate) fn token_data_in_span(
-        &self,
-        snapshot: Option<SnapshotId>,
-        span: Span,
-    ) -> Result<Vec<crate::component::parse::TokenData>, LexInterrupt> {
-        let state = self.snapshot_state(snapshot)?;
-        let Some(occurrences) = state.occurrences.get(&span.uri) else {
-            return Ok(Vec::new());
+    pub fn token_data_in_span(&self, span: Span) -> Vec<crate::component::parse::TokenData> {
+        let Some(occurrences) = self.latest.occurrences.get(&span.uri) else {
+            return Vec::new();
         };
-        Ok(self.token_data_from_occurrences(occurrences, Some(span)))
+        self.token_data_from_occurrences(occurrences, Some(span))
     }
 
     fn is_skip_terminal(&self, terminal: TerminalId) -> bool {
@@ -449,59 +571,5 @@ impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
         self.compiled_states
             .get(state.id)
             .map(|state| &state.boundary_error)
-    }
-}
-
-#[layer(middle)]
-impl<Root, Lower> MiddleLayer for Lexer<Root, Lower>
-where
-    Root: LexerRoot,
-    Lower: NonTopLayer<Address = Uri<&'static str>, Unit = TokenData> + Send + Sync + 'static,
-{
-    type Lower = Lower;
-    type Error = LexInterrupt;
-    type Address = Uri<&'static str>;
-    type Unit = TextChunk;
-
-    fn pass(
-        &mut self,
-        _ctx: &Context,
-        changes: LayerChanges<Self>,
-    ) -> impl Future<Output = Result<LayerChanges<Self::Lower>, Self::Error>> + Send {
-        async move {
-            let revision = changes.revision;
-            if changes.changes.is_empty() {
-                self.push_state(revision.target);
-                return Ok(ChangeSet::empty(revision));
-            }
-            let mut working = (*self.latest).clone();
-            let mut lower_changes = Vec::new();
-            for change in changes.changes {
-                let mut snapshot = working
-                    .sources
-                    .get(&change.address)
-                    .map_or_else(String::new, ToString::to_string);
-                for splice in change.splices.iter().rev() {
-                    let inserted = splice
-                        .inserted
-                        .iter()
-                        .map(|chunk| chunk.0.as_ref())
-                        .collect::<String>();
-                    snapshot.replace_range(splice.old_range.clone(), &inserted);
-                }
-                if let Some(change) =
-                    self.lex_uri(&mut working, change.address, snapshot, &change.splices)?
-                {
-                    lower_changes.push(change);
-                }
-            }
-
-            self.latest = Arc::new(working);
-            self.push_state(revision.target);
-            Ok(ChangeSet {
-                revision,
-                changes: lower_changes,
-            })
-        }
     }
 }

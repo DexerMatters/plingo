@@ -1,5 +1,0 @@
-error: #[leave] was removed; use #[exit]
- --> tests/ui/terminal-reject-removed-leave.rs:6:5
-  |
-6 |     #[leave]
-  |     ^

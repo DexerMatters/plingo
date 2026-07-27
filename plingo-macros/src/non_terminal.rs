@@ -1,8 +1,8 @@
 use quote::{format_ident, quote};
 use syn::{
-    Field, Fields, Ident, ItemEnum, LitInt, Type, TypePath, Variant,
     parse::{Parse, ParseStream},
     spanned::Spanned,
+    Field, Fields, Ident, ItemEnum, LitInt, Type, TypePath, Variant,
 };
 
 use crate::shared::push_missing_derives;
@@ -33,7 +33,7 @@ pub fn expand_non_terminal_derive(mut item: ItemEnum) -> syn::Result<proc_macro:
         fn #register_fn(
             grammar: &mut ::plingo::component::parse::grammar::GrammarBuilder,
         ) -> ::plingo::component::parse::grammar::Symbol {
-            let (lhs, fresh) = grammar.begin_non_terminal(stringify!(#enum_ident));
+            let (lhs, fresh) = ::plingo::component::parse::__macro_private::begin_non_terminal(grammar, stringify!(#enum_ident));
             if !fresh {
                 return lhs;
             }
@@ -138,7 +138,7 @@ impl<'a> LowerCtx<'a> {
 
         registrations.push(quote! {
             #(#rhs_bindings)*
-            grammar.rule(
+            ::plingo::component::parse::__macro_private::rule(grammar,
                 #label,
                 lhs,
                 ::std::vec![#(#rhs_idents),*],
@@ -262,14 +262,16 @@ impl<'a> LowerCtx<'a> {
                 });
 
                 registrations.push(quote! {
-                    let opt_lhs = grammar.begin_internal_non_terminal(#synthetic);
+                    let opt_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
                     #(#inner_bindings)*
-                    grammar.rule(#synthetic, opt_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_none));
-                    grammar.rule(#synthetic, opt_lhs, ::std::vec![#(#inner_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_some));
+                    ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, opt_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_none));
+                    ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, opt_lhs, ::std::vec![#(#inner_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_some));
                 });
 
                 Ok(LoweredExpr {
-                    symbol_exprs: vec![quote! { grammar.begin_internal_non_terminal(#synthetic) }],
+                    symbol_exprs: vec![
+                        quote! { ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
+                    ],
                     value_kind: ValueKind::Option(Box::new(inner_kind)),
                     name: capture_name,
                     captures,
@@ -395,13 +397,13 @@ impl<'a> LowerCtx<'a> {
                             }
                         });
                         registrations.push(quote! {
-                            let rep_lhs = grammar.begin_internal_non_terminal(#synthetic);
-                            let tail_lhs = grammar.begin_internal_non_terminal(#tail_synthetic);
+                            let rep_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
+                            let tail_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #tail_synthetic);
                             #(#item_bindings)*
-                            grammar.rule(#synthetic, rep_lhs, ::std::vec![#(#item_idents),*, tail_lhs], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
+                            ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![#(#item_idents),*, tail_lhs], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
                             #(#tail_bindings)*
-                            grammar.rule(#synthetic, tail_lhs, ::std::vec![#(#tail_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_tail));
-                            grammar.rule(#synthetic, tail_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
+                            ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, tail_lhs, ::std::vec![#(#tail_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_tail));
+                            ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, tail_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
                         });
                     } else {
                         let item_bindings = inner_symbols
@@ -443,16 +445,16 @@ impl<'a> LowerCtx<'a> {
                             }
                         });
                         registrations.push(quote! {
-                            let rep_lhs = grammar.begin_internal_non_terminal(#synthetic);
+                            let rep_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
                             #(#item_bindings)*
-                            grammar.rule(#synthetic, rep_lhs, ::std::vec![rep_lhs, #(#item_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
-                            grammar.rule(#synthetic, rep_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
+                            ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![rep_lhs, #(#item_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
+                            ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
                         });
                     }
 
                     return Ok(LoweredExpr {
                         symbol_exprs: vec![
-                            quote! { grammar.begin_internal_non_terminal(#synthetic) },
+                            quote! { ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
                         ],
                         value_kind: ValueKind::Repeat(Box::new(item_kind)),
                         name: capture_name,
@@ -479,12 +481,12 @@ impl<'a> LowerCtx<'a> {
                         }
                     });
                     registrations.push(quote! {
-                        let rep_lhs = grammar.begin_internal_non_terminal(#synthetic);
-                        grammar.rule(#synthetic, rep_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
+                        let rep_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
+                        ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
                     });
                 } else {
                     registrations.push(quote! {
-                        let rep_lhs = grammar.begin_internal_non_terminal(#synthetic);
+                        let rep_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
                     });
                 }
 
@@ -567,12 +569,14 @@ impl<'a> LowerCtx<'a> {
                     });
                     registrations.push(quote! {
                         #(#seq_bindings)*
-                        grammar.rule(#synthetic, rep_lhs, ::std::vec![#(#seq_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder));
+                        ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![#(#seq_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder));
                     });
                 }
 
                 Ok(LoweredExpr {
-                    symbol_exprs: vec![quote! { grammar.begin_internal_non_terminal(#synthetic) }],
+                    symbol_exprs: vec![
+                        quote! { ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
+                    ],
                     value_kind: ValueKind::Vec(Box::new(item_kind)),
                     name: capture_name,
                     captures,
@@ -681,15 +685,17 @@ impl<'a> LowerCtx<'a> {
                 });
 
                 registrations.push(quote! {
-                    let alt_lhs = grammar.begin_internal_non_terminal(#synthetic);
+                    let alt_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
                     #(#left_bindings)*
-                    grammar.rule(#synthetic, alt_lhs, ::std::vec![#(#left_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#left_builder));
+                    ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, alt_lhs, ::std::vec![#(#left_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#left_builder));
                     #(#right_bindings)*
-                    grammar.rule(#synthetic, alt_lhs, ::std::vec![#(#right_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#right_builder));
+                    ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, alt_lhs, ::std::vec![#(#right_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#right_builder));
                 });
 
                 Ok(LoweredExpr::new(
-                    vec![quote! { grammar.begin_internal_non_terminal(#synthetic) }],
+                    vec![
+                        quote! { ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
+                    ],
                     ValueKind::Either(Box::new(left_kind), Box::new(right_kind)),
                 ))
             }

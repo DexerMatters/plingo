@@ -1,7 +1,0 @@
-error[E0605]: non-primitive cast: `for<'a, 'b> fn(&'a str, Option<&'b str>) -> Option<String> {old_with}` as `for<'a, 'b> fn(&'a mut WithCx<'b, Tokens>)`
- --> tests/ui/terminal-reject-legacy-with-signature.rs:3:10
-  |
-3 | #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
-  |          ^^^^^^^^ invalid cast
-  |
-  = note: this error originates in the derive macro `Terminal` (in Nightly builds, run with -Z macro-backtrace for more info)

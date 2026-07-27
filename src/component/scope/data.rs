@@ -1,13 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
-    sync::Arc,
 };
 
 use fluent_uri::Uri;
 use thiserror::Error;
 
-use crate::{component::parse::data::product::ProductId, scheme::change::FlowUnit};
+use crate::component::parse::{AstKey, data::product::ProductId};
 
 /// Opaque identity of a scope in a committed scope snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -44,85 +43,18 @@ pub struct ScopeReference<Reference> {
     pub reference: Reference,
 }
 
-/// Exact committed graph and effect changes produced by one parser revision.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScopePatch<Label, Datum, Reference, Request> {
-    pub added_scopes: Arc<[Scope]>,
-    pub removed_scopes: Arc<[Scope]>,
-    pub added_datums: Arc<[ScopeDatum<Datum>]>,
-    pub removed_datums: Arc<[ScopeDatum<Datum>]>,
-    pub added_edges: Arc<[ScopeEdge<Label>]>,
-    pub removed_edges: Arc<[ScopeEdge<Label>]>,
-    pub added_references: Arc<[ScopeReference<Reference>]>,
-    pub removed_references: Arc<[ScopeReference<Reference>]>,
-    /// Effects whose first live owner was committed by this revision.
-    pub required_sources: Arc<[Request]>,
-    /// Effects whose final live owner was removed by this revision.
-    pub released_sources: Arc<[Request]>,
-    pub rebuilt_frames: usize,
-    pub removed_frames: usize,
-}
-
-impl<Label, Datum, Reference, Request> Default for ScopePatch<Label, Datum, Reference, Request> {
-    fn default() -> Self {
-        Self {
-            added_scopes: Arc::from([]),
-            removed_scopes: Arc::from([]),
-            added_datums: Arc::from([]),
-            removed_datums: Arc::from([]),
-            added_edges: Arc::from([]),
-            removed_edges: Arc::from([]),
-            added_references: Arc::from([]),
-            removed_references: Arc::from([]),
-            required_sources: Arc::from([]),
-            released_sources: Arc::from([]),
-            rebuilt_frames: 0,
-            removed_frames: 0,
-        }
-    }
-}
-
-impl<Label, Datum, Reference, Request> ScopePatch<Label, Datum, Reference, Request> {
-    pub fn is_empty(&self) -> bool {
-        self.added_scopes.is_empty()
-            && self.removed_scopes.is_empty()
-            && self.added_datums.is_empty()
-            && self.removed_datums.is_empty()
-            && self.added_edges.is_empty()
-            && self.removed_edges.is_empty()
-            && self.added_references.is_empty()
-            && self.removed_references.is_empty()
-            && self.required_sources.is_empty()
-            && self.released_sources.is_empty()
-            && self.rebuilt_frames == 0
-            && self.removed_frames == 0
-    }
-}
-
-impl<Label, Datum, Reference, Request> FlowUnit for ScopePatch<Label, Datum, Reference, Request>
-where
-    Label: Clone + Send + Sync + 'static,
-    Datum: Clone + Send + Sync + 'static,
-    Reference: Clone + Send + Sync + 'static,
-    Request: Clone + Send + Sync + 'static,
-{
-    fn extent(&self) -> usize {
-        1
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum ScopeError {
     #[error("an acyclic relationship from {from:?} to {to:?} closes a cycle")]
     Cycle { from: Scope, to: Scope },
+    #[error("parsed AST artifact {0:?} is unavailable")]
+    MissingAst(AstKey),
     #[error("parser product {0} has no typed AST value")]
     MissingAstProduct(ProductId),
     #[error("typed AST value for parser product {0} is unavailable")]
     MissingAstValue(ProductId),
     #[error("unknown scope {0:?}")]
     MissingScope(Scope),
-    #[error("scope {0:?} has multiple datums")]
-    DuplicateDatum(Scope),
     #[error("scope rule failed: {0}")]
     Rule(String),
 }
@@ -134,17 +66,27 @@ pub(crate) struct AstOwner {
     pub product: ProductId,
 }
 
-/// Contextual analysis identity. A graph scope is owned by [`AstOwner`], while
-/// a frame tracks facts emitted when that AST is visited from `incoming`.
+/// Contextual task identity for one AST visited from an incoming scope.
+///
+/// This is public so clients can directly request an individual scope frame.
+/// Parser-product ownership remains internal to the scope snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct FrameKey {
-    pub owner: AstOwner,
+pub struct ScopeFrameKey {
+    pub ast: AstKey,
     pub incoming: Scope,
+}
+
+impl ScopeFrameKey {
+    pub const fn new(ast: AstKey, incoming: Scope) -> Self {
+        Self { ast, incoming }
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct FrameDraft<Label, Datum, Reference, Request> {
-    pub children: HashSet<FrameKey>,
+    pub children: HashSet<ScopeFrameKey>,
+    /// Child tasks to require after this draft has been committed.
+    pub pending: Vec<ScopeFrameKey>,
     pub edges: Vec<ScopeEdge<Label>>,
     pub datums: Vec<ScopeDatum<Datum>>,
     pub references: Vec<ScopeReference<Reference>>,
@@ -155,6 +97,7 @@ impl<Label, Datum, Reference, Request> Default for FrameDraft<Label, Datum, Refe
     fn default() -> Self {
         Self {
             children: HashSet::new(),
+            pending: Vec::new(),
             edges: Vec::new(),
             datums: Vec::new(),
             references: Vec::new(),
@@ -165,7 +108,8 @@ impl<Label, Datum, Reference, Request> Default for FrameDraft<Label, Datum, Refe
 
 #[derive(Clone)]
 pub(crate) struct FrameRecord<Label, Datum, Reference, Request> {
-    pub children: HashSet<FrameKey>,
+    pub owner: AstOwner,
+    pub children: HashSet<ScopeFrameKey>,
     pub edges: Vec<ScopeEdge<Label>>,
     pub datums: Vec<ScopeDatum<Datum>>,
     pub references: Vec<(u64, ScopeReference<Reference>)>,
@@ -175,8 +119,9 @@ pub(crate) struct FrameRecord<Label, Datum, Reference, Request> {
 #[derive(Clone)]
 pub(crate) struct GraphState<Label, Datum> {
     pub scopes: HashSet<Scope>,
-    /// Datum plus exact owner count for shared scopes.
-    pub datums: HashMap<Scope, (Datum, usize)>,
+    /// Exact support count for each datum fact. A scope may carry multiple
+    /// user-defined datums; the graph imposes no declaration/type semantics.
+    pub datums: HashMap<ScopeDatum<Datum>, usize>,
     pub edges: HashMap<ScopeEdge<Label>, usize>,
 }
 
@@ -198,14 +143,14 @@ pub struct ScopeSnapshot<Anchor, Label, Datum, Reference, Request> {
     pub(crate) next_scope: u64,
     pub(crate) next_fact: u64,
     pub(crate) graph: GraphState<Label, Datum>,
-    pub(crate) roots: HashMap<Uri<&'static str>, HashSet<FrameKey>>,
+    pub(crate) roots: HashMap<Uri<&'static str>, HashSet<ScopeFrameKey>>,
     pub(crate) root_scopes: HashMap<Uri<&'static str>, Scope>,
     /// One graph scope per parser-owned AST identity; no positional slots.
     pub(crate) ast_scopes: HashMap<AstOwner, Scope>,
     /// Stable application-owned scopes for values with no AST identity.
     pub(crate) external_scopes: HashMap<Anchor, Scope>,
-    pub(crate) frames: HashMap<FrameKey, FrameRecord<Label, Datum, Reference, Request>>,
-    pub(crate) parents: HashMap<FrameKey, HashSet<FrameKey>>,
+    pub(crate) frames: HashMap<ScopeFrameKey, FrameRecord<Label, Datum, Reference, Request>>,
+    pub(crate) parents: HashMap<ScopeFrameKey, HashSet<ScopeFrameKey>>,
     pub(crate) references: HashMap<u64, ScopeReference<Reference>>,
     pub(crate) request_counts: HashMap<Request, usize>,
 }
@@ -340,27 +285,6 @@ where
     pub fn release_source(&mut self, request: Request) {
         if !self.required_sources.remove(&request) {
             self.released_sources.insert(request);
-        }
-    }
-
-    pub fn finish(self) -> ScopePatch<Label, Datum, Reference, Request> {
-        ScopePatch {
-            added_scopes: self.added_scopes.into_iter().collect::<Vec<_>>().into(),
-            removed_scopes: self.removed_scopes.into_iter().collect::<Vec<_>>().into(),
-            added_datums: self.added_datums.into_iter().collect::<Vec<_>>().into(),
-            removed_datums: self.removed_datums.into_iter().collect::<Vec<_>>().into(),
-            added_edges: self.added_edges.into_iter().collect::<Vec<_>>().into(),
-            removed_edges: self.removed_edges.into_iter().collect::<Vec<_>>().into(),
-            added_references: self.added_references.into_iter().collect::<Vec<_>>().into(),
-            removed_references: self
-                .removed_references
-                .into_iter()
-                .collect::<Vec<_>>()
-                .into(),
-            required_sources: self.required_sources.into_iter().collect::<Vec<_>>().into(),
-            released_sources: self.released_sources.into_iter().collect::<Vec<_>>().into(),
-            rebuilt_frames: self.rebuilt_frames,
-            removed_frames: self.removed_frames,
         }
     }
 }

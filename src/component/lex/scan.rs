@@ -10,7 +10,7 @@ use super::{
     StateAction, TokenAction, WhenCx, WithCx, token::TokenMatch,
 };
 
-impl<Root: LexerRoot, Lower> Lexer<Root, Lower> {
+impl<Root: LexerRoot> Lexer<Root> {
     pub(crate) fn lex_cont(
         &mut self,
         start_state: LexerState<Root>,

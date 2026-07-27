@@ -9,22 +9,21 @@ use indexmap::IndexSet;
 use super::{
     ParseColumn, ParseError, ParseToken, ReductionKey, ReplayPlan, SessionContext, checkpoint,
 };
-use crate::component::{
-    lex::LexerRoot,
-    parse::{
-        IncrementalParseStats, ParseAddress, ParseChange, ParseUnit, Parser, ParserSnapshotState,
-        data::{
-            ast::AstArena,
-            green::TreeArena,
-            gss::{GssArena, GssNodeId},
-            product::{ProductArena, ProductData, ProductId},
+use crate::{
+    component::{
+        lex::LexerRoot,
+        parse::{
+            IncrementalParseStats, Parser, ParserSnapshotState,
+            data::{
+                ast::AstArena,
+                green::TreeArena,
+                gss::{GssArena, GssNodeId},
+                product::{ProductArena, ProductData, ProductId},
+            },
+            types::SessionArenas,
         },
-        types::SessionArenas,
     },
-};
-use crate::scheme::{
-    change::{AddressChange, Splice},
-    layer::NonTopLayer,
+    scheme::change::AddressChange,
 };
 
 struct ReusableSuffix {
@@ -213,22 +212,14 @@ fn maybe_reuse_suffix(
     Ok(true)
 }
 
-impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
-    pub(crate) async fn parse_delta_batch(
+impl<Root: LexerRoot + Clone> Parser<Root> {
+    pub(crate) fn parse_delta_batch(
         &mut self,
         working: &mut ParserSnapshotState,
         change: AddressChange<fluent_uri::Uri<&'static str>, crate::component::parse::TokenData>,
-    ) -> Result<Vec<ParseChange>, ParseError>
-    where
-        Lower: NonTopLayer<Address = ParseAddress, Unit = ParseUnit>,
-    {
+    ) -> Result<(), ParseError> {
         let total_start = Instant::now();
         let uri = change.address;
-        let roots_before = working
-            .roots
-            .get(&uri)
-            .map(|roots| roots.as_ref().clone())
-            .unwrap_or_default();
 
         let plan_start = Instant::now();
         let plan = ReplayPlan::from_change(
@@ -266,7 +257,6 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
             actions: &self.actions,
             gotos: &self.gotos,
             error_recovery: self.config.error_recovery,
-            error_recovery_timeout: self.config.error_recovery_timeout,
         };
         let session_setup_elapsed = session_setup_start.elapsed();
 
@@ -279,37 +269,21 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
                     .map(|token| session_ctx.state.token_columns.get(&token.column).copied()),
             )
             .collect::<Vec<_>>();
-        let fallback = self.config.incremental_reparse_limit.is_some_and(|limit| {
-            plan.new_units.len().saturating_sub(plan.restart_boundary) > limit
-        });
-        let restart_token_boundary = if fallback {
-            0
-        } else {
-            (0..=plan
-                .restart_boundary
-                .min(old_boundary_columns.len().saturating_sub(1)))
-                .rev()
-                .find(|&boundary| {
-                    old_boundary_columns[boundary].is_some_and(|column| {
-                        session_ctx
-                            .state
-                            .columns
-                            .get(column)
-                            .is_some_and(|column| !column.error_derived)
-                    })
-                })
-                .unwrap_or(0)
-        };
+        // Replay begins at the nearest checkpoint at or before the first
+        // changed token. Recovery columns are valid deterministic checkpoints;
+        // their exact frontier state participates in later convergence proof.
+        let restart_token_boundary = (0..=plan
+            .restart_boundary
+            .min(old_boundary_columns.len().saturating_sub(1)))
+            .rev()
+            .find(|&boundary| old_boundary_columns[boundary].is_some())
+            .unwrap_or(0);
         let restart_boundary = old_boundary_columns[restart_token_boundary].unwrap_or(0);
-        let old_column_base = if fallback {
-            session_ctx.state.columns.len()
-        } else {
-            old_boundary_columns
-                .get(plan.old_reuse_start..)
-                .and_then(|boundaries| boundaries.iter().flatten().next())
-                .copied()
-                .unwrap_or(session_ctx.state.columns.len())
-        };
+        let old_column_base = old_boundary_columns
+            .get(plan.old_reuse_start..)
+            .and_then(|boundaries| boundaries.iter().flatten().next())
+            .copied()
+            .unwrap_or(session_ctx.state.columns.len());
         let checkpoint_start = Instant::now();
         let old_suffix_columns = session_ctx
             .state
@@ -317,11 +291,13 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
             .get(old_column_base..)
             .unwrap_or_default()
             .to_vec();
+        // A recovery-derived column remains reusable when its complete
+        // frontier/checkpoint is equal. Error status alone is not a reason to
+        // discard a proven-equivalent suffix.
         let mut old_suffix_is_clean = vec![true; old_suffix_columns.len() + 1];
         for index in (0..old_suffix_columns.len()).rev() {
-            old_suffix_is_clean[index] = old_suffix_is_clean[index + 1]
-                && !old_suffix_columns[index].error_derived
-                && old_suffix_columns[index].token.is_some();
+            old_suffix_is_clean[index] =
+                old_suffix_is_clean[index + 1] && old_suffix_columns[index].token.is_some();
         }
         let product_origins = session_ctx
             .state
@@ -438,9 +414,12 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
                     continue;
                 }
                 recover_elapsed += recover_start.elapsed();
-                return Err(ParseError::NoActiveStacks {
-                    column: Some(token.column),
-                });
+                // An unrecoverable token still becomes a durable error product.
+                // Continue replaying so later valid tokens, diagnostics, and
+                // partial roots remain observable in this same revision.
+                session_ctx.delete_parse_token(column, token)?;
+                i += 1;
+                continue;
             }
             shift_elapsed += shift_start.elapsed();
 
@@ -496,55 +475,12 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
         working.incremental_stats.insert(uri, stats);
         let stats_elapsed = stats_start.elapsed();
 
-        let diff_start = Instant::now();
-        let lower_deltas = if roots_before.is_empty() || roots_after.is_empty() {
-            let old_units = roots_before
-                .iter()
-                .copied()
-                .map(|product| ParseUnit { product })
-                .collect::<Vec<_>>();
-            let new_units = roots_after
-                .iter()
-                .copied()
-                .map(|product| ParseUnit { product })
-                .collect::<Vec<_>>();
-            if old_units.is_empty() && new_units.is_empty() {
-                Vec::new()
-            } else {
-                let old_extent = old_units.len();
-                let new_extent = new_units.len();
-                vec![AddressChange {
-                    address: ParseAddress {
-                        uri,
-                        parent_path: Vec::new(),
-                    },
-                    old_extent,
-                    new_extent,
-                    splices: vec![Splice {
-                        old_range: 0..old_extent,
-                        new_range: 0..new_extent,
-                        removed: Arc::from(old_units),
-                        inserted: Arc::from(new_units),
-                    }],
-                }]
-            }
-        } else {
-            super::super::diff::diff_trees(
-                &arenas.products,
-                &arenas.trees,
-                &roots_before,
-                &roots_after,
-                uri,
-            )
-        };
-        let diff_elapsed = diff_start.elapsed();
         working.roots.insert(uri, Arc::new(roots_after));
         working.tokens.insert(uri, Arc::new(plan.new_units.clone()));
 
         let total_elapsed = total_start.elapsed();
-        log::debug!(
-            target: "Measure",
-            "parse {} total={:?} plan={:?} session={:?} checkpoints={:?} truncate={:?} tokens={:?} replay={:?} reduce={:?} shift={:?} recover={:?} converge={:?} replay_misc={:?} compact={:?} stats={:?} diff={:?} fallback={} restart={} reparsed={} reused={} checks={} checkpoint_matches={} frontier_matches={} old_suffix={} replay_tokens={} suffix_rebased={} old_tokens={} new_tokens={} prefix={} suffix={}",
+        eprintln!(
+            "[parse-replay] uri={} total={:?} plan={:?} session={:?} checkpoints={:?} truncate={:?} tokens={:?} replay={:?} reduce={:?} shift={:?} recover={:?} converge={:?} replay_misc={:?} compact={:?} stats={:?} restart={} reparsed={} reused={} checks={} checkpoint_matches={} frontier_matches={} old_suffix={} replay_tokens={} suffix_rebased={} old_tokens={} new_tokens={} prefix={} suffix={}",
             uri,
             total_elapsed,
             plan_elapsed,
@@ -560,8 +496,6 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
             replay_misc_elapsed,
             compact_elapsed,
             stats_elapsed,
-            diff_elapsed,
-            fallback,
             restart_boundary,
             reparsed,
             reused,
@@ -577,6 +511,6 @@ impl<Root: LexerRoot + Clone, Lower> Parser<Root, Lower> {
             plan.suffix_len,
         );
 
-        Ok(lower_deltas)
+        Ok(())
     }
 }

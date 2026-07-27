@@ -1,10 +1,4 @@
-pub mod call;
-pub mod change;
-pub mod context;
-pub mod error;
-pub mod layer;
-pub mod runtime;
-pub mod snapshot;
-
-#[doc(hidden)]
-pub mod __macro_private;
+/// Internal sequence-diff vocabulary retained by lexer and parser algorithms.
+pub(crate) mod change;
+/// The sole public execution model: commands, nodes, views, and subscriptions.
+pub mod node;

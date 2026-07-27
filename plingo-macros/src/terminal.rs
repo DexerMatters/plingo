@@ -389,13 +389,13 @@ fn parse_enum_scopes(
                     "duplicate variant entry in the same scope",
                 ));
             }
-            if let Some(child) = &config.enter {
-                if !known_scopes.contains(&child.to_string()) {
-                    return Err(syn::Error::new(
-                        child.span(),
-                        "unknown child scope in #[enter(...)]",
-                    ));
-                }
+            if let Some(child) = &config.enter
+                && !known_scopes.contains(&child.to_string())
+            {
+                return Err(syn::Error::new(
+                    child.span(),
+                    "unknown child scope in #[enter(...)]",
+                ));
             }
             assigned.insert(entry.variant.to_string());
         }
@@ -770,7 +770,7 @@ fn build_parser_terminal_impl(
         let label = format!("{}::{}", root_ident, variant_ident);
         let terminal = terminal_id_expr(root_ident, index);
         arms.push(quote! {
-            stringify!(#variant_ident) => grammar.terminal_symbol(
+            stringify!(#variant_ident) => ::plingo::component::parse::__macro_private::terminal_symbol(grammar,
                 #label,
                 #terminal,
                 ::std::option::Option::None,

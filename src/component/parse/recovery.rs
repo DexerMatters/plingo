@@ -5,7 +5,6 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     sync::Arc,
-    time::{Duration, Instant},
 };
 
 use crate::component::parse::{
@@ -27,23 +26,6 @@ pub(crate) enum Repair {
 #[derive(Debug, Clone)]
 pub(crate) struct RecoveryResult {
     pub(crate) repairs: Vec<Repair>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RecoveryError {
-    Timeout { elapsed: Duration },
-}
-
-impl std::fmt::Display for RecoveryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Timeout { elapsed } => write!(
-                f,
-                "recovery search timed out after {:?} (no complete repair found)",
-                elapsed
-            ),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -155,12 +137,10 @@ pub(crate) fn find_recovery(
     ctx: &SessionContext<'_>,
     column: usize,
     tokens: &[ParseToken],
-    timeout: Duration,
-) -> Result<Option<RecoveryResult>, RecoveryError> {
-    let start = Instant::now();
+) -> Option<RecoveryResult> {
     let stacks = active_stack_paths(ctx, column);
     if stacks.is_empty() || tokens.is_empty() {
-        return Ok(None);
+        return None;
     }
 
     let mut queue = BinaryHeap::new();
@@ -181,11 +161,6 @@ pub(crate) fn find_recovery(
     let mut best_solution: Option<Vec<Repair>> = None;
 
     while let Some(item) = queue.pop() {
-        if start.elapsed() >= timeout {
-            return Err(RecoveryError::Timeout {
-                elapsed: start.elapsed(),
-            });
-        }
         if solution_cost.is_some_and(|best| item.cost > best) {
             // The queue is cost ordered, so later candidates cannot improve this
             // repair. Equal-cost candidates remain for deterministic tie-breaking.
@@ -276,7 +251,7 @@ pub(crate) fn find_recovery(
         }
     }
 
-    Ok(best_solution.map(|repairs| RecoveryResult { repairs }))
+    best_solution.map(|repairs| RecoveryResult { repairs })
 }
 
 fn repairs_better(candidate: &[Repair], current: &[Repair]) -> bool {

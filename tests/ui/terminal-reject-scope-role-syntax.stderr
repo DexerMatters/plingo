@@ -1,5 +1,0 @@
-error: scope entries only declare membership; move enter/exit onto the variant attributes
- --> tests/ui/terminal-reject-scope-role-syntax.rs:6:20
-  |
-6 |         QuoteStart => enter(string, quote_key),
-  |                    ^

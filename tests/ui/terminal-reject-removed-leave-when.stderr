@@ -1,5 +1,0 @@
-error: #[leave_when(...)] was removed; use #[exit] with #[when(...)]
- --> tests/ui/terminal-reject-removed-leave-when.rs:6:5
-  |
-6 |     #[leave_when(always)]
-  |     ^

@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use rand::{distr::Distribution, rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, distr::Distribution, rngs::StdRng};
 
 use crate::component::parse::grammar::TerminalId;
 

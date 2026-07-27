@@ -1,12 +1,14 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::marker::PhantomData;
+use std::{
+    collections::{BTreeSet, HashMap, VecDeque},
+    marker::PhantomData,
+};
 
 use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 
 use crate::component::parse::{
-    grammar::{Grammar, NonTerminalId, ProductionId, Symbol, TerminalId},
     Parser, ParserConfig, ParserSnapshotState,
+    grammar::{Grammar, NonTerminalId, ProductionId, Symbol, TerminalId},
 };
 
 pub type LRStateId = usize;
@@ -77,11 +79,11 @@ impl ActionSet {
 }
 
 impl Grammar {
-    pub fn build_lr1<Root, Lower>(&self) -> Parser<Root, Lower> {
-        self.build_lr1_with_config::<Root, Lower>(ParserConfig::default())
+    pub fn build_lr1<Root>(&self) -> Parser<Root> {
+        self.build_lr1_with_config::<Root>(ParserConfig::default())
     }
 
-    pub fn build_lr1_with_config<Root, Lower>(&self, config: ParserConfig) -> Parser<Root, Lower> {
+    pub fn build_lr1_with_config<Root>(&self, config: ParserConfig) -> Parser<Root> {
         let mut states = Vec::new();
         let mut state_keys = IndexSet::new();
         let mut queue = VecDeque::new();
@@ -110,7 +112,7 @@ impl Grammar {
             }
         }
 
-        let mut runtime = Parser {
+        let mut runtime: Parser<Root> = Parser {
             grammar: self.clone(),
             actions: vec![ActionSet::default(); states.len() * self.terminal_count()],
             gotos: vec![None; states.len() * self.non_terminals.len()],
@@ -120,8 +122,7 @@ impl Grammar {
             session_arenas: HashMap::new(),
             config,
             latest: ParserSnapshotState::default().into(),
-            _lower: PhantomData,
-            _snapshot: Default::default(),
+            _root: PhantomData,
         };
 
         self.fill_tables(&mut runtime);
@@ -186,7 +187,7 @@ impl Grammar {
             .collect()
     }
 
-    fn fill_tables<Root, Lower>(&self, runtime: &mut Parser<Root, Lower>) {
+    fn fill_tables<Root>(&self, runtime: &mut Parser<Root>) {
         let transitions = runtime
             .transitions
             .iter()
@@ -229,7 +230,7 @@ impl Grammar {
     }
 }
 
-impl<Root, Lower> Parser<Root, Lower> {
+impl<Root> Parser<Root> {
     pub fn action_set(&self, state: LRStateId, terminal: TerminalId) -> &ActionSet {
         &self.actions[self.grammar.action_index(state, terminal)]
     }

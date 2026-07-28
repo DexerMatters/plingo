@@ -1,7 +1,7 @@
 //! Parser provider for the node graph runtime.
 //!
-//! Parsing observes a token stream and materializes an immutable typed AST view.
-//! It has no downstream type or pass method.
+//! One parser derivation publishes an immutable [`AstSnapshot`]. Typed AST
+//! and location views are independent keyed projections of that snapshot.
 
 use std::{marker::PhantomData, sync::Arc, time::Instant};
 
@@ -9,68 +9,20 @@ use fluent_uri::Uri;
 
 use crate::{
     component::{
-        lex::{LexerNode, LexerRoot, node::TokenChanges},
+        lex::{node::TokenRevision, LexerNode, LexerRoot},
         parse::{
-            AstView, ParseErrorInfo, Parser,
             data::{ast::AstBox, product::ProductId},
+            AstKey, AstSnapshot, ParseErrorInfo, ParseStatus, Parser,
         },
     },
     scheme::node::{ComponentState, DeriveCx, Node, NodeError, ReclaimCx, View},
+    utils::Span,
 };
 
-/// A typed, immutable parser result for one document.
-struct ParsedDocument<Ast> {
-    pub roots: Arc<[ProductId]>,
-    pub ast: Arc<AstView<Ast>>,
-}
-
-impl<Ast> Clone for ParsedDocument<Ast> {
-    fn clone(&self) -> Self {
-        Self {
-            roots: Arc::clone(&self.roots),
-            ast: Arc::clone(&self.ast),
-        }
-    }
-}
-
-impl<Ast> PartialEq for ParsedDocument<Ast> {
-    fn eq(&self, other: &Self) -> bool {
-        self.roots == other.roots
-            && self.ast.uri() == other.ast.uri()
-            && self
-                .ast
-                .roots()
-                .iter()
-                .map(|root| (root.id, root.uri))
-                .eq(other.ast.roots().iter().map(|root| (root.id, root.uri)))
-            && self.ast.entries().iter().map(ast_identity).eq(other
-                .ast
-                .entries()
-                .iter()
-                .map(ast_identity))
-    }
-}
-
-impl<Ast> Eq for ParsedDocument<Ast> {}
-
-fn ast_identity<Ast>(
-    entry: &crate::component::parse::AstViewEntry<Ast>,
-) -> (usize, Uri<&'static str>, ProductId) {
-    (entry.ast_box.id, entry.ast_box.uri, entry.product)
-}
-
-/// Stable identity of one reachable typed AST value.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct AstKey {
-    pub uri: Uri<&'static str>,
-    pub id: usize,
-}
-
-/// One independently observable typed AST artifact.
+/// One independently observable semantic AST artifact. Locations are exposed
+/// separately so a span-only edit does not invalidate semantic consumers.
 pub struct ParsedAst<Root, Ast>(PhantomData<fn() -> (Root, Ast)>);
 
-/// The payload deliberately compares parser identity rather than requiring an
-/// application AST type to implement `PartialEq`.
 pub struct AstArtifact<Ast> {
     pub ast_box: AstBox<Ast>,
     pub product: ProductId,
@@ -106,41 +58,10 @@ where
     type Value = AstArtifact<Ast>;
 }
 
-/// The ordered typed-AST roots of one document.
+/// Typed AST keys reachable from one document snapshot. It is the manifest
+/// used by document-level reconcilers; each key has its own semantic/location
+/// view.
 pub struct ParseRoots<Root, Ast>(PhantomData<fn() -> (Root, Ast)>);
-
-/// Parser diagnostics materialized for one document snapshot.
-pub struct ParseDiagnostics<Root>(PhantomData<fn() -> Root>);
-
-impl<Root: LexerRoot> View for ParseDiagnostics<Root> {
-    type Key = Uri<&'static str>;
-    type Value = Arc<[ParseErrorInfo]>;
-}
-
-/// Materialized parser state for editor-facing consumers. Recovered input
-/// commits partial roots and diagnostics; an unrecoverable revision commits an
-/// empty root set rather than preserving stale syntax.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ParseStatus {
-    Clean,
-    Recovered { diagnostics: usize },
-    Unrecoverable { diagnostics: usize },
-}
-
-pub struct ParseStatusView<Root>(PhantomData<fn() -> Root>);
-
-impl<Root: LexerRoot> View for ParseStatusView<Root> {
-    type Key = Uri<&'static str>;
-    type Value = ParseStatus;
-}
-
-/// Incremental replay work performed for the current token revision.
-pub struct ParseStats<Root>(PhantomData<fn() -> Root>);
-
-impl<Root: LexerRoot> View for ParseStats<Root> {
-    type Key = Uri<&'static str>;
-    type Value = crate::component::parse::IncrementalParseStats;
-}
 
 impl<Root, Ast> View for ParseRoots<Root, Ast>
 where
@@ -151,8 +72,50 @@ where
     type Value = Arc<[AstKey]>;
 }
 
-/// Incremental parser node. Its mutable replay arenas are implementation
-/// storage; callers observe keyed root and AST artifacts.
+/// Immutable AST dereference boundary for one document publication.
+pub struct ParseSnapshot<Root>(PhantomData<fn() -> Root>);
+
+impl<Root: LexerRoot> View for ParseSnapshot<Root> {
+    type Key = Uri<&'static str>;
+    type Value = Arc<AstSnapshot>;
+}
+
+/// Source location for one typed semantic AST artifact. Consumers that only
+/// need semantics should not observe this view.
+pub struct AstLocation<Root, Ast>(PhantomData<fn() -> (Root, Ast)>);
+
+impl<Root, Ast> View for AstLocation<Root, Ast>
+where
+    Root: LexerRoot,
+    Ast: Send + Sync + 'static,
+{
+    type Key = AstKey;
+    type Value = Span;
+}
+
+pub struct ParseDiagnostics<Root>(PhantomData<fn() -> Root>);
+
+impl<Root: LexerRoot> View for ParseDiagnostics<Root> {
+    type Key = Uri<&'static str>;
+    type Value = Arc<[ParseErrorInfo]>;
+}
+
+pub struct ParseStatusView<Root>(PhantomData<fn() -> Root>);
+
+impl<Root: LexerRoot> View for ParseStatusView<Root> {
+    type Key = Uri<&'static str>;
+    type Value = ParseStatus;
+}
+
+pub struct ParseStats<Root>(PhantomData<fn() -> Root>);
+
+impl<Root: LexerRoot> View for ParseStats<Root> {
+    type Key = Uri<&'static str>;
+    type Value = crate::component::parse::IncrementalParseStats;
+}
+
+/// Incremental parser node. Mutable replay state remains local; graph-owned
+/// keyed facts provide semantic and location-level invalidation.
 pub struct ParserNode<Root, Ast>
 where
     Root: LexerRoot + Clone,
@@ -181,86 +144,43 @@ where
     Ast: Send + Sync + 'static,
 {
     type Key = Uri<&'static str>;
-    type Output = ParseRoots<Root, Ast>;
+    type Output = ParseSnapshot<Root>;
 
     fn derive(
         &self,
         cx: &mut DeriveCx<'_, '_>,
         uri: Self::Key,
-    ) -> Result<Arc<[AstKey]>, NodeError> {
+    ) -> Result<Arc<AstSnapshot>, NodeError> {
         let total_start = Instant::now();
-        let inputs_start = Instant::now();
         let _ = cx.require::<LexerNode<Root>>(uri)?;
-        let token_delta = cx.observe::<TokenChanges<Root>>(uri)?;
-        let inputs_elapsed = inputs_start.elapsed();
-        let changed_tokens = token_delta
-            .changes
-            .iter()
-            .map(|change| {
-                change
-                    .splices
-                    .iter()
-                    .map(|splice| splice.removed.len() + splice.inserted.len())
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
+        // The lexer publishes exact replay splices and final source/token
+        // coordinates as one fact. This prevents a parser task from seeing a
+        // new source together with a prior lexer delta in the same graph
+        // transaction.
+        let token_revision = cx.observe::<TokenRevision<Root>>(uri)?;
 
-        let (parsed, diagnostics, stats, replay_elapsed, ast_elapsed, diagnostics_elapsed) = {
+        let (snapshot, diagnostics, stats) = {
             let parser = cx.state_mut(&self.parser)?;
-            let replay_start = Instant::now();
-            let roots = parser
-                .derive_changes(uri, &token_delta.changes)
+            let snapshot = parser
+                .derive_changes(uri, &token_revision.changes)
+                .and_then(|_| {
+                    parser.commit_snapshot(
+                        uri,
+                        Arc::clone(&token_revision.source),
+                        &token_revision.tokens,
+                    )
+                })
                 .map_err(|error| NodeError::message(error.to_string()))?;
-            let replay_elapsed = replay_start.elapsed();
-            let ast_start = Instant::now();
-            let ast = parser
-                .ast_view::<Ast>(&parser.latest, uri)
-                .map_err(|error| NodeError::message(error.to_string()))?;
-            let ast_elapsed = ast_start.elapsed();
-            let diagnostics_start = Instant::now();
             let diagnostics: Arc<[ParseErrorInfo]> = parser.latest_parse_diagnostics(uri).into();
-            let diagnostics_elapsed = diagnostics_start.elapsed();
-            let stats = parser.incremental_stats(uri).unwrap_or_default();
             (
-                ParsedDocument {
-                    roots: roots.into(),
-                    ast: Arc::new(ast),
-                },
+                snapshot,
                 diagnostics,
-                stats,
-                replay_elapsed,
-                ast_elapsed,
-                diagnostics_elapsed,
+                parser.incremental_stats(uri).unwrap_or_default(),
             )
         };
-
-        let emit_start = Instant::now();
-        let roots: Arc<[AstKey]> = parsed
-            .ast
-            .roots()
-            .iter()
-            .map(|root| AstKey {
-                uri: root.uri,
-                id: root.id,
-            })
-            .collect::<Vec<_>>()
-            .into();
-        for entry in parsed.ast.entries() {
-            cx.emit::<ParsedAst<Root, Ast>>(
-                AstKey {
-                    uri: entry.ast_box.uri,
-                    id: entry.ast_box.id,
-                },
-                AstArtifact {
-                    ast_box: entry.ast_box,
-                    product: entry.product,
-                    value: Arc::clone(&entry.value),
-                },
-            )?;
-        }
         let status = if diagnostics.is_empty() {
             ParseStatus::Clean
-        } else if roots.is_empty() {
+        } else if snapshot.ast_keys().next().is_none() {
             ParseStatus::Unrecoverable {
                 diagnostics: diagnostics.len(),
             }
@@ -269,23 +189,45 @@ where
                 diagnostics: diagnostics.len(),
             }
         };
+
+        let artifacts = snapshot
+            .ast_keys()
+            .filter_map(|key| {
+                let ast_box = AstBox::<Ast>::new(key.id, key.uri);
+                ast_box.resolve(&snapshot).ok().map(|resolved| {
+                    (
+                        key,
+                        AstArtifact {
+                            ast_box,
+                            product: resolved.product(),
+                            value: resolved.arc(),
+                        },
+                        resolved.span(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let roots: Arc<[AstKey]> = artifacts
+            .iter()
+            .map(|(key, _, _)| key.clone())
+            .collect::<Vec<_>>()
+            .into();
+
+        for (key, artifact, span) in artifacts {
+            cx.emit::<ParsedAst<Root, Ast>>(key.clone(), artifact)?;
+            cx.emit::<AstLocation<Root, Ast>>(key, span)?;
+        }
+        cx.emit::<ParseRoots<Root, Ast>>(uri, Arc::clone(&roots))?;
         cx.emit::<ParseStats<Root>>(uri, stats)?;
         cx.emit::<ParseStatusView<Root>>(uri, status)?;
         cx.emit::<ParseDiagnostics<Root>>(uri, diagnostics)?;
-        let emit_elapsed = emit_start.elapsed();
         eprintln!(
-            "[parse-node] uri={uri} total={:?} inputs={:?} replay={:?} ast_view={:?} diagnostics={:?} emit={:?} token_changes={} changed_tokens={} roots={}",
+            "[parse-node] uri={uri} total={:?} token_changes={} roots={}",
             total_start.elapsed(),
-            inputs_elapsed,
-            replay_elapsed,
-            ast_elapsed,
-            diagnostics_elapsed,
-            emit_elapsed,
-            token_delta.changes.len(),
-            changed_tokens,
+            token_revision.changes.len(),
             roots.len(),
         );
-        Ok(roots)
+        Ok(snapshot)
     }
 
     fn reclaim(&self, cx: &mut ReclaimCx<'_, '_>, uri: Self::Key) -> Result<(), NodeError> {
@@ -310,16 +252,19 @@ mod tests {
     use crate::{
         component::{
             lex::{LexErrorInfo, LexerNode},
-            parse::{AstToken, grammar::Grammar},
+            parse::{grammar::Grammar, AstToken},
             source::{SourceEdit, SourceNode},
         },
-        scheme::node::Graph,
-        utils::Span,
+        scheme::node::{Graph, ViewUpdate},
+        utils::{RangeOrPoint, Span},
     };
 
     #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
-    #[scopes(root { Number })]
+    #[scopes(root { Whitespace, Number })]
     enum Tokens {
+        #[regex(r"\s+")]
+        #[skip]
+        Whitespace,
         #[regex(r"[0-9]+")]
         Number(usize),
         #[error]
@@ -340,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_node_derives_an_ast_view_from_the_token_view() {
+    fn parser_revision_resolves_ast_boxes_and_tracks_span_only_updates() {
         let uri = Span::new("test://node-parser", 0, 0).unwrap().uri;
         let parser = Grammar::from_spec::<Value>().build_lr1::<Tokens>();
         let mut graph = Graph::new();
@@ -356,12 +301,107 @@ mod tests {
             }))
             .unwrap();
 
-        let roots = graph.request::<ParserNode<Tokens, Value>>(uri).unwrap();
-        assert_eq!(roots.len(), 1);
+        let snapshot = graph.request::<ParserNode<Tokens, Value>>(uri).unwrap();
+        let roots = graph.read::<ParseRoots<Tokens, Value>>(uri).unwrap();
+        let root = roots[0].clone();
         let artifact = graph
-            .read::<ParsedAst<Tokens, Value>>(roots[0].clone())
+            .read::<ParsedAst<Tokens, Value>>(root.clone())
             .expect("the root AST artifact must be materialized");
-        assert_eq!(artifact.ast_box.id, roots[0].id);
-        assert_eq!(artifact.ast_box.uri, uri);
+        let semantic = graph
+            .subscribe_view::<ParsedAst<Tokens, Value>>(root.clone())
+            .unwrap();
+        let location = graph
+            .subscribe_view::<AstLocation<Tokens, Value>>(root.clone())
+            .unwrap();
+        let _ = semantic.recv().unwrap();
+        let _ = location.recv().unwrap();
+
+        let resolved = artifact.ast_box.resolve(&snapshot).unwrap();
+        assert!(matches!(&*resolved, Value::Number(_)));
+        assert_eq!(resolved.span(), Span::new_uri(uri, 0, 2).unwrap());
+        assert_eq!(
+            resolved.span().to_line_col(snapshot.source()),
+            RangeOrPoint::Range((0, 0), (0, 2))
+        );
+
+        graph
+            .command(SourceNode::apply(SourceEdit::Insert {
+                key: Span::point_uri(uri, 0).unwrap(),
+                value: "\n".into(),
+            }))
+            .unwrap();
+        let shifted = graph.read::<ParseSnapshot<Tokens>>(uri).unwrap();
+        assert_eq!(
+            artifact
+                .ast_box
+                .span(&shifted)
+                .unwrap()
+                .to_line_col(shifted.source()),
+            RangeOrPoint::Range((1, 0), (1, 2)),
+        );
+        assert!(
+            semantic.try_recv().is_err(),
+            "span-only edits do not invalidate semantic AST facts"
+        );
+        assert!(matches!(
+            location.recv().unwrap(),
+            ViewUpdate::Changed { .. }
+        ));
+
+        graph
+            .command(SourceNode::apply(SourceEdit::Insert {
+                key: Span::point_uri(uri, 1).unwrap(),
+                value: "\u{2003}".into(),
+            }))
+            .unwrap();
+        let unicode_shifted = graph.read::<ParseSnapshot<Tokens>>(uri).unwrap();
+        assert_eq!(
+            artifact.ast_box.span(&unicode_shifted).unwrap(),
+            Span::new_uri(uri, 4, 6).unwrap(),
+        );
+        assert_eq!(
+            artifact
+                .ast_box
+                .span(&unicode_shifted)
+                .unwrap()
+                .to_line_col(unicode_shifted.source()),
+            RangeOrPoint::Range((1, 1), (1, 3)),
+            "Rope conversion reports character columns rather than UTF-8 bytes"
+        );
+        assert!(semantic.try_recv().is_err());
+        assert!(matches!(
+            location.recv().unwrap(),
+            ViewUpdate::Changed { .. }
+        ));
+        assert_eq!(
+            artifact.ast_box.span(&snapshot).unwrap(),
+            Span::new_uri(uri, 0, 2).unwrap(),
+            "held historical snapshots retain their original source coordinates"
+        );
+
+        graph
+            .command(SourceNode::apply_all(vec![
+                SourceEdit::Delete {
+                    key: Span::new_uri(uri, 4, 6).unwrap(),
+                },
+                SourceEdit::Insert {
+                    key: Span::point_uri(uri, 4).unwrap(),
+                    value: "7".into(),
+                },
+            ]))
+            .unwrap();
+        let replaced = graph.read::<ParseSnapshot<Tokens>>(uri).unwrap();
+        assert!(matches!(
+            semantic.recv().unwrap(),
+            ViewUpdate::Removed { .. }
+        ));
+        assert!(matches!(
+            location.recv().unwrap(),
+            ViewUpdate::Removed { .. }
+        ));
+        assert!(matches!(
+            artifact.ast_box.resolve(&replaced),
+            Err(crate::component::parse::AstLookupError::Deleted { .. })
+        ));
     }
 }

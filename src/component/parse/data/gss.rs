@@ -91,6 +91,10 @@ impl GssArena {
         self.nodes.get_index(id)
     }
 
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub fn get_edge(&self, id: GssEdgeId) -> Option<&GssEdge> {
         self.edges.get_index(id)
     }
@@ -208,6 +212,7 @@ impl GssArena {
             {
                 return false;
             }
+
             let old_edges = arena.outgoing_edges(old).copied().collect::<Vec<_>>();
             let new_edges = arena.outgoing_edges(new).copied().collect::<Vec<_>>();
             if old_edges.len() != new_edges.len() {

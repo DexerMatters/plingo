@@ -21,12 +21,13 @@ pub use data::ast::AstToken;
 pub use data::green::{ErrorKind, ParseErrorInfo};
 pub use identity::TokenFingerprint;
 pub use node::{
-    AstArtifact, AstKey, ParseDiagnostics, ParseRoots, ParseStats, ParseStatus, ParseStatusView,
-    ParsedAst, ParserNode,
+    AstArtifact, AstLocation, ParseDiagnostics, ParseRoots, ParseSnapshot, ParseStats,
+    ParseStatusView, ParsedAst, ParserNode,
 };
 pub use parser::Parser;
 pub use parsing::ParseError;
 pub use types::{
-    AstView, AstViewEntry, IncrementalParseStats, ParseForest, ParserConfig, ParserSnapshotState,
-    TokenData, TokenOccurrenceId,
+    AstKey, AstLookupError, AstSnapshot, AstSnapshotEntry, IncrementalParseStats, ParseForest,
+    ParseSnapshotId, ParseStatus, ParserConfig, ParserSnapshotState, ResolvedAst, TokenData,
+    TokenOccurrenceId,
 };

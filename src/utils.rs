@@ -348,14 +348,15 @@ impl Span {
         }
     }
 
-    /// Converts the char offsets in this span to line and column numbers using
-    /// the provided source text.
+    /// Converts this byte-addressed span to zero-based Rope line/character
+    /// coordinates using the provided source text.
     pub fn to_line_col(&self, source: &Rope) -> RangeOrPoint<(usize, usize)> {
-        let start_line = source.char_to_line(self.range.start());
-        let start_col = self.range.start() - source.line_to_char(start_line);
-        let end_line = source.char_to_line(self.range.end());
-        let end_col = self.range.end() - source.line_to_char(end_line);
-        RangeOrPoint::from_range((start_line, start_col), (end_line, end_col))
+        let line_col = |byte: usize| {
+            let character = source.byte_to_char(byte.min(source.len_bytes()));
+            let line = source.char_to_line(character);
+            (line, character - source.line_to_char(line))
+        };
+        RangeOrPoint::from_range(line_col(self.range.start()), line_col(self.range.end()))
     }
 
     pub fn map_range(&self, f: impl FnOnce(RangeOrPoint<usize>) -> RangeOrPoint<usize>) -> Self {

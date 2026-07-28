@@ -378,9 +378,8 @@ where
         );
         let total_elapsed = total_start.elapsed();
 
-        log::debug!(
-            target: "Measure",
-            "lex {} total={:?} fetch_source={:?} old_visible={:?} delta_scan={:?} restart_lookup={:?} old_suffix={:?} replay={:?} splice={:?} new_visible={:?} batch_diff={:?} changed={} restart={} restart_token={} change_end={} net_shift={} new_prefix={} reused_suffix={} old_tokens={} new_tokens={} prefix={} suffix={}",
+        eprintln!(
+            "[lex-replay] uri={} total={:?} fetch_source={:?} old_visible={:?} delta_scan={:?} restart_lookup={:?} old_suffix={:?} replay={:?} splice={:?} new_visible={:?} batch_diff={:?} status={} changed={} restart_byte={} restart_token={} change_end={} net_shift={} relexed={} reused={} old_tokens={} new_tokens={} prefix={} suffix={}",
             uri,
             total_elapsed,
             fetch_source_elapsed,
@@ -392,6 +391,11 @@ where
             state_splice_elapsed,
             new_visible_elapsed,
             batch_diff_elapsed,
+            if convergence.is_some() {
+                "converged"
+            } else {
+                "eof"
+            },
             changed,
             restart_point,
             restart_token_pos,

@@ -13,24 +13,10 @@ use plingo::component;
 
 use component::{
     lex::LexErrorInfo,
-    parse::{AstToken, ParseErrorInfo, data::AstBox},
+    parse::{data::AstBox, AstToken, ParseErrorInfo},
 };
 
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
-#[scopes(root {
-    Whitespace,
-    LeftBrace,
-    RightBrace,
-    LeftBracket,
-    RightBracket,
-    Comma,
-    Colon,
-    String,
-    Number,
-    True,
-    False,
-    Null
-})]
 pub enum JsonToken {
     #[regex(r"[[:space:]]+")]
     #[skip]

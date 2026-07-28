@@ -5,7 +5,7 @@ use bitvec::vec::BitVec;
 use crate::component::parse::{
     __macro_private::NonTerminalSpec,
     data::{
-        ast::{AstArena, AstBox, AstId, TokenEntryId},
+        ast::{AnchoredSpan, AstArena, AstBox, AstId, TokenEntryId},
         green::{ErrorKind, GreenId, TreeArena},
         product::{Product, ProductArena, ProductData, ProductId},
     },
@@ -187,11 +187,35 @@ pub struct BuildCx<'a> {
     pub trees: &'a mut TreeArena,
     pub products: &'a mut ProductArena,
     pub ast: &'a mut AstArena,
+    /// Stable token occurrence immediately following this reduction. Empty
+    /// productions use it as their zero-width source anchor.
+    pub boundary: usize,
 }
 
 impl<'a> BuildCx<'a> {
     pub fn green_of(&self, product: ProductId) -> Result<GreenId, BuildError> {
         Ok(self.product(product)?.green)
+    }
+
+    fn child_metadata(&self, children: &[ProductId]) -> (AnchoredSpan, Vec<AstId>) {
+        let extent = AnchoredSpan::cover(
+            children
+                .iter()
+                .filter_map(|child| self.products.get(*child).map(|product| product.extent)),
+            self.boundary,
+        );
+        let mut ast_ids = children
+            .iter()
+            .flat_map(|child| {
+                self.products
+                    .get(*child)
+                    .into_iter()
+                    .flat_map(|product| product.ast_ids.iter().copied())
+            })
+            .collect::<Vec<_>>();
+        ast_ids.sort_unstable();
+        ast_ids.dedup();
+        (extent, ast_ids)
     }
 
     pub fn expect_node<T: 'static>(&self, product: ProductId) -> Result<AstBox<T>, BuildError> {
@@ -245,10 +269,12 @@ impl<'a> BuildCx<'a> {
             .map(|&child| self.green_of(child))
             .collect::<Result<Vec<_>, _>>()?;
         let green = self.trees.node(self.lhs(production)?, greens);
-        let ast = self.ast.insert(value);
+        let (extent, mut ast_ids) = self.child_metadata(children);
+        let ast = self.ast.insert(value, extent);
+        ast_ids.push(ast.id);
         let product = self
             .products
-            .insert(Product::node(green, ast, children.to_vec()));
+            .insert(Product::node(green, ast, children.to_vec()).with_metadata(extent, ast_ids));
         self.ast.bind_product(ast.id, product);
         Ok(product)
     }
@@ -262,11 +288,14 @@ impl<'a> BuildCx<'a> {
         length: usize,
         terminal: TerminalId,
         entry: TokenEntryId,
+        occurrence: usize,
         fingerprint: TokenFingerprint,
     ) -> ProductId {
         let green = self.trees.leaf(length, terminal);
-        self.products
-            .insert(Product::token(green, entry, fingerprint))
+        self.products.insert(
+            Product::token(green, entry, fingerprint)
+                .with_metadata(AnchoredSpan::token(occurrence), Vec::new()),
+        )
     }
 
     pub fn alloc_typed_token<T>(
@@ -281,10 +310,12 @@ impl<'a> BuildCx<'a> {
         T: Send + Sync + 'static,
     {
         let green = self.trees.leaf(length, terminal);
-        let ast = self.ast.insert(value);
-        let product = self
-            .products
-            .insert(Product::typed_token(green, entry, fingerprint, ast));
+        let extent = AnchoredSpan::point(self.boundary);
+        let ast = self.ast.insert(value, extent);
+        let product = self.products.insert(
+            Product::typed_token(green, entry, fingerprint, ast)
+                .with_metadata(extent, vec![ast.id]),
+        );
         self.ast.bind_product(ast.id, product);
         product
     }
@@ -302,7 +333,9 @@ impl<'a> BuildCx<'a> {
         let green = self.trees.error(
             length, kind, node, children, unexpected, expected, recovered, None,
         );
-        self.products.insert(Product::error(green))
+        self.products.insert(
+            Product::error(green).with_metadata(AnchoredSpan::point(self.boundary), Vec::new()),
+        )
     }
 
     pub fn alloc_error_with_children(
@@ -325,9 +358,10 @@ impl<'a> BuildCx<'a> {
         let green = self.trees.error(
             length, kind, node, greens, unexpected, expected, recovered, None,
         );
-        Ok(self
-            .products
-            .insert(Product::error_with_children(green, children.to_vec())))
+        let (extent, ast_ids) = self.child_metadata(children);
+        Ok(self.products.insert(
+            Product::error_with_children(green, children.to_vec()).with_metadata(extent, ast_ids),
+        ))
     }
 
     pub fn is_error(&self, product: ProductId) -> Result<bool, BuildError> {

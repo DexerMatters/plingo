@@ -11,7 +11,9 @@ use fluent_uri::Uri;
 use crate::{
     component::{
         lex::LexerRoot,
-        parse::{AstArtifact, AstKey, ParseRoots, ParsedAst, ParserNode, data::AstBox},
+        parse::{
+            data::AstBox, AstArtifact, AstKey, AstLocation, ParseRoots, ParsedAst, ParserNode,
+        },
         source::LoadSourceText,
     },
     scheme::node::{
@@ -21,12 +23,12 @@ use crate::{
 };
 
 use super::{
-    ScopeProperty,
     data::{
         AstOwner, FrameDraft, PatchBuilder, Scope, ScopeDatum, ScopeEdge, ScopeError,
         ScopeFrameKey, ScopeReference, ScopeSnapshot,
     },
     query::ResolutionPath,
+    ScopeProperty,
 };
 
 type State<Anchor, Label, Datum, Reference, Request> =
@@ -404,11 +406,11 @@ where
     }
 
     fn root(&self, cx: &mut DeriveCx<'_, '_>, uri: Uri<&'static str>) -> Result<(), NodeError> {
-        cx.require::<ParserNode<Root, Ast>>(uri)?;
+        // Materialize parser facts once, then depend only on the typed
+        // manifest. Location-only snapshot publications therefore leave this
+        // root reconciler and all semantic frames untouched.
+        cx.materialize::<ParserNode<Root, Ast>>(uri)?;
         let roots = cx.observe::<ParseRoots<Root, Ast>>(uri)?;
-        for ast in roots.iter().cloned() {
-            cx.observe::<ParsedAst<Root, Ast>>(ast)?;
-        }
 
         let (root_scope, frames) = {
             let state = cx.state_mut(&self.state)?;
@@ -435,7 +437,6 @@ where
     }
 
     fn frame(&self, cx: &mut DeriveCx<'_, '_>, key: ScopeFrameKey) -> Result<(), NodeError> {
-        cx.require::<ParserNode<Root, Ast>>(key.ast.uri)?;
         let artifact = match cx.observe::<ParsedAst<Root, Ast>>(key.ast.clone()) {
             Ok(artifact) => artifact,
             // A parser revision can invalidate an orphaned frame before its
@@ -629,9 +630,21 @@ where
         })
     }
 
-    /// Reads and caches the individual parser artifact that owns `node`.
+    /// Reads and caches the individual semantic AST artifact that owns `node`.
     pub fn ast(&mut self, node: AstBox<Ast>) -> Result<&Ast, ScopeError> {
         Ok(self.artifact(node)?.value.as_ref())
+    }
+
+    /// Opt-in source dependency for rules that need a diagnostic location.
+    /// Pure scope rules should use [`ScopeCx::ast`] only.
+    pub fn span(&mut self, node: AstBox<Ast>) -> Result<crate::utils::Span, ScopeError> {
+        let key = AstKey {
+            uri: node.uri,
+            id: node.id,
+        };
+        self.derive
+            .observe::<AstLocation<Root, Ast>>(key.clone())
+            .map_err(|_| ScopeError::MissingAst(key))
     }
 
     pub fn scope(&mut self) -> Scope {
@@ -700,7 +713,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::fmt;
+    use std::{
+        fmt,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use plingo_macros::{NonTerminal, Terminal};
 
@@ -708,7 +727,7 @@ mod tests {
     use crate::{
         component::{
             lex::{LexErrorInfo, LexerNode},
-            parse::{AstToken, ParserNode, grammar::Grammar},
+            parse::{grammar::Grammar, AstToken, ParserNode},
             source::{SourceEdit, SourceNode},
         },
         scheme::node::Graph,
@@ -716,8 +735,11 @@ mod tests {
     };
 
     #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
-    #[scopes(root { Number })]
+    #[scopes(root { Whitespace, Number })]
     enum Tokens {
+        #[regex(r"\s+")]
+        #[skip]
+        Whitespace,
         #[regex(r"[0-9]+")]
         Number(usize),
         #[error]
@@ -763,9 +785,12 @@ mod tests {
         graph
             .install(ParserNode::<Tokens, Value>::from_parser(parser))
             .unwrap();
+        let visits = Arc::new(AtomicUsize::new(0));
+        let visitor_visits = Arc::clone(&visits);
         graph
             .install(ScopeNode::<Tokens, Value, (), Label, Datum, (), ()>::new(
-                |cx, node, incoming| {
+                move |cx, node, incoming| {
+                    visitor_visits.fetch_add(1, Ordering::Relaxed);
                     let current = cx.scope();
                     cx.datum(current, Datum(node.id));
                     cx.edge(current, Label::Declares, incoming, ScopeProperty::Cyclic);
@@ -840,24 +865,33 @@ mod tests {
         );
         let datums = graph.facts::<ScopeDatums<Datum>>();
         assert!(datums.iter().all(|datum| datum.datum.0 == roots[0].id));
-        assert!(
-            graph
-                .facts::<ScopeEdges<Label>>()
-                .iter()
-                .all(|edge| edge.source == datums[0].scope)
-        );
+        assert!(graph
+            .facts::<ScopeEdges<Label>>()
+            .iter()
+            .all(|edge| edge.source == datums[0].scope));
         assert_eq!(graph.facts::<SourceRequirements<()>>(), vec![()]);
+
+        let semantic_visits = visits.load(Ordering::Relaxed);
+        graph
+            .command(SourceNode::apply(SourceEdit::Insert {
+                key: Span::point_uri(uri, 0).unwrap(),
+                value: "\n".into(),
+            }))
+            .unwrap();
+        assert_eq!(
+            visits.load(Ordering::Relaxed),
+            semantic_visits,
+            "location-only edits do not rerun semantic scope frames"
+        );
 
         drop(_resolution);
         drop(_root);
         graph.collect_garbage().unwrap();
         assert!(graph.facts::<ScopeDatums<Datum>>().is_empty());
         assert!(graph.facts::<ScopeEdges<Label>>().is_empty());
-        assert!(
-            graph
-                .read::<ScopeHandle<Tokens, Value, (), Label, Datum, (), ()>>(ScopeKey::root(uri))
-                .is_none()
-        );
+        assert!(graph
+            .read::<ScopeHandle<Tokens, Value, (), Label, Datum, (), ()>>(ScopeKey::root(uri))
+            .is_none());
 
         let _rematerialized = graph
             .request::<ScopeNode<Tokens, Value, (), Label, Datum, (), ()>>(ScopeKey::root(uri))

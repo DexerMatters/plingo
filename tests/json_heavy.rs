@@ -1,25 +1,25 @@
 mod common;
 
-use std::{sync::Arc, sync::mpsc::TryRecvError};
+use std::{sync::mpsc::TryRecvError, sync::Arc};
 
 use common::json::{JsonDocument, JsonToken};
 use plingo::{
-    Graph, Subscription,
     component::{
         lex::{LexDiagnostics, LexStats, LexerNode, TokenArtifact, TokenKey, TokenOrder},
         parse::{
-            ParseDiagnostics, ParseRoots, ParseStats, ParseStatus, ParseStatusView, ParserNode,
-            grammar::Grammar,
+            grammar::Grammar, ParseDiagnostics, ParseRoots, ParseSnapshot, ParseStats, ParseStatus,
+            ParseStatusView, ParserNode,
         },
         source::{SourceEdit, SourceNode},
     },
     utils::Span,
+    Graph, Subscription,
 };
 
 struct JsonRuntime {
     graph: Graph,
     uri: fluent_uri::Uri<&'static str>,
-    subscription: Subscription<ParseRoots<JsonToken, JsonDocument>>,
+    subscription: Subscription<ParseSnapshot<JsonToken>>,
 }
 
 impl JsonRuntime {
@@ -345,16 +345,14 @@ fn released_document_caches_reinitialize_without_replaying_stale_deltas() {
     } = runtime;
     drop(subscription);
     graph.collect_garbage().unwrap();
-    assert!(
-        graph
-            .read::<ParseRoots<JsonToken, JsonDocument>>(uri)
-            .is_none()
-    );
+    assert!(graph
+        .read::<ParseRoots<JsonToken, JsonDocument>>(uri)
+        .is_none());
 
     let rematerialized = graph
         .request::<ParserNode<JsonToken, JsonDocument>>(uri)
         .unwrap();
-    assert!(!rematerialized.value().is_empty());
+    assert!(rematerialized.value().ast_keys().next().is_some());
     assert_eq!(
         graph
             .read::<ParseDiagnostics<JsonToken>>(uri)
@@ -403,9 +401,8 @@ fn independent_documents_do_not_cross_invalidate() {
             value: " ".into(),
         }))
         .unwrap();
-    assert_eq!(
-        subscription_b.try_recv(),
-        Err(TryRecvError::Empty),
+    assert!(
+        matches!(subscription_b.try_recv(), Err(TryRecvError::Empty)),
         "an edit to URI A must not publish a URI B parser update"
     );
     assert_eq!(

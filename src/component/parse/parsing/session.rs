@@ -36,12 +36,13 @@ impl SessionContext<'_> {
         self.gotos[self.grammar.goto_index(state, non_terminal)]
     }
 
-    fn build_cx(&mut self) -> BuildCx<'_> {
+    fn build_cx(&mut self, boundary: usize) -> BuildCx<'_> {
         BuildCx {
             productions: &self.grammar.productions,
             trees: self.trees,
             products: self.products,
             ast: self.ast,
+            boundary,
         }
     }
 
@@ -54,6 +55,7 @@ impl SessionContext<'_> {
         expected: Symbol,
         recovered: bool,
         location: Option<usize>,
+        anchor: usize,
     ) -> Result<ProductId, ParseError> {
         let green = self.trees.error(
             length,
@@ -65,7 +67,14 @@ impl SessionContext<'_> {
             recovered,
             location,
         );
-        let product = self.products.insert(Product::error(green));
+        let extent = if length == 0 {
+            crate::component::parse::data::ast::AnchoredSpan::point(anchor)
+        } else {
+            crate::component::parse::data::ast::AnchoredSpan::token(anchor)
+        };
+        let product = self
+            .products
+            .insert(Product::error(green).with_metadata(extent, Vec::new()));
         Ok(product)
     }
 
@@ -165,18 +174,29 @@ impl SessionContext<'_> {
         &mut self,
         production: u32,
         children: &[ProductId],
+        boundary: usize,
     ) -> Result<ProductId, ParseError> {
+        // Empty reductions are position-sensitive. Including their stable
+        // lookahead anchor prevents a cached zero-width product from being
+        // reused at a different source boundary.
         let key = ReductionKey {
             production,
             children: children.to_vec(),
+            boundary: children.is_empty().then_some(boundary),
         };
         if let Some(&product) = self.state.reduced_products.get(&key) {
             return Ok(product);
         }
         let build_fn = self.grammar.productions[production as usize].build;
-        let mut cx = self.build_cx();
+        let mut cx = self.build_cx(boundary);
         let product = build_fn(&mut cx, production, children)?;
-        self.state.reduced_products.insert(key, product);
+        self.state.reduced_products.insert(key.clone(), product);
+        // A self-referential reduction cannot be recursively remapped. The
+        // former origin scan excluded it as well; omitting it here makes reuse
+        // reject that suffix instead of recursing indefinitely.
+        if !key.children.contains(&product) {
+            self.state.reduction_origins.insert(product, key);
+        }
         Ok(product)
     }
 
@@ -188,6 +208,7 @@ impl SessionContext<'_> {
         &mut self,
         column: usize,
         lookahead: TerminalId,
+        boundary: usize,
     ) -> Result<(), ParseError> {
         loop {
             let mut changed = false;
@@ -218,7 +239,8 @@ impl SessionContext<'_> {
                                         non_terminal: lhs,
                                     });
                                 };
-                                let product = self.reduce_cached(production, &path.products)?;
+                                let product =
+                                    self.reduce_cached(production, &path.products, boundary)?;
                                 if self.record_column_product(product, column) {
                                     changed = true;
                                 }
@@ -239,7 +261,7 @@ impl SessionContext<'_> {
                         Action::Accept => {
                             let rhs_len = self.grammar.production_rhs_len(0);
                             for path in self.reduce_paths(column, node_id, 0, rhs_len) {
-                                let product = self.reduce_cached(0, &path.products)?;
+                                let product = self.reduce_cached(0, &path.products, boundary)?;
                                 if self.record_column_product(product, column) {
                                     changed = true;
                                 }
@@ -327,6 +349,7 @@ impl SessionContext<'_> {
                 Symbol::T(self.grammar.error_terminal),
                 true,
                 Some(next_column),
+                token.column,
             )?;
             Some(product)
         } else {
@@ -359,11 +382,12 @@ impl SessionContext<'_> {
                     if !self.state.token_products.contains_key(&token.column) {
                         // One source token can shift through multiple GSS paths;
                         // every path must share its single token product.
-                        let mut cx = self.build_cx();
+                        let mut cx = self.build_cx(token.column);
                         let product = cx.alloc_token(
                             token.length,
                             token.terminal,
                             token.entry,
+                            token.column,
                             token.fingerprint,
                         );
                         self.state.token_products.insert(token.column, product);
@@ -408,7 +432,7 @@ impl SessionContext<'_> {
             );
             self.state.token_columns.insert(token.column, next_column);
             self.state.columns[next_column].set_error_derived();
-            self.reduce_until_stable(next_column, self.grammar.error_terminal)?;
+            self.reduce_until_stable(next_column, self.grammar.error_terminal, token.column)?;
         } else {
             let product = self.state.token_products[&token.column];
             self.state
@@ -425,7 +449,7 @@ impl SessionContext<'_> {
         from_column: usize,
         terminal: TerminalId,
         unexpected: Option<Symbol>,
-        _location: Option<usize>,
+        location: Option<usize>,
     ) -> Result<usize, ParseError> {
         let next_column = from_column + 1;
         let product = self.alloc_error_node(
@@ -436,6 +460,7 @@ impl SessionContext<'_> {
             Symbol::T(terminal),
             true,
             Some(next_column),
+            location.unwrap_or(0),
         )?;
         let mut next_active = IndexSet::new();
         let active_nodes: Vec<_> = self.state.columns[from_column].active_nodes().collect();
@@ -480,7 +505,7 @@ impl SessionContext<'_> {
             ),
         );
         self.state.columns[next_column].set_error_derived();
-        self.reduce_until_stable(next_column, terminal)?;
+        self.reduce_until_stable(next_column, terminal, location.unwrap_or(0))?;
         Ok(next_column)
     }
 
@@ -498,6 +523,7 @@ impl SessionContext<'_> {
             Symbol::T(self.grammar.error_terminal),
             true,
             Some(next_column),
+            token.column,
         )?;
         let active = self.state.columns[from_column].active.clone();
         self.state
@@ -518,7 +544,7 @@ impl SessionContext<'_> {
         );
         self.state.columns[next_column].set_error_derived();
         self.state.token_columns.insert(token.column, next_column);
-        self.reduce_until_stable(next_column, self.grammar.error_terminal)?;
+        self.reduce_until_stable(next_column, self.grammar.error_terminal, token.column)?;
         Ok(next_column)
     }
 
@@ -545,7 +571,11 @@ impl SessionContext<'_> {
             let column = self.state.current_column();
             match repair {
                 Repair::Insert(terminal) => {
-                    self.reduce_until_stable(column, terminal)?;
+                    self.reduce_until_stable(
+                        column,
+                        terminal,
+                        tokens.get(index).map_or(0, |token| token.column),
+                    )?;
                     let unexpected = tokens.get(index).map(|token| Symbol::T(token.terminal));
                     let location = tokens.get(index).map(|token| token.column);
                     self.shift_synthetic_terminal(column, terminal, unexpected, location)?;
@@ -561,7 +591,7 @@ impl SessionContext<'_> {
                     let Some(token) = tokens.get(index) else {
                         return Ok(None);
                     };
-                    self.reduce_until_stable(column, token.terminal)?;
+                    self.reduce_until_stable(column, token.terminal, token.column)?;
                     self.shift_parse_token(column, token)?;
                     index += 1;
                 }
@@ -578,7 +608,7 @@ impl SessionContext<'_> {
                         merge_source_terminal: Some(token.terminal),
                         ..*token
                     };
-                    self.reduce_until_stable(column, self.grammar.error_terminal)?;
+                    self.reduce_until_stable(column, self.grammar.error_terminal, token.column)?;
                     self.shift_parse_token(column, &modified)?;
                     index += 1;
                 }

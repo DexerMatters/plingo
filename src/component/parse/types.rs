@@ -1,8 +1,11 @@
 //! Public parser vocabulary and snapshot values shared by all parser subsystems.
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{any::TypeId, collections::HashMap, fmt, ops::Deref, sync::Arc};
 
 use fluent_uri::Uri;
+use ropey::Rope;
+
+use crate::utils::Span;
 
 use crate::component::parse::{
     data::{
@@ -38,126 +41,185 @@ pub struct ParseForest {
     pub roots: Vec<ProductId>,
 }
 
-/// One typed AST value in an [`AstView`].
-///
-/// The value is shared with the parser's AST arena, so constructing a view does
-/// not require `T: Clone` and the value remains valid after later revisions are
-/// parsed.
-pub struct AstViewEntry<T> {
-    pub ast_box: AstBox<T>,
-    pub product: ProductId,
-    pub value: Arc<T>,
+/// Stable identity of a reachable AST value across parser publications.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AstKey {
+    pub uri: Uri<&'static str>,
+    pub id: AstId,
 }
 
-impl<T> Clone for AstViewEntry<T> {
-    fn clone(&self) -> Self {
-        Self {
-            ast_box: self.ast_box,
-            product: self.product,
-            value: Arc::clone(&self.value),
+pub type ParseSnapshotId = u64;
+
+/// Metadata and source span for one AST value. The span is mandatory: it was
+/// anchored when the value's shift/reduction created its product.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AstSnapshotEntry {
+    pub product: ProductId,
+    pub type_id: TypeId,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AstLookupError {
+    WrongDocument,
+    Deleted { id: AstId },
+    TypeMismatch { id: AstId },
+}
+
+impl fmt::Display for AstLookupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongDocument => write!(f, "AST box belongs to a different document"),
+            Self::Deleted { id } => write!(f, "AST node #{id} is not live in this snapshot"),
+            Self::TypeMismatch { id } => write!(f, "AST node #{id} has a different runtime type"),
         }
     }
 }
 
-impl<T> AstViewEntry<T> {
-    pub fn owner(&self) -> ProductId {
+/// Snapshot-bound AST access. The contained value dereferences to `T`, while
+/// [`ResolvedAst::span`] returns the exact source extent from the same parser
+/// revision.
+pub struct ResolvedAst<T> {
+    value: Arc<T>,
+    product: ProductId,
+    span: Span,
+}
+
+impl<T> Deref for ResolvedAst<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> ResolvedAst<T> {
+    pub fn arc(&self) -> Arc<T> {
+        Arc::clone(&self.value)
+    }
+
+    pub fn product(&self) -> ProductId {
         self.product
     }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }
 
-/// An immutable, typed view of the AST reachable at one parser revision.
-///
-/// Views contain only nodes reachable from the selected snapshot's roots for
-/// `uri`. Arena values allocated by older or newer revisions are deliberately
-/// excluded.
-pub struct AstView<T> {
+/// Immutable parser result for one committed document revision. It owns the
+/// Rope used by consumers that want line/column formatting, so historical
+/// snapshots keep their original coordinate system.
+#[derive(Clone)]
+pub struct AstSnapshot {
+    id: ParseSnapshotId,
     uri: Uri<&'static str>,
-    roots: Arc<[AstBox<T>]>,
-    entries: Arc<[AstViewEntry<T>]>,
-    by_ast: Arc<HashMap<AstId, usize>>,
-    by_product: Arc<HashMap<ProductId, usize>>,
+    source: Arc<Rope>,
+    entries: Arc<HashMap<AstId, AstSnapshotEntry>>,
+    values: Arc<HashMap<AstId, Arc<dyn std::any::Any + Send + Sync>>>,
 }
 
-impl<T> Clone for AstView<T> {
-    fn clone(&self) -> Self {
-        Self {
-            uri: self.uri,
-            roots: Arc::clone(&self.roots),
-            entries: Arc::clone(&self.entries),
-            by_ast: Arc::clone(&self.by_ast),
-            by_product: Arc::clone(&self.by_product),
-        }
-    }
-}
-
-impl<T> AstView<T> {
+impl AstSnapshot {
     pub(crate) fn new(
+        id: ParseSnapshotId,
         uri: Uri<&'static str>,
-        roots: Vec<AstBox<T>>,
-        entries: Vec<AstViewEntry<T>>,
+        source: Arc<str>,
+        entries: HashMap<AstId, AstSnapshotEntry>,
+        values: HashMap<AstId, Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Self {
-        let by_ast = entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (entry.ast_box.id, index))
-            .collect();
-        let by_product = entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (entry.product, index))
-            .collect();
         Self {
+            id,
             uri,
-            roots: roots.into(),
-            entries: entries.into(),
-            by_ast: Arc::new(by_ast),
-            by_product: Arc::new(by_product),
+            source: Arc::new(Rope::from_str(&source)),
+            entries: Arc::new(entries),
+            values: Arc::new(values),
         }
     }
 
-    pub(crate) fn empty(uri: Uri<&'static str>) -> Self {
-        Self::new(uri, Vec::new(), Vec::new())
+    pub fn id(&self) -> ParseSnapshotId {
+        self.id
     }
 
     pub fn uri(&self) -> Uri<&'static str> {
         self.uri
     }
 
-    pub fn roots(&self) -> &[AstBox<T>] {
-        &self.roots
+    pub fn source(&self) -> &Rope {
+        &self.source
     }
 
-    pub fn entries(&self) -> &[AstViewEntry<T>] {
-        &self.entries
+    pub fn ast_keys(&self) -> impl Iterator<Item = AstKey> + '_ {
+        self.entries
+            .keys()
+            .copied()
+            .map(|id| AstKey { uri: self.uri, id })
     }
 
-    pub fn get(&self, ast_box: AstBox<T>) -> Option<&T> {
-        self.entry(ast_box).map(|entry| entry.value.as_ref())
-    }
-
-    pub fn entry(&self, ast_box: AstBox<T>) -> Option<&AstViewEntry<T>> {
-        if ast_box.uri != self.uri {
-            return None;
+    pub fn resolve<T>(&self, node: AstBox<T>) -> Result<ResolvedAst<T>, AstLookupError>
+    where
+        T: Send + Sync + 'static,
+    {
+        if node.uri != self.uri {
+            return Err(AstLookupError::WrongDocument);
         }
-        self.by_ast
-            .get(&ast_box.id)
-            .and_then(|&index| self.entries.get(index))
+        let entry = self
+            .entries
+            .get(&node.id)
+            .ok_or(AstLookupError::Deleted { id: node.id })?;
+        if entry.type_id != TypeId::of::<T>() {
+            return Err(AstLookupError::TypeMismatch { id: node.id });
+        }
+        let value = Arc::clone(
+            self.values
+                .get(&node.id)
+                .ok_or(AstLookupError::Deleted { id: node.id })?,
+        )
+        .downcast::<T>()
+        .map_err(|_| AstLookupError::TypeMismatch { id: node.id })?;
+        Ok(ResolvedAst {
+            value,
+            product: entry.product,
+            span: entry.span,
+        })
     }
 
-    pub fn owner(&self, ast_box: AstBox<T>) -> Option<ProductId> {
-        self.entry(ast_box).map(|entry| entry.product)
+    /// Convenience for consumers that only need ownership of the value.
+    /// Snapshot-bound `AstBox::resolve` remains the richer API.
+    pub fn get<T>(&self, node: AstBox<T>) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.resolve(node).ok().map(|resolved| resolved.arc())
+    }
+}
+
+impl<T> AstBox<T>
+where
+    T: Send + Sync + 'static,
+{
+    pub fn resolve(self, snapshot: &AstSnapshot) -> Result<ResolvedAst<T>, AstLookupError> {
+        snapshot.resolve(self)
     }
 
-    pub fn box_for_product(&self, product: ProductId) -> Option<AstBox<T>> {
-        self.by_product
-            .get(&product)
-            .and_then(|&index| self.entries.get(index))
-            .map(|entry| entry.ast_box)
+    pub fn span(self, snapshot: &AstSnapshot) -> Result<Span, AstLookupError> {
+        Ok(self.resolve(snapshot)?.span())
     }
+}
 
-    pub fn contains_product(&self, product: ProductId) -> bool {
-        self.by_product.contains_key(&product)
+impl PartialEq for AstSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
     }
+}
+
+impl Eq for AstSnapshot {}
+
+/// Materialized parser state for editor-facing consumers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParseStatus {
+    Clean,
+    Recovered { diagnostics: usize },
+    Unrecoverable { diagnostics: usize },
 }
 
 pub type TokenOccurrenceId = usize;

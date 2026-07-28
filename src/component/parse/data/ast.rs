@@ -7,6 +7,53 @@ use super::product::ProductId;
 pub type AstId = usize;
 pub type TokenEntryId = usize;
 
+/// A source extent expressed in stable token-occurrence coordinates.
+///
+/// The lexer may shift a token's bytes while preserving its occurrence ID. A
+/// parser product therefore stores these anchors rather than stale byte
+/// offsets. `end_at_token_end` distinguishes a real one-token range from a
+/// zero-width point before that token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AnchoredSpan {
+    pub start: usize,
+    pub end: usize,
+    pub end_at_token_end: bool,
+}
+
+impl AnchoredSpan {
+    pub const fn token(occurrence: usize) -> Self {
+        Self {
+            start: occurrence,
+            end: occurrence,
+            end_at_token_end: true,
+        }
+    }
+
+    pub const fn point(occurrence: usize) -> Self {
+        Self {
+            start: occurrence,
+            end: occurrence,
+            end_at_token_end: false,
+        }
+    }
+
+    pub fn cover(children: impl IntoIterator<Item = Self>, fallback: usize) -> Self {
+        let mut children = children.into_iter();
+        let Some(first) = children.next() else {
+            return Self::point(fallback);
+        };
+        children.fold(first, |extent, child| Self {
+            start: extent.start.min(child.start),
+            end: extent.end.max(child.end),
+            end_at_token_end: if child.end >= extent.end {
+                child.end_at_token_end
+            } else {
+                extent.end_at_token_end
+            },
+        })
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct AstBox<T> {
     pub id: AstId,
@@ -54,37 +101,47 @@ impl<T> AstToken<T> {
 }
 
 #[derive(Clone)]
+struct AstRecord {
+    value: Arc<dyn Any + Send + Sync>,
+    owner: Option<ProductId>,
+    extent: AnchoredSpan,
+}
+
+#[derive(Clone)]
 pub struct AstArena {
-    values: Vec<Arc<dyn Any + Send + Sync>>,
-    owners: Vec<Option<ProductId>>,
+    records: Vec<AstRecord>,
     uri: Uri<&'static str>,
 }
 
 impl AstArena {
     pub fn new(uri: Uri<&'static str>) -> Self {
         Self {
-            values: Vec::new(),
-            owners: Vec::new(),
+            records: Vec::new(),
             uri,
         }
     }
 
-    pub fn insert<T>(&mut self, value: T) -> AstBox<T>
+    /// Allocates an AST value together with the source extent determined by
+    /// the shift/reduction that created it.
+    pub fn insert<T>(&mut self, value: T, extent: AnchoredSpan) -> AstBox<T>
     where
         T: Send + Sync + 'static,
     {
-        let id = self.values.len();
-        self.values.push(Arc::new(value));
-        self.owners.push(None);
+        let id = self.records.len();
+        self.records.push(AstRecord {
+            value: Arc::new(value),
+            owner: None,
+            extent,
+        });
         AstBox::new(id, self.uri)
     }
 
     pub fn get<T: 'static>(&self, node: AstBox<T>) -> Option<&T> {
-        self.values.get(node.id)?.downcast_ref()
+        self.records.get(node.id)?.value.downcast_ref()
     }
 
     pub fn expect<T: 'static>(&self, id: AstId) -> Option<AstBox<T>> {
-        self.values.get(id)?.downcast_ref::<T>()?;
+        self.records.get(id)?.value.downcast_ref::<T>()?;
         Some(AstBox::new(id, self.uri))
     }
 
@@ -92,27 +149,30 @@ impl AstArena {
     where
         T: Clone + 'static,
     {
-        self.values.get(id)?.downcast_ref::<T>().cloned()
+        self.records.get(id)?.value.downcast_ref::<T>().cloned()
     }
 
-    pub(crate) fn cloned_arc<T>(&self, id: AstId) -> Option<Arc<T>>
-    where
-        T: Send + Sync + 'static,
-    {
-        Arc::clone(self.values.get(id)?).downcast::<T>().ok()
+    pub(crate) fn cloned_erased(&self, id: AstId) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.records.get(id).map(|record| Arc::clone(&record.value))
     }
 
-    pub(crate) fn contains(&self, id: AstId) -> bool {
-        self.values.get(id).is_some()
+    pub(crate) fn extent_of(&self, id: AstId) -> Option<AnchoredSpan> {
+        self.records.get(id).map(|record| record.extent)
+    }
+
+    pub(crate) fn type_of(&self, id: AstId) -> Option<std::any::TypeId> {
+        self.records
+            .get(id)
+            .map(|record| record.value.as_ref().type_id())
     }
 
     pub fn bind_product(&mut self, id: AstId, product: ProductId) {
-        if let Some(owner) = self.owners.get_mut(id) {
-            *owner = Some(product);
+        if let Some(record) = self.records.get_mut(id) {
+            record.owner = Some(product);
         }
     }
 
     pub fn product_of(&self, id: AstId) -> Option<ProductId> {
-        self.owners.get(id).copied().flatten()
+        self.records.get(id).and_then(|record| record.owner)
     }
 }

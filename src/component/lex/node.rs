@@ -42,19 +42,21 @@ impl<Root: LexerRoot> View for TokenOrder<Root> {
     type Value = Arc<[TokenKey]>;
 }
 
-/// Exact token changes emitted for one source revision. Parser replay consumes
-/// this typed revision directly instead of rediscovering a broad token diff.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TokenDelta {
+/// One atomic lexer publication. It keeps exact parser replay splices and the
+/// final coordinate/source state together, including edits that only shift
+/// skipped whitespace and therefore need no grammar replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TokenRevisionData {
     pub changes: Arc<[AddressChange<Uri<&'static str>, TokenData>]>,
+    pub tokens: Arc<[TokenData]>,
+    pub source: Arc<str>,
 }
 
-/// The token delta corresponding to the current [`TokenOrder`] revision.
-pub(crate) struct TokenChanges<Root>(PhantomData<fn() -> Root>);
+pub(crate) struct TokenRevision<Root>(PhantomData<fn() -> Root>);
 
-impl<Root: LexerRoot> View for TokenChanges<Root> {
+impl<Root: LexerRoot> View for TokenRevision<Root> {
     type Key = Uri<&'static str>;
-    type Value = Arc<TokenDelta>;
+    type Value = Arc<TokenRevisionData>;
 }
 
 /// Incremental lexer work performed for the current source revision.
@@ -112,7 +114,7 @@ impl<Root: LexerRoot + Clone> Node for LexerNode<Root> {
         let (tokens, changes, diagnostics, stats) = {
             let lexer = cx.state_mut(&self.lexer)?;
             let document = lexer
-                .derive_document(uri, source, &source_change)
+                .derive_document(uri, Arc::clone(&source), &source_change)
                 .map_err(|error| NodeError::message(error.to_string()))?;
             let diagnostics = document
                 .tokens
@@ -143,10 +145,13 @@ impl<Root: LexerRoot + Clone> Node for LexerNode<Root> {
                 *token,
             )?;
         }
-        cx.emit::<TokenChanges<Root>>(
+        let changes: Arc<[AddressChange<Uri<&'static str>, TokenData>]> = changes.into();
+        cx.emit::<TokenRevision<Root>>(
             uri,
-            Arc::new(TokenDelta {
-                changes: changes.into(),
+            Arc::new(TokenRevisionData {
+                changes,
+                tokens: tokens.clone().into(),
+                source: Arc::clone(&source),
             }),
         )?;
         cx.emit::<LexStats<Root>>(uri, stats)?;

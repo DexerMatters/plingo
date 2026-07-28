@@ -43,6 +43,8 @@ struct ReductionPath {
 struct ReductionKey {
     production: u32,
     children: Vec<ProductId>,
+    /// Empty reductions are anchored at their lookahead occurrence.
+    boundary: Option<TokenOccurrenceId>,
 }
 
 #[derive(Debug)]
@@ -103,6 +105,9 @@ pub struct ParserSessionState {
     token_columns: HashMap<TokenOccurrenceId, usize>,
     token_products: HashMap<TokenOccurrenceId, ProductId>,
     reduced_products: HashMap<ReductionKey, ProductId>,
+    /// Inverse reduction cache used by suffix product rebasing. Keeping this
+    /// index avoids rediscovering origins by scanning every cached reduction.
+    reduction_origins: HashMap<ProductId, ReductionKey>,
 }
 
 pub(crate) struct SessionContext<'a> {

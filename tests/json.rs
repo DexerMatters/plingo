@@ -1,78 +1,59 @@
 mod common;
 
 use std::{
-    collections::HashSet,
     fs,
     path::Path,
     sync::{Arc, mpsc},
 };
 
 use color_print::cprintln;
-use common::json::{JsonDocument, JsonToken};
+use common::{
+    json::{JsonDocument, JsonToken},
+    until::print_json_ast,
+};
 use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
-    event::{AccessKind, AccessMode, ModifyKind, RenameMode},
+    event::{AccessKind, AccessMode, DataChange, ModifyKind, RenameMode},
 };
 use plingo::{
     Graph, Subscription, ViewUpdate,
     component::{
         lex::LexerNode,
-        parse::{AstKey, ParseRoots, ParserNode, grammar::Grammar},
+        parse::{AstSnapshot, ParseRoots, ParseSnapshot, ParserNode, grammar::Grammar},
         source::{SourceEdit, SourceNode},
     },
     utils::Span,
 };
 use similar::{ChangeTag, TextDiff};
 
-/// A deliberately small downstream sink: it observes parser roots and prints
-/// the stable AST identities that were deleted or created by each commit.
-struct DebugSink {
-    previous: HashSet<AstKey>,
-}
+/// Downstream consumers render immutable parser snapshots; keyed AST views
+/// provide the graph-owned insertion/retraction granularity.
+struct DebugSink;
 
 impl DebugSink {
     fn new() -> Self {
-        Self {
-            previous: HashSet::new(),
-        }
+        Self
     }
 
-    fn consume(&mut self, graph: &Graph, update: ViewUpdate<Arc<[AstKey]>>) -> Result<(), String> {
-        let (snapshot, current) = match update {
+    fn consume(
+        &mut self,
+        graph: &Graph,
+        update: ViewUpdate<Arc<AstSnapshot>>,
+    ) -> Result<(), String> {
+        let (graph_snapshot, snapshot) = match update {
             ViewUpdate::Initial { snapshot, value } | ViewUpdate::Changed { snapshot, value } => {
-                (snapshot, value.iter().cloned().collect())
+                (snapshot, Some(value))
             }
-            ViewUpdate::Removed { snapshot } => (snapshot, HashSet::new()),
+            ViewUpdate::Removed { snapshot } => (snapshot, None),
         };
-        cprintln!("<bold,cyan>parser delta</> <dim>snapshot={snapshot}</>");
-
-        let mut deleted = self
-            .previous
-            .difference(&current)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut created = current
-            .difference(&self.previous)
-            .cloned()
-            .collect::<Vec<_>>();
-        deleted.sort_by_key(|key| (key.id, key.uri.to_string()));
-        created.sort_by_key(|key| (key.id, key.uri.to_string()));
-
-        for key in deleted {
-            cprintln!("<red>  - delete <bold>node#{}</></>", key.id);
+        cprintln!("<bold,cyan>parser snapshot</> <dim>graph_snapshot={graph_snapshot}</>");
+        let Some(snapshot) = snapshot else {
+            cprintln!("<red>  parser snapshot removed</>");
+            return Ok(());
+        };
+        if let Some(roots) = graph.read::<ParseRoots<JsonToken, JsonDocument>>(snapshot.uri()) {
+            print_json_ast(graph, roots.as_ref());
         }
-        for key in created {
-            let product = graph
-                .read::<plingo::component::parse::ParsedAst<JsonToken, JsonDocument>>(key.clone())
-                .map(|artifact| artifact.product);
-            cprintln!(
-                "<green>  + create <bold>node#{}</> <dim>product={:?}</></>",
-                key.id,
-                product
-            );
-        }
-
-        self.previous = current;
         Ok(())
     }
 }
@@ -80,7 +61,7 @@ impl DebugSink {
 fn drain_parser_updates(
     sink: &mut DebugSink,
     graph: &Graph,
-    subscription: &Subscription<ParseRoots<JsonToken, JsonDocument>>,
+    subscription: &Subscription<ParseSnapshot<JsonToken>>,
 ) -> Result<(), String> {
     while let Ok(update) = subscription.try_recv() {
         sink.consume(graph, update)?;
@@ -107,6 +88,22 @@ fn json_syntax_builds_with_macro_grammar() {
     let grammar = Grammar::from_spec::<JsonDocument>();
     assert!(grammar.terminal_count() > 0);
     assert_eq!(JsonToken::Null.to_string(), "Null");
+}
+
+#[test]
+fn watcher_accepts_only_completed_file_revisions() {
+    let path = Path::new("test_data/test.txt");
+    let close = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
+        .add_path(path.to_path_buf());
+    let in_progress = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+        .add_path(path.to_path_buf());
+    let rename = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+        .add_path(Path::new("test_data/.test.txt.tmp").to_path_buf())
+        .add_path(path.to_path_buf());
+
+    assert!(completed_write(&close, path));
+    assert!(!completed_write(&in_progress, path));
+    assert!(completed_write(&rename, path));
 }
 
 #[test]

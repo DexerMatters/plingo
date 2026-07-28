@@ -6,9 +6,7 @@ use std::{
 
 use indexmap::IndexSet;
 
-use super::{
-    ParseColumn, ParseError, ParseToken, ReductionKey, ReplayPlan, SessionContext, checkpoint,
-};
+use super::{ParseColumn, ParseError, ParseToken, ReplayPlan, SessionContext, checkpoint};
 use crate::{
     component::{
         lex::LexerRoot,
@@ -29,19 +27,89 @@ use crate::{
 struct ReusableSuffix {
     columns: Vec<ParseColumn>,
     boundary_columns: Vec<Option<usize>>,
+    /// A convergence candidate may only enter a suffix containing ordinary
+    /// token columns. Recovery columns are replayed, not structurally reused.
     clean: Vec<bool>,
     column_base: usize,
-    product_origins: HashMap<ProductId, ReductionKey>,
     token_columns: HashMap<usize, usize>,
+}
+
+/// Phase accounting for exact parser convergence. These durations are emitted
+/// with each replay so a logical suffix reuse can be distinguished from its
+/// physical mapping/rebase cost.
+#[derive(Default)]
+struct ReuseTiming {
+    checkpoint: Duration,
+    frontier_match: Duration,
+    tail_validation: Duration,
+    product_remap: Duration,
+    rebase: Duration,
+}
+
+/// Dense parser-arena IDs make vector-backed remapping substantially cheaper
+/// than hashing every retained node/product during suffix rebasing.
+struct ProductRemap {
+    values: Vec<Option<ProductId>>,
+}
+
+impl ProductRemap {
+    fn from_mapping(mapping: HashMap<ProductId, ProductId>, capacity: usize) -> Self {
+        let mut values = vec![None; capacity];
+        for (old, new) in mapping {
+            if old >= values.len() {
+                values.resize(old + 1, None);
+            }
+            values[old] = Some(new);
+        }
+        Self { values }
+    }
+
+    fn get(&self, old: ProductId) -> Option<ProductId> {
+        self.values.get(old).copied().flatten()
+    }
+
+    fn insert(&mut self, old: ProductId, new: ProductId) {
+        if old >= self.values.len() {
+            self.values.resize(old + 1, None);
+        }
+        self.values[old] = Some(new);
+    }
+}
+
+struct NodeRemap {
+    values: Vec<Option<GssNodeId>>,
+}
+
+impl NodeRemap {
+    fn from_mapping(mapping: HashMap<GssNodeId, GssNodeId>, capacity: usize) -> Self {
+        let mut values = vec![None; capacity];
+        for (old, new) in mapping {
+            if old >= values.len() {
+                values.resize(old + 1, None);
+            }
+            values[old] = Some(new);
+        }
+        Self { values }
+    }
+
+    fn get(&self, old: GssNodeId) -> Option<GssNodeId> {
+        self.values.get(old).copied().flatten()
+    }
+
+    fn insert(&mut self, old: GssNodeId, new: GssNodeId) {
+        if old >= self.values.len() {
+            self.values.resize(old + 1, None);
+        }
+        self.values[old] = Some(new);
+    }
 }
 
 fn remap_product(
     old: ProductId,
-    mapping: &mut HashMap<ProductId, ProductId>,
-    origins: &HashMap<ProductId, ReductionKey>,
+    mapping: &mut ProductRemap,
     session_ctx: &mut SessionContext<'_>,
 ) -> Result<Option<ProductId>, ParseError> {
-    if let Some(&product) = mapping.get(&old) {
+    if let Some(product) = mapping.get(old) {
         return Ok(Some(product));
     }
     let Some(data) = session_ctx
@@ -55,17 +123,18 @@ fn remap_product(
         mapping.insert(old, old);
         return Ok(Some(old));
     }
-    let Some(origin) = origins.get(&old) else {
+    let Some(origin) = session_ctx.state.reduction_origins.get(&old).cloned() else {
         return Ok(None);
     };
     let mut children = Vec::with_capacity(origin.children.len());
     for &child in &origin.children {
-        let Some(child) = remap_product(child, mapping, origins, session_ctx)? else {
+        let Some(child) = remap_product(child, mapping, session_ctx)? else {
             return Ok(None);
         };
         children.push(child);
     }
-    let product = session_ctx.reduce_cached(origin.production, &children)?;
+    let product =
+        session_ctx.reduce_cached(origin.production, &children, origin.boundary.unwrap_or(0))?;
     mapping.insert(old, product);
     Ok(Some(product))
 }
@@ -76,6 +145,7 @@ fn maybe_reuse_suffix(
     session_ctx: &mut SessionContext<'_>,
     current: (usize, usize),
     stats: &mut IncrementalParseStats,
+    timing: &mut ReuseTiming,
 ) -> Result<bool, ParseError> {
     let (current_boundary, current_token_boundary) = current;
     // Only the final-coordinate suffix can correspond to the base revision's
@@ -99,6 +169,7 @@ fn maybe_reuse_suffix(
         return Ok(false);
     };
 
+    let checkpoint_start = Instant::now();
     let current_frontier = {
         let current_column = &mut session_ctx.state.columns[current_boundary];
         checkpoint::frontier_checkpoint_for_column(current_column, session_ctx.gss).clone()
@@ -108,47 +179,66 @@ fn maybe_reuse_suffix(
         checkpoint::frontier_checkpoint_for_column(old_column, session_ctx.gss).clone()
     };
     if current_frontier != old_frontier {
+        timing.checkpoint += checkpoint_start.elapsed();
         return Ok(false);
     }
+    timing.checkpoint += checkpoint_start.elapsed();
     stats.checkpoint_matches += 1;
 
+    let frontier_start = Instant::now();
     let old_column = &old.columns[old_index];
     let current_column = &session_ctx.state.columns[current_boundary];
     let old_base = old_column.base_active_nodes().collect::<Vec<_>>();
     let old_active = old_column.active_nodes().collect::<Vec<_>>();
     let new_base = current_column.base_active_nodes().collect::<Vec<_>>();
     let new_active = current_column.active_nodes().collect::<Vec<_>>();
-    let Some((mut nodes, mut products, shared_prefix)) = session_ctx
+    let Some((frontier_nodes, frontier_products, shared_prefix)) = session_ctx
         .gss
         .match_frontiers((&old_base, &old_active), (&new_base, &new_active))
     else {
+        timing.frontier_match += frontier_start.elapsed();
         return Ok(false);
     };
+    timing.frontier_match += frontier_start.elapsed();
     stats.frontier_matches += 1;
     stats.frontier_converged = true;
 
+    let mut nodes = NodeRemap::from_mapping(frontier_nodes, session_ctx.gss.node_count());
+    let mut products =
+        ProductRemap::from_mapping(frontier_products, session_ctx.products.products.len());
+
     let tail = &old.columns[old_index + 1..];
+    let tail_validation_start = Instant::now();
     if tail.iter().any(|column| {
         column
             .token
             .is_none_or(|token| !old.token_columns.contains_key(&token))
     }) {
+        timing.tail_validation += tail_validation_start.elapsed();
         return Ok(false);
     }
-    let mut planned_nodes = HashMap::<GssNodeId, (usize, usize)>::new();
+    timing.tail_validation += tail_validation_start.elapsed();
+
+    let rebase_start = Instant::now();
+    let mut scheduled_nodes = vec![false; session_ctx.gss.node_count()];
+    let mut planned_nodes = Vec::<(GssNodeId, usize, usize)>::new();
     for (offset, column) in tail.iter().enumerate() {
         for node in column.base_active_nodes().chain(column.active_nodes()) {
+            if nodes.get(node).is_some() || scheduled_nodes[node] {
+                continue;
+            }
             let Some(state) = session_ctx.gss.get_node(node).map(|node| node.state) else {
                 return Ok(false);
             };
-            planned_nodes.insert(node, (state, current_boundary + offset + 1));
+            scheduled_nodes[node] = true;
+            planned_nodes.push((node, state, current_boundary + offset + 1));
         }
     }
 
     let mut planned_edges = Vec::new();
-    for &node in planned_nodes.keys() {
+    for &(node, _, _) in &planned_nodes {
         for edge in session_ctx.gss.outgoing_edges(node) {
-            if !nodes.contains_key(&edge.to) && !planned_nodes.contains_key(&edge.to) {
+            if nodes.get(edge.to).is_none() && !scheduled_nodes[edge.to] {
                 if !shared_prefix {
                     return Ok(false);
                 }
@@ -160,20 +250,26 @@ fn maybe_reuse_suffix(
         }
     }
 
+    timing.rebase += rebase_start.elapsed();
+
+    let product_remap_start = Instant::now();
     for &(_, _, product) in &planned_edges {
-        if remap_product(product, &mut products, &old.product_origins, session_ctx)?.is_none() {
+        if remap_product(product, &mut products, session_ctx)?.is_none() {
             return Ok(false);
         }
     }
     for column in tail {
         for &product in column.products.iter().chain(column.accepted()) {
-            if remap_product(product, &mut products, &old.product_origins, session_ctx)?.is_none() {
+            if remap_product(product, &mut products, session_ctx)?.is_none() {
                 return Ok(false);
             }
         }
     }
 
-    for (&old_node, &(state, column)) in &planned_nodes {
+    timing.product_remap += product_remap_start.elapsed();
+
+    let rebase_start = Instant::now();
+    for &(old_node, state, column) in &planned_nodes {
         let new_node = session_ctx
             .gss
             .node(state, column, session_ctx.state.generation);
@@ -181,30 +277,52 @@ fn maybe_reuse_suffix(
     }
     for (from, to, product) in planned_edges {
         session_ctx.gss.add_edge(
-            nodes[&from],
-            nodes[&to],
-            products[&product],
+            nodes.get(from).expect("proven node correspondence"),
+            nodes.get(to).expect("proven node correspondence"),
+            products
+                .get(product)
+                .expect("proven product correspondence"),
             session_ctx.state.generation,
         );
     }
 
-    let mut reused_columns = tail.to_vec();
+    // The suffix was moved out of the working session during replay setup;
+    // transfer its reusable tail directly rather than cloning every column.
+    let mut reused_columns = old.columns.split_off(old_index + 1);
     for column in &mut reused_columns {
         column.token = column.token.map(|token| old.token_columns[&token]);
-        column.base_active = column.base_active.iter().map(|node| nodes[node]).collect();
-        column.active = column.active.iter().map(|node| nodes[node]).collect();
+        column.base_active = column
+            .base_active
+            .iter()
+            .map(|node| nodes.get(*node).expect("proven node correspondence"))
+            .collect();
+        column.active = column
+            .active
+            .iter()
+            .map(|node| nodes.get(*node).expect("proven node correspondence"))
+            .collect();
         column.products = column
             .products
             .iter()
-            .map(|product| products[product])
+            .map(|product| {
+                products
+                    .get(*product)
+                    .expect("proven product correspondence")
+            })
             .collect();
         column.accepted = column
             .accepted
             .iter()
-            .map(|product| products[product])
+            .map(|product| {
+                products
+                    .get(*product)
+                    .expect("proven product correspondence")
+            })
             .collect();
         column.checkpoint_cache = Default::default();
     }
+
+    timing.rebase += rebase_start.elapsed();
 
     stats.reconverged_new_boundary = Some(current_boundary);
     stats.reconverged_old_boundary = Some(old_boundary);
@@ -285,27 +403,20 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             .copied()
             .unwrap_or(session_ctx.state.columns.len());
         let checkpoint_start = Instant::now();
-        let old_suffix_columns = session_ctx
-            .state
-            .columns
-            .get(old_column_base..)
-            .unwrap_or_default()
-            .to_vec();
-        // A recovery-derived column remains reusable when its complete
-        // frontier/checkpoint is equal. Error status alone is not a reason to
-        // discard a proven-equivalent suffix.
+        // Move only a suffix strictly beyond the retained restart checkpoint.
+        // When the old reusable boundary includes that checkpoint (notably an
+        // initial EOF replacement), preserve it in the working session and
+        // snapshot the suffix instead; `truncate_to_column` requires it.
+        let old_suffix_columns = if old_column_base <= restart_boundary {
+            session_ctx.state.columns[old_column_base..].to_vec()
+        } else {
+            session_ctx.state.columns.split_off(old_column_base)
+        };
         let mut old_suffix_is_clean = vec![true; old_suffix_columns.len() + 1];
         for index in (0..old_suffix_columns.len()).rev() {
             old_suffix_is_clean[index] =
                 old_suffix_is_clean[index + 1] && old_suffix_columns[index].token.is_some();
         }
-        let product_origins = session_ctx
-            .state
-            .reduced_products
-            .iter()
-            .filter(|(key, product)| !key.children.contains(product))
-            .map(|(key, &product)| (product, key.clone()))
-            .collect();
         let token_columns = plan
             .old_units
             .get(plan.old_reuse_start..)
@@ -323,7 +434,6 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             boundary_columns: old_boundary_columns,
             clean: old_suffix_is_clean,
             column_base: old_column_base,
-            product_origins,
             token_columns,
         };
         let checkpoint_elapsed = checkpoint_start.elapsed();
@@ -358,12 +468,13 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
         let mut shift_elapsed = Duration::default();
         let mut recover_elapsed = Duration::default();
         let mut converge_elapsed = Duration::default();
+        let mut reuse_timing = ReuseTiming::default();
         let mut i = 0usize;
         while i < parse_tokens.len() {
             let token = &parse_tokens[i];
             let column = session_ctx.state.current_column();
             let reduce_start = Instant::now();
-            session_ctx.reduce_until_stable(column, token.terminal)?;
+            session_ctx.reduce_until_stable(column, token.terminal, token.column)?;
             reduce_elapsed += reduce_start.elapsed();
 
             // Stored columns include reductions selected by the next lookahead,
@@ -375,6 +486,7 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
                 &mut session_ctx,
                 (column, restart_token_boundary + i),
                 &mut stats,
+                &mut reuse_timing,
             )? {
                 converge_elapsed += converge_start.elapsed();
                 break;
@@ -426,7 +538,7 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             if token.terminal == eof {
                 let next_column = session_ctx.state.current_column();
                 let reduce_start = Instant::now();
-                session_ctx.reduce_until_stable(next_column, token.terminal)?;
+                session_ctx.reduce_until_stable(next_column, token.terminal, token.column)?;
                 reduce_elapsed += reduce_start.elapsed();
             }
 
@@ -472,6 +584,13 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
         stats.reparsed = reparsed;
         stats.reused = reused;
         stats.recovery_columns = recovery_columns;
+        let replay_status = if stats.reconverged_old_boundary.is_some() {
+            "reused-suffix"
+        } else if recovery_columns > 0 {
+            "recovered-to-eof"
+        } else {
+            "replayed-to-eof"
+        };
         working.incremental_stats.insert(uri, stats);
         let stats_elapsed = stats_start.elapsed();
 
@@ -480,7 +599,7 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
 
         let total_elapsed = total_start.elapsed();
         eprintln!(
-            "[parse-replay] uri={} total={:?} plan={:?} session={:?} checkpoints={:?} truncate={:?} tokens={:?} replay={:?} reduce={:?} shift={:?} recover={:?} converge={:?} replay_misc={:?} compact={:?} stats={:?} restart={} reparsed={} reused={} checks={} checkpoint_matches={} frontier_matches={} old_suffix={} replay_tokens={} suffix_rebased={} old_tokens={} new_tokens={} prefix={} suffix={}",
+            "[parse-replay] uri={} total={:?} plan={:?} session={:?} checkpoints={:?} truncate={:?} tokens={:?} replay={:?} reduce={:?} shift={:?} recover={:?} converge={:?} reuse_checkpoint={:?} frontier_match={:?} tail_validate={:?} product_remap={:?} suffix_rebase={:?} replay_misc={:?} compact={:?} stats={:?} status={} restart={} reparsed={} reused={} recovery_columns={} checks={} checkpoint_matches={} frontier_matches={} old_suffix={} replay_tokens={} suffix_rebased={} old_tokens={} new_tokens={} prefix={} suffix={}",
             uri,
             total_elapsed,
             plan_elapsed,
@@ -493,12 +612,19 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             shift_elapsed,
             recover_elapsed,
             converge_elapsed,
+            reuse_timing.checkpoint,
+            reuse_timing.frontier_match,
+            reuse_timing.tail_validation,
+            reuse_timing.product_remap,
+            reuse_timing.rebase,
             replay_misc_elapsed,
             compact_elapsed,
             stats_elapsed,
+            replay_status,
             restart_boundary,
             reparsed,
             reused,
+            recovery_columns,
             stats.convergence_checks,
             stats.checkpoint_matches,
             stats.frontier_matches,

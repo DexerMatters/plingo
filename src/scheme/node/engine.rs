@@ -587,6 +587,16 @@ impl<'transaction, 'nodes> DeriveCx<'transaction, 'nodes> {
         self.transaction.component_state_mut(state)
     }
 
+    /// Ensures another node's primary output exists without making this task
+    /// depend on that output. Pair this with a narrower secondary view when a
+    /// coordinator only needs materialization, not every primary revision.
+    pub fn materialize<N: Node>(&mut self, key: N::Key) -> Result<(), NodeError> {
+        let task = TaskId::new::<N>(key);
+        self.transaction.run_node(task.clone())?;
+        self.children.insert(task);
+        Ok(())
+    }
+
     /// Ensures another node's primary output exists and observes it.
     pub fn require<N: Node>(
         &mut self,

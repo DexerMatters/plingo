@@ -1,8 +1,8 @@
-use std::any::TypeId;
+use std::{any::TypeId, sync::Arc};
 
 use crate::component::parse::{
     data::{
-        ast::{AstBox, AstId, TokenEntryId},
+        ast::{AnchoredSpan, AstBox, AstId, TokenEntryId},
         green::GreenId,
     },
     identity::TokenFingerprint,
@@ -10,15 +10,31 @@ use crate::component::parse::{
 
 pub type ProductId = usize;
 
+/// Parser-computed metadata shared by every projection of a committed parse.
+/// Both fields are assembled at shift/reduction time; snapshot publication does
+/// not need to walk child products to rediscover AST reachability or spans.
 #[derive(Clone)]
 pub struct Product {
     pub green: GreenId,
     pub data: ProductData,
+    pub extent: AnchoredSpan,
+    pub ast_ids: Arc<[AstId]>,
 }
 
 impl Product {
     pub fn new(green: GreenId, data: ProductData) -> Self {
-        Self { green, data }
+        Self {
+            green,
+            data,
+            extent: AnchoredSpan::point(0),
+            ast_ids: Arc::from([]),
+        }
+    }
+
+    pub fn with_metadata(mut self, extent: AnchoredSpan, ast_ids: impl Into<Arc<[AstId]>>) -> Self {
+        self.extent = extent;
+        self.ast_ids = ast_ids.into();
+        self
     }
 
     pub fn error(green: GreenId) -> Self {

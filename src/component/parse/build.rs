@@ -7,8 +7,8 @@ use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 
 use crate::component::parse::{
-    Parser, ParserConfig, ParserSnapshotState,
     grammar::{Grammar, NonTerminalId, ProductionId, Symbol, TerminalId},
+    Parser, ParserConfig, ParserSnapshotState,
 };
 
 pub type LRStateId = usize;
@@ -122,6 +122,7 @@ impl Grammar {
             session_arenas: HashMap::new(),
             config,
             latest: ParserSnapshotState::default().into(),
+            next_snapshot: 0,
             _root: PhantomData,
         };
 

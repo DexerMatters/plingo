@@ -10,6 +10,7 @@ enum-iterator = "2.3.0"
 fluent-uri = "0.4.1"
 
 # For efficient data structures
+arc-swap = "1.7"
 smallvec = "1.15.1"
 ropey = "1.6.1"
 indexmap = "2.14.0"
@@ -40,6 +41,10 @@ plingo-macros = { path = "plingo-macros" }
 [dependencies.tokio]
 features = ["sync", "rt", "rt-multi-thread", "macros"]
 version = "1.52.3"
+
+[dependencies.tokio-util]
+features = ["rt"]
+version = "0.7"
 
 [dev-dependencies]
 notify = "8.2.0"

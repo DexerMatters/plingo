@@ -88,7 +88,8 @@ mod tests {
             }
         );
 
-        let before = graph.snapshot();
+        let reader = graph.reader();
+        let before = reader.snapshot();
         graph
             .command(SetText {
                 key: "document".into(),
@@ -98,6 +99,7 @@ mod tests {
 
         assert_eq!(graph.read_at::<Count>(&before, "document".into()), Some(2));
         assert_eq!(graph.read::<Count>("document".into()), Some(3));
+        assert_eq!(reader.read::<Count>("document".into()), Some(3));
         assert_eq!(
             subscription.recv().unwrap(),
             ViewUpdate::Changed {
@@ -142,7 +144,8 @@ mod tests {
             subscription.recv().unwrap(),
             ViewUpdate::Initial { .. }
         ));
-        let snapshot = graph.snapshot();
+        let reader = graph.reader();
+        let snapshot = reader.snapshot();
 
         let result = graph.command(SetText {
             key: "document".into(),
@@ -150,6 +153,8 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(graph.read::<Text>("document".into()), Some("ok".into()));
+        assert_eq!(reader.read::<Text>("document".into()), Some("ok".into()));
+        assert_eq!(reader.snapshot().id(), snapshot.id());
         assert_eq!(
             graph.read_at::<Text>(&snapshot, "document".into()),
             Some("ok".into())

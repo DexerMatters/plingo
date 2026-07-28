@@ -1,19 +1,19 @@
 mod common;
 
-use std::{sync::mpsc::TryRecvError, sync::Arc};
+use std::{sync::Arc, sync::mpsc::TryRecvError};
 
 use common::json::{JsonDocument, JsonToken};
 use plingo::{
+    Graph, Subscription,
     component::{
         lex::{LexDiagnostics, LexStats, LexerNode, TokenArtifact, TokenKey, TokenOrder},
         parse::{
-            grammar::Grammar, ParseDiagnostics, ParseRoots, ParseSnapshot, ParseStats, ParseStatus,
-            ParseStatusView, ParserNode,
+            ParseDiagnostics, ParseRoots, ParseSnapshot, ParseStats, ParseStatus, ParseStatusView,
+            ParserNode, grammar::Grammar,
         },
         source::{SourceEdit, SourceNode},
     },
     utils::Span,
-    Graph, Subscription,
 };
 
 struct JsonRuntime {
@@ -345,9 +345,11 @@ fn released_document_caches_reinitialize_without_replaying_stale_deltas() {
     } = runtime;
     drop(subscription);
     graph.collect_garbage().unwrap();
-    assert!(graph
-        .read::<ParseRoots<JsonToken, JsonDocument>>(uri)
-        .is_none());
+    assert!(
+        graph
+            .read::<ParseRoots<JsonToken, JsonDocument>>(uri)
+            .is_none()
+    );
 
     let rematerialized = graph
         .request::<ParserNode<JsonToken, JsonDocument>>(uri)

@@ -8,12 +8,12 @@ use std::collections::HashMap;
 
 use color_print::cprintln;
 use plingo::{
+    Graph,
     component::{
         lex::{TokenArtifact, TokenOrder},
-        parse::{data::AstBox, AstKey, AstSnapshot, AstToken, ParseSnapshot},
+        parse::{AstKey, AstSnapshot, AstToken, ParseSnapshot, data::AstBox},
         source::DocumentText,
     },
-    Graph,
 };
 
 use super::json::{

@@ -1,6 +1,6 @@
 extern crate self as plingo;
 
-pub use plingo_macros::{NonTerminal, Terminal, generate};
+pub use plingo_macros::{NonTerminal, Terminal, generate, label_regex, relative_label_regex};
 pub use scheme::node::{
     Command, CommandCx, DeriveCx, Graph, Node, NodeError, Relation, RelationSubscription,
     RelationUpdate, Snapshot, SnapshotId, Subscription, View, ViewUpdate,

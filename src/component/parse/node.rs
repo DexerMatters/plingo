@@ -9,10 +9,10 @@ use fluent_uri::Uri;
 
 use crate::{
     component::{
-        lex::{node::TokenRevision, LexerNode, LexerRoot},
+        lex::{LexerNode, LexerRoot, node::TokenRevision},
         parse::{
-            data::{ast::AstBox, product::ProductId},
             AstKey, AstSnapshot, ParseErrorInfo, ParseStatus, Parser,
+            data::{ast::AstBox, product::ProductId},
         },
     },
     scheme::node::{ComponentState, DeriveCx, Node, NodeError, ReclaimCx, View},
@@ -252,7 +252,7 @@ mod tests {
     use crate::{
         component::{
             lex::{LexErrorInfo, LexerNode},
-            parse::{grammar::Grammar, AstToken},
+            parse::{AstToken, grammar::Grammar},
             source::{SourceEdit, SourceNode},
         },
         scheme::node::{Graph, ViewUpdate},

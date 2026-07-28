@@ -7,8 +7,8 @@ use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 
 use crate::component::parse::{
-    grammar::{Grammar, NonTerminalId, ProductionId, Symbol, TerminalId},
     Parser, ParserConfig, ParserSnapshotState,
+    grammar::{Grammar, NonTerminalId, ProductionId, Symbol, TerminalId},
 };
 
 pub type LRStateId = usize;

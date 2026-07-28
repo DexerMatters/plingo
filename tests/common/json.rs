@@ -13,7 +13,7 @@ use plingo::component;
 
 use component::{
     lex::LexErrorInfo,
-    parse::{data::AstBox, AstToken, ParseErrorInfo},
+    parse::{AstToken, ParseErrorInfo, data::AstBox},
 };
 
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]

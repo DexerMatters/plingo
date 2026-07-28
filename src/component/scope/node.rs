@@ -1,224 +1,81 @@
-//! Scope-graph derivations for the node runtime.
+//! Built-in scope allocation and scope-graph query nodes.
 //!
-//! Scope work is split into root ownership tasks and independently demandable
-//! AST frames.  Frames own only the facts they emit; the graph runtime reclaims
-//! them when their root or parent task no longer requires them.
+//! User-defined semantic rules live in `component::elaborate`. This module owns
+//! only stable scope allocation plus the typed relations and query machinery
+//! shared by elaborators.
 
-use std::{collections::HashMap, hash::Hash, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, fmt, hash::Hash, marker::PhantomData, sync::Arc};
 
 use fluent_uri::Uri;
 
 use crate::{
-    component::{
-        lex::LexerRoot,
-        parse::{
-            data::AstBox, AstArtifact, AstKey, AstLocation, ParseRoots, ParsedAst, ParserNode,
-        },
-        source::LoadSourceText,
-    },
+    component::{parse::ParsedAst, source::LoadSourceText},
     scheme::node::{
-        ComponentState, DeriveCx, Graph, IndexedRelation, Node, NodeError, NodeKey, ReclaimCx,
-        Relation, View,
+        ComponentState, DeriveCx, Graph, IndexedRelation, Node, NodeError, Relation, View,
     },
 };
 
 use super::{
-    data::{
-        AstOwner, FrameDraft, PatchBuilder, Scope, ScopeDatum, ScopeEdge, ScopeError,
-        ScopeFrameKey, ScopeReference, ScopeSnapshot,
-    },
-    query::ResolutionPath,
-    ScopeProperty,
+    DatumSelector, PathExpr, ResolutionPath, Scope, ScopeAllocation, ScopeDatum, ScopeDomain,
+    ScopeEdge, ScopeOwner, ScopeReference,
 };
 
-type State<Anchor, Label, Datum, Reference, Request> =
-    ScopeSnapshot<Anchor, Label, Datum, Reference, Request>;
-type PatchDraft<Label, Datum, Reference, Request> = PatchBuilder<Label, Datum, Reference, Request>;
+/// Unit completion marker for one scope allocation task.
+pub struct ScopeCatalogStamp<D: ScopeDomain>(PhantomData<fn() -> D>);
 
-type Visitor<Root, Ast, Anchor, Label, Datum, Reference, Request> =
-    dyn ScopeVisitor<Root, Ast, Anchor, Label, Datum, Reference, Request>;
-
-trait ScopeVisitor<Root, Ast, Anchor, Label, Datum, Reference, Request>: Send + Sync
-where
-    Root: LexerRoot + Clone,
-    Ast: Clone + Send + Sync + 'static,
-    Anchor: Clone + Eq + Hash + Send + Sync + 'static,
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-    Reference: Clone + Eq + Hash + Send + Sync + 'static,
-    Request: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    fn visit<'scope, 'transaction, 'nodes>(
-        &self,
-        cx: &mut ScopeCx<
-            'scope,
-            'transaction,
-            'nodes,
-            Root,
-            Ast,
-            Anchor,
-            Label,
-            Datum,
-            Reference,
-            Request,
-        >,
-        node: AstBox<Ast>,
-        incoming: Scope,
-    ) -> Result<(), ScopeError>;
-}
-
-impl<Root, Ast, Anchor, Label, Datum, Reference, Request, F>
-    ScopeVisitor<Root, Ast, Anchor, Label, Datum, Reference, Request> for F
-where
-    Root: LexerRoot + Clone,
-    Ast: Clone + Send + Sync + 'static,
-    Anchor: Clone + Eq + Hash + Send + Sync + 'static,
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-    Reference: Clone + Eq + Hash + Send + Sync + 'static,
-    Request: Clone + Eq + Hash + Send + Sync + 'static,
-    F: for<'scope, 'transaction, 'nodes> Fn(
-            &mut ScopeCx<
-                'scope,
-                'transaction,
-                'nodes,
-                Root,
-                Ast,
-                Anchor,
-                Label,
-                Datum,
-                Reference,
-                Request,
-            >,
-            AstBox<Ast>,
-            Scope,
-        ) -> Result<(), ScopeError>
-        + Send
-        + Sync,
-{
-    fn visit<'scope, 'transaction, 'nodes>(
-        &self,
-        cx: &mut ScopeCx<
-            'scope,
-            'transaction,
-            'nodes,
-            Root,
-            Ast,
-            Anchor,
-            Label,
-            Datum,
-            Reference,
-            Request,
-        >,
-        node: AstBox<Ast>,
-        incoming: Scope,
-    ) -> Result<(), ScopeError> {
-        self(cx, node, incoming)
-    }
-}
-
-/// Key of one scope-task invocation.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ScopeKey {
-    Root(Uri<&'static str>),
-    Frame(ScopeFrameKey),
-}
-
-impl ScopeKey {
-    pub const fn root(uri: Uri<&'static str>) -> Self {
-        Self::Root(uri)
-    }
-
-    pub const fn frame(frame: ScopeFrameKey) -> Self {
-        Self::Frame(frame)
-    }
-
-    pub const fn frame_for(ast: AstKey, incoming: Scope) -> Self {
-        Self::Frame(ScopeFrameKey::new(ast, incoming))
-    }
-}
-
-/// Backwards-neutral spelling for callers that want to emphasize task keys.
-pub type ScopeTaskKey = ScopeKey;
-
-/// Unit completion marker for one root or frame scope task.
-pub struct ScopeStamp<Root, Ast, Anchor, Label, Datum, Reference, Request>(
-    PhantomData<fn() -> (Root, Ast, Anchor, Label, Datum, Reference, Request)>,
-);
-
-impl<Root, Ast, Anchor, Label, Datum, Reference, Request> View
-    for ScopeStamp<Root, Ast, Anchor, Label, Datum, Reference, Request>
-where
-    Root: LexerRoot + Clone,
-    Ast: Clone + Send + Sync + 'static,
-    Anchor: Clone + Eq + Hash + Send + Sync + 'static,
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-    Reference: Clone + Eq + Hash + Send + Sync + 'static,
-    Request: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    type Key = ScopeKey;
+impl<D: ScopeDomain> View for ScopeCatalogStamp<D> {
+    type Key = ScopeOwner<D>;
     type Value = ();
 }
 
-/// Materialized scope identity for one root or contextual frame task.
-///
-/// Root keys resolve to the document root scope; frame keys resolve to the
-/// AST-owned scope for that frame's AST artifact. This lets clients construct
-/// resolution requests without discovering scopes indirectly through facts.
-pub struct ScopeHandle<Root, Ast, Anchor, Label, Datum, Reference, Request>(
-    PhantomData<fn() -> (Root, Ast, Anchor, Label, Datum, Reference, Request)>,
-);
+/// Materialized identity for one scope owner.
+pub struct ScopeHandle<D: ScopeDomain>(PhantomData<fn() -> D>);
 
-impl<Root, Ast, Anchor, Label, Datum, Reference, Request> View
-    for ScopeHandle<Root, Ast, Anchor, Label, Datum, Reference, Request>
-where
-    Root: LexerRoot + Clone,
-    Ast: Clone + Send + Sync + 'static,
-    Anchor: Clone + Eq + Hash + Send + Sync + 'static,
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-    Reference: Clone + Eq + Hash + Send + Sync + 'static,
-    Request: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    type Key = ScopeKey;
-    type Value = Scope;
+impl<D: ScopeDomain> View for ScopeHandle<D> {
+    type Key = ScopeOwner<D>;
+    type Value = Scope<D>;
+}
+
+/// Allocation facts whose additions/removals are the scope catalog's native
+/// delta stream.
+pub struct ScopeAllocations<D: ScopeDomain>(PhantomData<fn() -> D>);
+
+impl<D: ScopeDomain> Relation for ScopeAllocations<D> {
+    type Fact = ScopeAllocation<D>;
+}
+
+impl<D: ScopeDomain> IndexedRelation for ScopeAllocations<D> {
+    type Index = ScopeOwner<D>;
+
+    fn index(fact: &Self::Fact) -> Self::Index {
+        fact.owner.clone()
+    }
 }
 
 /// Public relation of URI-free graph edges.
-pub struct ScopeEdges<Label>(PhantomData<fn() -> Label>);
-impl<Label> Relation for ScopeEdges<Label>
-where
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    type Fact = ScopeEdge<Label>;
+pub struct ScopeEdges<D: ScopeDomain>(PhantomData<fn() -> D>);
+
+impl<D: ScopeDomain> Relation for ScopeEdges<D> {
+    type Fact = ScopeEdge<D>;
 }
 
-impl<Label> IndexedRelation for ScopeEdges<Label>
-where
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    type Index = Scope;
+impl<D: ScopeDomain> IndexedRelation for ScopeEdges<D> {
+    type Index = Scope<D>;
 
     fn index(fact: &Self::Fact) -> Self::Index {
         fact.source
     }
 }
 
-/// Public relation of URI-free graph datums.
-pub struct ScopeDatums<Datum>(PhantomData<fn() -> Datum>);
-impl<Datum> Relation for ScopeDatums<Datum>
-where
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    type Fact = ScopeDatum<Datum>;
+/// Public relation of URI-free graph data.
+pub struct ScopeDatums<D: ScopeDomain>(PhantomData<fn() -> D>);
+
+impl<D: ScopeDomain> Relation for ScopeDatums<D> {
+    type Fact = ScopeDatum<D>;
 }
 
-impl<Datum> IndexedRelation for ScopeDatums<Datum>
-where
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    type Index = Scope;
+impl<D: ScopeDomain> IndexedRelation for ScopeDatums<D> {
+    type Index = Scope<D>;
 
     fn index(fact: &Self::Fact) -> Self::Index {
         fact.scope
@@ -226,178 +83,86 @@ where
 }
 
 /// Public relation of URI-free graph references.
-pub struct ScopeReferences<Reference>(PhantomData<fn() -> Reference>);
-impl<Reference> Relation for ScopeReferences<Reference>
-where
-    Reference: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    type Fact = ScopeReference<Reference>;
+pub struct ScopeReferences<D: ScopeDomain>(PhantomData<fn() -> D>);
+
+impl<D: ScopeDomain> Relation for ScopeReferences<D> {
+    type Fact = ScopeReference<D>;
 }
 
-impl<Reference> IndexedRelation for ScopeReferences<Reference>
-where
-    Reference: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    type Index = Scope;
+impl<D: ScopeDomain> IndexedRelation for ScopeReferences<D> {
+    type Index = Scope<D>;
 
     fn index(fact: &Self::Fact) -> Self::Index {
         fact.scope
     }
 }
 
-/// Post-commit source requirements emitted by individual scope frames.
-pub struct SourceRequirements<Request>(PhantomData<fn() -> Request>);
-impl<Request> Relation for SourceRequirements<Request>
-where
-    Request: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    type Fact = Request;
+/// Post-commit source requirements emitted by elaborator frames.
+pub struct SourceRequirements<D: ScopeDomain>(PhantomData<fn() -> D>);
+
+impl<D: ScopeDomain> Relation for SourceRequirements<D> {
+    type Fact = D::Request;
 }
 
-impl<Request> IndexedRelation for SourceRequirements<Request>
-where
-    Request: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    type Index = Request;
+impl<D: ScopeDomain> IndexedRelation for SourceRequirements<D> {
+    type Index = D::Request;
 
     fn index(fact: &Self::Fact) -> Self::Index {
         fact.clone()
     }
 }
 
-/// A cacheable application-defined datum selector for resolution.
-pub trait DatumSelector<Datum>: NodeKey {
-    fn accepts(&self, datum: &Datum) -> bool;
+#[derive(Clone)]
+struct ScopeCatalogState<D: ScopeDomain> {
+    next_scope: u64,
+    scopes: HashMap<ScopeOwner<D>, Scope<D>>,
 }
 
-/// Stable key for one materialized scope resolution.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ResolutionKey<Label, Selector> {
-    pub start: Scope,
-    pub path: super::PathExpr<Label>,
-    pub selector: Selector,
-}
-
-/// Resolution result view keyed by [`ResolutionKey`].
-pub struct ScopeResolution<Label, Datum, Selector>(PhantomData<fn() -> (Label, Datum, Selector)>);
-
-impl<Label, Datum, Selector> View for ScopeResolution<Label, Datum, Selector>
-where
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-    Selector: DatumSelector<Datum>,
-{
-    type Key = ResolutionKey<Label, Selector>;
-    /// Resolution answers are unordered witnesses; relation insertion order
-    /// must not affect cache equality or subscription publication.
-    type Value = std::collections::HashSet<ResolutionPath<Label, Datum>>;
-}
-
-/// Generic node that resolves a query from materialized edge and datum facts.
-pub struct ResolutionNode<Label, Datum, Selector>(PhantomData<fn() -> (Label, Datum, Selector)>);
-
-impl<Label, Datum, Selector> Default for ResolutionNode<Label, Datum, Selector> {
+impl<D: ScopeDomain> Default for ScopeCatalogState<D> {
     fn default() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<Label, Datum, Selector> Node for ResolutionNode<Label, Datum, Selector>
-where
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-    Selector: DatumSelector<Datum>,
-{
-    type Key = ResolutionKey<Label, Selector>;
-    type Output = ScopeResolution<Label, Datum, Selector>;
-
-    fn derive(
-        &self,
-        cx: &mut DeriveCx<'_, '_>,
-        key: Self::Key,
-    ) -> Result<std::collections::HashSet<ResolutionPath<Label, Datum>>, NodeError> {
-        let selector = key.selector.clone();
-        Ok(super::query::resolve_indexed(
-            key.start,
-            key.path,
-            move |datum| selector.accepts(datum),
-            |scope, needs_datums| {
-                let edges = cx.relation_facts_at::<ScopeEdges<Label>>(scope);
-                let datums = if needs_datums {
-                    cx.relation_facts_at::<ScopeDatums<Datum>>(scope)
-                } else {
-                    Default::default()
-                };
-                (edges, datums)
-            },
-        ))
-    }
-}
-
-/// Generic scope rule node with root and frame task keys.
-pub struct ScopeNode<Root, Ast, Anchor, Label, Datum, Reference, Request>
-where
-    Root: LexerRoot + Clone,
-    Ast: Clone + Send + Sync + 'static,
-    Anchor: Clone + Eq + Hash + Send + Sync + 'static,
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-    Reference: Clone + Eq + Hash + Send + Sync + 'static,
-    Request: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    visitor: Arc<Visitor<Root, Ast, Anchor, Label, Datum, Reference, Request>>,
-    state: ComponentState<State<Anchor, Label, Datum, Reference, Request>>,
-}
-
-impl<Root, Ast, Anchor, Label, Datum, Reference, Request>
-    ScopeNode<Root, Ast, Anchor, Label, Datum, Reference, Request>
-where
-    Root: LexerRoot + Clone + 'static,
-    Ast: Clone + Send + Sync + 'static,
-    Anchor: Clone + Eq + Hash + Send + Sync + 'static,
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-    Reference: Clone + Eq + Hash + Send + Sync + 'static,
-    Request: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    pub fn new<F>(visitor: F) -> Self
-    where
-        F: for<'scope, 'transaction, 'nodes> Fn(
-                &mut ScopeCx<
-                    'scope,
-                    'transaction,
-                    'nodes,
-                    Root,
-                    Ast,
-                    Anchor,
-                    Label,
-                    Datum,
-                    Reference,
-                    Request,
-                >,
-                AstBox<Ast>,
-                Scope,
-            ) -> Result<(), ScopeError>
-            + Send
-            + Sync
-            + 'static,
-    {
         Self {
-            visitor: Arc::new(visitor),
-            state: ComponentState::new(State::default()),
+            next_scope: 0,
+            scopes: HashMap::new(),
+        }
+    }
+}
+
+/// Built-in owner-to-scope allocator.
+///
+/// It performs no language analysis and owns no scope graph facts beyond its
+/// allocation relation. Elaborator tasks own every edge, datum, reference, and
+/// source requirement they emit.
+pub struct ScopeCatalogNode<D: ScopeDomain> {
+    state: ComponentState<ScopeCatalogState<D>>,
+}
+
+impl<D: ScopeDomain> Default for ScopeCatalogNode<D> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<D: ScopeDomain> ScopeCatalogNode<D> {
+    pub fn new() -> Self {
+        Self {
+            state: ComponentState::new(ScopeCatalogState::default()),
         }
     }
 
+    /// Installs the built-in catalog required by elaborators in this domain.
+    pub fn install(graph: &mut Graph) -> Result<(), NodeError> {
+        graph.install(Self::new())
+    }
+
     /// Installs an idempotent post-commit loader for URI requirements emitted
-    /// by this scope node. The loader is invoked only on a requirement's first
-    /// live support and its text is applied in a follow-up transaction.
+    /// by elaborator frames.
     pub fn install_uri_source_loader(
         graph: &mut Graph,
         loader: impl Fn(Uri<&'static str>) -> Result<Arc<str>, String> + Send + Sync + 'static,
     ) where
-        Request: std::convert::Into<Uri<&'static str>> + std::fmt::Debug,
+        D::Request: Into<Uri<&'static str>> + fmt::Debug,
     {
-        graph.on_relation_added_command::<SourceRequirements<Request>, LoadSourceText>(
+        graph.on_relation_added_command::<SourceRequirements<D>, LoadSourceText>(
             move |_, request| {
                 let uri = request.into();
                 loader(uri).map(|text| LoadSourceText { uri, text })
@@ -405,497 +170,126 @@ where
         );
     }
 
-    fn root(&self, cx: &mut DeriveCx<'_, '_>, uri: Uri<&'static str>) -> Result<(), NodeError> {
-        // Materialize parser facts once, then depend only on the typed
-        // manifest. Location-only snapshot publications therefore leave this
-        // root reconciler and all semantic frames untouched.
-        cx.materialize::<ParserNode<Root, Ast>>(uri)?;
-        let roots = cx.observe::<ParseRoots<Root, Ast>>(uri)?;
-
-        let (root_scope, frames) = {
-            let state = cx.state_mut(&self.state)?;
-            let mut staged = state.clone();
-            let mut patch = PatchDraft::default();
-            let root_scope = staged.root_scope(uri, &mut patch);
-            let frames: std::collections::HashSet<ScopeFrameKey> = roots
-                .iter()
-                .cloned()
-                .map(|ast| ScopeFrameKey::new(ast, root_scope))
-                .collect();
-            staged.replace_roots(uri, frames.clone(), &mut patch);
-            *state = staged;
-            (root_scope, frames)
-        };
-        cx.emit::<ScopeHandle<Root, Ast, Anchor, Label, Datum, Reference, Request>>(
-            ScopeKey::root(uri),
-            root_scope,
-        )?;
-        for frame in frames {
-            cx.require::<Self>(ScopeKey::frame(frame))?;
+    fn ast_is_live(
+        cx: &mut DeriveCx<'_, '_>,
+        ast: crate::component::parse::AstKey,
+    ) -> Result<bool, NodeError> {
+        match cx.observe::<ParsedAst<D::Root, D::Ast>>(ast) {
+            Ok(_) => Ok(true),
+            Err(NodeError::MissingView(_)) => Ok(false),
+            Err(error) => Err(error),
         }
-        Ok(())
     }
+}
 
-    fn frame(&self, cx: &mut DeriveCx<'_, '_>, key: ScopeFrameKey) -> Result<(), NodeError> {
-        let artifact = match cx.observe::<ParsedAst<Root, Ast>>(key.ast.clone()) {
-            Ok(artifact) => artifact,
-            // A parser revision can invalidate an orphaned frame before its
-            // root task has reclaimed it. Forget private frame accounting now;
-            // the empty task output retracts runtime-owned facts transactionally.
-            Err(NodeError::MissingView(_)) => {
-                let mut staged = cx.state_mut(&self.state)?.clone();
-                let mut patch = PatchDraft::default();
-                staged.forget_frame(&key, &mut patch);
-                *cx.state_mut(&self.state)? = staged;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let owner = AstOwner {
-            uri: artifact.ast_box.uri,
-            product: artifact.product,
-        };
-        let node = artifact.ast_box;
-        let mut staged = cx.state_mut(&self.state)?.clone();
-        let mut patch = PatchDraft::default();
-        // Every materialized frame exposes its AST-owned scope, even when a
-        // particular rule does not itself emit graph facts from that scope.
-        let frame_scope = staged.ast_scope(&owner, &mut patch);
-        let mut draft = FrameDraft::default();
+impl<D: ScopeDomain> Node for ScopeCatalogNode<D> {
+    type Key = ScopeOwner<D>;
+    type Output = ScopeCatalogStamp<D>;
+
+    fn derive(&self, cx: &mut DeriveCx<'_, '_>, owner: Self::Key) -> Result<(), NodeError> {
+        if let ScopeOwner::Ast(ast) = &owner
+            && !Self::ast_is_live(cx, ast.clone())?
         {
-            let mut scope_cx: ScopeCx<
-                '_,
-                '_,
-                '_,
-                Root,
-                Ast,
-                Anchor,
-                Label,
-                Datum,
-                Reference,
-                Request,
-            > = ScopeCx {
-                state: &mut staged,
-                patch: &mut patch,
-                derive: cx,
-                owner: owner.clone(),
-                key: key.clone(),
-                draft: &mut draft,
-                asts: HashMap::from([(key.ast.clone(), artifact)]),
-                _root: PhantomData,
-            };
-            self.visitor
-                .visit(&mut scope_cx, node, key.incoming)
-                .map_err(|error| NodeError::message(error.to_string()))?;
+            cx.state_mut(&self.state)?.scopes.remove(&owner);
+            return Ok(());
         }
-        let edges = draft.edges.clone();
-        let datums = draft.datums.clone();
-        let references = draft.references.clone();
-        let requests = draft.requests.clone();
-        let pending = draft.pending.clone();
-        staged
-            .replace_frame(key.clone(), owner, draft, &mut patch)
-            .map_err(|error| NodeError::message(error.to_string()))?;
-        *cx.state_mut(&self.state)? = staged;
 
-        cx.emit::<ScopeHandle<Root, Ast, Anchor, Label, Datum, Reference, Request>>(
-            ScopeKey::frame(key.clone()),
-            frame_scope,
-        )?;
-        for edge in edges {
-            cx.emit_relation::<ScopeEdges<Label>>(edge)?;
-        }
-        for datum in datums {
-            cx.emit_relation::<ScopeDatums<Datum>>(datum)?;
-        }
-        for reference in references {
-            cx.emit_relation::<ScopeReferences<Reference>>(reference)?;
-        }
-        for request in requests {
-            cx.emit_relation::<SourceRequirements<Request>>(request)?;
-        }
-        for child in pending {
-            cx.require::<Self>(ScopeKey::frame(child))?;
-        }
+        let scope = {
+            let state = cx.state_mut(&self.state)?;
+            if let Some(scope) = state.scopes.get(&owner) {
+                *scope
+            } else {
+                let scope = Scope::allocated(state.next_scope);
+                state.next_scope = state
+                    .next_scope
+                    .checked_add(1)
+                    .ok_or(NodeError::RevisionOverflow)?;
+                state.scopes.insert(owner.clone(), scope);
+                scope
+            }
+        };
+        cx.emit::<ScopeHandle<D>>(owner.clone(), scope)?;
+        cx.emit_relation::<ScopeAllocations<D>>(ScopeAllocation { owner, scope })?;
+        Ok(())
+    }
+
+    fn reclaim(
+        &self,
+        cx: &mut crate::scheme::node::ReclaimCx<'_, '_>,
+        owner: Self::Key,
+    ) -> Result<(), NodeError> {
+        cx.state_mut(&self.state)?.scopes.remove(&owner);
         Ok(())
     }
 }
 
-impl<Root, Ast, Anchor, Label, Datum, Reference, Request> Node
-    for ScopeNode<Root, Ast, Anchor, Label, Datum, Reference, Request>
-where
-    Root: LexerRoot + Clone + 'static,
-    Ast: Clone + Send + Sync + 'static,
-    Anchor: Clone + Eq + Hash + Send + Sync + 'static,
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-    Reference: Clone + Eq + Hash + Send + Sync + 'static,
-    Request: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    type Key = ScopeKey;
-    type Output = ScopeStamp<Root, Ast, Anchor, Label, Datum, Reference, Request>;
+/// Stable key for one materialized scope resolution.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ResolutionKey<D: ScopeDomain, Selector> {
+    pub start: Scope<D>,
+    pub path: PathExpr<<D as ScopeDomain>::Label>,
+    pub selector: Selector,
+}
 
-    fn derive(&self, cx: &mut DeriveCx<'_, '_>, key: Self::Key) -> Result<(), NodeError> {
-        match key {
-            ScopeKey::Root(uri) => self.root(cx, uri),
-            ScopeKey::Frame(key) => self.frame(cx, key),
-        }
-    }
-
-    fn reclaim(&self, cx: &mut ReclaimCx<'_, '_>, key: Self::Key) -> Result<(), NodeError> {
-        let mut staged = cx.state_mut(&self.state)?.clone();
-        let mut patch = PatchDraft::default();
-        match key {
-            ScopeKey::Root(uri) => staged.forget_root(
-                uri,
-                |frame| cx.is_live::<Self>(ScopeKey::frame(frame.clone())),
-                &mut patch,
-            ),
-            ScopeKey::Frame(frame) => staged.forget_frame(&frame, &mut patch),
-        }
-
-        // Graph task ownership is authoritative. Once the final root/frame
-        // task disappears, discard every private allocation/cache record so a
-        // later demand cannot inherit stale frames, fact counts, or requests.
-        if !cx.has_materialized::<Self>() {
-            staged = State::default();
-        }
-        *cx.state_mut(&self.state)? = staged;
-        Ok(())
+impl<D: ScopeDomain, Selector: fmt::Debug> fmt::Debug for ResolutionKey<D, Selector> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolutionKey")
+            .field("start", &self.start)
+            .field("path", &"..")
+            .field("selector", &self.selector)
+            .finish()
     }
 }
 
-/// Rule-local mutation surface for one [`ScopeNode`] frame.
-pub struct ScopeCx<
-    'scope,
-    'transaction,
-    'nodes,
-    Root,
-    Ast,
-    Anchor,
-    Label,
-    Datum,
-    Reference,
-    Request,
-> where
-    Root: LexerRoot + Clone,
-    Ast: Clone + Send + Sync + 'static,
-    Anchor: Clone + Eq + Hash + Send + Sync + 'static,
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-    Reference: Clone + Eq + Hash + Send + Sync + 'static,
-    Request: Clone + Eq + Hash + Send + Sync + 'static,
+/// Resolution result view keyed by [`ResolutionKey`].
+pub struct ScopeResolution<D: ScopeDomain, Selector>(PhantomData<fn() -> (D, Selector)>);
+
+impl<D, Selector> View for ScopeResolution<D, Selector>
+where
+    D: ScopeDomain,
+    Selector: DatumSelector<D>,
 {
-    state: &'scope mut State<Anchor, Label, Datum, Reference, Request>,
-    patch: &'scope mut PatchDraft<Label, Datum, Reference, Request>,
-    derive: &'scope mut DeriveCx<'transaction, 'nodes>,
-    owner: AstOwner,
-    key: ScopeFrameKey,
-    draft: &'scope mut FrameDraft<Label, Datum, Reference, Request>,
-    asts: HashMap<AstKey, AstArtifact<Ast>>,
-    _root: PhantomData<fn() -> Root>,
+    type Key = ResolutionKey<D, Selector>;
+    type Value = std::collections::HashSet<ResolutionPath<D>>;
 }
 
-impl<Root, Ast, Anchor, Label, Datum, Reference, Request>
-    ScopeCx<'_, '_, '_, Root, Ast, Anchor, Label, Datum, Reference, Request>
+/// Generic node that resolves a query from materialized edge and datum facts.
+pub struct ResolutionNode<D: ScopeDomain, Selector>(PhantomData<fn() -> (D, Selector)>);
+
+impl<D: ScopeDomain, Selector> Default for ResolutionNode<D, Selector> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<D, Selector> Node for ResolutionNode<D, Selector>
 where
-    Root: LexerRoot + Clone + 'static,
-    Ast: Clone + Send + Sync + 'static,
-    Anchor: Clone + Eq + Hash + Send + Sync + 'static,
-    Label: Clone + Eq + Hash + Send + Sync + 'static,
-    Datum: Clone + Eq + Hash + Send + Sync + 'static,
-    Reference: Clone + Eq + Hash + Send + Sync + 'static,
-    Request: Clone + Eq + Hash + Send + Sync + 'static,
+    D: ScopeDomain,
+    Selector: DatumSelector<D>,
 {
-    fn artifact(&mut self, node: AstBox<Ast>) -> Result<&AstArtifact<Ast>, ScopeError> {
-        let key = AstKey {
-            uri: node.uri,
-            id: node.id,
-        };
-        if !self.asts.contains_key(&key) {
-            let artifact = self
-                .derive
-                .observe::<ParsedAst<Root, Ast>>(key.clone())
-                .map_err(|_| ScopeError::MissingAst(key.clone()))?;
-            self.asts.insert(key.clone(), artifact);
-        }
-        Ok(self.asts.get(&key).expect("AST artifact was inserted"))
-    }
+    type Key = ResolutionKey<D, Selector>;
+    type Output = ScopeResolution<D, Selector>;
 
-    fn owner_of(&mut self, node: AstBox<Ast>) -> Result<AstOwner, ScopeError> {
-        let artifact = self.artifact(node)?;
-        Ok(AstOwner {
-            uri: artifact.ast_box.uri,
-            product: artifact.product,
-        })
-    }
-
-    /// Reads and caches the individual semantic AST artifact that owns `node`.
-    pub fn ast(&mut self, node: AstBox<Ast>) -> Result<&Ast, ScopeError> {
-        Ok(self.artifact(node)?.value.as_ref())
-    }
-
-    /// Opt-in source dependency for rules that need a diagnostic location.
-    /// Pure scope rules should use [`ScopeCx::ast`] only.
-    pub fn span(&mut self, node: AstBox<Ast>) -> Result<crate::utils::Span, ScopeError> {
-        let key = AstKey {
-            uri: node.uri,
-            id: node.id,
-        };
-        self.derive
-            .observe::<AstLocation<Root, Ast>>(key.clone())
-            .map_err(|_| ScopeError::MissingAst(key))
-    }
-
-    pub fn scope(&mut self) -> Scope {
-        self.state.ast_scope(&self.owner, self.patch)
-    }
-
-    pub fn scope_of(&mut self, node: AstBox<Ast>) -> Result<Scope, ScopeError> {
-        let owner = self.owner_of(node)?;
-        Ok(self.state.ast_scope(&owner, self.patch))
-    }
-
-    pub fn external_scope(&mut self, anchor: Anchor) -> Scope {
-        self.state.external_scope(anchor, self.patch)
-    }
-
-    pub fn edge(&mut self, source: Scope, label: Label, target: Scope, property: ScopeProperty) {
-        self.draft.edges.push(ScopeEdge {
-            source,
-            label,
-            target,
-            property,
-        });
-    }
-
-    pub fn datum(&mut self, scope: Scope, datum: Datum) {
-        self.draft.datums.push(ScopeDatum { scope, datum });
-    }
-
-    pub fn reference(&mut self, scope: Scope, reference: Reference) {
-        self.draft
-            .references
-            .push(ScopeReference { scope, reference });
-    }
-
-    /// Schedules a child frame. It is required only after this frame commits.
-    pub fn visit(&mut self, node: AstBox<Ast>, incoming: Scope) -> Result<(), ScopeError> {
-        self.owner_of(node)?;
-        let child = ScopeFrameKey::new(
-            AstKey {
-                uri: node.uri,
-                id: node.id,
+    fn derive(
+        &self,
+        cx: &mut DeriveCx<'_, '_>,
+        key: Self::Key,
+    ) -> Result<std::collections::HashSet<ResolutionPath<D>>, NodeError> {
+        let selector = key.selector.clone();
+        Ok(super::query::resolve_indexed(
+            key.start,
+            key.path,
+            move |datum| selector.accepts(datum),
+            |scope, needs_datums| {
+                let edges = cx.relation_facts_at::<ScopeEdges<D>>(scope);
+                let datums = if needs_datums {
+                    cx.relation_facts_at::<ScopeDatums<D>>(scope)
+                } else {
+                    Default::default()
+                };
+                (edges, datums)
             },
-            incoming,
-        );
-        if self.draft.children.insert(child.clone()) {
-            self.draft.pending.push(child);
-        }
-        Ok(())
-    }
-
-    pub fn require_source(&mut self, request: Request) {
-        if !self.draft.requests.contains(&request) {
-            self.draft.requests.push(request);
-        }
-    }
-
-    pub fn fail(&self, reason: impl Into<String>) -> ScopeError {
-        ScopeError::Rule(reason.into())
-    }
-
-    /// The task key currently being evaluated.
-    pub fn key(&self) -> &ScopeFrameKey {
-        &self.key
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        fmt,
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        },
-    };
-
-    use plingo_macros::{NonTerminal, Terminal};
-
-    use super::*;
-    use crate::{
-        component::{
-            lex::{LexErrorInfo, LexerNode},
-            parse::{grammar::Grammar, AstToken, ParserNode},
-            source::{SourceEdit, SourceNode},
-        },
-        scheme::node::Graph,
-        utils::Span,
-    };
-
-    #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
-    #[scopes(root { Whitespace, Number })]
-    enum Tokens {
-        #[regex(r"\s+")]
-        #[skip]
-        Whitespace,
-        #[regex(r"[0-9]+")]
-        Number(usize),
-        #[error]
-        Error(LexErrorInfo),
-    }
-
-    impl fmt::Display for Tokens {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(formatter, "{self:?}")
-        }
-    }
-
-    #[allow(dead_code)]
-    #[derive(NonTerminal, Debug, Clone)]
-    enum Value {
-        #[rule(Tokens::Number)]
-        Number(#[from(0)] AstToken<Tokens>),
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-    enum Label {
-        Declares,
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-    struct Datum(usize);
-
-    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-    struct AnyDatum;
-
-    impl DatumSelector<Datum> for AnyDatum {
-        fn accepts(&self, _: &Datum) -> bool {
-            true
-        }
-    }
-
-    #[test]
-    fn scope_frames_publish_nested_uri_free_facts_and_retract_stale_roots() {
-        let uri = Span::new("test://node-scope", 0, 0).unwrap().uri;
-        let parser = Grammar::from_spec::<Value>().build_lr1::<Tokens>();
-        let mut graph = Graph::new();
-        graph.install(LexerNode::<Tokens>::new().unwrap()).unwrap();
-        graph
-            .install(ParserNode::<Tokens, Value>::from_parser(parser))
-            .unwrap();
-        let visits = Arc::new(AtomicUsize::new(0));
-        let visitor_visits = Arc::clone(&visits);
-        graph
-            .install(ScopeNode::<Tokens, Value, (), Label, Datum, (), ()>::new(
-                move |cx, node, incoming| {
-                    visitor_visits.fetch_add(1, Ordering::Relaxed);
-                    let current = cx.scope();
-                    cx.datum(current, Datum(node.id));
-                    cx.edge(current, Label::Declares, incoming, ScopeProperty::Cyclic);
-                    cx.require_source(());
-                    cx.ast(node)?;
-                    if current != incoming {
-                        cx.visit(node, current)?;
-                    }
-                    Ok(())
-                },
-            ))
-            .unwrap();
-        graph
-            .install(ResolutionNode::<Label, Datum, AnyDatum>::default())
-            .unwrap();
-        graph.command(SourceNode::load(uri)).unwrap();
-        graph
-            .command(SourceNode::apply(SourceEdit::Insert {
-                key: Span::point_uri(uri, 0).unwrap(),
-                value: "7".into(),
-            }))
-            .unwrap();
-
-        let _root = graph
-            .request::<ScopeNode<Tokens, Value, (), Label, Datum, (), ()>>(ScopeKey::root(uri))
-            .unwrap();
-        let root_scope = graph
-            .read::<ScopeHandle<Tokens, Value, (), Label, Datum, (), ()>>(ScopeKey::root(uri))
-            .expect("the root task must materialize its root scope handle");
-        let datums = graph.facts::<ScopeDatums<Datum>>();
-        assert_ne!(root_scope, datums[0].scope);
-        let edges = graph.facts::<ScopeEdges<Label>>();
-        assert_eq!(datums.len(), 1);
-        assert_eq!(
-            edges.len(),
-            2,
-            "the queued child frame publishes its own edge"
-        );
-        assert_eq!(graph.facts::<SourceRequirements<()>>(), vec![()]);
-        let scope = datums[0].scope;
-        let root_id = datums[0].datum.0;
-        let _resolution = graph
-            .request::<ResolutionNode<Label, Datum, AnyDatum>>(ResolutionKey {
-                start: scope,
-                path: super::super::PathExpr::Epsilon,
-                selector: AnyDatum,
-            })
-            .unwrap();
-        assert_eq!(
-            _resolution.len(),
-            1,
-            "resolution remains requestable through indexed relations",
-        );
-
-        assert_eq!(graph.facts::<ScopeDatums<Datum>>()[0].scope, scope);
-
-        graph
-            .command(SourceNode::apply(SourceEdit::Insert {
-                key: Span::point_uri(uri, 1).unwrap(),
-                value: "8".into(),
-            }))
-            .unwrap();
-        graph
-            .command(SourceNode::apply(SourceEdit::Delete {
-                key: Span::new("test://node-scope", 0, 1).unwrap(),
-            }))
-            .unwrap();
-        let roots = graph.read::<ParseRoots<Tokens, Value>>(uri).unwrap();
-        assert_ne!(
-            roots[0].id, root_id,
-            "the parser produced a replacement root"
-        );
-        let datums = graph.facts::<ScopeDatums<Datum>>();
-        assert!(datums.iter().all(|datum| datum.datum.0 == roots[0].id));
-        assert!(graph
-            .facts::<ScopeEdges<Label>>()
-            .iter()
-            .all(|edge| edge.source == datums[0].scope));
-        assert_eq!(graph.facts::<SourceRequirements<()>>(), vec![()]);
-
-        let semantic_visits = visits.load(Ordering::Relaxed);
-        graph
-            .command(SourceNode::apply(SourceEdit::Insert {
-                key: Span::point_uri(uri, 0).unwrap(),
-                value: "\n".into(),
-            }))
-            .unwrap();
-        assert_eq!(
-            visits.load(Ordering::Relaxed),
-            semantic_visits,
-            "location-only edits do not rerun semantic scope frames"
-        );
-
-        drop(_resolution);
-        drop(_root);
-        graph.collect_garbage().unwrap();
-        assert!(graph.facts::<ScopeDatums<Datum>>().is_empty());
-        assert!(graph.facts::<ScopeEdges<Label>>().is_empty());
-        assert!(graph
-            .read::<ScopeHandle<Tokens, Value, (), Label, Datum, (), ()>>(ScopeKey::root(uri))
-            .is_none());
-
-        let _rematerialized = graph
-            .request::<ScopeNode<Tokens, Value, (), Label, Datum, (), ()>>(ScopeKey::root(uri))
-            .unwrap();
-        assert_eq!(graph.facts::<ScopeDatums<Datum>>().len(), 1);
+        ))
     }
 }

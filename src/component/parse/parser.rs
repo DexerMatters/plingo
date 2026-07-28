@@ -13,6 +13,7 @@ use crate::{
     component::{
         lex::LexerRoot,
         parse::{
+            ParseError,
             build::{ActionSet, Conflict, LR1State, LRStateId},
             data::{ast::AstId, green::ParseErrorInfo},
             diagnostics,
@@ -21,7 +22,6 @@ use crate::{
                 AstSnapshot, AstSnapshotEntry, IncrementalParseStats, ParseSnapshotId,
                 ParserConfig, ParserSnapshotState, SessionArenas, TokenData,
             },
-            ParseError,
         },
     },
     scheme::change::AddressChange,

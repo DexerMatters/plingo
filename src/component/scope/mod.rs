@@ -1,16 +1,20 @@
-//! URI-free scope graph facts and node derivations.
+//! Built-in, typed scope allocation plus graph-native scope facts.
+//!
+//! Language semantics are implemented by `component::elaborate::ElaboratorNode`
+//! passes, not by user callbacks inside this module.
 
 mod data;
-mod engine;
 pub mod node;
 mod query;
 
 pub use data::{
-    Scope, ScopeDatum, ScopeEdge, ScopeError, ScopeFrameKey, ScopeProperty, ScopeReference,
+    DatumSelector, Scope, ScopeAllocation, ScopeDatum, ScopeDomain, ScopeEdge, ScopeError,
+    ScopeOwner, ScopeProperty, ScopeReference,
 };
 pub use node::{
-    DatumSelector, ResolutionKey, ResolutionNode, ScopeCx, ScopeDatums, ScopeEdges, ScopeHandle,
-    ScopeKey, ScopeNode, ScopeReferences, ScopeResolution, ScopeStamp, ScopeTaskKey,
-    SourceRequirements,
+    ResolutionKey, ResolutionNode, ScopeAllocations, ScopeCatalogNode, ScopeCatalogStamp,
+    ScopeDatums, ScopeEdges, ScopeHandle, ScopeReferences, ScopeResolution, SourceRequirements,
 };
-pub use query::{PathExpr, ResolutionPath};
+pub use plingo_macros::{label_regex, relative_label_regex};
+pub(crate) use query::resolve_indexed;
+pub use query::{PathExpr, RelativeRegex, ResolutionPath};

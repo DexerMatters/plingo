@@ -1,3 +1,5 @@
+use arc_swap::ArcSwap;
+
 use super::{
     api::{Command, Node, NodeError, Relation, SnapshotId, View},
     engine::{
@@ -15,6 +17,7 @@ use std::{
     sync::{Arc, Mutex, mpsc},
 };
 
+#[derive(Clone)]
 pub struct Snapshot {
     id: SnapshotId,
     state: Arc<GraphState>,
@@ -23,6 +26,70 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn id(&self) -> SnapshotId {
         self.id
+    }
+
+    /// Reads a view from this immutable committed snapshot.
+    pub fn read<V: View>(&self, key: V::Key) -> Option<V::Value> {
+        read_from_state::<V>(&self.state, key)
+    }
+
+    /// Returns whether this snapshot contains a supported relation fact.
+    pub fn contains<R: Relation>(&self, fact: R::Fact) -> bool {
+        self.state
+            .relation_supports
+            .contains_key(&RelationFactId::new::<R>(fact))
+    }
+
+    /// Returns the facts of one relation visible in this snapshot.
+    pub fn facts<R: Relation>(&self) -> Vec<R::Fact> {
+        self.state
+            .relation_supports
+            .keys()
+            .filter_map(RelationFactId::get::<R>)
+            .collect()
+    }
+
+    /// Returns the revision in which a view key last changed.
+    pub fn changed_at<V: View>(&self, key: V::Key) -> Option<SnapshotId> {
+        self.state
+            .facts
+            .get(&FactId::new::<V>(key))
+            .map(|fact| fact.changed_at)
+    }
+}
+
+/// Cloneable, read-only access to the latest successfully committed state.
+/// Writes remain serialized through [`Graph`] or [`super::GraphHandle`].
+#[derive(Clone)]
+pub struct GraphReader {
+    current: Arc<ArcSwap<GraphState>>,
+}
+
+impl GraphReader {
+    /// Captures the current immutable snapshot. The returned value remains
+    /// stable even when later transactions commit.
+    pub fn snapshot(&self) -> Snapshot {
+        let state = self.current.load_full();
+        Snapshot {
+            id: state.revision,
+            state,
+        }
+    }
+
+    pub fn read<V: View>(&self, key: V::Key) -> Option<V::Value> {
+        self.snapshot().read::<V>(key)
+    }
+
+    pub fn contains<R: Relation>(&self, fact: R::Fact) -> bool {
+        self.snapshot().contains::<R>(fact)
+    }
+
+    pub fn facts<R: Relation>(&self) -> Vec<R::Fact> {
+        self.snapshot().facts::<R>()
+    }
+
+    pub fn changed_at<V: View>(&self, key: V::Key) -> Option<SnapshotId> {
+        self.snapshot().changed_at::<V>(key)
     }
 }
 
@@ -291,6 +358,7 @@ struct EffectWork {
 /// A non-stratified runtime of nodes, views, requests, and subscriptions.
 pub struct Graph {
     state: Arc<GraphState>,
+    current: Arc<ArcSwap<GraphState>>,
     history: BTreeMap<SnapshotId, Arc<GraphState>>,
     nodes: HashMap<TypeId, Arc<dyn ErasedNode>>,
     subscribers: HashMap<FactId, Vec<Box<dyn ErasedSubscriber>>>,
@@ -316,6 +384,7 @@ impl Graph {
         let mut history = BTreeMap::new();
         history.insert(0, Arc::clone(&state));
         Self {
+            current: Arc::new(ArcSwap::from(Arc::clone(&state))),
             state,
             history,
             nodes: HashMap::new(),
@@ -339,6 +408,13 @@ impl Graph {
         Snapshot {
             id: self.state.revision,
             state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Returns a cloneable, lock-free reader for the latest committed state.
+    pub fn reader(&self) -> GraphReader {
+        GraphReader {
+            current: Arc::clone(&self.current),
         }
     }
 
@@ -746,6 +822,7 @@ impl Graph {
                 .cloned(),
         );
 
+        self.current.store(Arc::clone(&state));
         self.state = Arc::clone(&state);
         self.history.insert(snapshot, state);
         self.prune_history();

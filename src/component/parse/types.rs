@@ -9,7 +9,7 @@ use crate::utils::Span;
 
 use crate::component::parse::{
     data::{
-        ast::{AstBox, AstId, TokenEntryId},
+        ast::{AstBox, AstId, AstToken, TokenEntryId},
         green::TreeArena,
         gss::GssArena,
         product::{ProductArena, ProductId},
@@ -36,11 +36,6 @@ impl Default for ParserConfig {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct ParseForest {
-    pub roots: Vec<ProductId>,
-}
-
 /// Stable identity of a reachable AST value across parser publications.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AstKey {
@@ -56,6 +51,12 @@ pub type ParseSnapshotId = u64;
 pub struct AstSnapshotEntry {
     pub product: ProductId,
     pub type_id: TypeId,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AstTokenSnapshotEntry {
+    pub terminal: Option<TerminalId>,
     pub span: Span,
 }
 
@@ -117,6 +118,7 @@ pub struct AstSnapshot {
     source: Arc<Rope>,
     entries: Arc<HashMap<AstId, AstSnapshotEntry>>,
     values: Arc<HashMap<AstId, Arc<dyn std::any::Any + Send + Sync>>>,
+    tokens: Arc<HashMap<TokenEntryId, AstTokenSnapshotEntry>>,
 }
 
 impl AstSnapshot {
@@ -126,6 +128,7 @@ impl AstSnapshot {
         source: Arc<str>,
         entries: HashMap<AstId, AstSnapshotEntry>,
         values: HashMap<AstId, Arc<dyn std::any::Any + Send + Sync>>,
+        tokens: HashMap<TokenEntryId, AstTokenSnapshotEntry>,
     ) -> Self {
         Self {
             id,
@@ -133,6 +136,7 @@ impl AstSnapshot {
             source: Arc::new(Rope::from_str(&source)),
             entries: Arc::new(entries),
             values: Arc::new(values),
+            tokens: Arc::new(tokens),
         }
     }
 
@@ -153,6 +157,32 @@ impl AstSnapshot {
             .keys()
             .copied()
             .map(|id| AstKey { uri: self.uri, id })
+    }
+
+    /// Every live value as immutable erased metadata. Parser publication uses
+    /// this to materialize one graph fact per AST identity without requiring a
+    /// parser node for every concrete AST type.
+    pub(crate) fn erased_entries(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            AstKey,
+            AstSnapshotEntry,
+            Arc<dyn std::any::Any + Send + Sync>,
+        ),
+    > + '_ {
+        self.entries.iter().filter_map(|(id, entry)| {
+            self.values.get(id).map(|value| {
+                (
+                    AstKey {
+                        uri: self.uri,
+                        id: *id,
+                    },
+                    entry.clone(),
+                    Arc::clone(value),
+                )
+            })
+        })
     }
 
     pub fn resolve<T>(&self, node: AstBox<T>) -> Result<ResolvedAst<T>, AstLookupError>
@@ -190,6 +220,17 @@ impl AstSnapshot {
         T: Send + Sync + 'static,
     {
         self.resolve(node).ok().map(|resolved| resolved.arc())
+    }
+
+    pub fn token<T>(&self, token: AstToken<T>) -> Option<&AstTokenSnapshotEntry> {
+        self.tokens.get(&token.id)
+    }
+
+    pub fn source_text(&self, span: Span) -> String {
+        let span = span.trim(&self.source);
+        self.source
+            .byte_slice(span.range.start()..span.range.end())
+            .to_string()
     }
 }
 
@@ -235,13 +276,6 @@ pub struct IncrementalParseStats {
     pub reparsed: usize,
     pub reused: usize,
     pub recovery_columns: usize,
-    pub frontier_converged: bool,
-}
-
-impl fmt::Display for ParseForest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} parse roots", self.roots.len())
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -19,8 +19,8 @@ use crate::{
             diagnostics,
             grammar::{BuildError, Grammar, Symbol},
             types::{
-                AstSnapshot, AstSnapshotEntry, IncrementalParseStats, ParseSnapshotId,
-                ParserConfig, ParserSnapshotState, SessionArenas, TokenData,
+                AstSnapshot, AstSnapshotEntry, AstTokenSnapshotEntry, IncrementalParseStats,
+                ParseSnapshotId, ParserConfig, ParserSnapshotState, SessionArenas, TokenData,
             },
         },
     },
@@ -158,9 +158,26 @@ impl<Root> Parser<Root> {
             }
         }
 
+        let tokens = token_coordinates
+            .iter()
+            .map(|token| {
+                let end = token.start.saturating_add(token.length).min(source.len());
+                let span = Span::new_uri(uri, token.start.min(end), token.start.max(end))
+                    .expect("parser token coordinates are UTF-8 source boundaries");
+                (
+                    token.id,
+                    AstTokenSnapshotEntry {
+                        terminal: token.terminal,
+                        span,
+                    },
+                )
+            })
+            .collect();
         let id = self.next_snapshot;
         self.next_snapshot = self.next_snapshot.saturating_add(1);
-        Ok(Arc::new(AstSnapshot::new(id, uri, source, entries, values)))
+        Ok(Arc::new(AstSnapshot::new(
+            id, uri, source, entries, values, tokens,
+        )))
     }
 
     pub fn incremental_stats(&self, uri: Uri<&'static str>) -> Option<IncrementalParseStats> {

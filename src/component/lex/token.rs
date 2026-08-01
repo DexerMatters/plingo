@@ -33,11 +33,6 @@ pub trait FromLexeme: Sized {
     fn from_lexeme(lexeme: &str) -> Result<Self, Self::Error>;
 }
 
-/// Lexer configuration is retained as an extension point. Incremental replay
-/// has no budget-based fallback: it always runs to proven convergence or EOF.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LexerConfig;
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IncrementalLexStats {
     pub restart_byte: usize,

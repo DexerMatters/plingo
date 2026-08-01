@@ -50,16 +50,6 @@ impl ParseColumn {
         true
     }
 
-    pub(crate) fn retain_accepted(&mut self, product: ProductId) -> bool {
-        if self.accepted.len() == 1 && self.accepted[0] == product {
-            return false;
-        }
-        self.accepted.clear();
-        self.accepted.push(product);
-        self.invalidate_checkpoint_cache();
-        true
-    }
-
     pub(crate) fn insert_active(&mut self, node: GssNodeId) -> bool {
         let inserted = self.active.insert(node);
         if inserted {

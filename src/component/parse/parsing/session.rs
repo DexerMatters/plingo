@@ -1,5 +1,3 @@
-use std::{cmp::Reverse, collections::HashMap};
-
 use indexmap::IndexSet;
 
 use super::{ParseColumn, ParseError, ParseToken, ReductionKey, ReductionPath, SessionContext};
@@ -108,66 +106,6 @@ impl SessionContext<'_> {
         if !diagnostics.contains(&info) {
             diagnostics.push(info);
         }
-    }
-
-    fn root_score(
-        &self,
-        product_id: ProductId,
-        memo: &mut HashMap<ProductId, (usize, usize, usize)>,
-    ) -> (usize, usize, usize) {
-        if let Some(score) = memo.get(&product_id) {
-            return *score;
-        }
-
-        let Some(product) = self.products.get(product_id) else {
-            return (usize::MAX, 0, 0);
-        };
-        let Some(tree) = self.trees.get(product.green) else {
-            return (usize::MAX, 0, 0);
-        };
-
-        let score = match &product.data {
-            ProductData::Error { .. } => (1, 1, tree.length),
-            ProductData::Token { .. } => (0, 1, tree.length),
-            ProductData::Node { children, .. } => {
-                let mut errors = 0usize;
-                let mut nodes = 1usize;
-                for &child in children {
-                    let (child_errors, child_nodes, _) = self.root_score(child, memo);
-                    errors = errors.saturating_add(child_errors);
-                    nodes = nodes.saturating_add(child_nodes);
-                }
-                (errors, nodes, tree.length)
-            }
-        };
-
-        memo.insert(product_id, score);
-        score
-    }
-
-    fn choose_best_root(&self, roots: &[ProductId]) -> Option<ProductId> {
-        let mut memo = HashMap::new();
-        roots.iter().copied().min_by_key(|&product_id| {
-            let (errors, nodes, length) = self.root_score(product_id, &mut memo);
-            (Reverse(length), errors, Reverse(nodes), product_id)
-        })
-    }
-
-    pub(crate) fn compact_accepted_roots(&mut self) {
-        let Some(column) = self.state.columns.last() else {
-            return;
-        };
-        if column.accepted.len() <= 1 {
-            return;
-        }
-
-        let Some(best) = self.choose_best_root(&column.accepted) else {
-            return;
-        };
-        let Some(column) = self.state.columns.last_mut() else {
-            return;
-        };
-        column.retain_accepted(best);
     }
 
     pub(super) fn reduce_cached(

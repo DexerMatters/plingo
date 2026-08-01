@@ -4,14 +4,14 @@ use std::{sync::Arc, sync::mpsc::TryRecvError};
 
 use common::json::{JsonDocument, JsonToken};
 use plingo::{
-    Graph, Subscription,
+    DemandLease, Graph, ReadGraph, Subscription,
     component::{
         lex::{LexDiagnostics, LexStats, LexerNode, TokenArtifact, TokenKey, TokenOrder},
         parse::{
             ParseDiagnostics, ParseRoots, ParseSnapshot, ParseStats, ParseStatus, ParseStatusView,
             ParserNode, grammar::Grammar,
         },
-        source::{SourceEdit, SourceNode},
+        source::{DocumentText, SourceEdit, SourceInput},
     },
     utils::Span,
 };
@@ -19,6 +19,7 @@ use plingo::{
 struct JsonRuntime {
     graph: Graph,
     uri: fluent_uri::Uri<&'static str>,
+    _demand: DemandLease,
     subscription: Subscription<ParseSnapshot<JsonToken>>,
 }
 
@@ -33,41 +34,43 @@ impl JsonRuntime {
         graph
             .install(ParserNode::<JsonToken, JsonDocument>::from_parser(parser))
             .unwrap();
-        graph.command(SourceNode::load(uri)).unwrap();
+        graph.command(SourceInput::load(uri)).unwrap();
         graph
-            .command(SourceNode::apply(SourceEdit::Insert {
+            .command(SourceInput::apply(SourceEdit::Insert {
                 key: Span::point_uri(uri, 0).unwrap(),
                 value: text.into(),
             }))
             .unwrap();
-        let subscription = graph
-            .subscribe::<ParserNode<JsonToken, JsonDocument>>(uri)
+        let demand = graph
+            .demand::<ParserNode<JsonToken, JsonDocument>>(uri)
             .unwrap();
+        let subscription = graph.subscribe::<ParseSnapshot<JsonToken>>(uri).unwrap();
         let _ = subscription.recv().unwrap();
         Self {
             graph,
             uri,
+            _demand: demand,
             subscription,
         }
     }
 
     fn apply(&mut self, edits: Vec<SourceEdit>) {
-        self.graph.command(SourceNode::apply_all(edits)).unwrap();
+        self.graph.command(SourceInput::apply_all(edits)).unwrap();
         while self.subscription.try_recv().is_ok() {}
     }
 
     fn text(&self) -> Arc<str> {
-        SourceNode::text(&self.graph, self.uri).unwrap()
+        self.graph.get::<DocumentText>(self.uri).unwrap()
     }
 
     fn roots(&self) -> Arc<[plingo::component::parse::AstKey]> {
         self.graph
-            .read::<ParseRoots<JsonToken, JsonDocument>>(self.uri)
+            .get::<ParseRoots<JsonToken, JsonDocument>>(self.uri)
             .unwrap()
     }
 
     fn token_keys(&self) -> Arc<[TokenKey]> {
-        self.graph.read::<TokenOrder<JsonToken>>(self.uri).unwrap()
+        self.graph.get::<TokenOrder<JsonToken>>(self.uri).unwrap()
     }
 
     fn token_shape(
@@ -82,7 +85,7 @@ impl JsonRuntime {
             .map(|key| {
                 let token = self
                     .graph
-                    .read::<TokenArtifact<JsonToken>>(key.clone())
+                    .get::<TokenArtifact<JsonToken>>(key.clone())
                     .unwrap();
                 (token.terminal, token.length, token.fingerprint)
             })
@@ -90,29 +93,29 @@ impl JsonRuntime {
     }
 
     fn lex_stats(&self) -> plingo::component::lex::IncrementalLexStats {
-        self.graph.read::<LexStats<JsonToken>>(self.uri).unwrap()
+        self.graph.get::<LexStats<JsonToken>>(self.uri).unwrap()
     }
 
     fn parse_stats(&self) -> plingo::component::parse::IncrementalParseStats {
-        self.graph.read::<ParseStats<JsonToken>>(self.uri).unwrap()
+        self.graph.get::<ParseStats<JsonToken>>(self.uri).unwrap()
     }
 
     fn diagnostic_count(&self) -> usize {
         self.graph
-            .read::<ParseDiagnostics<JsonToken>>(self.uri)
+            .get::<ParseDiagnostics<JsonToken>>(self.uri)
             .unwrap()
             .len()
     }
 
     fn status(&self) -> ParseStatus {
         self.graph
-            .read::<ParseStatusView<JsonToken>>(self.uri)
+            .get::<ParseStatusView<JsonToken>>(self.uri)
             .unwrap()
     }
 
     fn lex_diagnostic_count(&self) -> usize {
         self.graph
-            .read::<LexDiagnostics<JsonToken>>(self.uri)
+            .get::<LexDiagnostics<JsonToken>>(self.uri)
             .unwrap()
             .len()
     }
@@ -341,25 +344,31 @@ fn released_document_caches_reinitialize_without_replaying_stale_deltas() {
     let JsonRuntime {
         mut graph,
         uri,
+        _demand,
         subscription,
     } = runtime;
     drop(subscription);
+    drop(_demand);
     graph.collect_garbage().unwrap();
     assert!(
         graph
-            .read::<ParseRoots<JsonToken, JsonDocument>>(uri)
+            .get::<ParseRoots<JsonToken, JsonDocument>>(uri)
             .is_none()
     );
 
-    let rematerialized = graph
-        .request::<ParserNode<JsonToken, JsonDocument>>(uri)
+    let _rematerialized = graph
+        .demand::<ParserNode<JsonToken, JsonDocument>>(uri)
         .unwrap();
-    assert!(rematerialized.value().ast_keys().next().is_some());
-    assert_eq!(
+    assert!(
         graph
-            .read::<ParseDiagnostics<JsonToken>>(uri)
+            .get::<ParseSnapshot<JsonToken>>(uri)
             .unwrap()
-            .len(),
+            .ast_keys()
+            .next()
+            .is_some()
+    );
+    assert_eq!(
+        graph.get::<ParseDiagnostics<JsonToken>>(uri).unwrap().len(),
         0
     );
 }
@@ -377,28 +386,30 @@ fn independent_documents_do_not_cross_invalidate() {
         .install(ParserNode::<JsonToken, JsonDocument>::from_parser(parser))
         .unwrap();
     for (uri, text) in [(uri_a, r#"{"value": 1}"#), (uri_b, r#"{"value": 2}"#)] {
-        graph.command(SourceNode::load(uri)).unwrap();
+        graph.command(SourceInput::load(uri)).unwrap();
         graph
-            .command(SourceNode::apply(SourceEdit::Insert {
+            .command(SourceInput::apply(SourceEdit::Insert {
                 key: Span::point_uri(uri, 0).unwrap(),
                 value: text.into(),
             }))
             .unwrap();
     }
-    let subscription_a = graph
-        .subscribe::<ParserNode<JsonToken, JsonDocument>>(uri_a)
+    let _demand_a = graph
+        .demand::<ParserNode<JsonToken, JsonDocument>>(uri_a)
         .unwrap();
-    let subscription_b = graph
-        .subscribe::<ParserNode<JsonToken, JsonDocument>>(uri_b)
+    let _demand_b = graph
+        .demand::<ParserNode<JsonToken, JsonDocument>>(uri_b)
         .unwrap();
+    let subscription_a = graph.subscribe::<ParseSnapshot<JsonToken>>(uri_a).unwrap();
+    let subscription_b = graph.subscribe::<ParseSnapshot<JsonToken>>(uri_b).unwrap();
     let _ = subscription_a.recv().unwrap();
     let _ = subscription_b.recv().unwrap();
     let roots_b = graph
-        .read::<ParseRoots<JsonToken, JsonDocument>>(uri_b)
+        .get::<ParseRoots<JsonToken, JsonDocument>>(uri_b)
         .unwrap();
 
     graph
-        .command(SourceNode::apply(SourceEdit::Insert {
+        .command(SourceInput::apply(SourceEdit::Insert {
             key: Span::point_uri(uri_a, 1).unwrap(),
             value: " ".into(),
         }))
@@ -409,7 +420,7 @@ fn independent_documents_do_not_cross_invalidate() {
     );
     assert_eq!(
         graph
-            .read::<ParseRoots<JsonToken, JsonDocument>>(uri_b)
+            .get::<ParseRoots<JsonToken, JsonDocument>>(uri_b)
             .unwrap(),
         roots_b
     );
@@ -424,7 +435,7 @@ fn atomic_batches_reject_mixed_documents_without_publishing_a_partial_revision()
 
     let error = runtime
         .graph
-        .command(SourceNode::apply_all(vec![
+        .command(SourceInput::apply_all(vec![
             SourceEdit::Insert {
                 key: Span::point_uri(runtime.uri, 1).unwrap(),
                 value: " ".into(),

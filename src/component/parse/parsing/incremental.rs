@@ -201,7 +201,6 @@ fn maybe_reuse_suffix(
     };
     timing.frontier_match += frontier_start.elapsed();
     stats.frontier_matches += 1;
-    stats.frontier_converged = true;
 
     let mut nodes = NodeRemap::from_mapping(frontier_nodes, session_ctx.gss.node_count());
     let mut products =
@@ -494,7 +493,6 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             converge_elapsed += converge_start.elapsed();
 
             if token.terminal == eof && !session_ctx.state.accepted().is_empty() {
-                session_ctx.compact_accepted_roots();
                 break;
             }
 
@@ -526,7 +524,7 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
                     continue;
                 }
                 recover_elapsed += recover_start.elapsed();
-                // An unrecoverable token still becomes a durable error product.
+                // An unrecoverable token still becomes a persistent error product.
                 // Continue replaying so later valid tokens, diagnostics, and
                 // partial roots remain observable in this same revision.
                 session_ctx.delete_parse_token(column, token)?;
@@ -548,9 +546,6 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
         let replay_misc_elapsed = replay_elapsed
             .saturating_sub(reduce_elapsed + shift_elapsed + recover_elapsed + converge_elapsed);
 
-        let compact_start = Instant::now();
-        session_ctx.compact_accepted_roots();
-        let compact_elapsed = compact_start.elapsed();
         let roots_after = session_ctx.state.accepted().to_vec();
 
         let reused = stats
@@ -598,8 +593,8 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
         working.tokens.insert(uri, Arc::new(plan.new_units.clone()));
 
         let total_elapsed = total_start.elapsed();
-        eprintln!(
-            "[parse-replay] uri={} total={:?} plan={:?} session={:?} checkpoints={:?} truncate={:?} tokens={:?} replay={:?} reduce={:?} shift={:?} recover={:?} converge={:?} reuse_checkpoint={:?} frontier_match={:?} tail_validate={:?} product_remap={:?} suffix_rebase={:?} replay_misc={:?} compact={:?} stats={:?} status={} restart={} reparsed={} reused={} recovery_columns={} checks={} checkpoint_matches={} frontier_matches={} old_suffix={} replay_tokens={} suffix_rebased={} old_tokens={} new_tokens={} prefix={} suffix={}",
+        log::debug!(
+            "[parse-replay] uri={} total={:?} plan={:?} session={:?} checkpoints={:?} truncate={:?} tokens={:?} replay={:?} reduce={:?} shift={:?} recover={:?} converge={:?} reuse_checkpoint={:?} frontier_match={:?} tail_validate={:?} product_remap={:?} suffix_rebase={:?} replay_misc={:?} stats={:?} status={} restart={} reparsed={} reused={} recovery_columns={} checks={} checkpoint_matches={} frontier_matches={} old_suffix={} replay_tokens={} suffix_rebased={} old_tokens={} new_tokens={} prefix={} suffix={}",
             uri,
             total_elapsed,
             plan_elapsed,
@@ -618,7 +613,6 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             reuse_timing.product_remap,
             reuse_timing.rebase,
             replay_misc_elapsed,
-            compact_elapsed,
             stats_elapsed,
             replay_status,
             restart_boundary,

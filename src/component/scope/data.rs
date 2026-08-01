@@ -4,115 +4,72 @@ use std::{
     marker::PhantomData,
 };
 
-use fluent_uri::Uri;
-use thiserror::Error;
+use crate::component::lex::LexerRoot;
 
-use crate::{
-    component::{lex::LexerRoot, parse::AstKey},
-    scheme::node::NodeKey,
-};
-
-/// Declares the types that belong to one independent scope-graph domain.
-///
-/// Domain typing prevents facts from unrelated languages or analyses from
-/// sharing opaque scope identities merely because their label/data types match.
+/// Types owned by one independent scope-graph domain.
 pub trait ScopeDomain: Clone + Eq + Hash + Send + Sync + 'static {
     type Root: LexerRoot + Clone + 'static;
     type Ast: Clone + Send + Sync + 'static;
-    type Anchor: Clone + Eq + Hash + Send + Sync + 'static;
+    type ScopeKey: Clone + Eq + Hash + Send + Sync + 'static;
+    type ScopeData: Clone + Eq + Hash + Send + Sync + 'static;
     type Label: Clone + Eq + Hash + Send + Sync + 'static;
-    type Datum: Clone + Eq + Hash + Send + Sync + 'static;
-    type Reference: Clone + Eq + Hash + Send + Sync + 'static;
     type Request: Clone + Eq + Hash + Send + Sync + 'static;
 }
 
-/// Opaque identity of one scope in domain `D`.
-pub struct Scope<D: ScopeDomain>(u64, PhantomData<fn() -> D>);
+/// Stable graph-local identity for one domain-defined semantic scope.
+pub struct ScopeId<D: ScopeDomain>(u64, PhantomData<fn() -> D>);
 
-impl<D: ScopeDomain> Scope<D> {
-    pub(crate) const fn allocated(id: u64) -> Self {
+impl<D: ScopeDomain> ScopeId<D> {
+    pub(crate) const fn logical(id: u64) -> Self {
         Self(id, PhantomData)
+    }
+
+    pub(crate) const fn id(self) -> u64 {
+        self.0
     }
 }
 
-impl<D: ScopeDomain> Copy for Scope<D> {}
-impl<D: ScopeDomain> Clone for Scope<D> {
+impl<D: ScopeDomain> Copy for ScopeId<D> {}
+impl<D: ScopeDomain> Clone for ScopeId<D> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<D: ScopeDomain> PartialEq for Scope<D> {
+impl<D: ScopeDomain> PartialEq for ScopeId<D> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
-impl<D: ScopeDomain> Eq for Scope<D> {}
-impl<D: ScopeDomain> Hash for Scope<D> {
+impl<D: ScopeDomain> Eq for ScopeId<D> {}
+impl<D: ScopeDomain> Hash for ScopeId<D> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }
 }
-impl<D: ScopeDomain> PartialOrd for Scope<D> {
+impl<D: ScopeDomain> PartialOrd for ScopeId<D> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl<D: ScopeDomain> Ord for Scope<D> {
+impl<D: ScopeDomain> Ord for ScopeId<D> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0.cmp(&other.0)
     }
 }
-impl<D: ScopeDomain> fmt::Debug for Scope<D> {
+impl<D: ScopeDomain> fmt::Debug for ScopeId<D> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("Scope").field(&self.0).finish()
+        formatter.debug_tuple("ScopeId").field(&self.0).finish()
     }
 }
 
-/// Stable owner of a scope allocation.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub enum ScopeOwner<D: ScopeDomain> {
-    Document(Uri<&'static str>),
-    Ast(AstKey),
-    External(D::Anchor),
-}
-
-impl<D: ScopeDomain> fmt::Debug for ScopeOwner<D> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Document(uri) => formatter.debug_tuple("Document").field(uri).finish(),
-            Self::Ast(ast) => formatter.debug_tuple("Ast").field(ast).finish(),
-            Self::External(_) => formatter.write_str("External(..)"),
-        }
-    }
-}
-
-impl<D: ScopeDomain> ScopeOwner<D> {
-    pub const fn document(uri: Uri<&'static str>) -> Self {
-        Self::Document(uri)
-    }
-
-    pub const fn ast(ast: AstKey) -> Self {
-        Self::Ast(ast)
-    }
-
-    pub fn external(anchor: D::Anchor) -> Self {
-        Self::External(anchor)
-    }
-}
-
-/// One visible scope allocation. This relation exposes allocation/reclamation as
-/// ordinary graph additions/removals without a broad scope-delta wrapper.
+/// Public catalog allocation for one semantic scope.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScopeAllocation<D: ScopeDomain> {
-    pub owner: ScopeOwner<D>,
-    pub scope: Scope<D>,
+    pub key: D::ScopeKey,
+    pub scope: ScopeId<D>,
 }
 
-/// Cycle policy declared by one scope relationship.
-///
-/// Scope facts are multi-owner graph relations. The property travels with the
-/// fact so a domain-specific validator can enforce acyclic subsets without
-/// coupling semantic passes to a private scope-state ledger.
+/// Cycle policy declared by one relationship.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ScopeProperty {
     #[default]
@@ -120,40 +77,27 @@ pub enum ScopeProperty {
     Acyclic,
 }
 
-/// A datum attached to a scope.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ScopeDatum<D: ScopeDomain> {
-    pub scope: Scope<D>,
-    pub datum: D::Datum,
+/// A complete scope is safe to use as a resolution frontier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ScopeLifecycle<D: ScopeDomain> {
+    pub scope: ScopeId<D>,
 }
 
-/// A labelled relationship in a scope graph.
+impl<D: ScopeDomain> ScopeLifecycle<D> {
+    pub const fn closed(scope: ScopeId<D>) -> Self {
+        Self { scope }
+    }
+
+    pub const fn is_closed(&self) -> bool {
+        true
+    }
+}
+
+/// A labelled graph relationship.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScopeEdge<D: ScopeDomain> {
-    pub source: Scope<D>,
+    pub source: ScopeId<D>,
     pub label: D::Label,
-    pub target: Scope<D>,
+    pub target: ScopeId<D>,
     pub property: ScopeProperty,
-}
-
-/// An application-defined reference attached to a scope.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ScopeReference<D: ScopeDomain> {
-    pub scope: Scope<D>,
-    pub reference: D::Reference,
-}
-
-#[derive(Debug, Error)]
-pub enum ScopeError<D: ScopeDomain> {
-    #[error("parsed AST artifact {0:?} is unavailable")]
-    MissingAst(AstKey),
-    #[error("scope {0:?} is unavailable")]
-    MissingScope(Scope<D>),
-    #[error("scope rule failed: {0}")]
-    Rule(String),
-}
-
-/// A selector used by a materialized scope-resolution query.
-pub trait DatumSelector<D: ScopeDomain>: NodeKey {
-    fn accepts(&self, datum: &D::Datum) -> bool;
 }

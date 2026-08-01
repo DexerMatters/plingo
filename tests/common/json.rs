@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use plingo_macros::{NonTerminal, Terminal};
+use plingo_macros::{NonTerminal, PrettyNonTerminal, PrettyTerminal, Terminal};
 
 use plingo::component;
 
@@ -16,7 +16,7 @@ use component::{
     parse::{AstToken, ParseErrorInfo, data::AstBox},
 };
 
-#[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Terminal, PrettyTerminal, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum JsonToken {
     #[regex(r"[[:space:]]+")]
     #[skip]
@@ -53,7 +53,7 @@ impl std::fmt::Display for JsonToken {
     }
 }
 
-#[derive(NonTerminal, Debug, Clone)]
+#[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
 pub enum JsonDocument {
     #[rule(JsonValue)]
     Root(#[from(0)] AstBox<JsonValue>),
@@ -61,7 +61,7 @@ pub enum JsonDocument {
     Error(#[from(0)] ParseErrorInfo),
 }
 
-#[derive(NonTerminal, Debug, Clone)]
+#[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
 pub enum JsonValue {
     #[rule(JsonObject)]
     Object(#[from(0)] AstBox<JsonObject>),
@@ -81,31 +81,31 @@ pub enum JsonValue {
     Error(#[from(0)] ParseErrorInfo),
 }
 
-#[derive(NonTerminal, Debug, Clone)]
+#[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
 pub enum JsonObject {
     #[rule(JsonToken::LeftBrace, [JsonMembers], JsonToken::RightBrace)]
     Object(#[from(1)] Option<AstBox<JsonMembers>>),
 }
 
-#[derive(NonTerminal, Debug, Clone)]
+#[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
 pub enum JsonMembers {
     #[rule({JsonMember}{JsonToken::Comma})]
     Members(#[from(0)] Vec<AstBox<JsonMember>>),
 }
 
-#[derive(NonTerminal, Debug, Clone)]
+#[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
 pub enum JsonMember {
     #[rule(JsonToken::String, JsonToken::Colon, JsonValue)]
     Member(#[from(0)] AstToken<JsonToken>, #[from(2)] AstBox<JsonValue>),
 }
 
-#[derive(NonTerminal, Debug, Clone)]
+#[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
 pub enum JsonArray {
     #[rule(JsonToken::LeftBracket, [JsonElements], JsonToken::RightBracket)]
     Array(#[from(1)] Option<AstBox<JsonElements>>),
 }
 
-#[derive(NonTerminal, Debug, Clone)]
+#[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
 pub enum JsonElements {
     #[rule({JsonValue}{JsonToken::Comma})]
     Elements(#[from(0)] Vec<AstBox<JsonValue>>),

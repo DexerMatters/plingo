@@ -82,8 +82,8 @@ fn translate_offset(offset: usize, shift: isize) -> Result<usize, LexInterrupt> 
 
 use super::{
     __macro_private::{BuildErrorToken, TokenMatcher},
-    IncrementalLexStats, LexErrorInfo, LexInterrupt, LexToken, LexerConfig, LexerCreationError,
-    LexerRoot, ResolvedToken, TokenState, build,
+    IncrementalLexStats, LexErrorInfo, LexInterrupt, LexToken, LexerCreationError, LexerRoot,
+    ResolvedToken, TokenState, build,
     mode::{LexerState, State, StateInfo},
     token::{CompiledState, SYNTHETIC_EOF_ID, StateMatcher, TokenOccurrence},
 };
@@ -195,8 +195,6 @@ where
     compiled_states: Vec<CompiledState<Root>>,
     state_ids: HashMap<String, State<Root>>,
     skip_terminals: HashSet<TerminalId>,
-    pub config: LexerConfig,
-
     latest: Arc<LexerSnapshotState<Root>>,
     pub(super) arena: Vec<LexToken<Root>>,
 }
@@ -357,7 +355,6 @@ impl<Root: LexerRoot> Lexer<Root> {
             compiled_states,
             state_ids,
             skip_terminals,
-            config: LexerConfig,
             arena: Vec::new(),
             latest: Arc::new(LexerSnapshotState::default()),
         })

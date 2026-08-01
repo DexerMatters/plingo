@@ -1,8 +1,10 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use quote::{format_ident, quote};
 use syn::{
-    parse::{Parse, ParseStream},
-    spanned::Spanned,
     Field, Fields, Ident, ItemEnum, LitInt, Type, TypePath, Variant,
+    parse::{Parse, ParseStream, discouraged::Speculative},
+    spanned::Spanned,
 };
 
 use crate::shared::push_missing_derives;
@@ -11,21 +13,69 @@ pub fn expand_non_terminal_derive(mut item: ItemEnum) -> syn::Result<proc_macro:
     push_missing_derives(&mut item, &["Debug"])?;
     let enum_ident = item.ident.clone();
     let variants = item.variants.clone();
+    let walk_arms = variants
+        .iter()
+        .map(direct_child_walk_arm)
+        .collect::<Vec<_>>();
     strip_non_terminal_attrs(&mut item);
 
     let register_fn = format_ident!("__plingo_register_non_terminal_{}", enum_ident);
+    let mut rules = variants
+        .iter()
+        .map(parse_rule_spec)
+        .collect::<syn::Result<Vec<_>>>()?;
+    let tier_plan = TierPlan::build(&enum_ident, &variants, &mut rules)?;
+
     let mut builders = Vec::new();
     let mut registrations = Vec::new();
-    for (variant_index, variant) in variants.iter().enumerate() {
-        let lowered = LowerCtx::new(&enum_ident, variant_index).lower_variant(variant)?;
+    for ((variant_index, variant), rule) in variants.iter().enumerate().zip(&rules) {
+        let lhs = tier_plan
+            .as_ref()
+            .and_then(|plan| rule.output_level.map(|level| plan.symbol(level)))
+            .map(|symbol| quote! { #symbol })
+            .unwrap_or_else(|| quote! { lhs });
+        let lowered = LowerCtx::new(
+            &enum_ident,
+            variant_index,
+            tier_plan.as_ref().map(|plan| &plan.symbols),
+        )
+        .lower_variant(variant, &rule.expr, lhs)?;
         builders.extend(lowered.builders);
         registrations.extend(lowered.registrations);
     }
+
+    let tier_lowering = tier_plan
+        .as_ref()
+        .map(|plan| plan.lowering(&enum_ident))
+        .transpose()?;
+    let tier_builders = tier_lowering
+        .as_ref()
+        .map(|lowering| lowering.builders.as_slice())
+        .unwrap_or_default();
+    let tier_bindings = tier_lowering
+        .as_ref()
+        .map(|lowering| lowering.bindings.as_slice())
+        .unwrap_or_default();
+    let tier_promotions = tier_lowering
+        .as_ref()
+        .map(|lowering| lowering.promotions.as_slice())
+        .unwrap_or_default();
 
     Ok(quote! {
         impl ::plingo::component::parse::__macro_private::NonTerminalSpec for #enum_ident {
             fn register(grammar: &mut ::plingo::component::parse::grammar::GrammarBuilder) -> ::plingo::component::parse::grammar::Symbol {
                 #register_fn(grammar)
+            }
+        }
+
+        impl ::plingo::component::semantic::AstWalk for #enum_ident {
+            fn direct_children(
+                &self,
+                visitor: &mut dyn ::core::ops::FnMut(::plingo::component::parse::AstKey),
+            ) {
+                match self {
+                    #(#walk_arms),*
+                }
             }
         }
 
@@ -37,12 +87,85 @@ pub fn expand_non_terminal_derive(mut item: ItemEnum) -> syn::Result<proc_macro:
             if !fresh {
                 return lhs;
             }
+            #(#tier_builders)*
+            #(#tier_bindings)*
             #(#builders)*
             #(#registrations)*
+            #(#tier_promotions)*
             lhs
         }
     }
     .into())
+}
+
+fn direct_child_walk_arm(variant: &Variant) -> proc_macro2::TokenStream {
+    let variant_ident = &variant.ident;
+    match &variant.fields {
+        Fields::Named(fields) => {
+            let children = fields
+                .named
+                .iter()
+                .filter(|field| contains_ast_box(&field.ty))
+                .map(|field| field.ident.as_ref().expect("named field"))
+                .collect::<Vec<_>>();
+            let bindings = children
+                .iter()
+                .map(|field| format_ident!("__plingo_child_{field}"))
+                .collect::<Vec<_>>();
+            let visits = bindings.iter().map(|binding| {
+                quote! {
+                    ::plingo::component::semantic::AstWalkField::ast_children(#binding, visitor);
+                }
+            });
+            quote! {
+                Self::#variant_ident { #(#children: #bindings,)* .. } => { #(#visits)* }
+            }
+        }
+        Fields::Unnamed(fields) => {
+            let bindings = fields
+                .unnamed
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    contains_ast_box(&field.ty).then(|| format_ident!("__plingo_child_{index}"))
+                })
+                .collect::<Vec<_>>();
+            let patterns = bindings.iter().map(|binding| match binding {
+                Some(binding) => quote! { #binding },
+                None => quote! { _ },
+            });
+            let visits = bindings.iter().flatten().map(|binding| {
+                quote! {
+                    ::plingo::component::semantic::AstWalkField::ast_children(#binding, visitor);
+                }
+            });
+            quote! {
+                Self::#variant_ident(#(#patterns),*) => { #(#visits)* }
+            }
+        }
+        Fields::Unit => quote! { Self::#variant_ident => {} },
+    }
+}
+
+fn contains_ast_box(ty: &Type) -> bool {
+    let Type::Path(path) = ty else {
+        return false;
+    };
+    let Some(segment) = path.path.segments.last() else {
+        return false;
+    };
+    if segment.ident == "AstBox" {
+        return true;
+    }
+    if !matches!(segment.ident.to_string().as_str(), "Option" | "Vec" | "Box") {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return false;
+    };
+    arguments.args.iter().any(
+        |argument| matches!(argument, syn::GenericArgument::Type(inner) if contains_ast_box(inner)),
+    )
 }
 
 fn strip_non_terminal_attrs(item: &mut ItemEnum) {
@@ -61,31 +184,193 @@ struct LoweredVariant {
     registrations: Vec<proc_macro2::TokenStream>,
 }
 
+struct TierLowering {
+    builders: Vec<proc_macro2::TokenStream>,
+    bindings: Vec<proc_macro2::TokenStream>,
+    promotions: Vec<proc_macro2::TokenStream>,
+}
+
+/// One generated nonterminal for each declared binding-power level.  Lower
+/// numbers are less binding; promotions only move from a looser level to the
+/// next tighter level.  Consequently a rule can only recurse through the
+/// levels it explicitly names.
+struct TierPlan {
+    levels: Vec<u32>,
+    symbols: BTreeMap<u32, Ident>,
+}
+
+impl TierPlan {
+    fn build(
+        enum_ident: &Ident,
+        variants: &syn::punctuated::Punctuated<Variant, syn::Token![,]>,
+        rules: &mut [RuleSpec],
+    ) -> syn::Result<Option<Self>> {
+        let tiered = rules
+            .iter()
+            .any(|rule| rule.output.is_some() || rule.expr.contains_tiered_non_terminal());
+        if !tiered {
+            return Ok(None);
+        }
+
+        let mut levels = BTreeSet::new();
+        for (variant, rule) in variants.iter().zip(rules.iter_mut()) {
+            if let Some(output) = &rule.output {
+                if !is_current_non_terminal(&output.ty, enum_ident) {
+                    return Err(syn::Error::new(
+                        output.ty.span(),
+                        format!(
+                            "tiered rule output must name the current nonterminal `{enum_ident}`"
+                        ),
+                    ));
+                }
+                levels.insert(output.level);
+            }
+            rule.expr
+                .collect_and_validate_tiers(enum_ident, &mut levels)?;
+
+            if rule.output.is_none() && rule.expr.contains_tiered_non_terminal() {
+                let Some(level) = rule.expr.leading_tier() else {
+                    return Err(syn::Error::new(
+                        variant.span(),
+                        format!(
+                            "a tiered rule must begin with `{enum_ident}:n`, or use the explicit `{enum_ident}:n <- ...` form"
+                        ),
+                    ));
+                };
+                rule.output_level = Some(level);
+            } else if let Some(output) = &rule.output {
+                rule.output_level = Some(output.level);
+            }
+        }
+
+        let Some(tightest) = levels.last().copied() else {
+            return Err(syn::Error::new(
+                enum_ident.span(),
+                "a tiered nonterminal requires at least one `Nonterminal:n` binding-power annotation",
+            ));
+        };
+        for rule in rules {
+            rule.output_level.get_or_insert(tightest);
+        }
+
+        let levels = levels.into_iter().collect::<Vec<_>>();
+        let symbols = levels
+            .iter()
+            .map(|level| {
+                (
+                    *level,
+                    format_ident!("__plingo_tier_{}_{}", enum_ident, level),
+                )
+            })
+            .collect();
+        Ok(Some(Self { levels, symbols }))
+    }
+
+    fn symbol(&self, level: u32) -> &Ident {
+        &self.symbols[&level]
+    }
+
+    fn lowering(&self, enum_ident: &Ident) -> syn::Result<TierLowering> {
+        let passthrough = format_ident!("__plingo_build_{}_tier_passthrough", enum_ident);
+        let bindings = self
+            .levels
+            .iter()
+            .map(|level| {
+                let symbol = self.symbol(*level);
+                let label = syn::LitStr::new(
+                    &format!("{enum_ident}::__tier_{level}"),
+                    enum_ident.span(),
+                );
+                quote! {
+                    let #symbol = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #label);
+                }
+            })
+            .collect();
+
+        let root_label = syn::LitStr::new(&format!("{enum_ident}::__tier_root"), enum_ident.span());
+        let first = self.symbol(self.levels[0]);
+        let mut promotions = vec![quote! {
+            ::plingo::component::parse::__macro_private::rule(
+                grammar,
+                #root_label,
+                lhs,
+                ::std::vec![#first],
+                ::std::option::Option::None,
+                ::std::option::Option::Some(#passthrough),
+            );
+        }];
+        for levels in self.levels.windows(2) {
+            let lower = self.symbol(levels[0]);
+            let tighter = self.symbol(levels[1]);
+            let label = syn::LitStr::new(
+                &format!(
+                    "{enum_ident}::__tier_promotion_{}_to_{}",
+                    levels[0], levels[1]
+                ),
+                enum_ident.span(),
+            );
+            promotions.push(quote! {
+                ::plingo::component::parse::__macro_private::rule(
+                    grammar,
+                    #label,
+                    #lower,
+                    ::std::vec![#tighter],
+                    ::std::option::Option::None,
+                    ::std::option::Option::Some(#passthrough),
+                );
+            });
+        }
+
+        Ok(TierLowering {
+            builders: vec![quote! {
+                fn #passthrough(
+                    _: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
+                    _: ::plingo::component::parse::grammar::ProductionId,
+                    children: &[::plingo::component::parse::data::ProductId],
+                ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
+                    ::plingo::component::parse::__macro_private::production_child(children, 0)
+                }
+            }],
+            bindings,
+            promotions,
+        })
+    }
+}
+
 struct LowerCtx<'a> {
     enum_ident: &'a Ident,
     variant_index: usize,
     synthetic_index: usize,
+    tier_symbols: Option<&'a BTreeMap<u32, Ident>>,
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(enum_ident: &'a Ident, variant_index: usize) -> Self {
+    fn new(
+        enum_ident: &'a Ident,
+        variant_index: usize,
+        tier_symbols: Option<&'a BTreeMap<u32, Ident>>,
+    ) -> Self {
         Self {
             enum_ident,
             variant_index,
             synthetic_index: 0,
+            tier_symbols,
         }
     }
 
-    fn lower_variant(mut self, variant: &Variant) -> syn::Result<LoweredVariant> {
+    fn lower_variant(
+        mut self,
+        variant: &Variant,
+        rule: &RuleExpr,
+        lhs: proc_macro2::TokenStream,
+    ) -> syn::Result<LoweredVariant> {
         let enum_ident = self.enum_ident;
         let builder_ident = format_ident!("__plingo_build_{}_{}", enum_ident, self.variant_index);
         let variant_ident = &variant.ident;
         let label = format!("{}::{}", enum_ident, variant_ident);
-        let rule = parse_rule_expr(variant)?;
-
         let mut builders = Vec::new();
         let mut registrations = Vec::new();
-        let lowered = self.lower_expr(&rule, &mut builders, &mut registrations)?;
+        let lowered = self.lower_expr(rule, &mut builders, &mut registrations)?;
         let rhs_exprs = lowered.symbol_exprs;
         let mut named_captures = Vec::new();
         if let Some(name) = &lowered.name {
@@ -140,7 +425,7 @@ impl<'a> LowerCtx<'a> {
             #(#rhs_bindings)*
             ::plingo::component::parse::__macro_private::rule(grammar,
                 #label,
-                lhs,
+                #lhs,
                 ::std::vec![#(#rhs_idents),*],
                 ::std::option::Option::None,
                 ::std::option::Option::Some(#builder_ident),
@@ -162,7 +447,7 @@ impl<'a> LowerCtx<'a> {
         match expr {
             RuleExpr::Empty => Ok(LoweredExpr::new(Vec::new(), ValueKind::Unit)),
             RuleExpr::Atom(atom) => Ok(LoweredExpr::new(
-                vec![atom_symbol_expr(atom)],
+                vec![self.atom_symbol_expr(atom)?],
                 atom_value_type(atom)?,
             )),
             RuleExpr::Seq(items) => {
@@ -200,16 +485,36 @@ impl<'a> LowerCtx<'a> {
             }
             RuleExpr::Optional(inner) => {
                 let lowered = self.lower_expr(inner, builders, registrations)?;
-                let capture_name = lowered.name.clone();
-                let captures = lowered.captures;
+                // An optional sequence with exactly one named child projects
+                // that child rather than its punctuation-bearing tuple. Thus
+                // `[Token::Colon, $annotation(Type)]` has the concrete value
+                // `Option<AstBox<Type>>`, not `Option<(AstToken<_>, AstBox<Type>)>`.
+                let projected = lowered
+                    .name
+                    .as_ref()
+                    .map(|name| (name.clone(), 0usize, lowered.value_kind.clone()))
+                    .or_else(|| (lowered.captures.len() == 1).then(|| lowered.captures[0].clone()));
+                let capture_name = projected.as_ref().map(|(name, _, _)| name.clone());
+                // The wrapper owns one RHS symbol; nested capture coordinates
+                // refer to its internal production and cannot escape directly.
+                let captures = Vec::new();
                 let synthetic = self.synthetic_name("opt");
                 let builder_none = self.synthetic_builder("opt_none");
                 let builder_some = self.synthetic_builder("opt_some");
-                let inner_kind = lowered.value_kind.clone();
+                let inner_kind = projected
+                    .as_ref()
+                    .map(|(_, _, kind)| kind.clone())
+                    .unwrap_or_else(|| lowered.value_kind.clone());
                 let inner_type = inner_kind.ty_tokens();
-                let inner_extract = inner_kind.extract_expr(
-                    quote! { ::plingo::component::parse::__macro_private::production_child(children, 0)? },
-                );
+                let inner_extract = if let Some((_, index, kind)) = &projected {
+                    kind.extract_expr(quote! {
+                        ::plingo::component::parse::__macro_private::production_child(children, #index)?
+                    })
+                } else {
+                    inner_kind.extract_expr(
+                        quote! { ::plingo::component::parse::__macro_private::production_child(children, 0)? },
+                    )
+                };
                 let inner_symbols = lowered.symbol_exprs;
                 let inner_bindings = inner_symbols
                     .iter()
@@ -750,6 +1055,40 @@ impl<'a> LowerCtx<'a> {
             }),
         }
     }
+
+    fn atom_symbol_expr(&self, atom: &Atom) -> syn::Result<proc_macro2::TokenStream> {
+        match atom {
+            Atom::NonTerminal(ty) => Ok(quote! {
+                <#ty as ::plingo::component::parse::__macro_private::NonTerminalSpec>::register(grammar)
+            }),
+            Atom::TieredNonTerminal { level, .. } => {
+                let Some(symbols) = self.tier_symbols else {
+                    return Err(syn::Error::new(
+                        self.enum_ident.span(),
+                        "internal error: tiered rule was lowered without tier symbols",
+                    ));
+                };
+                let Some(symbol) = symbols.get(level) else {
+                    return Err(syn::Error::new(
+                        self.enum_ident.span(),
+                        "internal error: tiered rule referenced an unknown binding-power level",
+                    ));
+                };
+                Ok(quote! { #symbol })
+            }
+            Atom::Token { root, variant } => Ok(quote! {
+                <#root as ::plingo::component::parse::__macro_private::TokenVariantSpec>::register_terminal(
+                    grammar,
+                    stringify!(#variant),
+                )
+            }),
+            Atom::Error => Ok(quote! {
+                ::plingo::component::parse::grammar::Symbol::T(
+                    ::plingo::component::parse::grammar::ERROR_TERMINAL,
+                )
+            }),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -869,11 +1208,23 @@ enum RuleExpr {
 enum Atom {
     Token { root: Type, variant: Ident },
     NonTerminal(Type),
+    TieredNonTerminal { ty: Type, level: u32 },
     Error,
 }
 
-fn parse_rule_expr(variant: &Variant) -> syn::Result<RuleExpr> {
-    let mut expr = None;
+struct RuleSpec {
+    expr: RuleExpr,
+    output: Option<TierTarget>,
+    output_level: Option<u32>,
+}
+
+struct TierTarget {
+    ty: Type,
+    level: u32,
+}
+
+fn parse_rule_spec(variant: &Variant) -> syn::Result<RuleSpec> {
+    let mut rule = None;
     let mut is_error = false;
     for attr in &variant.attrs {
         if attr.path().is_ident("parse_err") {
@@ -883,18 +1234,22 @@ fn parse_rule_expr(variant: &Variant) -> syn::Result<RuleExpr> {
                     "duplicate #[parse_err] attribute",
                 ));
             }
-            if expr.is_some() {
+            if rule.is_some() {
                 return Err(syn::Error::new(
                     attr.span(),
                     "#[parse_err] and #[rule] cannot be used on the same variant",
                 ));
             }
             is_error = true;
-            expr = Some(RuleExpr::Atom(Atom::Error));
+            rule = Some(RuleSpec {
+                expr: RuleExpr::Atom(Atom::Error),
+                output: None,
+                output_level: None,
+            });
             continue;
         }
         if attr.path().is_ident("rule") {
-            if expr.is_some() {
+            if rule.is_some() {
                 return Err(syn::Error::new(
                     attr.span(),
                     "duplicate #[rule(...)] attribute",
@@ -906,21 +1261,147 @@ fn parse_rule_expr(variant: &Variant) -> syn::Result<RuleExpr> {
                     "#[parse_err] and #[rule] cannot be used on the same variant",
                 ));
             }
-            expr = Some(
+            rule = Some(
                 if matches!(&attr.meta, syn::Meta::List(meta) if meta.tokens.is_empty()) {
-                    RuleExpr::Empty
+                    RuleSpec {
+                        expr: RuleExpr::Empty,
+                        output: None,
+                        output_level: None,
+                    }
                 } else {
-                    attr.parse_args::<RuleExpr>()?
+                    attr.parse_args::<RuleSpec>()?
                 },
             );
         }
     }
-    expr.ok_or_else(|| {
+    rule.ok_or_else(|| {
         syn::Error::new(
             variant.span(),
             "each nonterminal variant requires #[rule(...)] or #[parse_err]",
         )
     })
+}
+
+impl Parse for RuleSpec {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let fork = input.fork();
+        let explicit_output = (|| {
+            let ty: Type = fork.parse()?;
+            let _: syn::Token![:] = fork.parse()?;
+            let level = fork.parse::<LitInt>()?.base10_parse::<u32>()?;
+            let _: syn::Token![<] = fork.parse()?;
+            let _: syn::Token![-] = fork.parse()?;
+            Ok::<_, syn::Error>(TierTarget { ty, level })
+        })();
+
+        let output = if let Ok(output) = explicit_output {
+            input.advance_to(&fork);
+            Some(output)
+        } else {
+            None
+        };
+        let expr = parse_alt(input)?;
+        Ok(Self {
+            expr,
+            output,
+            output_level: None,
+        })
+    }
+}
+
+impl RuleExpr {
+    fn contains_tiered_non_terminal(&self) -> bool {
+        match self {
+            Self::Atom(Atom::TieredNonTerminal { .. }) => true,
+            Self::Empty | Self::Atom(_) => false,
+            Self::Seq(items) | Self::Alt(items) => {
+                items.iter().any(Self::contains_tiered_non_terminal)
+            }
+            Self::Optional(inner) | Self::Named(_, inner) => inner.contains_tiered_non_terminal(),
+            Self::Repeat(inner, separator, _) => {
+                inner.contains_tiered_non_terminal()
+                    || separator
+                        .as_deref()
+                        .is_some_and(Self::contains_tiered_non_terminal)
+            }
+        }
+    }
+
+    /// Collect the levels used by this production and reject an unqualified
+    /// self-reference.  The latter would bypass the tier grammar and bring
+    /// its ambiguity back.
+    fn collect_and_validate_tiers(
+        &self,
+        enum_ident: &Ident,
+        levels: &mut BTreeSet<u32>,
+    ) -> syn::Result<()> {
+        match self {
+            Self::Empty | Self::Atom(Atom::Token { .. }) | Self::Atom(Atom::Error) => Ok(()),
+            Self::Atom(Atom::NonTerminal(ty)) => {
+                if is_current_non_terminal(ty, enum_ident) {
+                    Err(syn::Error::new(
+                        ty.span(),
+                        format!(
+                            "a tiered `{enum_ident}` grammar must write self-references as `{enum_ident}:n`"
+                        ),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Atom(Atom::TieredNonTerminal { ty, level }) => {
+                if !is_current_non_terminal(ty, enum_ident) {
+                    return Err(syn::Error::new(
+                        ty.span(),
+                        format!(
+                            "tier annotations currently address only the enclosing nonterminal `{enum_ident}`"
+                        ),
+                    ));
+                }
+                levels.insert(*level);
+                Ok(())
+            }
+            Self::Seq(items) | Self::Alt(items) => {
+                for item in items {
+                    item.collect_and_validate_tiers(enum_ident, levels)?;
+                }
+                Ok(())
+            }
+            Self::Optional(inner) | Self::Named(_, inner) => {
+                inner.collect_and_validate_tiers(enum_ident, levels)
+            }
+            Self::Repeat(inner, separator, _) => {
+                inner.collect_and_validate_tiers(enum_ident, levels)?;
+                if let Some(separator) = separator {
+                    separator.collect_and_validate_tiers(enum_ident, levels)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The compact form `#[rule(Expr:n, ...)]` means `Expr:n <- Expr:n,
+    /// ...`.  Restrict inference to the first direct symbol so prefix,
+    /// postfix, and non-associative rules remain explicit and easy to read.
+    fn leading_tier(&self) -> Option<u32> {
+        match self {
+            Self::Atom(Atom::TieredNonTerminal { level, .. }) => Some(*level),
+            Self::Named(_, inner) => inner.leading_tier(),
+            Self::Seq(items) => items.first().and_then(Self::leading_tier),
+            _ => None,
+        }
+    }
+}
+
+fn is_current_non_terminal(ty: &Type, enum_ident: &Ident) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    type_path.qself.is_none()
+        && type_path.path.leading_colon.is_none()
+        && type_path.path.segments.len() == 1
+        && type_path.path.segments[0].ident == *enum_ident
+        && type_path.path.segments[0].arguments.is_empty()
 }
 
 impl Parse for RuleExpr {
@@ -1018,6 +1499,12 @@ fn parse_atom(input: ParseStream) -> syn::Result<RuleExpr> {
         ));
     };
 
+    if input.peek(syn::Token![:]) {
+        let _: syn::Token![:] = input.parse()?;
+        let level = input.parse::<LitInt>()?.base10_parse::<u32>()?;
+        return Ok(RuleExpr::Atom(Atom::TieredNonTerminal { ty, level }));
+    }
+
     if type_path.qself.is_none()
         && type_path.path.segments.len() == 2
         && type_path.path.segments[0].arguments.is_empty()
@@ -1034,34 +1521,10 @@ fn parse_atom(input: ParseStream) -> syn::Result<RuleExpr> {
     Ok(RuleExpr::Atom(Atom::NonTerminal(ty)))
 }
 
-fn atom_symbol_expr(atom: &Atom) -> proc_macro2::TokenStream {
-    match atom {
-        Atom::NonTerminal(ty) => {
-            quote! {
-                <#ty as ::plingo::component::parse::__macro_private::NonTerminalSpec>::register(grammar)
-            }
-        }
-        Atom::Token { root, variant } => {
-            quote! {
-                <#root as ::plingo::component::parse::__macro_private::TokenVariantSpec>::register_terminal(
-                    grammar,
-                    stringify!(#variant),
-                )
-            }
-        }
-        Atom::Error => {
-            quote! {
-                ::plingo::component::parse::grammar::Symbol::T(
-                    ::plingo::component::parse::grammar::ERROR_TERMINAL,
-                )
-            }
-        }
-    }
-}
-
 fn atom_value_type(atom: &Atom) -> syn::Result<ValueKind> {
     match atom {
         Atom::NonTerminal(ty) => Ok(ValueKind::Node(ty.clone())),
+        Atom::TieredNonTerminal { ty, .. } => Ok(ValueKind::Node(ty.clone())),
         Atom::Token { root, .. } => Ok(ValueKind::Token(root.clone())),
         Atom::Error => Ok(ValueKind::Error),
     }

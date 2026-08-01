@@ -378,7 +378,7 @@ where
         );
         let total_elapsed = total_start.elapsed();
 
-        eprintln!(
+        log::debug!(
             "[lex-replay] uri={} total={:?} fetch_source={:?} old_visible={:?} delta_scan={:?} restart_lookup={:?} old_suffix={:?} replay={:?} splice={:?} new_visible={:?} batch_diff={:?} status={} changed={} restart_byte={} restart_token={} change_end={} net_shift={} relexed={} reused={} old_tokens={} new_tokens={} prefix={} suffix={}",
             uri,
             total_elapsed,

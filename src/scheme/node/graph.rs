@@ -1,17 +1,20 @@
 use arc_swap::ArcSwap;
 
 use super::{
-    api::{Command, Node, NodeError, Relation, SnapshotId, View},
+    api::{
+        Command, DefinitionEdge, EdgeKind, IndexedRelation, InputNode, NodeError, NodeInspection,
+        NodeProvider, NodeSchema, PortKind, ReadGraph, Relation, SnapshotId, View,
+    },
     engine::{
-        CommandCx, ErasedNode, NodeEntry, StagedComponentState, Transaction,
-        commit_component_states,
+        CommandCx, DeferredChildFactory, ErasedProvider, ProviderEntry, StagedComponentState,
+        Transaction, commit_component_states,
     },
     identity::{ErasedValue, FactId, RelationFactId, TaskId, typed_value},
     state::GraphState,
 };
 use std::{
     any::{TypeId, type_name},
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     marker::PhantomData,
     sync::{Arc, Mutex, mpsc},
@@ -28,33 +31,39 @@ impl Snapshot {
         self.id
     }
 
-    /// Reads a view from this immutable committed snapshot.
-    pub fn read<V: View>(&self, key: V::Key) -> Option<V::Value> {
-        read_from_state::<V>(&self.state, key)
-    }
-
-    /// Returns whether this snapshot contains a supported relation fact.
-    pub fn contains<R: Relation>(&self, fact: R::Fact) -> bool {
-        self.state
-            .relation_supports
-            .contains_key(&RelationFactId::new::<R>(fact))
-    }
-
-    /// Returns the facts of one relation visible in this snapshot.
-    pub fn facts<R: Relation>(&self) -> Vec<R::Fact> {
-        self.state
-            .relation_supports
-            .keys()
-            .filter_map(RelationFactId::get::<R>)
-            .collect()
-    }
-
     /// Returns the revision in which a view key last changed.
     pub fn changed_at<V: View>(&self, key: V::Key) -> Option<SnapshotId> {
         self.state
             .facts
             .get(&FactId::new::<V>(key))
             .map(|fact| fact.changed_at)
+    }
+}
+
+impl ReadGraph for Snapshot {
+    fn get<V: View>(&self, key: V::Key) -> Option<V::Value> {
+        read_from_state::<V>(&self.state, key)
+    }
+
+    fn contains<R: Relation>(&self, fact: R::Fact) -> bool {
+        self.state
+            .relation_supports
+            .contains_key(&RelationFactId::new::<R>(fact))
+    }
+
+    fn scan<R: IndexedRelation>(&self, index: R::Index) -> Vec<R::Fact> {
+        self.scan_all::<R>()
+            .into_iter()
+            .filter(|fact| R::index(fact) == index)
+            .collect()
+    }
+
+    fn scan_all<R: Relation>(&self) -> Vec<R::Fact> {
+        self.state
+            .relation_supports
+            .keys()
+            .filter_map(RelationFactId::get::<R>)
+            .collect()
     }
 }
 
@@ -76,20 +85,23 @@ impl GraphReader {
         }
     }
 
-    pub fn read<V: View>(&self, key: V::Key) -> Option<V::Value> {
-        self.snapshot().read::<V>(key)
-    }
-
-    pub fn contains<R: Relation>(&self, fact: R::Fact) -> bool {
-        self.snapshot().contains::<R>(fact)
-    }
-
-    pub fn facts<R: Relation>(&self) -> Vec<R::Fact> {
-        self.snapshot().facts::<R>()
-    }
-
     pub fn changed_at<V: View>(&self, key: V::Key) -> Option<SnapshotId> {
         self.snapshot().changed_at::<V>(key)
+    }
+}
+
+impl ReadGraph for GraphReader {
+    fn get<V: View>(&self, key: V::Key) -> Option<V::Value> {
+        self.snapshot().get::<V>(key)
+    }
+    fn contains<R: Relation>(&self, fact: R::Fact) -> bool {
+        self.snapshot().contains::<R>(fact)
+    }
+    fn scan<R: IndexedRelation>(&self, index: R::Index) -> Vec<R::Fact> {
+        self.snapshot().scan::<R>(index)
+    }
+    fn scan_all<R: Relation>(&self) -> Vec<R::Fact> {
+        self.snapshot().scan_all::<R>()
     }
 }
 
@@ -101,12 +113,10 @@ pub enum ViewUpdate<V> {
     Removed { snapshot: SnapshotId },
 }
 
-/// A durable subscription to one keyed view.
+/// A subscription to one materialized map fact.
 pub struct Subscription<V: View> {
     receiver: mpsc::Receiver<ViewUpdate<V::Value>>,
-    /// Derived-view subscriptions retain a task pin until dropped. Root-view
-    /// subscriptions have no lease.
-    lease: Option<PinLease>,
+
     _cleanup: SubscriberLease,
     _view: PhantomData<fn() -> V>,
 }
@@ -132,7 +142,7 @@ pub enum RelationUpdate<F> {
     Removed { snapshot: SnapshotId, fact: F },
 }
 
-/// Durable observation of one multi-owner relation fact.
+/// Observation of one support-counted relation fact.
 pub struct RelationSubscription<R: Relation> {
     receiver: mpsc::Receiver<RelationUpdate<R::Fact>>,
     _cleanup: SubscriberLease,
@@ -146,20 +156,6 @@ impl<R: Relation> RelationSubscription<R> {
 
     pub fn try_recv(&self) -> Result<RelationUpdate<R::Fact>, mpsc::TryRecvError> {
         self.receiver.try_recv()
-    }
-}
-
-/// A demand lease released automatically when its owner is dropped.
-struct PinLease {
-    task: TaskId,
-    releases: Arc<Mutex<Vec<TaskId>>>,
-}
-
-impl Drop for PinLease {
-    fn drop(&mut self) {
-        if let Ok(mut releases) = self.releases.lock() {
-            releases.push(self.task.clone());
-        }
     }
 }
 
@@ -188,29 +184,18 @@ impl Drop for SubscriberLease {
     }
 }
 
-/// Result of a demand-driven request. Holding it keeps the requested node and
-/// its required descendants materialized; dropping it queues their release.
-pub struct RequestHandle<N: Node> {
-    value: <N::Output as View>::Value,
-    _lease: PinLease,
-    _node: PhantomData<fn() -> N>,
+/// A demand lease keeps one provider instance and its descendants materialized;
+/// dropping it queues their release.
+pub struct DemandLease {
+    task: TaskId,
+    releases: Arc<Mutex<Vec<TaskId>>>,
 }
 
-impl<N: Node> RequestHandle<N> {
-    pub fn value(&self) -> &<N::Output as View>::Value {
-        &self.value
-    }
-
-    pub fn into_value(self) -> <N::Output as View>::Value {
-        self.value.clone()
-    }
-}
-
-impl<N: Node> std::ops::Deref for RequestHandle<N> {
-    type Target = <N::Output as View>::Value;
-
-    fn deref(&self) -> &Self::Target {
-        &self.value
+impl Drop for DemandLease {
+    fn drop(&mut self) {
+        if let Ok(mut releases) = self.releases.lock() {
+            releases.push(self.task.clone());
+        }
     }
 }
 
@@ -355,21 +340,24 @@ struct EffectWork {
     run: Box<dyn FnOnce(&mut Graph) -> RelationEffectResult + Send>,
 }
 
-/// A non-stratified runtime of nodes, views, requests, and subscriptions.
+/// Transactional runtime of providers, typed ports, facts, demands, and subscriptions.
 pub struct Graph {
     state: Arc<GraphState>,
     current: Arc<ArcSwap<GraphState>>,
-    history: BTreeMap<SnapshotId, Arc<GraphState>>,
-    nodes: HashMap<TypeId, Arc<dyn ErasedNode>>,
+    providers: HashMap<TypeId, Arc<dyn ErasedProvider>>,
+    input_schemas: HashMap<TypeId, NodeSchema>,
+    definition_edges: Vec<DefinitionEdge>,
+    deferred_children: HashMap<TypeId, Vec<DeferredChildFactory>>,
     subscribers: HashMap<FactId, Vec<Box<dyn ErasedSubscriber>>>,
     relation_subscribers: HashMap<RelationFactId, Vec<Box<dyn ErasedRelationSubscriber>>>,
     relation_added_effects: HashMap<TypeId, Vec<Box<dyn ErasedRelationEffect>>>,
     relation_removed_effects: HashMap<TypeId, Vec<Box<dyn ErasedRelationEffect>>>,
     effect_failures: Vec<EffectFailure>,
+    pending_effects: VecDeque<EffectWork>,
+    draining_effects: bool,
     deferred_releases: Arc<Mutex<Vec<TaskId>>>,
     deferred_subscriber_removals: Arc<Mutex<Vec<(SubscriberId, SubscriberTarget)>>>,
     next_subscriber: SubscriberId,
-    retention: usize,
 }
 
 impl Default for Graph {
@@ -381,22 +369,23 @@ impl Default for Graph {
 impl Graph {
     pub fn new() -> Self {
         let state = Arc::new(GraphState::default());
-        let mut history = BTreeMap::new();
-        history.insert(0, Arc::clone(&state));
         Self {
             current: Arc::new(ArcSwap::from(Arc::clone(&state))),
             state,
-            history,
-            nodes: HashMap::new(),
+            providers: HashMap::new(),
+            input_schemas: HashMap::new(),
+            definition_edges: Vec::new(),
+            deferred_children: HashMap::new(),
             subscribers: HashMap::new(),
             relation_subscribers: HashMap::new(),
             relation_added_effects: HashMap::new(),
             relation_removed_effects: HashMap::new(),
             effect_failures: Vec::new(),
+            pending_effects: VecDeque::new(),
+            draining_effects: false,
             deferred_releases: Arc::new(Mutex::new(Vec::new())),
             deferred_subscriber_removals: Arc::new(Mutex::new(Vec::new())),
             next_subscriber: 0,
-            retention: 64,
         }
     }
 
@@ -418,47 +407,107 @@ impl Graph {
         }
     }
 
-    pub fn set_snapshot_retention(&mut self, retention: usize) {
-        self.retention = retention.max(1);
-        self.prune_history();
-    }
-
-    /// Installs a node implementation.  Node types are capabilities, so there
-    /// is at most one provider per concrete node type in a graph.
-    pub fn install<N: Node>(&mut self, node: N) -> Result<(), NodeError> {
-        if self.nodes.contains_key(&TypeId::of::<N>()) {
-            return Err(NodeError::DuplicateNode(type_name::<N>()));
+    /// Installs one provider. Provider kinds are unique capabilities in a
+    /// graph and their complete port schema is enforced at publication time.
+    pub fn install<P: NodeProvider>(&mut self, provider: P) -> Result<(), NodeError> {
+        if self.providers.contains_key(&TypeId::of::<P>()) {
+            return Err(NodeError::DuplicateProvider(type_name::<P>()));
         }
-        self.nodes
-            .insert(TypeId::of::<N>(), Arc::new(NodeEntry(node)));
+        let schema = P::schema();
+        self.record_publication_edges(&schema);
+        self.providers
+            .insert(TypeId::of::<P>(), Arc::new(ProviderEntry(provider)));
         Ok(())
     }
 
-    /// Reads a materialized value from the latest committed snapshot.
-    pub fn read<V: View>(&self, key: V::Key) -> Option<V::Value> {
-        read_from_state::<V>(&self.state, key)
+    /// Registers a first-class input-node schema. Commands remain the only
+    /// mutation authority for its map ports.
+    pub fn install_input<I: InputNode>(&mut self) -> Result<(), NodeError> {
+        let id = TypeId::of::<I>();
+        if self.input_schemas.contains_key(&id) {
+            return Err(NodeError::DuplicateInput(type_name::<I>()));
+        }
+        let schema = I::schema();
+        self.record_publication_edges(&schema);
+        self.input_schemas.insert(id, schema);
+        Ok(())
     }
 
-    /// Reads a value from an explicitly pinned historical snapshot.
-    pub fn read_at<V: View>(&self, snapshot: &Snapshot, key: V::Key) -> Option<V::Value> {
-        read_from_state::<V>(&snapshot.state, key)
+    /// Returns schemas for installed input authorities and derived providers.
+    pub fn schemas(&self) -> Vec<NodeSchema> {
+        let mut schemas = self.input_schemas.values().cloned().collect::<Vec<_>>();
+        schemas.extend(self.providers.values().map(|provider| provider.schema()));
+        schemas.sort_by_key(|schema| schema.provider);
+        schemas
     }
 
-    /// Returns whether a relation fact has at least one live supporting node.
-    pub fn contains<R: Relation>(&self, fact: R::Fact) -> bool {
-        self.state
-            .relation_supports
-            .contains_key(&RelationFactId::new::<R>(fact))
+    pub fn definition_edges(&self) -> &[DefinitionEdge] {
+        &self.definition_edges
     }
 
-    /// Returns the materialized facts of one relation.  Fact order is not part
-    /// of the relation contract.
-    pub fn facts<R: Relation>(&self) -> Vec<R::Fact> {
-        self.state
-            .relation_supports
-            .keys()
-            .filter_map(RelationFactId::get::<R>)
-            .collect()
+    fn record_publication_edges(&mut self, schema: &NodeSchema) {
+        self.definition_edges
+            .extend(schema.ports.iter().map(|port| DefinitionEdge {
+                from: schema.provider,
+                to: port.name,
+                kind: match port.kind {
+                    PortKind::Map => EdgeKind::Publishes,
+                    PortKind::Set | PortKind::IndexedSet => EdgeKind::Supports,
+                },
+            }));
+    }
+
+    pub fn inspect<P: NodeProvider>(&self, key: P::Key) -> NodeInspection {
+        let task = TaskId::new::<P>(key);
+        NodeInspection {
+            materialized: self.state.task_outputs.contains_key(&task),
+            root_pins: self.state.task_pins.get(&task).copied().unwrap_or_default(),
+            keeping_parents: self.state.child_parents.get(&task).map_or(0, HashSet::len),
+            publications: self.state.task_outputs.get(&task).map_or(0, HashSet::len),
+            relation_supports: self
+                .state
+                .task_relation_outputs
+                .get(&task)
+                .map_or(0, HashSet::len),
+            dependencies: self
+                .state
+                .task_dependencies
+                .get(&task)
+                .map_or(0, HashSet::len),
+            children: self.state.task_children.get(&task).map_or(0, HashSet::len),
+        }
+    }
+
+    /// Declares a typed keeps-alive edge from one provider kind to another.
+    pub fn connect<Parent, Child>(
+        &mut self,
+        key: impl Fn(Parent::Key) -> Child::Key + Send + Sync + 'static,
+    ) -> Result<(), NodeError>
+    where
+        Parent: NodeProvider,
+        Child: NodeProvider,
+    {
+        if !self.providers.contains_key(&TypeId::of::<Parent>()) {
+            return Err(NodeError::MissingProvider(type_name::<Parent>()));
+        }
+        if !self.providers.contains_key(&TypeId::of::<Child>()) {
+            return Err(NodeError::MissingProvider(type_name::<Child>()));
+        }
+        self.definition_edges.push(DefinitionEdge {
+            from: type_name::<Parent>(),
+            to: type_name::<Child>(),
+            kind: EdgeKind::KeepsAlive,
+        });
+        self.deferred_children
+            .entry(TypeId::of::<Parent>())
+            .or_default()
+            .push(Box::new(move |parent| {
+                parent
+                    .key
+                    .get::<Parent::Key>()
+                    .map(|parent_key| TaskId::new::<Child>(key(parent_key)))
+            }));
+        Ok(())
     }
 
     /// Subscribes to one relation fact. The initial event records its current
@@ -569,29 +618,42 @@ impl Graph {
             .map(|fact| fact.changed_at)
     }
 
-    /// Requests a node's primary output and returns an RAII demand handle.
-    ///
-    /// The output stays materialized only while the returned handle is alive.
-    /// Dropping it queues reclamation; call [`Self::collect_garbage`] to apply
-    /// queued releases immediately when no subsequent graph operation occurs.
-    pub fn request<N: Node>(&mut self, key: N::Key) -> Result<RequestHandle<N>, NodeError> {
+    /// Demands one provider instance and returns an RAII materialization lease.
+    /// The lease is the only root liveness handle; published values are read
+    /// through the shared [`ReadGraph`] protocol.
+    pub fn demand<P: NodeProvider>(&mut self, key: P::Key) -> Result<DemandLease, NodeError> {
         self.collect_garbage()?;
-        let lease = self.activate::<N>(key.clone())?;
-        let value = self
-            .read::<N::Output>(key)
-            .ok_or(NodeError::MissingView(type_name::<N::Output>()))?;
-        Ok(RequestHandle {
-            value,
-            _lease: lease,
-            _node: PhantomData,
+        if !self.providers.contains_key(&TypeId::of::<P>()) {
+            return Err(NodeError::MissingProvider(type_name::<P>()));
+        }
+        let base = self.state.revision;
+        let target = base.checked_add(1).ok_or(NodeError::RevisionOverflow)?;
+        let mut transaction = Transaction::new(
+            &self.providers,
+            &self.deferred_children,
+            (*self.state).clone(),
+            target,
+        );
+        let task = TaskId::new::<P>(key);
+        transaction.pin(task.clone());
+        if !transaction.state.task_outputs.contains_key(&task) {
+            transaction.schedule(task.clone());
+        }
+        transaction.run_pending()?;
+        let (state, component_states) = transaction.finish();
+        self.commit_transaction(state, component_states);
+        Ok(DemandLease {
+            task,
+            releases: Arc::clone(&self.deferred_releases),
         })
     }
 
-    /// Subscribes to a materialized view.  Root views can be subscribed to
-    /// directly; derived views are normally activated through [`Self::subscribe`].
-    pub fn subscribe_view<V: View>(&mut self, key: V::Key) -> Result<Subscription<V>, NodeError> {
+    /// Subscribes to one materialized map port. Demand is intentionally
+    /// separate: a subscription observes facts but does not silently create a
+    /// hidden provider lease.
+    pub fn subscribe<V: View>(&mut self, key: V::Key) -> Result<Subscription<V>, NodeError> {
         let value = self
-            .read::<V>(key.clone())
+            .get::<V>(key.clone())
             .ok_or(NodeError::MissingView(type_name::<V>()))?;
         let fact = FactId::new::<V>(key);
         let id = self.allocate_subscriber();
@@ -612,7 +674,6 @@ impl Graph {
             }));
         Ok(Subscription {
             receiver,
-            lease: None,
             _cleanup: SubscriberLease {
                 id,
                 target: SubscriberTarget::View(fact),
@@ -622,47 +683,8 @@ impl Graph {
         })
     }
 
-    /// Subscribes to and pins a node's primary output.
-    ///
-    /// The returned subscription owns an RAII lease. Dropping it queues task
-    /// reclamation; the graph drains that queue on its next mutation or when
-    /// [`Self::collect_garbage`] is called explicitly.
-    pub fn subscribe<N: Node>(
-        &mut self,
-        key: N::Key,
-    ) -> Result<Subscription<N::Output>, NodeError> {
-        self.collect_garbage()?;
-        let lease = self.activate::<N>(key.clone())?;
-        let mut subscription = self.subscribe_view::<N::Output>(key)?;
-        subscription.lease = Some(lease);
-        Ok(subscription)
-    }
-
-    /// Explicitly releases one outstanding root pin.
-    ///
-    /// Normal callers should drop a [`RequestHandle`] or [`Subscription`].
-    /// This escape hatch remains useful for host-managed demand accounting.
-    pub fn release<N: Node>(&mut self, key: N::Key) -> Result<(), NodeError> {
-        self.collect_garbage()?;
-        let task = TaskId::new::<N>(key);
-        if !self.state.task_pins.contains_key(&task) {
-            return Ok(());
-        }
-        let base = self.state.revision;
-        let target = base.checked_add(1).ok_or(NodeError::RevisionOverflow)?;
-        let mut transaction = Transaction::new(&self.nodes, (*self.state).clone(), target);
-        transaction.unpin(task);
-        transaction.run_pending()?;
-        let (state, component_states) = transaction.finish();
-        self.commit_transaction(state, component_states);
-        Ok(())
-    }
-
-    /// Alias for [`Self::release`].
-    pub fn unpin<N: Node>(&mut self, key: N::Key) -> Result<(), NodeError> {
-        self.release::<N>(key)
-    }
-
+    /// Explicitly releasing a demand is unnecessary: dropping [`DemandLease`]
+    /// queues reclamation and [`Self::collect_garbage`] applies it.
     fn allocate_subscriber(&mut self) -> SubscriberId {
         let id = self.next_subscriber;
         self.next_subscriber = self.next_subscriber.wrapping_add(1);
@@ -684,7 +706,12 @@ impl Graph {
         }
         let base = self.state.revision;
         let target = base.checked_add(1).ok_or(NodeError::RevisionOverflow)?;
-        let mut transaction = Transaction::new(&self.nodes, (*self.state).clone(), target);
+        let mut transaction = Transaction::new(
+            &self.providers,
+            &self.deferred_children,
+            (*self.state).clone(),
+            target,
+        );
         for task in releases {
             transaction.unpin(task);
         }
@@ -731,7 +758,12 @@ impl Graph {
         self.collect_garbage()?;
         let base = self.state.revision;
         let target = base.checked_add(1).ok_or(NodeError::RevisionOverflow)?;
-        let mut transaction = Transaction::new(&self.nodes, (*self.state).clone(), target);
+        let mut transaction = Transaction::new(
+            &self.providers,
+            &self.deferred_children,
+            (*self.state).clone(),
+            target,
+        );
         let output = {
             let mut cx = CommandCx {
                 transaction: &mut transaction,
@@ -744,27 +776,6 @@ impl Graph {
         Ok(output)
     }
 
-    fn activate<N: Node>(&mut self, key: N::Key) -> Result<PinLease, NodeError> {
-        if !self.nodes.contains_key(&TypeId::of::<N>()) {
-            return Err(NodeError::MissingNode(type_name::<N>()));
-        }
-        let base = self.state.revision;
-        let target = base.checked_add(1).ok_or(NodeError::RevisionOverflow)?;
-        let mut transaction = Transaction::new(&self.nodes, (*self.state).clone(), target);
-        let task = TaskId::new::<N>(key);
-        transaction.pin(task.clone());
-        if !transaction.state.task_outputs.contains_key(&task) {
-            transaction.schedule(task.clone());
-        }
-        transaction.run_pending()?;
-        let (state, component_states) = transaction.finish();
-        self.commit_transaction(state, component_states);
-        Ok(PinLease {
-            task,
-            releases: Arc::clone(&self.deferred_releases),
-        })
-    }
-
     /// Installs every part of a successful transaction before making it
     /// externally observable through subscriptions or effects.
     fn commit_transaction(
@@ -774,7 +785,8 @@ impl Graph {
     ) {
         commit_component_states(component_states);
         let effects = self.commit(state);
-        self.run_effects(effects);
+        self.pending_effects.extend(effects);
+        self.drain_effects();
     }
 
     fn commit(&mut self, state: GraphState) -> VecDeque<EffectWork> {
@@ -823,9 +835,7 @@ impl Graph {
         );
 
         self.current.store(Arc::clone(&state));
-        self.state = Arc::clone(&state);
-        self.history.insert(snapshot, state);
-        self.prune_history();
+        self.state = state;
 
         for fact in changed {
             let Some(subscribers) = self.subscribers.get_mut(&fact) else {
@@ -856,14 +866,18 @@ impl Graph {
         effects
     }
 
-    fn run_effects(&mut self, mut effects: VecDeque<EffectWork>) {
+    fn drain_effects(&mut self) {
+        if self.draining_effects {
+            return;
+        }
+        self.draining_effects = true;
         while let Some(EffectWork {
             snapshot,
             relation,
             relation_name,
             fact,
             run,
-        }) = effects.pop_front()
+        }) = self.pending_effects.pop_front()
         {
             if let Err(message) = run(self) {
                 self.effect_failures.push(EffectFailure {
@@ -875,15 +889,34 @@ impl Graph {
                 });
             }
         }
+        self.draining_effects = false;
+    }
+}
+
+impl ReadGraph for Graph {
+    fn get<V: View>(&self, key: V::Key) -> Option<V::Value> {
+        read_from_state::<V>(&self.state, key)
     }
 
-    fn prune_history(&mut self) {
-        while self.history.len() > self.retention {
-            let Some(oldest) = self.history.first_key_value().map(|(key, _)| *key) else {
-                break;
-            };
-            self.history.remove(&oldest);
-        }
+    fn contains<R: Relation>(&self, fact: R::Fact) -> bool {
+        self.state
+            .relation_supports
+            .contains_key(&RelationFactId::new::<R>(fact))
+    }
+
+    fn scan<R: IndexedRelation>(&self, index: R::Index) -> Vec<R::Fact> {
+        self.scan_all::<R>()
+            .into_iter()
+            .filter(|fact| R::index(fact) == index)
+            .collect()
+    }
+
+    fn scan_all<R: Relation>(&self) -> Vec<R::Fact> {
+        self.state
+            .relation_supports
+            .keys()
+            .filter_map(RelationFactId::get::<R>)
+            .collect()
     }
 }
 

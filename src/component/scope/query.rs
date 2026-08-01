@@ -1,6 +1,6 @@
 use std::{collections::HashSet, hash::Hash, sync::Arc};
 
-use super::{Scope, ScopeDatum, ScopeDomain, ScopeEdge};
+use super::{ScopeDomain, ScopeEdge, ScopeId};
 
 /// A regular path language used by scope-graph resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -85,10 +85,7 @@ where
 }
 
 /// A path regular expression interpreted relative to a starting scope.
-///
-/// [`crate::component::elaborate::Here::resolve`] starts it at the current
-/// scope, while `resolve_from` accepts an explicit scope. Labels are typed by
-/// the domain rather than parsed from strings.
+/// Labels are typed by the domain rather than parsed from strings.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RelativeRegex<Label>(PathExpr<Label>);
 
@@ -96,7 +93,7 @@ impl<Label> RelativeRegex<Label>
 where
     Label: Clone + Eq,
 {
-    /// Matches the current scope without traversing an edge.
+    /// Matches the starting scope without traversing an edge.
     pub fn here() -> Self {
         Self(PathExpr::Epsilon)
     }
@@ -144,12 +141,100 @@ impl<Label> From<PathExpr<Label>> for RelativeRegex<Label> {
     }
 }
 
-/// One resolution witness materialized by [`super::ResolutionNode`].
+/// A strict partial order over edge labels used to select visible paths.
+///
+/// `prefer(a, b)` means that a path using `a` at the first differing position
+/// outranks a path using `b`. Incomparable paths remain visible and therefore
+/// preserve ambiguity. A strict prefix is more specific than its extension,
+/// matching the calculus' end-of-path ordering.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PathOrder<Label> {
+    preferred: Arc<[(Label, Label)]>,
+}
+
+impl<Label> Default for PathOrder<Label> {
+    fn default() -> Self {
+        Self {
+            preferred: Arc::from([]),
+        }
+    }
+}
+
+impl<Label> PathOrder<Label>
+where
+    Label: Clone + Eq,
+{
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn prefer(mut self, preferred: Label, less_preferred: Label) -> Self {
+        let mut relations = self.preferred.to_vec();
+        if preferred != less_preferred
+            && !relations
+                .iter()
+                .any(|(left, right)| left == &preferred && right == &less_preferred)
+        {
+            relations.push((preferred, less_preferred));
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let snapshot = relations.clone();
+            for (left, middle) in &snapshot {
+                for (candidate, right) in &snapshot {
+                    if middle == candidate
+                        && left != right
+                        && !relations.iter().any(|(l, r)| l == left && r == right)
+                    {
+                        relations.push((left.clone(), right.clone()));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        self.preferred = relations.into();
+        self
+    }
+
+    pub fn compare<Scope>(
+        &self,
+        left: &ResolutionPath<Scope>,
+        right: &ResolutionPath<Scope>,
+    ) -> Option<std::cmp::Ordering>
+    where
+        Scope: ScopeDomain<Label = Label>,
+    {
+        for (left_label, right_label) in left.labels.iter().zip(right.labels.iter()) {
+            if left_label == right_label {
+                continue;
+            }
+            if self
+                .preferred
+                .iter()
+                .any(|(preferred, less)| preferred == left_label && less == right_label)
+            {
+                return Some(std::cmp::Ordering::Greater);
+            }
+            if self
+                .preferred
+                .iter()
+                .any(|(preferred, less)| preferred == right_label && less == left_label)
+            {
+                return Some(std::cmp::Ordering::Less);
+            }
+            return None;
+        }
+        Some(left.labels.len().cmp(&right.labels.len()).reverse())
+    }
+}
+
+/// One dependency-tracked resolution witness returned by semantic queries.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ResolutionPath<D: ScopeDomain> {
-    pub scopes: Arc<[Scope<D>]>,
+    pub scopes: Arc<[ScopeId<D>]>,
     pub labels: Arc<[<D as ScopeDomain>::Label]>,
-    pub datum: <D as ScopeDomain>::Datum,
+    pub data: <D as ScopeDomain>::ScopeData,
 }
 
 impl<D: ScopeDomain> std::fmt::Debug for ResolutionPath<D> {
@@ -158,32 +243,32 @@ impl<D: ScopeDomain> std::fmt::Debug for ResolutionPath<D> {
             .debug_struct("ResolutionPath")
             .field("scopes", &self.scopes)
             .field("labels", &"..")
-            .field("datum", &"..")
+            .field("data", &"..")
             .finish()
     }
 }
 
-/// Resolves a materialized query while observing only the edge and datum
-/// buckets reached by the traversal. The node runtime supplies bucket readers
-/// that record dependencies even for empty frontiers.
+/// Resolves a materialized query while observing only the edge buckets and
+/// mapped scope data reached by the traversal. The node runtime supplies
+/// readers that record dependencies even for empty frontiers.
 pub(crate) fn resolve_indexed<D, Accepts, Lookup>(
-    start: Scope<D>,
+    start: ScopeId<D>,
     path: PathExpr<<D as ScopeDomain>::Label>,
     accepts: Accepts,
     mut lookup: Lookup,
 ) -> HashSet<ResolutionPath<D>>
 where
     D: ScopeDomain,
-    Accepts: Fn(&D::Datum) -> bool,
-    Lookup: FnMut(Scope<D>, bool) -> (Vec<ScopeEdge<D>>, Vec<ScopeDatum<D>>),
+    Accepts: Fn(&D::ScopeData) -> bool,
+    Lookup: FnMut(ScopeId<D>, bool) -> (Vec<ScopeEdge<D>>, Option<D::ScopeData>),
 {
     #[derive(Clone)]
     struct Search<D: ScopeDomain> {
-        scope: Scope<D>,
+        scope: ScopeId<D>,
         expression: PathExpr<<D as ScopeDomain>::Label>,
-        scopes: Vec<Scope<D>>,
+        scopes: Vec<ScopeId<D>>,
         labels: Vec<<D as ScopeDomain>::Label>,
-        states: HashSet<(Scope<D>, PathExpr<<D as ScopeDomain>::Label>)>,
+        states: HashSet<(ScopeId<D>, PathExpr<<D as ScopeDomain>::Label>)>,
     }
 
     let initial = (start, path.clone());
@@ -200,20 +285,16 @@ where
 
     while let Some(search) = pending.pop() {
         let nullable = search.expression.nullable();
-        let (edges, datums) = lookup(search.scope, nullable);
-        if nullable {
-            for datum in datums
-                .into_iter()
-                .filter(|datum| datum.scope == search.scope)
-                .map(|datum| datum.datum)
-                .filter(|datum| accepts(datum))
-            {
-                answers.insert(ResolutionPath {
-                    scopes: search.scopes.clone().into(),
-                    labels: search.labels.clone().into(),
-                    datum,
-                });
-            }
+        let (edges, data) = lookup(search.scope, nullable);
+        if nullable
+            && let Some(data) = data
+            && accepts(&data)
+        {
+            answers.insert(ResolutionPath {
+                scopes: search.scopes.clone().into(),
+                labels: search.labels.clone().into(),
+                data,
+            });
         }
 
         for edge in edges {
@@ -238,98 +319,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{resolve_indexed, PathExpr};
-    use crate::component::{
-        lex::{LexerRoot, SlotStore, TokenState},
-        scope::{Scope, ScopeDatum, ScopeDomain},
-    };
-
-    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-    enum Label {
-        Lexical,
-        Declaration,
-    }
-
-    #[derive(Clone, PartialEq, Eq, Hash)]
-    struct TestRoot;
-    impl TokenState for TestRoot {
-        fn display_name() -> &'static str {
-            "TestRoot"
-        }
-        fn state_key() -> &'static str {
-            "test"
-        }
-    }
-    impl LexerRoot for TestRoot {
-        type SlotValue = ();
-        fn state_registrations(
-        ) -> Vec<crate::component::lex::__macro_private::ScopeRegistration<Self>> {
-            Vec::new()
-        }
-        fn slot_count() -> usize {
-            0
-        }
-        fn recover_key(_: &SlotStore<Self>) -> Option<&str> {
-            None
-        }
-    }
-
-    #[derive(Clone, PartialEq, Eq, Hash)]
-    struct Domain;
-    impl ScopeDomain for Domain {
-        type Root = TestRoot;
-        type Ast = ();
-        type Anchor = ();
-        type Label = Label;
-        type Datum = usize;
-        type Reference = ();
-        type Request = ();
-    }
-
-    #[test]
-    fn derivatives_accept_expected_language() {
-        let expression =
-            PathExpr::zero_or_more(Label::Lexical).then(PathExpr::label(Label::Declaration));
-        let after_lexical = expression.derivative(&Label::Lexical);
-        assert!(!after_lexical.nullable());
-        assert!(after_lexical.derivative(&Label::Declaration).nullable());
-        assert!(expression.derivative(&Label::Declaration).nullable());
-    }
-
-    #[test]
-    fn label_regex_macros_use_standard_regular_operators() {
-        let expression: PathExpr<Label> = crate::label_regex!(Label::Lexical * Label::Declaration);
-        let after_lexical = expression.derivative(&Label::Lexical);
-        assert!(!after_lexical.nullable());
-        assert!(after_lexical.derivative(&Label::Declaration).nullable());
-
-        let one_or_more: PathExpr<Label> = crate::label_regex!(Label::Lexical+);
-        assert!(!one_or_more.nullable());
-        assert!(one_or_more.derivative(&Label::Lexical).nullable());
-
-        let relative = crate::relative_label_regex!((Label::Lexical | Label::Declaration)?);
-        assert!(relative.nullable());
-        assert!(relative.derivative(&Label::Lexical).nullable());
-    }
-
-    #[test]
-    fn resolution_returns_all_matching_datums_on_one_scope() {
-        let scope = Scope::<Domain>::allocated(0);
-        let answers = resolve_indexed(
-            scope,
-            PathExpr::<Label>::Epsilon,
-            |_| true,
-            |_, _| {
-                (
-                    Vec::new(),
-                    vec![
-                        ScopeDatum::<Domain> { scope, datum: 1 },
-                        ScopeDatum::<Domain> { scope, datum: 2 },
-                    ],
-                )
-            },
-        );
-        assert_eq!(answers.len(), 2);
-    }
-}
+#[path = "../../../tests/unit/component_scope_query.rs"]
+mod tests;

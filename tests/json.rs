@@ -9,18 +9,18 @@ use std::{
 use color_print::cprintln;
 use common::{
     json::{JsonDocument, JsonToken},
-    until::print_json_ast,
+    utils::print_json_ast,
 };
 use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{AccessKind, AccessMode, DataChange, ModifyKind, RenameMode},
 };
 use plingo::{
-    Graph, Subscription, ViewUpdate,
+    Graph, ReadGraph, Subscription, ViewUpdate,
     component::{
         lex::LexerNode,
         parse::{AstSnapshot, ParseRoots, ParseSnapshot, ParserNode, grammar::Grammar},
-        source::{SourceEdit, SourceNode},
+        source::{SourceEdit, SourceInput},
     },
     utils::Span,
 };
@@ -51,7 +51,7 @@ impl DebugSink {
             cprintln!("<red>  parser snapshot removed</>");
             return Ok(());
         };
-        if let Some(roots) = graph.read::<ParseRoots<JsonToken, JsonDocument>>(snapshot.uri()) {
+        if let Some(roots) = graph.get::<ParseRoots<JsonToken, JsonDocument>>(snapshot.uri()) {
             print_json_ast(graph, roots.as_ref());
         }
         Ok(())
@@ -132,17 +132,18 @@ fn test_json_runtime() {
     graph
         .install(ParserNode::<JsonToken, JsonDocument>::from_parser(parser))
         .unwrap();
-    graph.command(SourceNode::load(uri)).unwrap();
+    graph.command(SourceInput::load(uri)).unwrap();
     graph
-        .command(SourceNode::apply(SourceEdit::Insert {
+        .command(SourceInput::apply(SourceEdit::Insert {
             key: Span::point_uri(uri, 0).unwrap(),
             value: current.clone(),
         }))
         .unwrap();
 
-    let subscription = graph
-        .subscribe::<ParserNode<JsonToken, JsonDocument>>(uri)
+    let _demand = graph
+        .demand::<ParserNode<JsonToken, JsonDocument>>(uri)
         .unwrap();
+    let subscription = graph.subscribe::<ParseSnapshot<JsonToken>>(uri).unwrap();
     let mut sink = DebugSink::new();
     sink.consume(&graph, subscription.recv().unwrap()).unwrap();
 
@@ -218,7 +219,7 @@ fn test_json_runtime() {
             }
         }
 
-        match graph.command(SourceNode::apply_all(edits)) {
+        match graph.command(SourceInput::apply_all(edits)) {
             Ok(()) => {
                 drain_parser_updates(&mut sink, &graph, &subscription).unwrap();
                 current = next;

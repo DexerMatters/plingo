@@ -7,7 +7,7 @@ use std::{ops::Range, sync::Arc};
 
 use crate::{
     component::source::{SourceDelta, SourceEdit, SourceSplice},
-    scheme::node::{Command, CommandCx, Graph, NodeError, View},
+    scheme::node::{Command, CommandCx, InputNode, NodeError, PortDeclaration, View, ViewFamily},
 };
 use fluent_uri::Uri;
 
@@ -22,30 +22,43 @@ impl View for DocumentText {
 /// The exact edit sequence that produced the current [`DocumentText`] value.
 /// Consumers use it to retain incremental boundaries without diffing complete
 /// document strings.
-pub(crate) struct DocumentChange;
+pub struct DocumentChange;
 
 impl View for DocumentChange {
     type Key = Uri<&'static str>;
     type Value = Arc<SourceDelta>;
 }
 
-/// Root component for source documents.
-///
-/// Root components do not derive another view: commands are their authority.
-/// `SourceNode` is therefore a namespace for the document view and commands,
-/// rather than a fake pass-through node.
+/// Declared input ports for one source-document authority.
+pub struct SourceViews;
+
+impl ViewFamily for SourceViews {
+    fn declaration() -> Vec<PortDeclaration> {
+        vec![
+            PortDeclaration::map::<DocumentText>(),
+            PortDeclaration::map::<DocumentChange>(),
+        ]
+    }
+}
+
+/// First-class input-node authority for source documents. It has no derive
+/// function: commands author its ports directly.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct SourceNode;
+pub struct SourceInput;
 
-impl SourceNode {
-    pub const fn new() -> Self {
-        Self
+impl InputNode for SourceInput {
+    type Key = Uri<&'static str>;
+    type Views = SourceViews;
+
+    fn schema() -> crate::scheme::node::NodeSchema {
+        crate::scheme::node::NodeSchema::new(
+            std::any::type_name::<Self>(),
+            Self::Views::declaration(),
+        )
     }
+}
 
-    pub fn text(graph: &Graph, uri: Uri<&'static str>) -> Option<Arc<str>> {
-        graph.read::<DocumentText>(uri)
-    }
-
+impl SourceInput {
     pub fn apply(edit: SourceEdit) -> ApplySourceEdit {
         ApplySourceEdit { edit }
     }
@@ -105,9 +118,7 @@ impl Command for ApplySourceEdits {
                 "an atomic source edit batch must target one document",
             ));
         }
-        let previous = cx
-            .read::<DocumentText>(uri)
-            .unwrap_or_else(|| Arc::from(""));
+        let previous = cx.get::<DocumentText>(uri).unwrap_or_else(|| Arc::from(""));
         let mut text = previous.to_string();
         let mut pieces = vec![Piece::Original(0..previous.len())];
         for edit in &self.edits {
@@ -138,7 +149,7 @@ impl Command for LoadSource {
     type Output = ();
 
     fn apply(self, cx: &mut CommandCx<'_, '_>) -> Result<(), NodeError> {
-        if cx.read::<DocumentText>(self.uri).is_none() {
+        if cx.get::<DocumentText>(self.uri).is_none() {
             cx.set::<DocumentText>(self.uri, Arc::from(""))?;
             cx.set::<DocumentChange>(self.uri, Arc::new(SourceDelta::default()))?;
         }
@@ -159,7 +170,7 @@ impl Command for LoadSourceText {
     type Output = ();
 
     fn apply(self, cx: &mut CommandCx<'_, '_>) -> Result<(), NodeError> {
-        if cx.read::<DocumentText>(self.uri).is_none() {
+        if cx.get::<DocumentText>(self.uri).is_none() {
             let length = self.text.len();
             cx.set::<DocumentText>(self.uri, Arc::clone(&self.text))?;
             cx.set::<DocumentChange>(
@@ -342,115 +353,5 @@ fn checked_boundary(text: &str, offset: usize) -> Result<usize, NodeError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{scheme::node::ViewUpdate, utils::Span};
-
-    #[test]
-    fn source_edits_reject_non_boundary_offsets() {
-        let uri = Span::new("test://node-source-boundary", 0, 0).unwrap().uri;
-        let mut graph = Graph::new();
-        graph.command(SourceNode::load(uri)).unwrap();
-        graph
-            .command(SourceNode::apply(SourceEdit::Insert {
-                key: Span::point_uri(uri, 0).unwrap(),
-                value: "α".into(),
-            }))
-            .unwrap();
-
-        let error = graph
-            .command(SourceNode::apply(SourceEdit::Insert {
-                key: Span::point_uri(uri, 1).unwrap(),
-                value: "x".into(),
-            }))
-            .expect_err("a byte inside a UTF-8 code point must not be rounded");
-        assert!(error.to_string().contains("UTF-8 boundary"));
-        assert_eq!(SourceNode::text(&graph, uri).as_deref(), Some("α"));
-    }
-
-    #[test]
-    fn batched_replacements_publish_disjoint_revision_splices() {
-        let uri = Span::new("test://node-source-splices", 0, 0).unwrap().uri;
-        let base = "head=11111;middle;tail=22222";
-        let mut graph = Graph::new();
-        graph.command(SourceNode::load(uri)).unwrap();
-        graph
-            .command(SourceNode::apply(SourceEdit::Insert {
-                key: Span::point_uri(uri, 0).unwrap(),
-                value: base.into(),
-            }))
-            .unwrap();
-        let first = base.find("11111").unwrap();
-        let second = base.find("22222").unwrap();
-        graph
-            .command(SourceNode::apply_all(vec![
-                SourceEdit::Delete {
-                    key: Span::new_uri(uri, first, first + 5).unwrap(),
-                },
-                SourceEdit::Insert {
-                    key: Span::point_uri(uri, first).unwrap(),
-                    value: "54321".into(),
-                },
-                SourceEdit::Delete {
-                    key: Span::new_uri(uri, second, second + 5).unwrap(),
-                },
-                SourceEdit::Insert {
-                    key: Span::point_uri(uri, second).unwrap(),
-                    value: "76543".into(),
-                },
-            ]))
-            .unwrap();
-
-        let delta = graph.read::<DocumentChange>(uri).unwrap();
-        assert_eq!(delta.splices.len(), 2);
-        assert_eq!(delta.splices[0].old_range, first..first + 5);
-        assert_eq!(delta.splices[0].inserted.as_ref(), "54321");
-        assert_eq!(delta.splices[1].old_range, second..second + 5);
-        assert_eq!(delta.splices[1].inserted.as_ref(), "76543");
-        assert_eq!(
-            SourceNode::text(&graph, uri).as_deref(),
-            Some("head=54321;middle;tail=76543")
-        );
-    }
-
-    #[test]
-    fn source_node_commands_are_versioned_and_subscribable() {
-        let uri = Span::new("test://node-source", 0, 0).unwrap().uri;
-        let mut graph = Graph::new();
-        graph.command(SourceNode::load(uri)).unwrap();
-        assert_eq!(SourceNode::text(&graph, uri).as_deref(), Some(""));
-
-        graph
-            .command(SourceNode::apply(SourceEdit::Insert {
-                key: Span::point_uri(uri, 0).unwrap(),
-                value: "α".into(),
-            }))
-            .unwrap();
-        let snapshot = graph.snapshot();
-        let subscription = graph
-            .subscribe_view::<DocumentText>(uri)
-            .expect("loaded source is materialized");
-        assert!(matches!(
-            subscription.recv().unwrap(),
-            ViewUpdate::Initial { .. }
-        ));
-
-        graph
-            .command(SourceNode::apply(SourceEdit::Insert {
-                key: Span::point_uri(uri, "α".len()).unwrap(),
-                value: "β".into(),
-            }))
-            .unwrap();
-        assert_eq!(
-            subscription.recv().unwrap(),
-            ViewUpdate::Changed {
-                snapshot: graph.revision(),
-                value: Arc::from("αβ"),
-            }
-        );
-        assert_eq!(
-            graph.read_at::<DocumentText>(&snapshot, uri).as_deref(),
-            Some("α")
-        );
-    }
-}
+#[path = "../../../tests/unit/component_source_node.rs"]
+mod tests;

@@ -17,14 +17,16 @@ mod state;
 
 pub use actor::{GraphActor, GraphActorError, GraphHandle, GraphRuntime};
 pub use api::{
-    Command, ComponentState, IndexedRelation, Node, NodeError, NodeKey, NodeValue, Relation,
-    SnapshotId, View,
+    Command, ComponentState, DefinitionEdge, EdgeKind, IndexedRelation, InputNode, NodeError,
+    NodeInspection, NodeKey, NodeProvider, NodeSchema, NodeValue, PortDeclaration, PortKind,
+    ReadGraph, Relation, SnapshotId, View, ViewFamily,
 };
 pub use engine::{CommandCx, DeriveCx, ReclaimCx};
 pub use graph::{
-    EffectFailure, Graph, GraphReader, RelationEffectResult, RelationSubscription, RelationUpdate,
-    RequestHandle, Snapshot, Subscription, ViewUpdate,
+    DemandLease, EffectFailure, Graph, GraphReader, RelationEffectResult, RelationSubscription,
+    RelationUpdate, Snapshot, Subscription, ViewUpdate,
 };
 
 #[cfg(test)]
+#[path = "../../tests/unit/scheme_node.rs"]
 mod tests;

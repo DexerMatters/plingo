@@ -1,4 +1,4 @@
-use super::api::{IndexedRelation, Node, NodeKey, NodeValue, Relation, View};
+use super::api::{IndexedRelation, NodeKey, NodeProvider, NodeValue, Relation, View};
 use std::{
     any::{Any, TypeId},
     fmt,
@@ -186,6 +186,8 @@ pub(crate) fn relation_bucket_for<R: IndexedRelation>(
 pub(crate) enum DependencyId {
     View(FactId),
     Relation(RelationFactId),
+    /// A whole relation scan, including when the relation is empty.
+    RelationType(TypeId),
     /// One indexed relation bucket, including a bucket that was empty when
     /// observed.
     RelationBucket(RelationBucketId),
@@ -193,14 +195,14 @@ pub(crate) enum DependencyId {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TaskId {
-    pub(crate) node: TypeId,
+    pub(crate) provider: TypeId,
     pub(crate) key: KeyId,
 }
 
 impl TaskId {
-    pub(crate) fn new<N: Node>(key: N::Key) -> Self {
+    pub(crate) fn new<P: NodeProvider>(key: P::Key) -> Self {
         Self {
-            node: TypeId::of::<N>(),
+            provider: TypeId::of::<P>(),
             key: KeyId::new(key),
         }
     }

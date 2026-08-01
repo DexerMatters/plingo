@@ -22,14 +22,11 @@ regex-automata = "0.4.14"
 rand = "0.10"
 rand_regex = "0.19.0"
 
-# For async streams
-async-stream = "0.3.6"
-tokio-stream = "0.1.17"
-
 # For logging
 log = "0.4.29"
 env_logger = "0.11.10"
 color-print = "0.3.7"
+terminal_size = "0.4.4"
 
 # For error handling
 anyhow = "1.0.102"
@@ -49,5 +46,3 @@ version = "0.7"
 [dev-dependencies]
 notify = "8.2.0"
 similar = "3.1.1"
-trybuild = "1.0.114"
-workspace_root = "0.2.0"

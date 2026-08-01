@@ -6,7 +6,7 @@
 //! or leaves the published snapshot unchanged.
 
 use super::{
-    Command, Graph, GraphReader, Node, NodeError, Relation, RelationSubscription, RequestHandle,
+    Command, Graph, GraphReader, NodeError, NodeProvider, Relation, RelationSubscription,
     Subscription, View,
 };
 use std::fmt;
@@ -23,7 +23,7 @@ type GraphWork = Box<dyn FnOnce(&mut Graph) + Send + 'static>;
 #[derive(Debug, Error)]
 pub enum GraphActorError {
     #[error(transparent)]
-    Node(#[from] NodeError),
+    Graph(#[from] NodeError),
     #[error("the graph actor has stopped")]
     Closed,
     #[error("the graph operation was cancelled before it began")]
@@ -67,9 +67,9 @@ impl GraphHandle {
         reply_receiver.await.map_err(|_| GraphActorError::Closed)?
     }
 
-    /// Installs a node implementation on the graph actor.
-    pub async fn install<N: Node>(&self, node: N) -> Result<(), GraphActorError> {
-        self.call(move |graph| graph.install(node)).await
+    /// Installs one provider on the graph actor.
+    pub async fn install<P: NodeProvider>(&self, provider: P) -> Result<(), GraphActorError> {
+        self.call(move |graph| graph.install(provider)).await
     }
 
     /// Applies one root command atomically.
@@ -105,36 +105,33 @@ impl GraphHandle {
             };
             let _ = reply_sender.send(result);
         });
-        tokio::select! {
-            _ = cancel.cancelled() => Err(GraphActorError::Cancelled),
-            sent = self.sender.send(work) => {
-                sent.map_err(|_| GraphActorError::Closed)?;
-                reply_receiver.await.map_err(|_| GraphActorError::Closed)?
-            }
-        }
+        // Do not race cancellation against `send`: a successful send has
+        // already enqueued work, so returning here could report cancellation
+        // while the actor later commits the command. The actor checks the
+        // token immediately before it starts the transaction instead.
+        self.sender
+            .send(work)
+            .await
+            .map_err(|_| GraphActorError::Closed)?;
+        reply_receiver.await.map_err(|_| GraphActorError::Closed)?
     }
 
-    /// Requests a derived node and returns its normal RAII demand handle.
-    pub async fn request<N: Node>(&self, key: N::Key) -> Result<RequestHandle<N>, GraphActorError> {
-        self.call(move |graph| graph.request::<N>(key)).await
+    /// Demands one provider instance until the returned lease is dropped.
+    pub async fn demand<P: NodeProvider>(
+        &self,
+        key: P::Key,
+    ) -> Result<super::DemandLease, GraphActorError> {
+        self.call(move |graph| graph.demand::<P>(key)).await
     }
 
     /// Subscribes to a materialized view. The returned subscription keeps the
     /// existing exact, unbounded update contract; callers may bridge it to an
     /// async stream if they need per-transition delivery.
-    pub async fn subscribe_view<V: View>(
+    pub async fn subscribe<V: View>(
         &self,
         key: V::Key,
     ) -> Result<Subscription<V>, GraphActorError> {
-        self.call(move |graph| graph.subscribe_view::<V>(key)).await
-    }
-
-    /// Activates and subscribes to a node's primary output.
-    pub async fn subscribe<N: Node>(
-        &self,
-        key: N::Key,
-    ) -> Result<Subscription<N::Output>, GraphActorError> {
-        self.call(move |graph| graph.subscribe::<N>(key)).await
+        self.call(move |graph| graph.subscribe::<V>(key)).await
     }
 
     /// Subscribes to one relation presence transition.
@@ -146,8 +143,8 @@ impl GraphHandle {
             .await
     }
 
-    /// Processes leases dropped by requests and subscriptions when no later
-    /// mutation is otherwise sent to the graph actor.
+    /// Processes leases dropped by demands when no later mutation is otherwise
+    /// sent to the graph actor.
     pub async fn collect_garbage(&self) -> Result<(), GraphActorError> {
         self.call(Graph::collect_garbage).await
     }
@@ -256,52 +253,5 @@ impl GraphActor {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scheme::node::{CommandCx, View};
-
-    struct Value;
-    impl View for Value {
-        type Key = String;
-        type Value = String;
-    }
-
-    struct Set(&'static str);
-    impl Command for Set {
-        type Output = ();
-
-        fn apply(self, cx: &mut CommandCx<'_, '_>) -> Result<(), NodeError> {
-            cx.set::<Value>("value".into(), self.0.into())
-        }
-    }
-
-    #[tokio::test]
-    async fn actor_serializes_commands_and_publishes_reader_snapshots() {
-        let runtime = GraphRuntime::spawn(Graph::new(), 4);
-        let handle = runtime.handle();
-        let first = handle.command(Set("one"));
-        let second = handle.command(Set("two"));
-        let (first, second) = tokio::join!(first, second);
-        first.unwrap();
-        second.unwrap();
-
-        let snapshot = handle.reader().snapshot();
-        assert_eq!(snapshot.read::<Value>("value".into()), Some("two".into()));
-        assert_eq!(snapshot.id(), 2);
-        runtime.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn queued_cancelled_command_does_not_mutate_the_graph() {
-        let runtime = GraphRuntime::spawn(Graph::new(), 1);
-        let handle = runtime.handle();
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        assert!(matches!(
-            handle.command_with_cancel(Set("cancelled"), cancel).await,
-            Err(GraphActorError::Cancelled)
-        ));
-        assert_eq!(handle.reader().read::<Value>("value".into()), None);
-        runtime.shutdown().await.unwrap();
-    }
-}
+#[path = "../../../tests/unit/scheme_node_actor.rs"]
+mod tests;

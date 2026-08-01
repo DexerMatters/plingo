@@ -1,6 +1,9 @@
 use super::{
     SnapshotId,
-    api::{ComponentState, IndexedRelation, Node, NodeError, Relation, View},
+    api::{
+        ComponentState, IndexedRelation, NodeError, NodeProvider, NodeSchema, ReadGraph, Relation,
+        View,
+    },
     graph::read_from_state,
     identity::{
         DependencyId, ErasedValue, FactId, RelationBucketId, RelationFactId, RelationIndexer,
@@ -10,12 +13,14 @@ use super::{
 };
 use std::{
     any::{Any, TypeId, type_name},
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
-pub(crate) trait ErasedNode: Send + Sync {
+pub(crate) trait ErasedProvider: Send + Sync {
     fn name(&self) -> &'static str;
+    fn schema(&self) -> NodeSchema;
     fn run<'nodes>(
         &self,
         transaction: &mut Transaction<'nodes>,
@@ -28,11 +33,14 @@ pub(crate) trait ErasedNode: Send + Sync {
     ) -> Result<(), NodeError>;
 }
 
-pub(crate) struct NodeEntry<N>(pub(crate) N);
+pub(crate) struct ProviderEntry<P>(pub(crate) P);
 
-impl<N: Node> ErasedNode for NodeEntry<N> {
+impl<P: NodeProvider> ErasedProvider for ProviderEntry<P> {
     fn name(&self) -> &'static str {
-        type_name::<N>()
+        type_name::<P>()
+    }
+    fn schema(&self) -> NodeSchema {
+        P::schema()
     }
 
     fn run<'nodes>(
@@ -42,18 +50,19 @@ impl<N: Node> ErasedNode for NodeEntry<N> {
     ) -> Result<(), NodeError> {
         let key = task
             .key
-            .get::<N::Key>()
-            .ok_or(NodeError::MissingNode(type_name::<N>()))?;
+            .get::<P::Key>()
+            .ok_or(NodeError::MissingProvider(type_name::<P>()))?;
         let (transaction, dependencies, outputs, relations, children) = {
             let mut cx = DeriveCx {
                 transaction,
-                dependencies: HashSet::new(),
+                schema: self.schema(),
+                dependencies: RefCell::new(HashSet::new()),
+                indexers: RefCell::new(HashMap::new()),
                 outputs: HashMap::new(),
                 relations: HashSet::new(),
                 children: HashSet::new(),
             };
-            let output = self.0.derive(&mut cx, key.clone())?;
-            cx.emit::<N::Output>(key, output)?;
+            self.0.derive(&mut cx, key)?;
             cx.finish()
         };
         transaction.replace_task_outputs(task, dependencies, outputs, relations, children)
@@ -66,15 +75,17 @@ impl<N: Node> ErasedNode for NodeEntry<N> {
     ) -> Result<(), NodeError> {
         let key = task
             .key
-            .get::<N::Key>()
-            .ok_or(NodeError::MissingNode(type_name::<N>()))?;
-        let mut cx = ReclaimCx { transaction };
-        self.0.reclaim(&mut cx, key)
+            .get::<P::Key>()
+            .ok_or(NodeError::MissingProvider(type_name::<P>()))?;
+        self.0.reclaim(&mut ReclaimCx { transaction }, key)
     }
 }
 
+pub(crate) type DeferredChildFactory = Box<dyn Fn(&TaskId) -> Option<TaskId> + Send + Sync>;
+
 pub(crate) struct Transaction<'a> {
-    nodes: &'a HashMap<TypeId, Arc<dyn ErasedNode>>,
+    providers: &'a HashMap<TypeId, Arc<dyn ErasedProvider>>,
+    deferred_children: &'a HashMap<TypeId, Vec<DeferredChildFactory>>,
     pub(crate) state: GraphState,
     target: SnapshotId,
     pending: VecDeque<TaskId>,
@@ -111,13 +122,15 @@ impl<T: Clone + Send + Sync + 'static> StagedComponentState for StagedState<T> {
 
 impl<'a> Transaction<'a> {
     pub(crate) fn new(
-        nodes: &'a HashMap<TypeId, Arc<dyn ErasedNode>>,
+        providers: &'a HashMap<TypeId, Arc<dyn ErasedProvider>>,
+        deferred_children: &'a HashMap<TypeId, Vec<DeferredChildFactory>>,
         mut state: GraphState,
         target: SnapshotId,
     ) -> Self {
         state.revision = target;
         Self {
-            nodes,
+            providers,
+            deferred_children,
             state,
             target,
             pending: VecDeque::new(),
@@ -135,12 +148,19 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    fn registered_children(&self, parent: &TaskId) -> Vec<TaskId> {
+        self.deferred_children
+            .get(&parent.provider)
+            .into_iter()
+            .flatten()
+            .filter_map(|factory| factory(parent))
+            .collect()
+    }
+
     pub(crate) fn run_pending(&mut self) -> Result<(), NodeError> {
         while !self.pending.is_empty() || !self.orphaned.is_empty() {
             if let Some(task) = self.pending.pop_front() {
-                if self.pending_set.contains(&task) {
-                    self.run_node(task)?;
-                }
+                self.run_node(task)?;
             } else if let Some(task) = self.orphaned.pop_front() {
                 self.orphaned_set.remove(&task);
                 self.reclaim_task(task)?;
@@ -188,37 +208,34 @@ impl<'a> Transaction<'a> {
         }
         if self.running.contains(&task) {
             return Err(NodeError::DependencyCycle(
-                self.nodes
-                    .get(&task.node)
+                self.providers
+                    .get(&task.provider)
                     .map_or("<unknown node>", |node| node.name()),
             ));
         }
         let node = self
-            .nodes
-            .get(&task.node)
+            .providers
+            .get(&task.provider)
             .cloned()
-            .ok_or(NodeError::MissingNode("<unknown node>"))?;
+            .ok_or(NodeError::MissingProvider("<unknown node>"))?;
         self.running.push(task.clone());
         let result = node.run(self, task);
         self.running.pop();
         result
     }
 
-    fn read<V: View>(&self, key: V::Key) -> Option<V::Value> {
-        read_from_state::<V>(&self.state, key)
-    }
-
     fn set_root<V: View>(&mut self, key: V::Key, value: V::Value) -> Result<(), NodeError> {
         let fact = FactId::new::<V>(key);
         if let Some(owner) = self.state.fact_owners.get(&fact) {
             return Err(NodeError::RootOutputConflict(
-                self.nodes
-                    .get(&owner.node)
+                self.providers
+                    .get(&owner.provider)
                     .map_or("<unknown node>", |node| node.name()),
             ));
         }
         self.write_fact(fact.clone(), boxed_value(value));
         self.state.root_facts.insert(fact);
+
         Ok(())
     }
 
@@ -263,14 +280,10 @@ impl<'a> Transaction<'a> {
             .ok_or_else(|| NodeError::message("component state type mismatch"))
     }
 
-    fn ensure_relation_index<R: IndexedRelation>(&mut self) {
-        let relation = TypeId::of::<R>();
+    fn register_relation_index(&mut self, relation: TypeId, indexer: RelationIndexer) {
         if self.state.relation_indexers.contains_key(&relation) {
             return;
         }
-        let indexer = RelationIndexer {
-            bucket_for: relation_bucket_for::<R>,
-        };
         self.state.relation_indexers.insert(relation, indexer);
         for fact in self
             .state
@@ -350,22 +363,22 @@ impl<'a> Transaction<'a> {
         relations: HashSet<RelationFactId>,
         children: HashSet<TaskId>,
     ) -> Result<(), NodeError> {
-        let node_name = self
-            .nodes
-            .get(&task.node)
-            .map_or("<unknown node>", |node| node.name());
+        let provider_name = self
+            .providers
+            .get(&task.provider)
+            .map_or("<unknown provider>", |provider| provider.name());
         for fact in outputs.keys() {
             if self.state.root_facts.contains(fact) {
-                return Err(NodeError::OutputRootConflict(node_name));
+                return Err(NodeError::OutputRootConflict(provider_name));
             }
             if let Some(owner) = self.state.fact_owners.get(fact)
                 && owner != &task
             {
                 return Err(NodeError::OutputConflict {
-                    node: node_name,
+                    provider: provider_name,
                     owner: self
-                        .nodes
-                        .get(&owner.node)
+                        .providers
+                        .get(&owner.provider)
                         .map_or("<unknown node>", |node| node.name()),
                 });
             }
@@ -400,6 +413,7 @@ impl<'a> Transaction<'a> {
                     self.schedule_dependents(DependencyId::RelationBucket(bucket));
                 }
                 self.schedule_dependents(DependencyId::Relation(relation.clone()));
+                self.schedule_dependents(DependencyId::RelationType(relation.relation));
             }
         }
         self.state
@@ -432,6 +446,7 @@ impl<'a> Transaction<'a> {
                     self.schedule_dependents(DependencyId::RelationBucket(bucket));
                 }
                 self.schedule_dependents(DependencyId::Relation(relation.clone()));
+                self.schedule_dependents(DependencyId::RelationType(relation.relation));
             }
         }
     }
@@ -526,10 +541,10 @@ impl<'a> Transaction<'a> {
         self.replace_task_children(task.clone(), HashSet::new());
 
         let node = self
-            .nodes
-            .get(&task.node)
+            .providers
+            .get(&task.provider)
             .cloned()
-            .ok_or(NodeError::MissingNode("<unknown node>"))?;
+            .ok_or(NodeError::MissingProvider("<unknown node>"))?;
         node.reclaim(self, task)
     }
 
@@ -555,25 +570,31 @@ pub(crate) fn commit_component_states(component_states: Vec<Box<dyn StagedCompon
     }
 }
 
-/// Context available to a node while deriving one keyed output set.
+type DerivePublication<'transaction, 'nodes> = (
+    &'transaction mut Transaction<'nodes>,
+    HashSet<DependencyId>,
+    HashMap<FactId, Arc<dyn ErasedValue>>,
+    HashSet<RelationFactId>,
+    HashSet<TaskId>,
+);
+
+/// Context available to a provider while deriving one keyed publication set.
 pub struct DeriveCx<'transaction, 'nodes> {
     transaction: &'transaction mut Transaction<'nodes>,
-    dependencies: HashSet<DependencyId>,
+    schema: NodeSchema,
+    dependencies: RefCell<HashSet<DependencyId>>,
+    indexers: RefCell<HashMap<TypeId, RelationIndexer>>,
     outputs: HashMap<FactId, Arc<dyn ErasedValue>>,
     relations: HashSet<RelationFactId>,
     children: HashSet<TaskId>,
 }
 
 impl<'transaction, 'nodes> DeriveCx<'transaction, 'nodes> {
-    /// Reads a view and records a dynamic invalidation dependency.
-    pub fn observe<V: View>(&mut self, key: V::Key) -> Result<V::Value, NodeError> {
-        let fact = FactId::new::<V>(key.clone());
-        // Absence is information too: a node that handles a missing view must
-        // rerun once the view is later materialized.
-        self.dependencies.insert(DependencyId::View(fact));
-        self.transaction
-            .read::<V>(key)
-            .ok_or(NodeError::MissingView(type_name::<V>()))
+    /// Reads a current value without adding an invalidation dependency. This is
+    /// for coordinators deciding whether to schedule work for a newly emitted
+    /// semantic publication.
+    pub(crate) fn peek<V: View>(&self, key: V::Key) -> Option<V::Value> {
+        read_from_state::<V>(&self.transaction.state, key)
     }
 
     /// Returns this transaction's mutable staged copy of component state.
@@ -587,69 +608,58 @@ impl<'transaction, 'nodes> DeriveCx<'transaction, 'nodes> {
         self.transaction.component_state_mut(state)
     }
 
-    /// Ensures another node's primary output exists without making this task
-    /// depend on that output. Pair this with a narrower secondary view when a
-    /// coordinator only needs materialization, not every primary revision.
-    pub fn materialize<N: Node>(&mut self, key: N::Key) -> Result<(), NodeError> {
-        let task = TaskId::new::<N>(key);
+    /// Materializes another provider and records a typed keeps-alive edge.
+    pub fn materialize<P: NodeProvider>(&mut self, key: P::Key) -> Result<(), NodeError> {
+        let task = TaskId::new::<P>(key);
         self.transaction.run_node(task.clone())?;
         self.children.insert(task);
         Ok(())
     }
 
-    /// Ensures another node's primary output exists and observes it.
-    pub fn require<N: Node>(
-        &mut self,
-        key: N::Key,
-    ) -> Result<<N::Output as View>::Value, NodeError> {
-        let task = TaskId::new::<N>(key.clone());
-        self.transaction.run_node(task.clone())?;
+    /// Schedules a provider child after this task's publication replacement.
+    pub fn defer<P: NodeProvider>(&mut self, key: P::Key) {
+        let task = TaskId::new::<P>(key);
+        self.transaction.schedule(task.clone());
         self.children.insert(task);
-        self.observe::<N::Output>(key)
     }
 
-    /// Observes whether a relation fact is present and records a dependency on
-    /// its support set.
-    pub fn observe_relation<R: Relation>(&mut self, fact: R::Fact) -> bool {
-        let relation = RelationFactId::new::<R>(fact);
-        let present = self
-            .transaction
-            .state
-            .relation_supports
-            .contains_key(&relation);
-        self.dependencies.insert(DependencyId::Relation(relation));
-        present
+    /// Defers every provider child connected to the current provider.
+    /// Children run only after the parent's facts commit, so they observe a
+    /// complete parser publication rather than partially emitted candidates.
+    pub(crate) fn defer_connected<P: NodeProvider>(&mut self, key: P::Key) {
+        let parent = TaskId::new::<P>(key);
+        for child in self.transaction.registered_children(&parent) {
+            self.transaction.schedule(child.clone());
+            self.children.insert(child);
+        }
     }
 
-    /// Reads facts in one indexed relation bucket and records a dependency on
-    /// that bucket, including when it is currently empty.
-    pub fn relation_facts_at<R: IndexedRelation>(&mut self, index: R::Index) -> Vec<R::Fact> {
-        self.transaction.ensure_relation_index::<R>();
-        let bucket = RelationBucketId::new::<R>(index);
-        self.dependencies
-            .insert(DependencyId::RelationBucket(bucket.clone()));
-        self.transaction
-            .state
-            .relation_buckets
-            .get(&bucket)
-            .into_iter()
-            .flatten()
-            .filter_map(RelationFactId::get::<R>)
-            .collect()
-    }
-
-    /// Emits one relation fact.  The fact remains visible while any other node
-    /// also emits it, and is retracted after this node's final support is gone.
+    /// Emits one relation fact. The fact remains visible while any other
+    /// provider also supports it, and is retracted after final support is gone.
     pub fn emit_relation<R: Relation>(&mut self, fact: R::Fact) -> Result<(), NodeError> {
+        if !self.schema.declares_relation::<R>() {
+            return Err(NodeError::UndeclaredPort {
+                provider: self.schema.provider,
+                port: type_name::<R>(),
+                kind: "relation",
+            });
+        }
         if !self.relations.insert(RelationFactId::new::<R>(fact)) {
             return Err(NodeError::DuplicateOutput(type_name::<R>()));
         }
         Ok(())
     }
 
-    /// Emits an additional owned output.  It is retracted automatically when
-    /// the current node run no longer emits it.
+    /// Emits an additional owned port fact, retracted when this provider run
+    /// no longer publishes it.
     pub fn emit<V: View>(&mut self, key: V::Key, value: V::Value) -> Result<(), NodeError> {
+        if !self.schema.declares_map::<V>() {
+            return Err(NodeError::UndeclaredPort {
+                provider: self.schema.provider,
+                port: type_name::<V>(),
+                kind: "map",
+            });
+        }
         let fact = FactId::new::<V>(key);
         if self.outputs.insert(fact, boxed_value(value)).is_some() {
             return Err(NodeError::DuplicateOutput(type_name::<V>()));
@@ -657,22 +667,70 @@ impl<'transaction, 'nodes> DeriveCx<'transaction, 'nodes> {
         Ok(())
     }
 
-    fn finish(
-        self,
-    ) -> (
-        &'transaction mut Transaction<'nodes>,
-        HashSet<DependencyId>,
-        HashMap<FactId, Arc<dyn ErasedValue>>,
-        HashSet<RelationFactId>,
-        HashSet<TaskId>,
-    ) {
+    fn finish(self) -> DerivePublication<'transaction, 'nodes> {
+        for (relation, indexer) in self.indexers.into_inner() {
+            self.transaction.register_relation_index(relation, indexer);
+        }
         (
             self.transaction,
-            self.dependencies,
+            self.dependencies.into_inner(),
             self.outputs,
             self.relations,
             self.children,
         )
+    }
+}
+
+impl ReadGraph for DeriveCx<'_, '_> {
+    fn get<V: View>(&self, key: V::Key) -> Option<V::Value> {
+        let fact = FactId::new::<V>(key.clone());
+        self.dependencies
+            .borrow_mut()
+            .insert(DependencyId::View(fact));
+        read_from_state::<V>(&self.transaction.state, key)
+    }
+
+    fn contains<R: Relation>(&self, fact: R::Fact) -> bool {
+        let relation = RelationFactId::new::<R>(fact);
+        self.dependencies
+            .borrow_mut()
+            .insert(DependencyId::Relation(relation.clone()));
+        self.transaction
+            .state
+            .relation_supports
+            .contains_key(&relation)
+    }
+
+    fn scan<R: IndexedRelation>(&self, index: R::Index) -> Vec<R::Fact> {
+        self.indexers
+            .borrow_mut()
+            .entry(TypeId::of::<R>())
+            .or_insert(RelationIndexer {
+                bucket_for: relation_bucket_for::<R>,
+            });
+        let bucket = RelationBucketId::new::<R>(index.clone());
+        self.dependencies
+            .borrow_mut()
+            .insert(DependencyId::RelationBucket(bucket));
+        self.transaction
+            .state
+            .relation_supports
+            .keys()
+            .filter_map(RelationFactId::get::<R>)
+            .filter(|fact| R::index(fact) == index)
+            .collect()
+    }
+
+    fn scan_all<R: Relation>(&self) -> Vec<R::Fact> {
+        self.dependencies
+            .borrow_mut()
+            .insert(DependencyId::RelationType(TypeId::of::<R>()));
+        self.transaction
+            .state
+            .relation_supports
+            .keys()
+            .filter_map(RelationFactId::get::<R>)
+            .collect()
     }
 }
 
@@ -684,7 +742,7 @@ pub struct ReclaimCx<'transaction, 'nodes> {
 }
 
 impl<'transaction, 'nodes> ReclaimCx<'transaction, 'nodes> {
-    /// Returns this transaction's staged copy of node-private state.
+    /// Returns this transaction's staged copy of provider-private state.
     pub fn state_mut<T: Clone + Send + Sync + 'static>(
         &mut self,
         state: &ComponentState<T>,
@@ -695,18 +753,17 @@ impl<'transaction, 'nodes> ReclaimCx<'transaction, 'nodes> {
     /// Whether another materialized instance of `N` remains alive after the
     /// current task was removed. This supports bounded private caches without
     /// leaking state after the final demand disappears.
-    pub fn has_materialized<N: Node>(&self) -> bool {
+    pub fn has_materialized<P: NodeProvider>(&self) -> bool {
         self.transaction
             .state
             .task_outputs
             .keys()
-            .any(|task| task.node == TypeId::of::<N>())
+            .any(|task| task.provider == TypeId::of::<P>())
     }
 
-    /// Whether a specific task still has a root pin or an owning parent after
-    /// the current task's child links were removed.
-    pub fn is_live<N: Node>(&self, key: N::Key) -> bool {
-        self.transaction.is_live(&TaskId::new::<N>(key))
+    /// Whether a specific provider task still has a root pin or parent.
+    pub fn is_live<P: NodeProvider>(&self, key: P::Key) -> bool {
+        self.transaction.is_live(&TaskId::new::<P>(key))
     }
 }
 
@@ -716,8 +773,8 @@ pub struct CommandCx<'transaction, 'nodes> {
 }
 
 impl<'transaction, 'nodes> CommandCx<'transaction, 'nodes> {
-    pub fn read<V: View>(&self, key: V::Key) -> Option<V::Value> {
-        self.transaction.read::<V>(key)
+    pub fn get<V: View>(&self, key: V::Key) -> Option<V::Value> {
+        read_from_state::<V>(&self.transaction.state, key)
     }
 
     pub fn set<V: View>(&mut self, key: V::Key, value: V::Value) -> Result<(), NodeError> {

@@ -9,7 +9,8 @@ use crate::utils::Span;
 
 pub mod node;
 pub use node::{
-    ApplySourceEdit, ApplySourceEdits, DocumentText, LoadSource, LoadSourceText, SourceNode,
+    ApplySourceEdit, ApplySourceEdits, DocumentChange, DocumentText, LoadSource, LoadSourceText,
+    SourceInput, SourceViews,
 };
 
 /// One editor operation against an authoritative source document.
@@ -31,7 +32,7 @@ impl SourceEdit {
 /// document revisions. A batch retains disjoint sparse splices with old/new
 /// coordinate maps rather than rediscovering one broad whole-text diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SourceSplice {
+pub struct SourceSplice {
     pub old_range: Range<usize>,
     pub new_range: Range<usize>,
     pub removed: Arc<str>,
@@ -40,6 +41,6 @@ pub(crate) struct SourceSplice {
 
 /// The exact sparse source delta that produced the current document revision.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct SourceDelta {
+pub struct SourceDelta {
     pub splices: Arc<[SourceSplice]>,
 }

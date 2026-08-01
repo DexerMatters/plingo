@@ -3,6 +3,7 @@ use std::{any::Any, marker::PhantomData, sync::Arc};
 use fluent_uri::Uri;
 
 use super::product::ProductId;
+use crate::component::parse::AstKey;
 
 pub type AstId = usize;
 pub type TokenEntryId = usize;
@@ -74,6 +75,14 @@ impl<T> AstBox<T> {
             id,
             uri,
             _marker: PhantomData,
+        }
+    }
+
+    /// Erases the AST value type while retaining this artifact's stable key.
+    pub fn key(self) -> AstKey {
+        AstKey {
+            uri: self.uri,
+            id: self.id,
         }
     }
 }

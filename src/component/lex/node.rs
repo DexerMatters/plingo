@@ -9,13 +9,13 @@ use fluent_uri::Uri;
 
 use crate::{
     component::{
-        lex::{Lexer, LexerConfig, LexerCreationError, LexerRoot},
+        lex::{Lexer, LexerCreationError, LexerRoot},
         parse::TokenData,
         source::{DocumentText, node::DocumentChange},
     },
     scheme::{
         change::AddressChange,
-        node::{ComponentState, DeriveCx, Node, NodeError, ReclaimCx, View},
+        node::{ComponentState, DeriveCx, NodeError, NodeProvider, ReadGraph, ReclaimCx, View},
     },
 };
 
@@ -26,12 +26,30 @@ pub struct TokenKey {
     pub occurrence: usize,
 }
 
+/// Stable parser-facing identity for one token entry. Unlike occurrence
+/// coordinates, this key lets typed AST token fields retrieve their semantic
+/// lexeme without observing span-only movement.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TokenEntryKey {
+    pub uri: Uri<&'static str>,
+    pub id: usize,
+}
+
 /// One independently observable token artifact.
 pub struct TokenArtifact<Root>(PhantomData<fn() -> Root>);
 
 impl<Root: LexerRoot> View for TokenArtifact<Root> {
     type Key = TokenKey;
     type Value = TokenData;
+}
+
+/// Semantic source text for one stable token entry. Its value remains equal
+/// when edits merely shift the token's byte coordinates.
+pub struct TokenLexeme<Root>(PhantomData<fn() -> Root>);
+
+impl<Root: LexerRoot> View for TokenLexeme<Root> {
+    type Key = TokenEntryKey;
+    type Value = Arc<str>;
 }
 
 /// The ordered token-occurrence manifest for a document.
@@ -79,7 +97,7 @@ impl<Root: LexerRoot> View for LexDiagnostics<Root> {
 ///
 /// Its mutable lexer cache is transactionally staged.  It additionally emits
 /// stable occurrence-keyed token artifacts, allowing consumers to depend on
-/// individual tokens rather than the document-wide compatibility stream.
+/// individual tokens rather than the document-wide token stream.
 pub struct LexerNode<Root: LexerRoot + Clone> {
     lexer: ComponentState<Lexer<Root>>,
 }
@@ -90,27 +108,33 @@ impl<Root: LexerRoot + Clone> LexerNode<Root> {
             lexer: ComponentState::new(Lexer::new()?),
         })
     }
-
-    pub fn with_config(config: LexerConfig) -> Result<Self, LexerCreationError> {
-        let mut lexer = Lexer::new()?;
-        lexer.config = config;
-        Ok(Self {
-            lexer: ComponentState::new(lexer),
-        })
-    }
 }
 
-impl<Root: LexerRoot + Clone> Node for LexerNode<Root> {
+impl<Root: LexerRoot + Clone> NodeProvider for LexerNode<Root> {
     type Key = Uri<&'static str>;
-    type Output = TokenOrder<Root>;
 
-    fn derive(
-        &self,
-        cx: &mut DeriveCx<'_, '_>,
-        uri: Self::Key,
-    ) -> Result<Arc<[TokenKey]>, NodeError> {
-        let source = cx.observe::<DocumentText>(uri)?;
-        let source_change = cx.observe::<DocumentChange>(uri)?;
+    fn schema() -> crate::scheme::node::NodeSchema {
+        use crate::scheme::node::PortDeclaration;
+        crate::scheme::node::NodeSchema::new(
+            std::any::type_name::<Self>(),
+            vec![
+                PortDeclaration::map::<TokenOrder<Root>>(),
+                PortDeclaration::map::<TokenArtifact<Root>>(),
+                PortDeclaration::map::<TokenLexeme<Root>>(),
+                PortDeclaration::map::<TokenRevision<Root>>(),
+                PortDeclaration::map::<LexStats<Root>>(),
+                PortDeclaration::map::<LexDiagnostics<Root>>(),
+            ],
+        )
+    }
+
+    fn derive(&self, cx: &mut DeriveCx<'_, '_>, uri: Self::Key) -> Result<(), NodeError> {
+        let source = cx
+            .get::<DocumentText>(uri)
+            .ok_or_else(NodeError::missing_view::<DocumentText>)?;
+        let source_change = cx
+            .get::<DocumentChange>(uri)
+            .ok_or_else(NodeError::missing_view::<DocumentChange>)?;
         let (tokens, changes, diagnostics, stats) = {
             let lexer = cx.state_mut(&self.lexer)?;
             let document = lexer
@@ -144,6 +168,9 @@ impl<Root: LexerRoot + Clone> Node for LexerNode<Root> {
                 },
                 *token,
             )?;
+            let end = token.start.saturating_add(token.length);
+            let lexeme: Arc<str> = source.get(token.start..end).unwrap_or_default().into();
+            cx.emit::<TokenLexeme<Root>>(TokenEntryKey { uri, id: token.id }, lexeme)?;
         }
         let changes: Arc<[AddressChange<Uri<&'static str>, TokenData>]> = changes.into();
         cx.emit::<TokenRevision<Root>>(
@@ -157,7 +184,8 @@ impl<Root: LexerRoot + Clone> Node for LexerNode<Root> {
         cx.emit::<LexStats<Root>>(uri, stats)?;
         cx.emit::<LexDiagnostics<Root>>(uri, diagnostics)?;
         let order: Arc<[TokenKey]> = order.into();
-        Ok(order)
+        cx.emit::<TokenOrder<Root>>(uri, order)?;
+        Ok(())
     }
 
     fn reclaim(&self, cx: &mut ReclaimCx<'_, '_>, uri: Self::Key) -> Result<(), NodeError> {
@@ -173,67 +201,5 @@ impl<Root: LexerRoot + Clone> Node for LexerNode<Root> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::fmt;
-
-    use plingo_macros::Terminal;
-
-    use super::*;
-    use crate::{
-        component::{
-            lex::LexErrorInfo,
-            source::{SourceEdit, SourceNode},
-        },
-        scheme::node::{Graph, ViewUpdate},
-        utils::Span,
-    };
-
-    #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
-    #[scopes(root { Word })]
-    enum TestTokens {
-        #[regex(r"[a-z]+")]
-        Word(String),
-        #[error]
-        Error(LexErrorInfo),
-    }
-
-    impl fmt::Display for TestTokens {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(formatter, "{self:?}")
-        }
-    }
-
-    #[test]
-    fn lexer_node_observes_source_without_a_lower_layer() {
-        let uri = Span::new("test://node-lexer", 0, 0).unwrap().uri;
-        let mut graph = Graph::new();
-        graph
-            .install(LexerNode::<TestTokens>::new().unwrap())
-            .unwrap();
-        graph.command(SourceNode::load(uri)).unwrap();
-
-        let subscription = graph.subscribe::<LexerNode<TestTokens>>(uri).unwrap();
-        assert!(matches!(
-            subscription.recv().unwrap(),
-            ViewUpdate::Initial { .. }
-        ));
-
-        graph
-            .command(SourceNode::apply(SourceEdit::Insert {
-                key: Span::point_uri(uri, 0).unwrap(),
-                value: "hello".into(),
-            }))
-            .unwrap();
-        let ViewUpdate::Changed { value, .. } = subscription.recv().unwrap() else {
-            panic!("source edit must publish a committed token update");
-        };
-        assert_eq!(value.len(), 2, "one word plus synthetic EOF");
-        assert_eq!(
-            graph
-                .read::<TokenArtifact<TestTokens>>(value[0].clone())
-                .expect("the ordered token must be materialized")
-                .length,
-            5
-        );
-    }
-}
+#[path = "../../../tests/unit/component_lex_node.rs"]
+mod tests;

@@ -109,15 +109,6 @@ pub enum ProductData {
     },
 }
 
-impl ProductData {
-    pub fn token_fingerprint(&self) -> Option<TokenFingerprint> {
-        match self {
-            Self::Token { fingerprint, .. } => Some(*fingerprint),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct ProductArena {
     pub products: Vec<Product>,

@@ -1,5 +1,6 @@
 use super::engine::{CommandCx, DeriveCx, ReclaimCx};
 use std::{
+    any::{TypeId, type_name},
     hash::Hash,
     sync::{Arc, Mutex},
 };
@@ -7,7 +8,7 @@ use thiserror::Error;
 
 pub type SnapshotId = u64;
 
-/// A stable, typed key used to address a view or a node instance.
+/// A stable, typed key used to address a view fact or provider instance.
 pub trait NodeKey: Clone + Eq + Hash + Send + Sync + 'static {}
 
 impl<T> NodeKey for T where T: Clone + Eq + Hash + Send + Sync + 'static {}
@@ -19,9 +20,9 @@ impl<T> NodeValue for T where T: Clone + PartialEq + Send + Sync + 'static {}
 
 /// A typed, keyed value exposed by the graph.
 ///
-/// A view is a durable, snapshot-readable fact table with at most one value
-/// per key.  Relations can be represented by making `Value` a collection whose
-/// complete replacement is owned by one node instance.
+/// A view is a snapshot-readable materialization with at most one value per
+/// key. Derived values remain materialized only while their producer is live;
+/// root values are retained until a command replaces them.
 pub trait View: Send + Sync + 'static {
     type Key: NodeKey;
     type Value: NodeValue;
@@ -44,24 +45,143 @@ pub trait IndexedRelation: Relation {
     fn index(fact: &Self::Fact) -> Self::Index;
 }
 
-/// A pure keyed derivation.
-///
-/// Nodes may observe any registered view and emit any number of views.  The
-/// returned value is automatically emitted as this node's primary output.
-/// Other emitted values are part of the same owned output set.
-pub trait Node: Send + Sync + 'static {
+/// The ownership policy of a declared node port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PortKind {
+    /// One owner publishes a keyed value.
+    Map,
+    /// One or more node instances support an immutable fact.
+    Set,
+    /// A support-counted set with independently observable index buckets.
+    IndexedSet,
+}
+
+/// Explicit schema-level edge categories. Runtime traversal never collapses
+/// these into an untyped neighbor relation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EdgeKind {
+    Publishes,
+    Supports,
+    DependsOn,
+    KeepsAlive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DefinitionEdge {
+    pub from: &'static str,
+    pub to: &'static str,
+    pub kind: EdgeKind,
+}
+
+/// Runtime metadata for one typed port. Type identities are intentionally kept
+/// distinct: a port type, rather than a universal integer, is its schema ID.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PortDeclaration {
+    pub name: &'static str,
+    pub type_id: TypeId,
+    pub kind: PortKind,
+}
+
+impl PortDeclaration {
+    pub fn map<V: View>() -> Self {
+        Self {
+            name: type_name::<V>(),
+            type_id: TypeId::of::<V>(),
+            kind: PortKind::Map,
+        }
+    }
+
+    pub fn set<R: Relation>() -> Self {
+        Self {
+            name: type_name::<R>(),
+            type_id: TypeId::of::<R>(),
+            kind: PortKind::Set,
+        }
+    }
+
+    pub fn indexed_set<R: IndexedRelation>() -> Self {
+        Self {
+            name: type_name::<R>(),
+            type_id: TypeId::of::<R>(),
+            kind: PortKind::IndexedSet,
+        }
+    }
+}
+
+/// Declared, inspectable schema of a provider's observable port family.
+#[derive(Clone, Debug)]
+pub struct NodeSchema {
+    pub provider: &'static str,
+    pub ports: Vec<PortDeclaration>,
+}
+
+impl NodeSchema {
+    pub fn new(provider: &'static str, ports: Vec<PortDeclaration>) -> Self {
+        Self { provider, ports }
+    }
+
+    pub fn declares_map<V: View>(&self) -> bool {
+        self.ports
+            .iter()
+            .any(|port| port.type_id == TypeId::of::<V>() && port.kind == PortKind::Map)
+    }
+
+    pub fn declares_relation<R: Relation>(&self) -> bool {
+        self.ports.iter().any(|port| {
+            port.type_id == TypeId::of::<R>()
+                && matches!(port.kind, PortKind::Set | PortKind::IndexedSet)
+        })
+    }
+}
+
+/// Inspection of one live provider instance and its typed edges.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeInspection {
+    pub materialized: bool,
+    pub root_pins: usize,
+    pub keeping_parents: usize,
+    pub publications: usize,
+    pub relation_supports: usize,
+    pub dependencies: usize,
+    pub children: usize,
+}
+
+/// A family of typed ports exposed by a provider. This is intentionally a
+/// small runtime declaration rather than a giant aggregate output value.
+pub trait ViewFamily: Send + Sync + 'static {
+    fn declaration() -> Vec<PortDeclaration>;
+}
+
+/// A first-class externally authored node category. Input nodes never derive;
+/// commands are the sole authority allowed to write their declared map ports.
+pub trait InputNode: Send + Sync + 'static {
     type Key: NodeKey;
-    type Output: View<Key = Self::Key>;
+    type Views: ViewFamily;
 
-    fn derive(
-        &self,
-        cx: &mut DeriveCx<'_, '_>,
-        key: Self::Key,
-    ) -> Result<<Self::Output as View>::Value, NodeError>;
+    fn schema() -> NodeSchema;
+}
 
-    /// Invoked after the runtime has retracted this task's outputs, relations,
-    /// dependencies, and child ownership. Nodes use this only to discard
-    /// private caches; published state is always runtime-owned.
+/// Common read protocol for immutable snapshots and reactive derivations.
+/// A derivation records dependencies for these operations; a snapshot simply
+/// reads its committed revision. Scan ordering is deliberately unspecified;
+/// callers that require order must sort by a domain-specific stable key.
+pub trait ReadGraph {
+    fn get<V: View>(&self, key: V::Key) -> Option<V::Value>;
+    fn contains<R: Relation>(&self, fact: R::Fact) -> bool;
+    fn scan<R: IndexedRelation>(&self, index: R::Index) -> Vec<R::Fact>;
+    fn scan_all<R: Relation>(&self) -> Vec<R::Fact>;
+}
+
+/// A stable keyed provider of declared typed ports.
+pub trait NodeProvider: Send + Sync + 'static {
+    type Key: NodeKey;
+
+    fn derive(&self, cx: &mut DeriveCx<'_, '_>, key: Self::Key) -> Result<(), NodeError>;
+
+    fn schema() -> NodeSchema
+    where
+        Self: Sized;
+
     fn reclaim(&self, _cx: &mut ReclaimCx<'_, '_>, _key: Self::Key) -> Result<(), NodeError> {
         Ok(())
     }
@@ -69,8 +189,8 @@ pub trait Node: Send + Sync + 'static {
 
 /// A root-state mutation.
 ///
-/// Commands are the only API that can update a root view.  Derived node output
-/// is written exclusively through [`DeriveCx`].
+/// Commands are the only API that can update a root port. Derived provider
+/// publications are written exclusively through [`DeriveCx`].
 pub trait Command: Send + 'static {
     type Output;
 
@@ -80,26 +200,34 @@ pub trait Command: Send + 'static {
 /// Errors raised by the node graph.
 #[derive(Debug, Error)]
 pub enum NodeError {
-    #[error("node `{0}` is not installed")]
-    MissingNode(&'static str),
+    #[error("provider `{0}` is not installed")]
+    MissingProvider(&'static str),
     #[error("view `{0}` has no value for the requested key")]
     MissingView(&'static str),
-    #[error("node `{0}` has already been installed")]
-    DuplicateNode(&'static str),
-    #[error("node dependency cycle detected while deriving `{0}`")]
+    #[error("provider `{0}` has already been installed")]
+    DuplicateProvider(&'static str),
+    #[error("provider dependency cycle detected while deriving `{0}`")]
     DependencyCycle(&'static str),
-    #[error("node `{node}` attempted to overwrite output owned by `{owner}`")]
+    #[error("provider `{provider}` attempted to overwrite output owned by `{owner}`")]
     OutputConflict {
-        node: &'static str,
+        provider: &'static str,
         owner: &'static str,
     },
-    #[error("node `{0}` attempted to overwrite an authoritative root view")]
+    #[error("provider `{0}` attempted to overwrite an authoritative root view")]
     OutputRootConflict(&'static str),
-    #[error("node `{0}` emitted the same view key more than once")]
+    #[error("provider `{0}` emitted the same view key more than once")]
     DuplicateOutput(&'static str),
+    #[error("provider `{provider}` attempted to publish undeclared {kind} port `{port}`")]
+    UndeclaredPort {
+        provider: &'static str,
+        port: &'static str,
+        kind: &'static str,
+    },
+    #[error("input node `{0}` has already been installed")]
+    DuplicateInput(&'static str),
     #[error("root command cannot overwrite output owned by `{0}`")]
     RootOutputConflict(&'static str),
-    #[error("node graph revision overflow")]
+    #[error("graph revision overflow")]
     RevisionOverflow,
     #[error("{0}")]
     Message(String),
@@ -109,11 +237,15 @@ impl NodeError {
     pub fn message(message: impl Into<String>) -> Self {
         Self::Message(message.into())
     }
+
+    pub fn missing_view<V: View>() -> Self {
+        Self::MissingView(type_name::<V>())
+    }
 }
 
-/// Mutable node-local data that is staged with the graph transaction.
+/// Mutable provider-local data staged with the graph transaction.
 ///
-/// Cloning the handle shares the same state. A derivation obtains a mutable
+/// Cloning the handle shares the same state. A provider obtains a mutable
 /// staged copy through [`DeriveCx::state_mut`]; that copy replaces the stored
 /// value only after the graph transaction commits successfully.
 pub struct ComponentState<T: Clone + Send + Sync + 'static> {

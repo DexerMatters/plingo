@@ -19,7 +19,7 @@ use plingo::{
     Graph, ReadGraph, Subscription, ViewUpdate,
     component::{
         lex::LexerNode,
-        parse::{AstSnapshot, ParseRoots, ParseSnapshot, ParserNode, grammar::Grammar},
+        parse::{AstSnapshot, ParseEntries, ParseSnapshot, ParserNode, grammar::Grammar},
         source::{SourceEdit, SourceInput},
     },
     utils::Span,
@@ -51,8 +51,13 @@ impl DebugSink {
             cprintln!("<red>  parser snapshot removed</>");
             return Ok(());
         };
-        if let Some(roots) = graph.get::<ParseRoots<JsonToken, JsonDocument>>(snapshot.uri()) {
-            print_json_ast(graph, roots.as_ref());
+        let entries = graph.scan::<ParseEntries<JsonToken>>(snapshot.uri());
+        if !entries.is_empty() {
+            let keys = entries
+                .iter()
+                .map(|entry| entry.node.clone())
+                .collect::<Vec<_>>();
+            print_json_ast(graph, &keys);
         }
         Ok(())
     }

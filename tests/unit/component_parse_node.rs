@@ -135,8 +135,20 @@ fn parser_node_publishes_every_accepted_interpretation() {
     let candidates = graph
         .get::<ParseCandidates<Tokens, AmbiguousValue>>(uri)
         .unwrap();
+    let entries = graph.scan::<crate::component::parse::ParseEntries<Tokens>>(uri);
 
     assert_eq!(candidates.len(), 2);
+    let mut entry_products = entries
+        .iter()
+        .map(|entry| entry.metadata)
+        .collect::<Vec<_>>();
+    let mut candidate_products = candidates
+        .iter()
+        .map(|candidate| candidate.product)
+        .collect::<Vec<_>>();
+    entry_products.sort_unstable();
+    candidate_products.sort_unstable();
+    assert_eq!(entry_products, candidate_products);
     assert_ne!(candidates[0].product, candidates[1].product);
     assert!(
         candidates
@@ -249,8 +261,8 @@ fn parser_revision_resolves_ast_boxes_and_tracks_span_only_updates() {
 
     let _demand = graph.demand::<ParserNode<Tokens, Value>>(uri).unwrap();
     let snapshot = graph.get::<ParseSnapshot<Tokens>>(uri).unwrap();
-    let roots = graph.get::<ParseRoots<Tokens, Value>>(uri).unwrap();
-    let root = roots[0].clone();
+    let entries = graph.scan::<ParseEntries<Tokens>>(uri);
+    let root = entries[0].node.clone();
     let artifact = graph
         .get::<ParsedAst<Tokens>>(root.clone())
         .expect("the root AST artifact must be materialized");

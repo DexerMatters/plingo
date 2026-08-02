@@ -1,4 +1,3 @@
-mod elaborator_role;
 mod generate;
 mod non_terminal;
 mod pretty;
@@ -26,11 +25,12 @@ pub fn lregex(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Builds a [`RelativeRegex`](::plingo::component::scope::RelativeRegex) for
-/// use with `FrameCx::resolve`, using the same syntax as [`label_regex`].
+/// Builds a [`ScopePath`](::plingo::component::scope::ScopePath) for
+/// `ScopeView::query_from`, using regex-style alternation (`|`),
+/// concatenation, grouping, and `*`/`+`/`?`.
 #[proc_macro]
-pub fn rlregex(input: TokenStream) -> TokenStream {
-    match scope_regex::expand_relative_label_regex(input.into()) {
+pub fn scope_path(input: TokenStream) -> TokenStream {
+    match scope_regex::expand_scope_path(input.into()) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.into_compile_error().into(),
     }
@@ -71,13 +71,6 @@ pub fn derive_non_terminal(item: TokenStream) -> TokenStream {
     }
 }
 
-#[proc_macro_derive(ElaboratorRole, attributes(elaborator))]
-pub fn derive_elaborator_role(item: TokenStream) -> TokenStream {
-    match elaborator_role::expand_elaborator_role(parse_macro_input!(item as syn::DeriveInput)) {
-        Ok(tokens) => tokens.into(),
-        Err(error) => error.into_compile_error().into(),
-    }
-}
 
 #[proc_macro_derive(PrettyNonTerminal)]
 pub fn derive_pretty_non_terminal(item: TokenStream) -> TokenStream {
@@ -104,5 +97,3 @@ pub fn derive_scope_domain(item: TokenStream) -> TokenStream {
         Err(err) => err.to_compile_error().into(),
     }
 }
-
-// Scope data is a domain-owned map value; no projection derive is needed.

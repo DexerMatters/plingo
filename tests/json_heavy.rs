@@ -8,8 +8,8 @@ use plingo::{
     component::{
         lex::{LexDiagnostics, LexStats, LexerNode, TokenArtifact, TokenKey, TokenOrder},
         parse::{
-            ParseDiagnostics, ParseRoots, ParseSnapshot, ParseStats, ParseStatus, ParseStatusView,
-            ParserNode, grammar::Grammar,
+            ParseDiagnostics, ParseEntries, ParseSnapshot, ParseStats, ParseStatus,
+            ParseStatusView, ParserNode, grammar::Grammar,
         },
         source::{DocumentText, SourceEdit, SourceInput},
     },
@@ -65,8 +65,11 @@ impl JsonRuntime {
 
     fn roots(&self) -> Arc<[plingo::component::parse::AstKey]> {
         self.graph
-            .get::<ParseRoots<JsonToken, JsonDocument>>(self.uri)
-            .unwrap()
+            .scan::<ParseEntries<JsonToken>>(self.uri)
+            .iter()
+            .map(|entry| entry.node.clone())
+            .collect::<Vec<_>>()
+            .into()
     }
 
     fn token_keys(&self) -> Arc<[TokenKey]> {
@@ -350,11 +353,7 @@ fn released_document_caches_reinitialize_without_replaying_stale_deltas() {
     drop(subscription);
     drop(_demand);
     graph.collect_garbage().unwrap();
-    assert!(
-        graph
-            .get::<ParseRoots<JsonToken, JsonDocument>>(uri)
-            .is_none()
-    );
+    assert!(graph.scan::<ParseEntries<JsonToken>>(uri).is_empty());
 
     let _rematerialized = graph
         .demand::<ParserNode<JsonToken, JsonDocument>>(uri)
@@ -404,9 +403,7 @@ fn independent_documents_do_not_cross_invalidate() {
     let subscription_b = graph.subscribe::<ParseSnapshot<JsonToken>>(uri_b).unwrap();
     let _ = subscription_a.recv().unwrap();
     let _ = subscription_b.recv().unwrap();
-    let roots_b = graph
-        .get::<ParseRoots<JsonToken, JsonDocument>>(uri_b)
-        .unwrap();
+    let roots_b = graph.scan::<ParseEntries<JsonToken>>(uri_b);
 
     graph
         .command(SourceInput::apply(SourceEdit::Insert {
@@ -418,12 +415,7 @@ fn independent_documents_do_not_cross_invalidate() {
         matches!(subscription_b.try_recv(), Err(TryRecvError::Empty)),
         "an edit to URI A must not publish a URI B parser update"
     );
-    assert_eq!(
-        graph
-            .get::<ParseRoots<JsonToken, JsonDocument>>(uri_b)
-            .unwrap(),
-        roots_b
-    );
+    assert_eq!(graph.scan::<ParseEntries<JsonToken>>(uri_b), roots_b);
 }
 
 #[test]

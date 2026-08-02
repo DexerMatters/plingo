@@ -1,8 +1,7 @@
+use std::collections::HashSet;
+
 use super::{PathExpr, PathOrder, ResolutionPath, resolve_indexed};
-use crate::component::{
-    lex::{LexerRoot, SlotStore, TokenState},
-    scope::{ScopeDomain, ScopeEdge, ScopeId, ScopeProperty},
-};
+use crate::component::scope::{ScopeDomain, ScopeEdge, ScopeId, ScopeProperty};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Label {
@@ -12,34 +11,8 @@ enum Label {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct TestRoot;
-impl TokenState for TestRoot {
-    fn display_name() -> &'static str {
-        "TestRoot"
-    }
-    fn state_key() -> &'static str {
-        "test"
-    }
-}
-impl LexerRoot for TestRoot {
-    type SlotValue = ();
-    fn state_registrations() -> Vec<crate::component::lex::__macro_private::ScopeRegistration<Self>>
-    {
-        Vec::new()
-    }
-    fn slot_count() -> usize {
-        0
-    }
-    fn recover_key(_: &SlotStore<Self>) -> Option<&str> {
-        None
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
 struct Domain;
 impl ScopeDomain for Domain {
-    type Root = TestRoot;
-    type Ast = ();
     type ScopeKey = ();
     type ScopeData = usize;
     type Label = Label;
@@ -67,7 +40,7 @@ fn label_regex_macros_use_standard_regular_operators() {
     assert!(!one_or_more.nullable());
     assert!(one_or_more.derivative(&Label::Lexical).nullable());
 
-    let relative = crate::rlregex!((Label::Lexical | Label::Declaration)?);
+    let relative = crate::scope_path!((Label::Lexical | Label::Declaration)?);
     assert!(relative.nullable());
     assert!(relative.derivative(&Label::Lexical).nullable());
 }
@@ -82,7 +55,7 @@ fn resolution_returns_one_mapped_data_value_on_one_scope() {
         |_, _| (Vec::new(), Some(7)),
     );
     assert_eq!(answers.len(), 1);
-    assert_eq!(answers.iter().next().expect("one answer").data, 7);
+    assert_eq!(answers.iter().next().expect("one answer").data(), &7);
 }
 
 #[test]
@@ -116,6 +89,43 @@ fn path_order_keeps_incomparable_paths_visible() {
         transitive_order.compare(&local, &imported),
         Some(std::cmp::Ordering::Greater)
     );
+}
+
+#[test]
+fn path_order_partitions_shadowed_witnesses() {
+    let scope = ScopeId::<Domain>::logical(0);
+    let local = ResolutionPath {
+        scopes: vec![scope, scope].into(),
+        labels: vec![Label::Declaration].into(),
+        data: 1,
+    };
+    let outer = ResolutionPath {
+        scopes: vec![scope, scope, scope].into(),
+        labels: vec![Label::Lexical, Label::Declaration].into(),
+        data: 2,
+    };
+    let (visible, shadowed) = super::partition_visible(
+        HashSet::from([local, outer]),
+        &PathOrder::new().prefer(Label::Declaration, Label::Lexical),
+    );
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].data(), &1);
+    assert_eq!(shadowed.len(), 1);
+    assert_eq!(shadowed[0].0.data(), &2);
+    assert_eq!(shadowed[0].1.len(), 1);
+    assert_eq!(shadowed[0].1[0].data(), &1);
+}
+
+#[test]
+fn resolution_witness_exposes_data_without_struct_destructuring() {
+    let scope = ScopeId::<Domain>::logical(0);
+    let witness = ResolutionPath {
+        scopes: vec![scope].into(),
+        labels: Vec::new().into(),
+        data: 7,
+    };
+    assert_eq!(witness.data(), &7);
+    assert_eq!(witness.into_data(), 7);
 }
 
 #[test]

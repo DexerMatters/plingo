@@ -4,8 +4,6 @@ use syn::{DeriveInput, Result, Type};
 
 pub fn expand_scope_domain(input: DeriveInput) -> Result<TokenStream> {
     let domain = input.ident;
-    let mut root = None;
-    let mut ast = None;
     let mut scope_key = None;
     let mut scope_data = None;
     let mut label = None;
@@ -22,8 +20,6 @@ pub fn expand_scope_domain(input: DeriveInput) -> Result<TokenStream> {
                 .ok_or_else(|| meta.error("expected a scope-domain field name"))?;
             let value: Type = meta.value()?.parse()?;
             match name.to_string().as_str() {
-                "root" => root = Some(value),
-                "ast" => ast = Some(value),
                 "scope_key" => scope_key = Some(value),
                 "scope_data" => scope_data = Some(value),
                 "label" => label = Some(value),
@@ -37,8 +33,6 @@ pub fn expand_scope_domain(input: DeriveInput) -> Result<TokenStream> {
     let required = |value: Option<Type>, name: &str| {
         value.ok_or_else(|| syn::Error::new_spanned(&domain, format!("missing `{name}`")))
     };
-    let root = required(root, "root")?;
-    let ast = required(ast, "ast")?;
     let scope_key = required(scope_key, "scope_key")?;
     let scope_data = required(scope_data, "scope_data")?;
     let label = required(label, "label")?;
@@ -46,8 +40,6 @@ pub fn expand_scope_domain(input: DeriveInput) -> Result<TokenStream> {
 
     Ok(quote! {
         impl ::plingo::component::scope::ScopeDomain for #domain {
-            type Root = #root;
-            type Ast = #ast;
             type ScopeKey = #scope_key;
             type ScopeData = #scope_data;
             type Label = #label;

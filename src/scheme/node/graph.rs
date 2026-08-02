@@ -6,8 +6,8 @@ use super::{
         NodeProvider, NodeSchema, PortKind, ReadGraph, Relation, SnapshotId, View,
     },
     engine::{
-        CommandCx, DeferredChildFactory, ErasedProvider, ProviderEntry, StagedComponentState,
-        Transaction, commit_component_states,
+        CommandCx, DeferredChildFactory, ErasedProvider, ProviderEntry, StagedProviderState,
+        Transaction, commit_provider_states,
     },
     identity::{ErasedValue, FactId, RelationFactId, TaskId, typed_value},
     state::GraphState,
@@ -19,6 +19,8 @@ use std::{
     marker::PhantomData,
     sync::{Arc, Mutex, mpsc},
 };
+
+use crate::component::api::{Component, ComponentProvider, component_task};
 
 #[derive(Clone)]
 pub struct Snapshot {
@@ -347,7 +349,7 @@ pub struct Graph {
     providers: HashMap<TypeId, Arc<dyn ErasedProvider>>,
     input_schemas: HashMap<TypeId, NodeSchema>,
     definition_edges: Vec<DefinitionEdge>,
-    deferred_children: HashMap<TypeId, Vec<DeferredChildFactory>>,
+    deferred_children: Arc<HashMap<TypeId, Vec<DeferredChildFactory>>>,
     subscribers: HashMap<FactId, Vec<Box<dyn ErasedSubscriber>>>,
     relation_subscribers: HashMap<RelationFactId, Vec<Box<dyn ErasedRelationSubscriber>>>,
     relation_added_effects: HashMap<TypeId, Vec<Box<dyn ErasedRelationEffect>>>,
@@ -358,6 +360,7 @@ pub struct Graph {
     deferred_releases: Arc<Mutex<Vec<TaskId>>>,
     deferred_subscriber_removals: Arc<Mutex<Vec<(SubscriberId, SubscriberTarget)>>>,
     next_subscriber: SubscriberId,
+    workers: usize,
 }
 
 impl Default for Graph {
@@ -367,7 +370,19 @@ impl Default for Graph {
 }
 
 impl Graph {
+    /// Creates a graph that automatically uses the machine's available
+    /// parallelism for isolated ready-task waves.
     pub fn new() -> Self {
+        Self::with_workers(
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+        )
+    }
+
+    /// Creates a graph with a bounded worker count. One worker is useful for
+    /// deterministic scheduler debugging; normal hosts should use [`Self::new`].
+    pub fn with_workers(workers: usize) -> Self {
         let state = Arc::new(GraphState::default());
         Self {
             current: Arc::new(ArcSwap::from(Arc::clone(&state))),
@@ -375,7 +390,7 @@ impl Graph {
             providers: HashMap::new(),
             input_schemas: HashMap::new(),
             definition_edges: Vec::new(),
-            deferred_children: HashMap::new(),
+            deferred_children: Arc::new(HashMap::new()),
             subscribers: HashMap::new(),
             relation_subscribers: HashMap::new(),
             relation_added_effects: HashMap::new(),
@@ -386,7 +401,12 @@ impl Graph {
             deferred_releases: Arc::new(Mutex::new(Vec::new())),
             deferred_subscriber_removals: Arc::new(Mutex::new(Vec::new())),
             next_subscriber: 0,
+            workers: workers.max(1),
         }
+    }
+
+    pub fn workers(&self) -> usize {
+        self.workers
     }
 
     pub fn revision(&self) -> SnapshotId {
@@ -457,8 +477,17 @@ impl Graph {
             }));
     }
 
+    /// Inspects one live provider instance and its typed edges.
     pub fn inspect<P: NodeProvider>(&self, key: P::Key) -> NodeInspection {
-        let task = TaskId::new::<P>(key);
+        self.inspect_task(TaskId::new::<P>(key))
+    }
+
+    /// Inspects one live component instance.
+    pub fn inspect_component<C: Component>(&self, value: C) -> NodeInspection {
+        self.inspect_task(component_task(value))
+    }
+
+    fn inspect_task(&self, task: TaskId) -> NodeInspection {
         NodeInspection {
             materialized: self.state.task_outputs.contains_key(&task),
             root_pins: self.state.task_pins.get(&task).copied().unwrap_or_default(),
@@ -498,14 +527,87 @@ impl Graph {
             to: type_name::<Child>(),
             kind: EdgeKind::KeepsAlive,
         });
-        self.deferred_children
+        Arc::make_mut(&mut self.deferred_children)
             .entry(TypeId::of::<Parent>())
             .or_default()
-            .push(Box::new(move |parent| {
+            .push(Arc::new(move |parent| {
                 parent
                     .key
                     .get::<Parent::Key>()
                     .map(|parent_key| TaskId::new::<Child>(key(parent_key)))
+            }));
+        Ok(())
+    }
+
+    /// Declares a typed keeps-alive edge from a kernel provider to a component.
+    pub fn connect_component<Parent, Child>(
+        &mut self,
+        key: impl Fn(Parent::Key) -> Child + Send + Sync + 'static,
+    ) -> Result<(), NodeError>
+    where
+        Parent: NodeProvider,
+        Child: Component,
+    {
+        if !self.providers.contains_key(&TypeId::of::<Parent>()) {
+            return Err(NodeError::MissingProvider(type_name::<Parent>()));
+        }
+        if !self
+            .providers
+            .contains_key(&TypeId::of::<ComponentProvider<Child>>())
+        {
+            return Err(NodeError::MissingProvider(type_name::<Child>()));
+        }
+        self.definition_edges.push(DefinitionEdge {
+            from: type_name::<Parent>(),
+            to: type_name::<Child>(),
+            kind: EdgeKind::KeepsAlive,
+        });
+        Arc::make_mut(&mut self.deferred_children)
+            .entry(TypeId::of::<Parent>())
+            .or_default()
+            .push(Arc::new(move |parent| {
+                parent
+                    .key
+                    .get::<Parent::Key>()
+                    .map(|parent_key| component_task(key(parent_key)))
+            }));
+        Ok(())
+    }
+
+    /// Declares a typed keeps-alive edge from one component kind to another.
+    pub fn connect_components<Parent, Child>(
+        &mut self,
+        key: impl Fn(Parent) -> Child + Send + Sync + 'static,
+    ) -> Result<(), NodeError>
+    where
+        Parent: Component,
+        Child: Component,
+    {
+        if !self
+            .providers
+            .contains_key(&TypeId::of::<ComponentProvider<Parent>>())
+        {
+            return Err(NodeError::MissingProvider(type_name::<Parent>()));
+        }
+        if !self
+            .providers
+            .contains_key(&TypeId::of::<ComponentProvider<Child>>())
+        {
+            return Err(NodeError::MissingProvider(type_name::<Child>()));
+        }
+        self.definition_edges.push(DefinitionEdge {
+            from: type_name::<Parent>(),
+            to: type_name::<Child>(),
+            kind: EdgeKind::KeepsAlive,
+        });
+        Arc::make_mut(&mut self.deferred_children)
+            .entry(TypeId::of::<ComponentProvider<Parent>>())
+            .or_default()
+            .push(Arc::new(move |parent| {
+                parent
+                    .key
+                    .get::<Parent>()
+                    .map(|parent_key| component_task(key(parent_key)))
             }));
         Ok(())
     }
@@ -629,8 +731,8 @@ impl Graph {
         let base = self.state.revision;
         let target = base.checked_add(1).ok_or(NodeError::RevisionOverflow)?;
         let mut transaction = Transaction::new(
-            &self.providers,
-            &self.deferred_children,
+            Arc::new(self.providers.clone()),
+            Arc::clone(&self.deferred_children),
             (*self.state).clone(),
             target,
         );
@@ -639,13 +741,61 @@ impl Graph {
         if !transaction.state.task_outputs.contains_key(&task) {
             transaction.schedule(task.clone());
         }
-        transaction.run_pending()?;
-        let (state, component_states) = transaction.finish();
-        self.commit_transaction(state, component_states);
+        transaction.run_pending(self.workers)?;
+        let (state, provider_states) = transaction.finish();
+        self.commit_transaction(state, provider_states);
         Ok(DemandLease {
             task,
             releases: Arc::clone(&self.deferred_releases),
         })
+    }
+
+    /// Requests one component instance and returns an RAII materialization
+    /// lease. The component value is both the identity and the input; no
+    /// separate key type exists.
+    pub fn request<C: Component>(&mut self, value: C) -> Result<DemandLease, NodeError> {
+        self.collect_garbage()?;
+        if !self
+            .providers
+            .contains_key(&TypeId::of::<ComponentProvider<C>>())
+        {
+            return Err(NodeError::MissingProvider(type_name::<C>()));
+        }
+        let base = self.state.revision;
+        let target = base.checked_add(1).ok_or(NodeError::RevisionOverflow)?;
+        let mut transaction = Transaction::new(
+            Arc::new(self.providers.clone()),
+            Arc::clone(&self.deferred_children),
+            (*self.state).clone(),
+            target,
+        );
+        let task = component_task(value);
+        transaction.pin(task.clone());
+        if !transaction.state.task_outputs.contains_key(&task) {
+            transaction.schedule(task.clone());
+        }
+        transaction.run_pending(self.workers)?;
+        let (state, provider_states) = transaction.finish();
+        self.commit_transaction(state, provider_states);
+        Ok(DemandLease {
+            task,
+            releases: Arc::clone(&self.deferred_releases),
+        })
+    }
+
+    /// Registers one component kind. The component's declared [`WriteSet`]
+    /// (plus its canonical output port) becomes its enforced publication
+    /// schema.
+    pub fn register<C: Component>(&mut self) -> Result<(), NodeError> {
+        let id = TypeId::of::<ComponentProvider<C>>();
+        if self.providers.contains_key(&id) {
+            return Err(NodeError::DuplicateProvider(type_name::<C>()));
+        }
+        let provider = ComponentProvider::<C>::new();
+        let schema = provider.schema();
+        self.record_publication_edges(&schema);
+        self.providers.insert(id, Arc::new(provider));
+        Ok(())
     }
 
     /// Subscribes to one materialized map port. Demand is intentionally
@@ -707,17 +857,17 @@ impl Graph {
         let base = self.state.revision;
         let target = base.checked_add(1).ok_or(NodeError::RevisionOverflow)?;
         let mut transaction = Transaction::new(
-            &self.providers,
-            &self.deferred_children,
+            Arc::new(self.providers.clone()),
+            Arc::clone(&self.deferred_children),
             (*self.state).clone(),
             target,
         );
         for task in releases {
             transaction.unpin(task);
         }
-        transaction.run_pending()?;
-        let (state, component_states) = transaction.finish();
-        self.commit_transaction(state, component_states);
+        transaction.run_pending(self.workers)?;
+        let (state, provider_states) = transaction.finish();
+        self.commit_transaction(state, provider_states);
         Ok(())
     }
 
@@ -759,8 +909,8 @@ impl Graph {
         let base = self.state.revision;
         let target = base.checked_add(1).ok_or(NodeError::RevisionOverflow)?;
         let mut transaction = Transaction::new(
-            &self.providers,
-            &self.deferred_children,
+            Arc::new(self.providers.clone()),
+            Arc::clone(&self.deferred_children),
             (*self.state).clone(),
             target,
         );
@@ -770,9 +920,9 @@ impl Graph {
             };
             command.apply(&mut cx)?
         };
-        transaction.run_pending()?;
-        let (state, component_states) = transaction.finish();
-        self.commit_transaction(state, component_states);
+        transaction.run_pending(self.workers)?;
+        let (state, provider_states) = transaction.finish();
+        self.commit_transaction(state, provider_states);
         Ok(output)
     }
 
@@ -781,9 +931,9 @@ impl Graph {
     fn commit_transaction(
         &mut self,
         state: GraphState,
-        component_states: Vec<Box<dyn StagedComponentState>>,
+        provider_states: Vec<Box<dyn StagedProviderState>>,
     ) {
-        commit_component_states(component_states);
+        commit_provider_states(provider_states);
         let effects = self.commit(state);
         self.pending_effects.extend(effects);
         self.drain_effects();

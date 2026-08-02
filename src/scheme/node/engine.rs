@@ -1,7 +1,7 @@
 use super::{
     SnapshotId,
     api::{
-        ComponentState, IndexedRelation, NodeError, NodeProvider, NodeSchema, ReadGraph, Relation,
+        IndexedRelation, NodeError, NodeProvider, NodeSchema, ProviderState, ReadGraph, Relation,
         View,
     },
     graph::read_from_state,
@@ -16,21 +16,20 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
+    thread,
 };
 
 pub(crate) trait ErasedProvider: Send + Sync {
     fn name(&self) -> &'static str;
     fn schema(&self) -> NodeSchema;
-    fn run<'nodes>(
-        &self,
-        transaction: &mut Transaction<'nodes>,
-        task: TaskId,
-    ) -> Result<(), NodeError>;
-    fn reclaim<'nodes>(
-        &self,
-        transaction: &mut Transaction<'nodes>,
-        task: TaskId,
-    ) -> Result<(), NodeError>;
+    /// Whether this provider stages private state through
+    /// [`DeriveCx::state_mut`]. State-touching tasks always run on the serial
+    /// lane so parallel workers never observe staged mutations.
+    fn uses_state(&self) -> bool {
+        false
+    }
+    fn run<'tx>(&self, cx: DeriveCx<'tx>, task: TaskId) -> Result<DeriveCx<'tx>, NodeError>;
+    fn reclaim<'tx>(&self, cx: &mut ReclaimCx<'tx>, task: TaskId) -> Result<(), NodeError>;
 }
 
 pub(crate) struct ProviderEntry<P>(pub(crate) P);
@@ -42,71 +41,53 @@ impl<P: NodeProvider> ErasedProvider for ProviderEntry<P> {
     fn schema(&self) -> NodeSchema {
         P::schema()
     }
-
-    fn run<'nodes>(
-        &self,
-        transaction: &mut Transaction<'nodes>,
-        task: TaskId,
-    ) -> Result<(), NodeError> {
+    fn uses_state(&self) -> bool {
+        P::uses_state()
+    }
+    fn run<'tx>(&self, cx: DeriveCx<'tx>, task: TaskId) -> Result<DeriveCx<'tx>, NodeError> {
+        let mut cx = cx;
         let key = task
             .key
             .get::<P::Key>()
             .ok_or(NodeError::MissingProvider(type_name::<P>()))?;
-        let (transaction, dependencies, outputs, relations, children) = {
-            let mut cx = DeriveCx {
-                transaction,
-                schema: self.schema(),
-                dependencies: RefCell::new(HashSet::new()),
-                indexers: RefCell::new(HashMap::new()),
-                outputs: HashMap::new(),
-                relations: HashSet::new(),
-                children: HashSet::new(),
-            };
-            self.0.derive(&mut cx, key)?;
-            cx.finish()
-        };
-        transaction.replace_task_outputs(task, dependencies, outputs, relations, children)
+        self.0.derive(&mut cx, key)?;
+        Ok(cx)
     }
-
-    fn reclaim<'nodes>(
-        &self,
-        transaction: &mut Transaction<'nodes>,
-        task: TaskId,
-    ) -> Result<(), NodeError> {
+    fn reclaim<'tx>(&self, cx: &mut ReclaimCx<'tx>, task: TaskId) -> Result<(), NodeError> {
         let key = task
             .key
             .get::<P::Key>()
             .ok_or(NodeError::MissingProvider(type_name::<P>()))?;
-        self.0.reclaim(&mut ReclaimCx { transaction }, key)
+        self.0.reclaim(cx, key)
     }
 }
 
-pub(crate) type DeferredChildFactory = Box<dyn Fn(&TaskId) -> Option<TaskId> + Send + Sync>;
+pub(crate) type DeferredChildFactory = Arc<dyn Fn(&TaskId) -> Option<TaskId> + Send + Sync>;
 
-pub(crate) struct Transaction<'a> {
-    providers: &'a HashMap<TypeId, Arc<dyn ErasedProvider>>,
-    deferred_children: &'a HashMap<TypeId, Vec<DeferredChildFactory>>,
-    pub(crate) state: GraphState,
-    target: SnapshotId,
-    pending: VecDeque<TaskId>,
-    pending_set: HashSet<TaskId>,
-    running: Vec<TaskId>,
-    orphaned: VecDeque<TaskId>,
-    orphaned_set: HashSet<TaskId>,
-    component_states: HashMap<usize, Box<dyn StagedComponentState>>,
+/// One wave worker's recorded derivation outcome before coordinator merge.
+#[derive(Default)]
+pub(crate) struct TaskPatch {
+    pub(crate) dependencies: HashSet<DependencyId>,
+    pub(crate) outputs: HashMap<FactId, Arc<dyn ErasedValue>>,
+    pub(crate) relations: HashSet<RelationFactId>,
+    pub(crate) children: HashSet<TaskId>,
+    pub(crate) scheduled: HashSet<TaskId>,
+    pub(crate) relation_indexers: HashMap<TypeId, RelationIndexer>,
+    pub(crate) awaiting: bool,
+    pub(crate) awaited: HashSet<TaskId>,
 }
 
-pub(crate) trait StagedComponentState {
+pub(crate) trait StagedProviderState {
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn commit(self: Box<Self>);
 }
 
 pub(crate) struct StagedState<T: Clone + Send + Sync + 'static> {
-    target: ComponentState<T>,
+    target: ProviderState<T>,
     value: T,
 }
 
-impl<T: Clone + Send + Sync + 'static> StagedComponentState for StagedState<T> {
+impl<T: Clone + Send + Sync + 'static> StagedProviderState for StagedState<T> {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         &mut self.value
     }
@@ -120,10 +101,51 @@ impl<T: Clone + Send + Sync + 'static> StagedComponentState for StagedState<T> {
     }
 }
 
-impl<'a> Transaction<'a> {
+/// A single transaction against the graph. Providers and deferred-child
+/// factories are shared through `Arc` so derivations can run on worker threads
+/// without borrowing the graph.
+pub(crate) struct Transaction {
+    pub(crate) providers: Arc<HashMap<TypeId, Arc<dyn ErasedProvider>>>,
+    deferred_children: Arc<HashMap<TypeId, Vec<DeferredChildFactory>>>,
+    pub(crate) state: GraphState,
+    target: SnapshotId,
+    pending: VecDeque<TaskId>,
+    pending_set: HashSet<TaskId>,
+    orphaned: VecDeque<TaskId>,
+    orphaned_set: HashSet<TaskId>,
+    provider_states: HashMap<usize, Box<dyn StagedProviderState>>,
+    /// Tasks that suspended awaiting a child in this transaction, mapped to
+    /// the child tasks they await. Used for deterministic cycle detection.
+    suspended_awaits: HashMap<TaskId, HashSet<TaskId>>,
+}
+
+/// The finished derivation of one task, ready for coordinator application.
+pub(crate) enum DeriveOutput<'tx> {
+    Live {
+        transaction: &'tx mut Transaction,
+        dependencies: HashSet<DependencyId>,
+        outputs: HashMap<FactId, Arc<dyn ErasedValue>>,
+        relations: HashSet<RelationFactId>,
+        children: HashSet<TaskId>,
+        awaiting: bool,
+        awaited: HashSet<TaskId>,
+    },
+    Patch {
+        dependencies: HashSet<DependencyId>,
+        outputs: HashMap<FactId, Arc<dyn ErasedValue>>,
+        relations: HashSet<RelationFactId>,
+        children: HashSet<TaskId>,
+        scheduled: HashSet<TaskId>,
+        relation_indexers: HashMap<TypeId, RelationIndexer>,
+        awaiting: bool,
+        awaited: HashSet<TaskId>,
+    },
+}
+
+impl Transaction {
     pub(crate) fn new(
-        providers: &'a HashMap<TypeId, Arc<dyn ErasedProvider>>,
-        deferred_children: &'a HashMap<TypeId, Vec<DeferredChildFactory>>,
+        providers: Arc<HashMap<TypeId, Arc<dyn ErasedProvider>>>,
+        deferred_children: Arc<HashMap<TypeId, Vec<DeferredChildFactory>>>,
         mut state: GraphState,
         target: SnapshotId,
     ) -> Self {
@@ -135,10 +157,10 @@ impl<'a> Transaction<'a> {
             target,
             pending: VecDeque::new(),
             pending_set: HashSet::new(),
-            running: Vec::new(),
             orphaned: VecDeque::new(),
             orphaned_set: HashSet::new(),
-            component_states: HashMap::new(),
+            provider_states: HashMap::new(),
+            suspended_awaits: HashMap::new(),
         }
     }
 
@@ -148,23 +170,176 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    fn registered_children(&self, parent: &TaskId) -> Vec<TaskId> {
-        self.deferred_children
-            .get(&parent.provider)
-            .into_iter()
-            .flatten()
-            .filter_map(|factory| factory(parent))
-            .collect()
-    }
-
-    pub(crate) fn run_pending(&mut self) -> Result<(), NodeError> {
+    /// Drains ready work in immutable-read waves. State-touching tasks run on
+    /// the serial lane; pure tasks run concurrently on bounded workers.
+    pub(crate) fn run_pending(&mut self, workers: usize) -> Result<(), NodeError> {
         while !self.pending.is_empty() || !self.orphaned.is_empty() {
-            if let Some(task) = self.pending.pop_front() {
-                self.run_node(task)?;
-            } else if let Some(task) = self.orphaned.pop_front() {
+            if self.pending.is_empty() {
+                let task = self.orphaned.pop_front().expect("orphan queue is nonempty");
                 self.orphaned_set.remove(&task);
                 self.reclaim_task(task)?;
+                continue;
             }
+
+            if workers > 1 && self.pending.len() > 1 {
+                let mut wave = Vec::new();
+                while wave.len() < workers {
+                    let Some(front) = self.pending.front() else {
+                        break;
+                    };
+                    let uses_state = self
+                        .providers
+                        .get(&front.provider)
+                        .is_some_and(|provider| provider.uses_state());
+                    if uses_state {
+                        break;
+                    }
+                    let task = self
+                        .pending
+                        .pop_front()
+                        .expect("front task was inspected above");
+                    self.pending_set.remove(&task);
+                    wave.push(task);
+                }
+                if wave.len() > 1 {
+                    self.run_parallel_wave(wave)?;
+                    continue;
+                }
+                if wave.len() == 1 {
+                    let task = wave.pop().expect("one wave task");
+                    self.run_node(task)?;
+                    continue;
+                }
+            }
+
+            let task = self.pending.pop_front().expect("pending queue is nonempty");
+            self.run_node(task)?;
+        }
+        Ok(())
+    }
+
+    /// Runs one task serially against the live transaction state.
+    fn run_node(&mut self, task: TaskId) -> Result<(), NodeError> {
+        let should_run = self.pending_set.remove(&task)
+            || !self
+                .state
+                .task_outputs
+                .get(&task)
+                .is_some_and(|outputs| !outputs.is_empty());
+        if !should_run {
+            return Ok(());
+        }
+        let node = self
+            .providers
+            .get(&task.provider)
+            .cloned()
+            .ok_or(NodeError::MissingProvider("<unknown node>"))?;
+        let schema = node.schema();
+        let cx = DeriveCx::live(self, schema);
+        let cx = node.run(cx, task.clone())?;
+        let output = cx.finish();
+        let DeriveOutput::Live {
+            transaction,
+            dependencies,
+            outputs,
+            relations,
+            children,
+            awaiting,
+            awaited,
+        } = output
+        else {
+            unreachable!("serial derivations run in live mode");
+        };
+        let patch = TaskPatch {
+            dependencies,
+            outputs,
+            relations,
+            children,
+            scheduled: HashSet::new(),
+            relation_indexers: HashMap::new(),
+            awaiting,
+            awaited,
+        };
+        let mut applied_changed = HashSet::new();
+        transaction.apply_patch(task, patch, &mut applied_changed)?;
+        Ok(())
+    }
+
+    /// Runs a bounded batch of ready tasks on worker threads. Each worker
+    /// reads one shared immutable snapshot and records only local patch data;
+    /// the coordinator merges patches in stable ready-queue order and
+    /// reschedules any patch invalidated by an earlier write in the same wave.
+    fn run_parallel_wave(&mut self, wave: Vec<TaskId>) -> Result<(), NodeError> {
+        let snapshot = Arc::new(self.state.clone());
+        let awaits = Arc::new(self.suspended_awaits.clone());
+        let providers = Arc::clone(&self.providers);
+        let deferred_children = Arc::clone(&self.deferred_children);
+        let outcomes = thread::scope(|scope| {
+            let handles = wave
+                .iter()
+                .cloned()
+                .map(|task| {
+                    let snapshot = Arc::clone(&snapshot);
+                    let awaits = Arc::clone(&awaits);
+                    let providers = Arc::clone(&providers);
+                    let deferred_children = Arc::clone(&deferred_children);
+                    scope.spawn(move || {
+                        evaluate_worker(&providers, &snapshot, &awaits, &deferred_children, task)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| NodeError::message("a graph worker panicked"))?
+                })
+                .collect::<Result<Vec<_>, NodeError>>()
+        })?;
+
+        let mut applied_changed: HashSet<DependencyId> = HashSet::new();
+        for (task, patch) in wave.into_iter().zip(outcomes) {
+            if patch
+                .dependencies
+                .iter()
+                .any(|dependency| applied_changed.contains(dependency))
+            {
+                self.schedule(task);
+                continue;
+            }
+            self.apply_patch(task, patch, &mut applied_changed)?;
+        }
+        Ok(())
+    }
+
+    /// Applies one derivation patch to the live state. Returns the set of
+    /// dependency identities whose committed value actually changed, so later
+    /// same-wave patches can be invalidated precisely.
+    fn apply_patch(
+        &mut self,
+        task: TaskId,
+        patch: TaskPatch,
+        applied_changed: &mut HashSet<DependencyId>,
+    ) -> Result<(), NodeError> {
+        for (relation, indexer) in patch.relation_indexers {
+            self.register_relation_index(relation, indexer);
+        }
+        let changed = self.replace_task_outputs(
+            task.clone(),
+            patch.dependencies,
+            patch.outputs,
+            patch.relations,
+            patch.children,
+        )?;
+        applied_changed.extend(changed);
+        if patch.awaiting {
+            self.suspended_awaits.insert(task, patch.awaited);
+        } else {
+            self.suspended_awaits.remove(&task);
+        }
+        for child in patch.scheduled {
+            self.schedule(child);
         }
         Ok(())
     }
@@ -200,30 +375,6 @@ impl<'a> Transaction<'a> {
                 .is_some_and(|parents| !parents.is_empty())
     }
 
-    fn run_node(&mut self, task: TaskId) -> Result<(), NodeError> {
-        let should_run =
-            self.pending_set.remove(&task) || !self.state.task_outputs.contains_key(&task);
-        if !should_run {
-            return Ok(());
-        }
-        if self.running.contains(&task) {
-            return Err(NodeError::DependencyCycle(
-                self.providers
-                    .get(&task.provider)
-                    .map_or("<unknown node>", |node| node.name()),
-            ));
-        }
-        let node = self
-            .providers
-            .get(&task.provider)
-            .cloned()
-            .ok_or(NodeError::MissingProvider("<unknown node>"))?;
-        self.running.push(task.clone());
-        let result = node.run(self, task);
-        self.running.pop();
-        result
-    }
-
     fn set_root<V: View>(&mut self, key: V::Key, value: V::Value) -> Result<(), NodeError> {
         let fact = FactId::new::<V>(key);
         if let Some(owner) = self.state.fact_owners.get(&fact) {
@@ -239,7 +390,7 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
-    fn write_fact(&mut self, fact: FactId, value: Arc<dyn ErasedValue>) {
+    fn write_fact(&mut self, fact: FactId, value: Arc<dyn ErasedValue>) -> bool {
         let changed = self
             .state
             .facts
@@ -255,26 +406,30 @@ impl<'a> Transaction<'a> {
             );
             self.schedule_dependents(DependencyId::View(fact));
         }
+        changed
     }
 
-    fn remove_fact(&mut self, fact: &FactId) {
+    fn remove_fact(&mut self, fact: &FactId) -> bool {
         if self.state.facts.remove(fact).is_some() {
             self.schedule_dependents(DependencyId::View(fact.clone()));
+            true
+        } else {
+            false
         }
     }
 
     fn component_state_mut<T: Clone + Send + Sync + 'static>(
         &mut self,
-        state: &ComponentState<T>,
+        state: &ProviderState<T>,
     ) -> Result<&mut T, NodeError> {
         let id = Arc::as_ptr(&state.value) as usize;
-        if let std::collections::hash_map::Entry::Vacant(e) = self.component_states.entry(id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.provider_states.entry(id) {
             e.insert(Box::new(StagedState {
                 target: state.clone(),
                 value: state.get()?,
             }));
         }
-        self.component_states
+        self.provider_states
             .get_mut(&id)
             .and_then(|state| state.as_any_mut().downcast_mut())
             .ok_or_else(|| NodeError::message("component state type mismatch"))
@@ -355,6 +510,8 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// Applies one task's complete replacement contribution and returns the
+    /// set of dependency identities whose observable value changed.
     fn replace_task_outputs(
         &mut self,
         task: TaskId,
@@ -362,7 +519,8 @@ impl<'a> Transaction<'a> {
         outputs: HashMap<FactId, Arc<dyn ErasedValue>>,
         relations: HashSet<RelationFactId>,
         children: HashSet<TaskId>,
-    ) -> Result<(), NodeError> {
+    ) -> Result<HashSet<DependencyId>, NodeError> {
+        let mut changed = HashSet::new();
         let provider_name = self
             .providers
             .get(&task.provider)
@@ -388,10 +546,14 @@ impl<'a> Transaction<'a> {
         let old_outputs = self.state.task_outputs.remove(&task).unwrap_or_default();
         for fact in old_outputs.difference(&output_ids) {
             self.state.fact_owners.remove(fact);
-            self.remove_fact(fact);
+            if self.remove_fact(fact) {
+                changed.insert(DependencyId::View(fact.clone()));
+            }
         }
         for (fact, value) in outputs {
-            self.write_fact(fact.clone(), value);
+            if self.write_fact(fact.clone(), value) {
+                changed.insert(DependencyId::View(fact.clone()));
+            }
             self.state.fact_owners.insert(fact, task.clone());
         }
         self.state.task_outputs.insert(task.clone(), output_ids);
@@ -401,7 +563,7 @@ impl<'a> Transaction<'a> {
             .task_relation_outputs
             .remove(&task)
             .unwrap_or_default();
-        self.remove_task_relations(&task, &old_relations, &relations);
+        changed.extend(self.remove_task_relations(&task, &old_relations, &relations));
         for relation in &relations {
             let supports = self
                 .state
@@ -410,10 +572,13 @@ impl<'a> Transaction<'a> {
                 .or_default();
             if supports.insert(task.clone()) && supports.len() == 1 {
                 if let Some(bucket) = self.add_relation_to_bucket(relation) {
-                    self.schedule_dependents(DependencyId::RelationBucket(bucket));
+                    self.schedule_dependents(DependencyId::RelationBucket(bucket.clone()));
+                    changed.insert(DependencyId::RelationBucket(bucket));
                 }
                 self.schedule_dependents(DependencyId::Relation(relation.clone()));
                 self.schedule_dependents(DependencyId::RelationType(relation.relation));
+                changed.insert(DependencyId::Relation(relation.clone()));
+                changed.insert(DependencyId::RelationType(relation.relation));
             }
         }
         self.state
@@ -422,7 +587,7 @@ impl<'a> Transaction<'a> {
 
         self.replace_task_dependencies(task.clone(), dependencies);
         self.replace_task_children(task, children);
-        Ok(())
+        Ok(changed)
     }
 
     fn remove_task_relations(
@@ -430,7 +595,8 @@ impl<'a> Transaction<'a> {
         task: &TaskId,
         old_relations: &HashSet<RelationFactId>,
         retained_relations: &HashSet<RelationFactId>,
-    ) {
+    ) -> HashSet<DependencyId> {
+        let mut changed = HashSet::new();
         for relation in old_relations.difference(retained_relations) {
             let remove = self
                 .state
@@ -443,12 +609,16 @@ impl<'a> Transaction<'a> {
             if remove {
                 self.state.relation_supports.remove(relation);
                 if let Some(bucket) = self.remove_relation_from_bucket(relation) {
-                    self.schedule_dependents(DependencyId::RelationBucket(bucket));
+                    self.schedule_dependents(DependencyId::RelationBucket(bucket.clone()));
+                    changed.insert(DependencyId::RelationBucket(bucket));
                 }
                 self.schedule_dependents(DependencyId::Relation(relation.clone()));
                 self.schedule_dependents(DependencyId::RelationType(relation.relation));
+                changed.insert(DependencyId::Relation(relation.clone()));
+                changed.insert(DependencyId::RelationType(relation.relation));
             }
         }
+        changed
     }
 
     fn replace_task_dependencies(&mut self, task: TaskId, dependencies: HashSet<DependencyId>) {
@@ -511,10 +681,6 @@ impl<'a> Transaction<'a> {
         if self.is_live(&task) {
             return Ok(());
         }
-        if self.running.contains(&task) {
-            self.queue_reclaim(task);
-            return Ok(());
-        }
         self.pending_set.remove(&task);
 
         let dependencies = self
@@ -539,13 +705,15 @@ impl<'a> Transaction<'a> {
             .unwrap_or_default();
         self.remove_task_relations(&task, &relations, &HashSet::new());
         self.replace_task_children(task.clone(), HashSet::new());
+        self.suspended_awaits.remove(&task);
 
         let node = self
             .providers
             .get(&task.provider)
             .cloned()
             .ok_or(NodeError::MissingProvider("<unknown node>"))?;
-        node.reclaim(self, task)
+        let mut cx = ReclaimCx { transaction: self };
+        node.reclaim(&mut cx, task)
     }
 
     fn remove_task_dependencies(&mut self, task: &TaskId, dependencies: &HashSet<DependencyId>) {
@@ -559,78 +727,219 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub(crate) fn finish(self) -> (GraphState, Vec<Box<dyn StagedComponentState>>) {
-        (self.state, self.component_states.into_values().collect())
+    pub(crate) fn finish(self) -> (GraphState, Vec<Box<dyn StagedProviderState>>) {
+        (self.state, self.provider_states.into_values().collect())
     }
 }
 
-pub(crate) fn commit_component_states(component_states: Vec<Box<dyn StagedComponentState>>) {
-    for state in component_states {
+/// Evaluates one ready task against a shared immutable wave snapshot. The
+/// derivation records a local [`TaskPatch`]; nothing touches the transaction.
+fn evaluate_worker(
+    providers: &HashMap<TypeId, Arc<dyn ErasedProvider>>,
+    snapshot: &Arc<GraphState>,
+    awaits: &Arc<HashMap<TaskId, HashSet<TaskId>>>,
+    deferred_children: &Arc<HashMap<TypeId, Vec<DeferredChildFactory>>>,
+    task: TaskId,
+) -> Result<TaskPatch, NodeError> {
+    let node = providers
+        .get(&task.provider)
+        .cloned()
+        .ok_or(NodeError::MissingProvider("<unknown node>"))?;
+    let schema = node.schema();
+    let mut patch = TaskPatch::default();
+    let cx = DeriveCx::patch(snapshot, awaits, deferred_children, schema, &mut patch);
+    let cx = node.run(cx, task)?;
+    match cx.finish() {
+        DeriveOutput::Patch {
+            dependencies,
+            outputs,
+            relations,
+            children,
+            scheduled,
+            relation_indexers,
+            awaiting,
+            awaited,
+        } => {
+            patch.dependencies = dependencies;
+            patch.outputs = outputs;
+            patch.relations = relations;
+            patch.children = children;
+            patch.scheduled = scheduled;
+            patch.relation_indexers = relation_indexers;
+            patch.awaiting = awaiting;
+            patch.awaited = awaited;
+            Ok(patch)
+        }
+        DeriveOutput::Live { .. } => unreachable!("worker derivations run in patch mode"),
+    }
+}
+
+pub(crate) fn commit_provider_states(provider_states: Vec<Box<dyn StagedProviderState>>) {
+    for state in provider_states {
         state.commit();
     }
 }
 
-type DerivePublication<'transaction, 'nodes> = (
-    &'transaction mut Transaction<'nodes>,
-    HashSet<DependencyId>,
-    HashMap<FactId, Arc<dyn ErasedValue>>,
-    HashSet<RelationFactId>,
-    HashSet<TaskId>,
-);
+/// Where a derivation reads facts and records its staged contribution.
+pub(crate) enum DeriveMode<'tx> {
+    /// Serial execution: reads see the live transaction state and scheduling
+    /// touches the transaction directly.
+    Live { transaction: &'tx mut Transaction },
+    /// Parallel execution: reads see one shared wave snapshot and scheduling
+    /// is recorded in a worker-local patch.
+    Patch {
+        patch: &'tx mut TaskPatch,
+        snapshot: Arc<GraphState>,
+        awaits: Arc<HashMap<TaskId, HashSet<TaskId>>>,
+    },
+}
 
 /// Context available to a provider while deriving one keyed publication set.
-pub struct DeriveCx<'transaction, 'nodes> {
-    transaction: &'transaction mut Transaction<'nodes>,
+pub struct DeriveCx<'tx> {
+    mode: DeriveMode<'tx>,
+    deferred_children: Arc<HashMap<TypeId, Vec<DeferredChildFactory>>>,
     schema: NodeSchema,
     dependencies: RefCell<HashSet<DependencyId>>,
     indexers: RefCell<HashMap<TypeId, RelationIndexer>>,
     outputs: HashMap<FactId, Arc<dyn ErasedValue>>,
     relations: HashSet<RelationFactId>,
     children: HashSet<TaskId>,
+    pub(crate) awaiting: bool,
+    pub(crate) awaited: HashSet<TaskId>,
 }
 
-impl<'transaction, 'nodes> DeriveCx<'transaction, 'nodes> {
+impl<'tx> DeriveCx<'tx> {
+    pub(crate) fn live(transaction: &'tx mut Transaction, schema: NodeSchema) -> Self {
+        let deferred_children = Arc::clone(&transaction.deferred_children);
+        Self {
+            mode: DeriveMode::Live { transaction },
+            deferred_children,
+            schema,
+            dependencies: RefCell::new(HashSet::new()),
+            indexers: RefCell::new(HashMap::new()),
+            outputs: HashMap::new(),
+            relations: HashSet::new(),
+            children: HashSet::new(),
+            awaiting: false,
+            awaited: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn patch(
+        snapshot: &Arc<GraphState>,
+        awaits: &Arc<HashMap<TaskId, HashSet<TaskId>>>,
+        deferred_children: &Arc<HashMap<TypeId, Vec<DeferredChildFactory>>>,
+        schema: NodeSchema,
+        patch: &'tx mut TaskPatch,
+    ) -> Self {
+        Self {
+            mode: DeriveMode::Patch {
+                patch,
+                snapshot: Arc::clone(snapshot),
+                awaits: Arc::clone(awaits),
+            },
+            deferred_children: Arc::clone(deferred_children),
+            schema,
+            dependencies: RefCell::new(HashSet::new()),
+            indexers: RefCell::new(HashMap::new()),
+            outputs: HashMap::new(),
+            relations: HashSet::new(),
+            children: HashSet::new(),
+            awaiting: false,
+            awaited: HashSet::new(),
+        }
+    }
+
     /// Reads a current value without adding an invalidation dependency. This is
     /// for coordinators deciding whether to schedule work for a newly emitted
     /// semantic publication.
     pub(crate) fn peek<V: View>(&self, key: V::Key) -> Option<V::Value> {
-        read_from_state::<V>(&self.transaction.state, key)
+        match &self.mode {
+            DeriveMode::Live { transaction } => read_from_state::<V>(&transaction.state, key),
+            DeriveMode::Patch { snapshot, .. } => read_from_state::<V>(snapshot, key),
+        }
     }
 
     /// Returns this transaction's mutable staged copy of component state.
     ///
     /// The handle is cloned on first use in a transaction. Mutations are
-    /// discarded if the command or any later derivation fails.
+    /// discarded if the command or any later derivation fails. State-touching
+    /// providers run on the serial lane, so this is always live mode.
     pub fn state_mut<T: Clone + Send + Sync + 'static>(
         &mut self,
-        state: &ComponentState<T>,
+        state: &ProviderState<T>,
     ) -> Result<&mut T, NodeError> {
-        self.transaction.component_state_mut(state)
+        match &mut self.mode {
+            DeriveMode::Live { transaction } => transaction.component_state_mut(state),
+            DeriveMode::Patch { .. } => Err(NodeError::message(
+                "provider state is unavailable inside a parallel wave",
+            )),
+        }
     }
 
-    /// Materializes another provider and records a typed keeps-alive edge.
+    /// Materializes another provider inline. Kernel providers (parser, lexer,
+    /// scope catalog) use this to run their dependencies within one serial
+    /// derivation; component authors use schedule-and-read suspension instead.
     pub fn materialize<P: NodeProvider>(&mut self, key: P::Key) -> Result<(), NodeError> {
-        let task = TaskId::new::<P>(key);
-        self.transaction.run_node(task.clone())?;
-        self.children.insert(task);
-        Ok(())
+        match &mut self.mode {
+            DeriveMode::Live { transaction } => {
+                let task = TaskId::new::<P>(key);
+                transaction.run_node(task.clone())?;
+                self.children.insert(task);
+                Ok(())
+            }
+            DeriveMode::Patch { .. } => Err(NodeError::message(
+                "a provider cannot be materialized inline inside a parallel wave",
+            )),
+        }
     }
 
     /// Schedules a provider child after this task's publication replacement.
     pub fn defer<P: NodeProvider>(&mut self, key: P::Key) {
         let task = TaskId::new::<P>(key);
-        self.transaction.schedule(task.clone());
+        self.retain_task(task);
+    }
+
+    /// Retains one task and schedules it only when it is not yet materialized.
+    /// Materialized targets stay alive as children; invalidation reschedules
+    /// them through recorded dependencies, so re-calling an available child
+    /// never spins the scheduler.
+    pub(crate) fn retain_task(&mut self, task: TaskId) {
+        let materialized = match &self.mode {
+            DeriveMode::Live { transaction } => transaction
+                .state
+                .task_outputs
+                .get(&task)
+                .is_some_and(|outputs| !outputs.is_empty()),
+            DeriveMode::Patch { snapshot, .. } => snapshot
+                .task_outputs
+                .get(&task)
+                .is_some_and(|outputs| !outputs.is_empty()),
+        };
+        if !materialized {
+            match &mut self.mode {
+                DeriveMode::Live { transaction } => transaction.schedule(task.clone()),
+                DeriveMode::Patch { patch, .. } => {
+                    patch.scheduled.insert(task.clone());
+                }
+            }
+        }
         self.children.insert(task);
     }
 
-    /// Defers every provider child connected to the current provider.
+    /// Schedules every provider child connected to the given parent task.
     /// Children run only after the parent's facts commit, so they observe a
     /// complete parser publication rather than partially emitted candidates.
-    pub(crate) fn defer_connected<P: NodeProvider>(&mut self, key: P::Key) {
-        let parent = TaskId::new::<P>(key);
-        for child in self.transaction.registered_children(&parent) {
-            self.transaction.schedule(child.clone());
-            self.children.insert(child);
+    pub(crate) fn defer_connected(&mut self, task: &TaskId) {
+        let children = self
+            .deferred_children
+            .get(&task.provider)
+            .into_iter()
+            .flatten()
+            .filter_map(|factory| factory(task))
+            .collect::<Vec<_>>();
+        for child in children {
+            self.retain_task(child);
         }
     }
 
@@ -667,27 +976,87 @@ impl<'transaction, 'nodes> DeriveCx<'transaction, 'nodes> {
         Ok(())
     }
 
-    fn finish(self) -> DerivePublication<'transaction, 'nodes> {
-        for (relation, indexer) in self.indexers.into_inner() {
-            self.transaction.register_relation_index(relation, indexer);
+    /// Records that this derivation suspended awaiting a child. Staged
+    /// definitions and supports are discarded by [`Self::finish`].
+    pub(crate) fn mark_awaiting(&mut self) {
+        self.awaiting = true;
+    }
+
+    /// Detects a component call cycle: the caller awaits the target, and the
+    /// target transitively awaits the caller through earlier suspensions in
+    /// this transaction.
+    pub(crate) fn check_cycle(&self, caller: &TaskId, target: &TaskId) -> Result<(), NodeError> {
+        let awaits = match &self.mode {
+            DeriveMode::Live { transaction } => &transaction.suspended_awaits,
+            DeriveMode::Patch { awaits, .. } => awaits.as_ref(),
+        };
+        let mut pending = vec![target.clone()];
+        let mut seen: HashSet<TaskId> = HashSet::new();
+        while let Some(task) = pending.pop() {
+            if &task == caller {
+                return Err(NodeError::DependencyCycle(self.schema.provider));
+            }
+            if !seen.insert(task.clone()) {
+                continue;
+            }
+            if let Some(children) = awaits.get(&task) {
+                pending.extend(children.iter().cloned());
+            }
         }
-        (
-            self.transaction,
-            self.dependencies.into_inner(),
-            self.outputs,
-            self.relations,
-            self.children,
-        )
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> DeriveOutput<'tx> {
+        let dependencies = self.dependencies.into_inner();
+        let indexers = self.indexers.into_inner();
+        let mut outputs = self.outputs;
+        let mut relations = self.relations;
+        if self.awaiting {
+            outputs.clear();
+            relations.clear();
+        }
+        let awaiting = self.awaiting;
+        let awaited = self.awaited;
+        let children = self.children;
+        match self.mode {
+            DeriveMode::Live { transaction } => {
+                for (relation, indexer) in indexers {
+                    transaction.register_relation_index(relation, indexer);
+                }
+                DeriveOutput::Live {
+                    transaction,
+                    dependencies,
+                    outputs,
+                    relations,
+                    children,
+                    awaiting,
+                    awaited,
+                }
+            }
+            DeriveMode::Patch { patch, .. } => DeriveOutput::Patch {
+                dependencies,
+                outputs,
+                relations,
+                children,
+                scheduled: std::mem::take(&mut patch.scheduled),
+                relation_indexers: indexers,
+                awaiting,
+                awaited,
+            },
+        }
     }
 }
 
-impl ReadGraph for DeriveCx<'_, '_> {
+impl ReadGraph for DeriveCx<'_> {
     fn get<V: View>(&self, key: V::Key) -> Option<V::Value> {
         let fact = FactId::new::<V>(key.clone());
         self.dependencies
             .borrow_mut()
             .insert(DependencyId::View(fact));
-        read_from_state::<V>(&self.transaction.state, key)
+        match &self.mode {
+            DeriveMode::Live { transaction } => read_from_state::<V>(&transaction.state, key),
+            DeriveMode::Patch { snapshot, .. } => read_from_state::<V>(snapshot, key),
+        }
     }
 
     fn contains<R: Relation>(&self, fact: R::Fact) -> bool {
@@ -695,10 +1064,15 @@ impl ReadGraph for DeriveCx<'_, '_> {
         self.dependencies
             .borrow_mut()
             .insert(DependencyId::Relation(relation.clone()));
-        self.transaction
-            .state
-            .relation_supports
-            .contains_key(&relation)
+        let present = match &self.mode {
+            DeriveMode::Live { transaction } => {
+                transaction.state.relation_supports.contains_key(&relation)
+            }
+            DeriveMode::Patch { snapshot, .. } => {
+                snapshot.relation_supports.contains_key(&relation)
+            }
+        };
+        present
     }
 
     fn scan<R: IndexedRelation>(&self, index: R::Index) -> Vec<R::Fact> {
@@ -712,8 +1086,11 @@ impl ReadGraph for DeriveCx<'_, '_> {
         self.dependencies
             .borrow_mut()
             .insert(DependencyId::RelationBucket(bucket));
-        self.transaction
-            .state
+        let facts = match &self.mode {
+            DeriveMode::Live { transaction } => &transaction.state,
+            DeriveMode::Patch { snapshot, .. } => snapshot.as_ref(),
+        };
+        facts
             .relation_supports
             .keys()
             .filter_map(RelationFactId::get::<R>)
@@ -725,8 +1102,11 @@ impl ReadGraph for DeriveCx<'_, '_> {
         self.dependencies
             .borrow_mut()
             .insert(DependencyId::RelationType(TypeId::of::<R>()));
-        self.transaction
-            .state
+        let facts = match &self.mode {
+            DeriveMode::Live { transaction } => &transaction.state,
+            DeriveMode::Patch { snapshot, .. } => snapshot.as_ref(),
+        };
+        facts
             .relation_supports
             .keys()
             .filter_map(RelationFactId::get::<R>)
@@ -737,15 +1117,15 @@ impl ReadGraph for DeriveCx<'_, '_> {
 /// Context available while reclaiming a task whose externally visible outputs
 /// have already been removed. It deliberately exposes only private staged
 /// state, never graph output mutation.
-pub struct ReclaimCx<'transaction, 'nodes> {
-    transaction: &'transaction mut Transaction<'nodes>,
+pub struct ReclaimCx<'tx> {
+    transaction: &'tx mut Transaction,
 }
 
-impl<'transaction, 'nodes> ReclaimCx<'transaction, 'nodes> {
+impl<'tx> ReclaimCx<'tx> {
     /// Returns this transaction's staged copy of provider-private state.
     pub fn state_mut<T: Clone + Send + Sync + 'static>(
         &mut self,
-        state: &ComponentState<T>,
+        state: &ProviderState<T>,
     ) -> Result<&mut T, NodeError> {
         self.transaction.component_state_mut(state)
     }
@@ -768,11 +1148,11 @@ impl<'transaction, 'nodes> ReclaimCx<'transaction, 'nodes> {
 }
 
 /// Context available while applying a root-state command.
-pub struct CommandCx<'transaction, 'nodes> {
-    pub(crate) transaction: &'transaction mut Transaction<'nodes>,
+pub struct CommandCx<'tx> {
+    pub(crate) transaction: &'tx mut Transaction,
 }
 
-impl<'transaction, 'nodes> CommandCx<'transaction, 'nodes> {
+impl<'tx> CommandCx<'tx> {
     pub fn get<V: View>(&self, key: V::Key) -> Option<V::Value> {
         read_from_state::<V>(&self.transaction.state, key)
     }

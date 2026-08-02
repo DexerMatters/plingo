@@ -135,8 +135,8 @@ pub fn expand_label_regex(input: TokenStream) -> Result<TokenStream> {
     Ok(regex.expand())
 }
 
-pub fn expand_relative_label_regex(input: TokenStream) -> Result<TokenStream> {
+pub fn expand_scope_path(input: TokenStream) -> Result<TokenStream> {
     let RegexInput(regex) = syn::parse2(input)?;
     let expression = regex.expand();
-    Ok(quote!(::plingo::component::scope::RelativeRegex::from(#expression)))
+    Ok(quote!(::plingo::component::scope::ScopePath::from(#expression)))
 }

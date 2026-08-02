@@ -3,11 +3,11 @@
 use std::{collections::HashMap, marker::PhantomData};
 
 use crate::scheme::node::{
-    ComponentState, DeriveCx, IndexedRelation, NodeError, NodeProvider, NodeSchema,
-    PortDeclaration, Relation, View,
+    DeriveCx, IndexedRelation, NodeError, NodeProvider, NodeSchema, PortDeclaration, ProviderState,
+    Relation, View,
 };
 
-use super::{ScopeAllocation, ScopeDomain, ScopeEdge, ScopeId, ScopeLifecycle};
+use super::{ScopeAllocation, ScopeDomain, ScopeId};
 
 /// Materialized identity for one domain-owned semantic scope key.
 pub(crate) struct ScopeHandle<D: ScopeDomain>(PhantomData<fn() -> D>);
@@ -29,44 +29,6 @@ impl<D: ScopeDomain> IndexedRelation for ScopeAllocations<D> {
 
     fn index(fact: &Self::Fact) -> Self::Index {
         fact.key.clone()
-    }
-}
-
-/// One domain-defined datum per semantic scope.
-pub struct ScopeData<D: ScopeDomain>(PhantomData<fn() -> D>);
-
-impl<D: ScopeDomain> View for ScopeData<D> {
-    type Key = ScopeId<D>;
-    type Value = D::ScopeData;
-}
-
-/// Graph edges indexed by source scope.
-pub struct ScopeEdges<D: ScopeDomain>(PhantomData<fn() -> D>);
-
-impl<D: ScopeDomain> Relation for ScopeEdges<D> {
-    type Fact = ScopeEdge<D>;
-}
-
-impl<D: ScopeDomain> IndexedRelation for ScopeEdges<D> {
-    type Index = ScopeId<D>;
-
-    fn index(fact: &Self::Fact) -> Self::Index {
-        fact.source
-    }
-}
-
-/// Closed scope frontiers indexed by scope.
-pub struct ScopeLifecycles<D: ScopeDomain>(PhantomData<fn() -> D>);
-
-impl<D: ScopeDomain> Relation for ScopeLifecycles<D> {
-    type Fact = ScopeLifecycle<D>;
-}
-
-impl<D: ScopeDomain> IndexedRelation for ScopeLifecycles<D> {
-    type Index = ScopeId<D>;
-
-    fn index(fact: &Self::Fact) -> Self::Index {
-        fact.scope
     }
 }
 
@@ -102,7 +64,7 @@ impl<D: ScopeDomain> Default for ScopeCatalogState<D> {
 
 /// Stable, demand-reclaimable allocation catalog.
 pub(crate) struct ScopeCatalogNode<D: ScopeDomain> {
-    state: ComponentState<ScopeCatalogState<D>>,
+    state: ProviderState<ScopeCatalogState<D>>,
 }
 
 impl<D: ScopeDomain> Default for ScopeCatalogNode<D> {
@@ -114,7 +76,7 @@ impl<D: ScopeDomain> Default for ScopeCatalogNode<D> {
 impl<D: ScopeDomain> ScopeCatalogNode<D> {
     pub(crate) fn new() -> Self {
         Self {
-            state: ComponentState::new(ScopeCatalogState::default()),
+            state: ProviderState::new(ScopeCatalogState::default()),
         }
     }
 }
@@ -132,7 +94,7 @@ impl<D: ScopeDomain> NodeProvider for ScopeCatalogNode<D> {
         )
     }
 
-    fn derive(&self, cx: &mut DeriveCx<'_, '_>, key: Self::Key) -> Result<(), NodeError> {
+    fn derive(&self, cx: &mut DeriveCx<'_>, key: Self::Key) -> Result<(), NodeError> {
         let scope = {
             let state = cx.state_mut(&self.state)?;
             if let Some(scope) = state.scopes.get(&key) {
@@ -154,9 +116,13 @@ impl<D: ScopeDomain> NodeProvider for ScopeCatalogNode<D> {
 
     fn reclaim(
         &self,
-        _cx: &mut crate::scheme::node::ReclaimCx<'_, '_>,
+        _cx: &mut crate::scheme::node::ReclaimCx<'_>,
         _key: Self::Key,
     ) -> Result<(), NodeError> {
         Ok(())
+    }
+
+    fn uses_state() -> bool {
+        true
     }
 }

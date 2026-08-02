@@ -11,7 +11,7 @@ struct Set(&'static str);
 impl Command for Set {
     type Output = ();
 
-    fn apply(self, cx: &mut CommandCx<'_, '_>) -> Result<(), NodeError> {
+    fn apply(self, cx: &mut CommandCx<'_>) -> Result<(), NodeError> {
         cx.set::<Value>("value".into(), self.0.into())
     }
 }

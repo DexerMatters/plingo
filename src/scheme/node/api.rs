@@ -176,14 +176,24 @@ pub trait ReadGraph {
 pub trait NodeProvider: Send + Sync + 'static {
     type Key: NodeKey;
 
-    fn derive(&self, cx: &mut DeriveCx<'_, '_>, key: Self::Key) -> Result<(), NodeError>;
+    fn derive(&self, cx: &mut DeriveCx<'_>, key: Self::Key) -> Result<(), NodeError>;
 
     fn schema() -> NodeSchema
     where
         Self: Sized;
 
-    fn reclaim(&self, _cx: &mut ReclaimCx<'_, '_>, _key: Self::Key) -> Result<(), NodeError> {
+    fn reclaim(&self, _cx: &mut ReclaimCx<'_>, _key: Self::Key) -> Result<(), NodeError> {
         Ok(())
+    }
+
+    /// Whether derivations stage private state through [`DeriveCx::state_mut`].
+    /// State-touching providers always run on the serial lane; the flag is
+    /// statically declared per provider kind.
+    fn uses_state() -> bool
+    where
+        Self: Sized,
+    {
+        false
     }
 }
 
@@ -194,7 +204,7 @@ pub trait NodeProvider: Send + Sync + 'static {
 pub trait Command: Send + 'static {
     type Output;
 
-    fn apply(self, cx: &mut CommandCx<'_, '_>) -> Result<Self::Output, NodeError>;
+    fn apply(self, cx: &mut CommandCx<'_>) -> Result<Self::Output, NodeError>;
 }
 
 /// Errors raised by the node graph.
@@ -248,11 +258,11 @@ impl NodeError {
 /// Cloning the handle shares the same state. A provider obtains a mutable
 /// staged copy through [`DeriveCx::state_mut`]; that copy replaces the stored
 /// value only after the graph transaction commits successfully.
-pub struct ComponentState<T: Clone + Send + Sync + 'static> {
+pub struct ProviderState<T: Clone + Send + Sync + 'static> {
     pub(crate) value: Arc<Mutex<T>>,
 }
 
-impl<T: Clone + Send + Sync + 'static> ComponentState<T> {
+impl<T: Clone + Send + Sync + 'static> ProviderState<T> {
     pub fn new(value: T) -> Self {
         Self {
             value: Arc::new(Mutex::new(value)),
@@ -268,7 +278,7 @@ impl<T: Clone + Send + Sync + 'static> ComponentState<T> {
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> Clone for ComponentState<T> {
+impl<T: Clone + Send + Sync + 'static> Clone for ProviderState<T> {
     fn clone(&self) -> Self {
         Self {
             value: Arc::clone(&self.value),

@@ -2,12 +2,21 @@
 
 use std::sync::Arc;
 
-use super::syntax::*;
-use plingo::component::{
-    parse::{AstKey, data::AstBox},
-    scope::{ScopeId, ScopeProperty},
-    semantic::{Elaboration, ElaboratorCx, ElaboratorError, NoDiagnostic},
+use fluent_uri::Uri;
+use plingo::{
+    Component, Context, NodeError, Result,
+    component::writes,
+    component::{
+        parse::{AstKey, data::AstBox},
+        scope::{
+            ScopeDefinitions, ScopeEdges, ScopeEntries, ScopeId, ScopeProperty, SourceRequirements,
+        },
+        structural::StructureEntry,
+    },
+    scheme::node::Graph,
 };
+
+use super::syntax::{StlcDeclaration, StlcDocument, StlcExpr, StlcParam, StlcPath, StlcToken};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StlcScopeLabel {
@@ -20,7 +29,7 @@ pub enum StlcScopeLabel {
 /// Domain-owned identity for every semantic STLC scope.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StlcScopeKey {
-    Document(fluent_uri::Uri<&'static str>),
+    Document(Uri<&'static str>),
     Lexical(AstKey),
     Declaration(AstKey),
     Type(AstKey),
@@ -68,6 +77,9 @@ pub enum StlcTypeError {
     UnboundVariable {
         name: Arc<str>,
     },
+    ShadowedVariable {
+        name: Arc<str>,
+    },
     AmbiguousVariable {
         name: Arc<str>,
         candidates: usize,
@@ -75,198 +87,380 @@ pub enum StlcTypeError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, plingo::component::scope::ScopeDomain)]
-#[scope_domain(root = StlcToken, ast = StlcDocument, scope_key = StlcScopeKey, scope_data = StlcScopeData, label = StlcScopeLabel, request = Arc<str>)]
+#[scope_domain(
+    scope_key = StlcScopeKey,
+    scope_data = StlcScopeData,
+    label = StlcScopeLabel,
+    request = Arc<str>
+)]
 pub struct StlcScope;
 
-#[derive(plingo::ElaboratorRole)]
-#[elaborator(domain = StlcScope)]
-pub struct StlcNames;
+/// The one document coordinator for name resolution.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NameDocument {
+    pub uri: Uri<&'static str>,
+}
 
-type NameCx<'a, 'transaction, 'nodes> = ElaboratorCx<'a, 'transaction, 'nodes, StlcNames>;
-type NameError = ElaboratorError<NoDiagnostic>;
+/// One AST name task with its inherited scope.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NameAst {
+    pub ast: AstKey,
+    pub incoming: ScopeId<StlcScope>,
+}
 
-fn parameter_name(
-    here: &mut NameCx<'_, '_, '_>,
-    parameter: AstBox<StlcParam>,
-) -> Result<Arc<str>, NameError> {
-    let parameter = here.ast(parameter)?;
-    match parameter.as_ref() {
-        StlcParam::Bare(name, _) | StlcParam::Parenthesized(name, _) => here.text(*name),
+impl Component for NameDocument {
+    type Output = ();
+    type Writes = writes!(
+        ScopeDefinitions<StlcScope>,
+        ScopeEdges<StlcScope>,
+        ScopeEntries<StlcScope, Uri<&'static str>, ()>,
+    );
+
+    fn run(&self, cx: &mut Context<'_, Self>) -> Result<()> {
+        name_document(cx, self.uri)
     }
 }
 
-fn declare(
-    here: &mut NameCx<'_, '_, '_>,
-    environment: ScopeId<StlcScope>,
-    name: Arc<str>,
-    definition: AstKey,
-) -> Result<ScopeId<StlcScope>, NameError> {
-    let declaration = here.declare(
-        StlcScopeKey::Declaration(definition.clone()),
-        StlcScopeData::Declaration { name, definition },
-    )?;
-    here.edge(
-        environment,
-        StlcScopeLabel::Declaration,
-        declaration,
-        ScopeProperty::Acyclic,
-    )?;
-    here.seal(declaration)?;
-    Ok(declaration)
-}
+impl Component for NameAst {
+    type Output = ();
+    type Writes = writes!(
+        ScopeDefinitions<StlcScope>,
+        ScopeEdges<StlcScope>,
+        SourceRequirements<StlcScope>,
+    );
 
-fn lexical_scope(
-    here: &mut NameCx<'_, '_, '_>,
-    key: AstKey,
-    incoming: ScopeId<StlcScope>,
-) -> Result<ScopeId<StlcScope>, NameError> {
-    let scope = here.declare(StlcScopeKey::Lexical(key), StlcScopeData::Lexical)?;
-    here.edge(
-        scope,
-        StlcScopeLabel::Lexical,
-        incoming,
-        ScopeProperty::Acyclic,
-    )?;
-    Ok(scope)
-}
-
-fn elaborate_document(
-    here: &mut NameCx<'_, '_, '_>,
-    document: Arc<StlcDocument>,
-) -> Result<(), NameError> {
-    let uri = here.ast_key().uri;
-    let document_scope = here.declare_root(StlcScopeKey::Document(uri), StlcScopeData::Document)?;
-    let root_ast = here.ast_key();
-    let body_scope = lexical_scope(here, root_ast, document_scope)?;
-    if let StlcDocument::Lines(declarations) = document.as_ref() {
-        for declaration in declarations {
-            here.schedule(*declaration, body_scope, ())?;
-        }
+    fn run(&self, cx: &mut Context<'_, Self>) -> Result<()> {
+        name_ast(cx, self.ast.clone(), self.incoming)
     }
-    here.seal(body_scope)?;
-    here.seal(document_scope)?;
+}
+
+fn name_document(cx: &mut Context<'_, NameDocument>, uri: Uri<&'static str>) -> Result<()> {
+    let Some(document) = cx
+        .view::<plingo::component::Parsed<StlcToken, StlcDocument>>()
+        .accepted(uri)?
+    else {
+        return Ok(());
+    };
+    let root_ast = document.key();
+
+    let body_scope = {
+        let mut scopes = cx.view::<plingo::component::Scope<StlcScope>>();
+        let document_scope =
+            scopes.declare(StlcScopeKey::Document(uri), StlcScopeData::Document)?;
+        let body_scope = scopes.declare_linked(
+            StlcScopeKey::Lexical(root_ast.clone()),
+            StlcScopeData::Lexical,
+            document_scope,
+            StlcScopeLabel::Lexical,
+            ScopeProperty::Acyclic,
+        )?;
+        scopes.support_entry(StructureEntry::new(uri, document_scope, ()))?;
+        body_scope
+    };
+
+    if let StlcDocument::Lines(declarations) = document.value().as_ref() {
+        cx.keep_all(declarations.iter().map(|declaration| NameAst {
+            ast: declaration.key(),
+            incoming: body_scope,
+        }));
+    }
     Ok(())
 }
 
-fn elaborate_declaration(
-    here: &mut NameCx<'_, '_, '_>,
-    declaration: Arc<StlcDeclaration>,
-) -> Result<(), NameError> {
-    let incoming = here.incoming_scope();
-    let current = here.ast_key();
-    match declaration.as_ref() {
-        StlcDeclaration::Value(name, parameters, _, body) => {
-            let body_scope = lexical_scope(here, current.clone(), incoming)?;
-            let declaration_name = here.text(*name)?;
-            declare(here, body_scope, declaration_name, current.clone())?;
-            for parameter in parameters {
-                let name = parameter_name(here, *parameter)?;
-                declare(here, body_scope, name, parameter.key())?;
-            }
-            here.schedule(*body, body_scope, ())?;
-            here.seal(body_scope)?;
+fn name_ast(
+    cx: &mut Context<'_, NameAst>,
+    ast: AstKey,
+    incoming: ScopeId<StlcScope>,
+) -> Result<()> {
+    let (declaration, expression) = {
+        let mut parsed = cx.view::<plingo::component::Parsed<StlcToken, StlcDocument>>();
+        (
+            parsed.artifact::<StlcDeclaration>(ast.clone()),
+            parsed.artifact::<StlcExpr>(ast.clone()),
+        )
+    };
+    if let Some(declaration) = declaration {
+        name_declaration(cx, ast, incoming, declaration)?;
+    } else if let Some(expression) = expression {
+        name_expression(cx, ast, incoming, expression)?;
+    }
+    Ok(())
+}
+
+fn parameter_name(
+    parsed: &mut plingo::component::parse::ParsedView<'_, '_, NameAst, StlcToken, StlcDocument>,
+    parameter: AstBox<StlcParam>,
+) -> Result<Option<Arc<str>>> {
+    let value = parsed
+        .artifact::<StlcParam>(parameter.key())
+        .ok_or_else(|| NodeError::message("missing parameter AST"))?;
+    let token = match value.as_ref() {
+        StlcParam::Bare(name, _) | StlcParam::Parenthesized(name, _) => *name,
+    };
+    Ok(parsed.token_text(parameter.uri, token))
+}
+
+fn path_text(
+    parsed: &mut plingo::component::parse::ParsedView<'_, '_, NameAst, StlcToken, StlcDocument>,
+    path: AstBox<StlcPath>,
+) -> Result<Option<Arc<str>>> {
+    let value = parsed
+        .artifact::<StlcPath>(path.key())
+        .ok_or_else(|| NodeError::message("missing path AST"))?;
+    let StlcPath::Segments(segments) = value.as_ref();
+    let mut text = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if index != 0 {
+            text.push('.');
         }
-        StlcDeclaration::Import(path) => {
-            let path = path_text(here, *path)?;
-            let target = here.declare(
+        let Some(value) = parsed.token_text(path.uri, *segment) else {
+            return Ok(None);
+        };
+        text.push_str(&value);
+    }
+    Ok(Some(text.into()))
+}
+
+fn name_declaration(
+    cx: &mut Context<'_, NameAst>,
+    current: AstKey,
+    incoming: ScopeId<StlcScope>,
+    declaration: Arc<StlcDeclaration>,
+) -> Result<()> {
+    let StlcDeclaration::Value(name, parameters, _, body) = declaration.as_ref() else {
+        if let StlcDeclaration::Import(path) = declaration.as_ref() {
+            let mut parsed = cx.view::<plingo::component::Parsed<StlcToken, StlcDocument>>();
+            let Some(path) = path_text(&mut parsed, *path)? else {
+                return Ok(());
+            };
+            let mut scopes = cx.view::<plingo::component::Scope<StlcScope>>();
+            let target = scopes.declare(
                 StlcScopeKey::External(Arc::clone(&path)),
                 StlcScopeData::External {
                     path: Arc::clone(&path),
                 },
             )?;
-            here.edge(
+            scopes.support_edge(
                 incoming,
                 StlcScopeLabel::Import,
                 target,
                 ScopeProperty::Acyclic,
             )?;
-            here.seal(target)?;
-            here.require_source(path);
+            scopes.require_source(path)?;
         }
-        StlcDeclaration::Export(_) | StlcDeclaration::Error(_) => {}
+        return Ok(());
+    };
+
+    let mut parsed = cx.view::<plingo::component::Parsed<StlcToken, StlcDocument>>();
+    let Some(name) = parsed.token_text(current.uri, *name) else {
+        return Ok(());
+    };
+    let mut parameter_names = Vec::with_capacity(parameters.len());
+    for parameter in parameters {
+        let Some(name) = parameter_name(&mut parsed, *parameter)? else {
+            return Ok(());
+        };
+        parameter_names.push(name);
     }
+    drop(parsed);
+
+    let body_scope = {
+        let mut scopes = cx.view::<plingo::component::Scope<StlcScope>>();
+        let body_scope = scopes.declare_linked(
+            StlcScopeKey::Lexical(current.clone()),
+            StlcScopeData::Lexical,
+            incoming,
+            StlcScopeLabel::Lexical,
+            ScopeProperty::Acyclic,
+        )?;
+        scopes.declare_linked(
+            StlcScopeKey::Declaration(current.clone()),
+            StlcScopeData::Declaration {
+                name,
+                definition: current.clone(),
+            },
+            body_scope,
+            StlcScopeLabel::Declaration,
+            ScopeProperty::Acyclic,
+        )?;
+        for (parameter, name) in parameters.iter().zip(parameter_names) {
+            scopes.declare_linked(
+                StlcScopeKey::Declaration(parameter.key()),
+                StlcScopeData::Declaration {
+                    name,
+                    definition: parameter.key(),
+                },
+                body_scope,
+                StlcScopeLabel::Declaration,
+                ScopeProperty::Acyclic,
+            )?;
+        }
+        body_scope
+    };
+    cx.keep(NameAst {
+        ast: body.key(),
+        incoming: body_scope,
+    });
     Ok(())
 }
 
-fn path_text(here: &mut NameCx<'_, '_, '_>, path: AstBox<StlcPath>) -> Result<Arc<str>, NameError> {
-    let path = here.ast(path)?;
-    let StlcPath::Segments(segments) = path.as_ref();
-    Ok(segments
-        .iter()
-        .map(|segment| here.text(*segment))
-        .collect::<Result<Vec<_>, _>>()?
-        .join(".")
-        .into())
-}
-
-fn elaborate_expression(
-    here: &mut NameCx<'_, '_, '_>,
+fn name_expression(
+    cx: &mut Context<'_, NameAst>,
+    current: AstKey,
+    incoming: ScopeId<StlcScope>,
     expression: Arc<StlcExpr>,
-) -> Result<(), NameError> {
-    let incoming = here.incoming_scope();
-    let current = here.ast_key();
+) -> Result<()> {
     match expression.as_ref() {
-        StlcExpr::If(..)
-        | StlcExpr::Succ(..)
-        | StlcExpr::Group(..)
-        | StlcExpr::Add(..)
-        | StlcExpr::Apply(..) => {
-            here.schedule_children(expression.as_ref(), incoming, ())?;
+        StlcExpr::If(condition, then_branch, else_branch) => {
+            cx.keep(NameAst {
+                ast: condition.key(),
+                incoming,
+            });
+            cx.keep(NameAst {
+                ast: then_branch.key(),
+                incoming,
+            });
+            cx.keep(NameAst {
+                ast: else_branch.key(),
+                incoming,
+            });
         }
         StlcExpr::Case(scrutinee, zero_branch, successor, successor_branch) => {
-            here.schedule(*scrutinee, incoming, ())?;
-            here.schedule(*zero_branch, incoming, ())?;
-            let successor_scope = here.declare(
-                StlcScopeKey::CaseSuccessor(current.clone()),
-                StlcScopeData::CaseSuccessor,
-            )?;
-            here.edge(
-                successor_scope,
-                StlcScopeLabel::Lexical,
+            cx.keep(NameAst {
+                ast: scrutinee.key(),
                 incoming,
-                ScopeProperty::Acyclic,
-            )?;
-            let name = here.text(*successor)?;
-            declare(here, successor_scope, name, current.clone())?;
-            here.schedule(*successor_branch, successor_scope, ())?;
-            here.seal(successor_scope)?;
+            });
+            cx.keep(NameAst {
+                ast: zero_branch.key(),
+                incoming,
+            });
+            let successor_scope = {
+                let mut parsed = cx.view::<plingo::component::Parsed<StlcToken, StlcDocument>>();
+                let Some(name) = parsed.token_text(current.uri, *successor) else {
+                    return Ok(());
+                };
+                let mut scopes = cx.view::<plingo::component::Scope<StlcScope>>();
+                let successor_scope = scopes.declare(
+                    StlcScopeKey::CaseSuccessor(current.clone()),
+                    StlcScopeData::CaseSuccessor,
+                )?;
+                scopes.support_edge(
+                    successor_scope,
+                    StlcScopeLabel::Lexical,
+                    incoming,
+                    ScopeProperty::Acyclic,
+                )?;
+                scopes.declare_linked(
+                    StlcScopeKey::Declaration(current.clone()),
+                    StlcScopeData::Declaration {
+                        name,
+                        definition: current.clone(),
+                    },
+                    successor_scope,
+                    StlcScopeLabel::Declaration,
+                    ScopeProperty::Acyclic,
+                )?;
+                successor_scope
+            };
+            cx.keep(NameAst {
+                ast: successor_branch.key(),
+                incoming: successor_scope,
+            });
         }
         StlcExpr::Let(name, value, body) => {
-            let let_scope = lexical_scope(here, current.clone(), incoming)?;
-            let name = here.text(*name)?;
-            declare(here, let_scope, name, current.clone())?;
-            here.schedule(*value, incoming, ())?;
-            here.schedule(*body, let_scope, ())?;
-            here.seal(let_scope)?;
+            cx.keep(NameAst {
+                ast: value.key(),
+                incoming,
+            });
+            let let_scope = {
+                let mut parsed = cx.view::<plingo::component::Parsed<StlcToken, StlcDocument>>();
+                let Some(name) = parsed.token_text(current.uri, *name) else {
+                    return Ok(());
+                };
+                let mut scopes = cx.view::<plingo::component::Scope<StlcScope>>();
+                let let_scope = scopes.declare_linked(
+                    StlcScopeKey::Lexical(current.clone()),
+                    StlcScopeData::Lexical,
+                    incoming,
+                    StlcScopeLabel::Lexical,
+                    ScopeProperty::Acyclic,
+                )?;
+                scopes.declare_linked(
+                    StlcScopeKey::Declaration(current.clone()),
+                    StlcScopeData::Declaration {
+                        name,
+                        definition: current.clone(),
+                    },
+                    let_scope,
+                    StlcScopeLabel::Declaration,
+                    ScopeProperty::Acyclic,
+                )?;
+                let_scope
+            };
+            cx.keep(NameAst {
+                ast: body.key(),
+                incoming: let_scope,
+            });
         }
         StlcExpr::Lambda(parameter, body) => {
-            let lambda_scope = lexical_scope(here, current, incoming)?;
-            let name = parameter_name(here, *parameter)?;
-            declare(here, lambda_scope, name, parameter.key())?;
-            here.schedule(*body, lambda_scope, ())?;
-            here.seal(lambda_scope)?;
+            let mut parsed = cx.view::<plingo::component::Parsed<StlcToken, StlcDocument>>();
+            let Some(name) = parameter_name(&mut parsed, *parameter)? else {
+                return Ok(());
+            };
+            let lambda_scope = {
+                let mut scopes = cx.view::<plingo::component::Scope<StlcScope>>();
+                let lambda_scope = scopes.declare_linked(
+                    StlcScopeKey::Lexical(current.clone()),
+                    StlcScopeData::Lexical,
+                    incoming,
+                    StlcScopeLabel::Lexical,
+                    ScopeProperty::Acyclic,
+                )?;
+                scopes.declare_linked(
+                    StlcScopeKey::Declaration(parameter.key()),
+                    StlcScopeData::Declaration {
+                        name,
+                        definition: parameter.key(),
+                    },
+                    lambda_scope,
+                    StlcScopeLabel::Declaration,
+                    ScopeProperty::Acyclic,
+                )?;
+                lambda_scope
+            };
+            cx.keep(NameAst {
+                ast: body.key(),
+                incoming: lambda_scope,
+            });
         }
-        StlcExpr::Variable(_)
-        | StlcExpr::True(_)
+        StlcExpr::Succ(inner) | StlcExpr::Group(inner) => {
+            cx.keep(NameAst {
+                ast: inner.key(),
+                incoming,
+            });
+        }
+        StlcExpr::Add(left, right) | StlcExpr::Apply(left, right) => {
+            cx.keep(NameAst {
+                ast: left.key(),
+                incoming,
+            });
+            cx.keep(NameAst {
+                ast: right.key(),
+                incoming,
+            });
+        }
+        StlcExpr::True(_)
         | StlcExpr::False(_)
         | StlcExpr::Number(_)
+        | StlcExpr::Variable(_)
         | StlcExpr::Unit(_)
         | StlcExpr::Error(_) => {}
     }
     Ok(())
 }
 
-pub fn stlc_name_rules() -> impl for<'a, 't, 'n> Fn(
-    &mut ElaboratorCx<'a, 't, 'n, StlcNames>,
-) -> Result<Elaboration<()>, NameError>
-+ Send
-+ Sync
-+ 'static {
-    plingo::component::semantic::rules::<StlcNames>()
-        .root(elaborate_document)
-        .case(elaborate_declaration)
-        .case(elaborate_expression)
-        .otherwise(|_| Ok(()))
-        .build()
-        .expect("STLC name rule table is valid")
+pub fn install_name_components(graph: &mut Graph) -> std::result::Result<(), NodeError> {
+    graph.register::<NameDocument>()?;
+    graph.register::<NameAst>()?;
+    Ok(())
 }

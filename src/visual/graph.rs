@@ -13,9 +13,12 @@ use color_print::cformat;
 
 use crate::{
     Graph, ReadGraph,
-    component::scope::{
-        ScopeAllocation, ScopeAllocations, ScopeData, ScopeDomain, ScopeEdge, ScopeEdges, ScopeId,
-        ScopeProperty,
+    component::{
+        scope::{
+            ScopeAllocation, ScopeAllocations, ScopeDomain, ScopeEdge, ScopeId, ScopeProperty,
+            ScopeStructure,
+        },
+        structural::{StructureEdges, StructureNode},
     },
     utils::PrettyDisplay,
 };
@@ -36,13 +39,14 @@ impl<D: ScopeDomain> ScopeGraph<D> {
             .iter()
             .filter_map(|allocation| {
                 graph
-                    .get::<ScopeData<D>>(allocation.scope)
-                    .map(|data| (allocation.scope, data))
+                    .get::<StructureNode<ScopeStructure<D>>>(allocation.scope)
+                    .and_then(|artifact| artifact.deref::<D::ScopeData>())
+                    .map(|data| (allocation.scope, (*data).clone()))
             })
             .collect();
         Self {
             allocations,
-            edges: graph.scan_all::<ScopeEdges<D>>(),
+            edges: graph.scan_all::<StructureEdges<ScopeStructure<D>>>(),
             data,
         }
     }

@@ -2,6 +2,8 @@
 mod check;
 #[path = "../examples/stlc/name_resolve.rs"]
 mod name_resolve;
+#[path = "../examples/stlc/structural.rs"]
+mod structural;
 #[path = "../examples/stlc/syntax.rs"]
 mod syntax;
 #[path = "../examples/stlc/test.rs"]

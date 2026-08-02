@@ -91,7 +91,7 @@ pub struct ApplySourceEdit {
 impl Command for ApplySourceEdit {
     type Output = ();
 
-    fn apply(self, cx: &mut CommandCx<'_, '_>) -> Result<(), NodeError> {
+    fn apply(self, cx: &mut CommandCx<'_>) -> Result<(), NodeError> {
         ApplySourceEdits {
             edits: vec![self.edit],
         }
@@ -108,7 +108,7 @@ pub struct ApplySourceEdits {
 impl Command for ApplySourceEdits {
     type Output = ();
 
-    fn apply(self, cx: &mut CommandCx<'_, '_>) -> Result<(), NodeError> {
+    fn apply(self, cx: &mut CommandCx<'_>) -> Result<(), NodeError> {
         let Some(first) = self.edits.first() else {
             return Ok(());
         };
@@ -148,7 +148,7 @@ pub struct LoadSource {
 impl Command for LoadSource {
     type Output = ();
 
-    fn apply(self, cx: &mut CommandCx<'_, '_>) -> Result<(), NodeError> {
+    fn apply(self, cx: &mut CommandCx<'_>) -> Result<(), NodeError> {
         if cx.get::<DocumentText>(self.uri).is_none() {
             cx.set::<DocumentText>(self.uri, Arc::from(""))?;
             cx.set::<DocumentChange>(self.uri, Arc::new(SourceDelta::default()))?;
@@ -169,7 +169,7 @@ pub struct LoadSourceText {
 impl Command for LoadSourceText {
     type Output = ();
 
-    fn apply(self, cx: &mut CommandCx<'_, '_>) -> Result<(), NodeError> {
+    fn apply(self, cx: &mut CommandCx<'_>) -> Result<(), NodeError> {
         if cx.get::<DocumentText>(self.uri).is_none() {
             let length = self.text.len();
             cx.set::<DocumentText>(self.uri, Arc::clone(&self.text))?;

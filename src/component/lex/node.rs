@@ -15,7 +15,7 @@ use crate::{
     },
     scheme::{
         change::AddressChange,
-        node::{ComponentState, DeriveCx, NodeError, NodeProvider, ReadGraph, ReclaimCx, View},
+        node::{DeriveCx, NodeError, NodeProvider, ProviderState, ReadGraph, ReclaimCx, View},
     },
 };
 
@@ -99,13 +99,13 @@ impl<Root: LexerRoot> View for LexDiagnostics<Root> {
 /// stable occurrence-keyed token artifacts, allowing consumers to depend on
 /// individual tokens rather than the document-wide token stream.
 pub struct LexerNode<Root: LexerRoot + Clone> {
-    lexer: ComponentState<Lexer<Root>>,
+    lexer: ProviderState<Lexer<Root>>,
 }
 
 impl<Root: LexerRoot + Clone> LexerNode<Root> {
     pub fn new() -> Result<Self, LexerCreationError> {
         Ok(Self {
-            lexer: ComponentState::new(Lexer::new()?),
+            lexer: ProviderState::new(Lexer::new()?),
         })
     }
 }
@@ -128,7 +128,7 @@ impl<Root: LexerRoot + Clone> NodeProvider for LexerNode<Root> {
         )
     }
 
-    fn derive(&self, cx: &mut DeriveCx<'_, '_>, uri: Self::Key) -> Result<(), NodeError> {
+    fn derive(&self, cx: &mut DeriveCx<'_>, uri: Self::Key) -> Result<(), NodeError> {
         let source = cx
             .get::<DocumentText>(uri)
             .ok_or_else(NodeError::missing_view::<DocumentText>)?;
@@ -188,7 +188,7 @@ impl<Root: LexerRoot + Clone> NodeProvider for LexerNode<Root> {
         Ok(())
     }
 
-    fn reclaim(&self, cx: &mut ReclaimCx<'_, '_>, uri: Self::Key) -> Result<(), NodeError> {
+    fn reclaim(&self, cx: &mut ReclaimCx<'_>, uri: Self::Key) -> Result<(), NodeError> {
         let has_other_documents = cx.has_materialized::<Self>();
         let lexer = cx.state_mut(&self.lexer)?;
         if has_other_documents {
@@ -197,6 +197,10 @@ impl<Root: LexerRoot + Clone> NodeProvider for LexerNode<Root> {
             lexer.reset_documents();
         }
         Ok(())
+    }
+
+    fn uses_state() -> bool {
+        true
     }
 }
 

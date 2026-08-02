@@ -68,7 +68,7 @@ pub fn expand_non_terminal_derive(mut item: ItemEnum) -> syn::Result<proc_macro:
             }
         }
 
-        impl ::plingo::component::semantic::AstWalk for #enum_ident {
+        impl ::plingo::component::parse::AstWalk for #enum_ident {
             fn direct_children(
                 &self,
                 visitor: &mut dyn ::core::ops::FnMut(::plingo::component::parse::AstKey),
@@ -114,7 +114,7 @@ fn direct_child_walk_arm(variant: &Variant) -> proc_macro2::TokenStream {
                 .collect::<Vec<_>>();
             let visits = bindings.iter().map(|binding| {
                 quote! {
-                    ::plingo::component::semantic::AstWalkField::ast_children(#binding, visitor);
+                    ::plingo::component::parse::AstWalkField::ast_children(#binding, visitor);
                 }
             });
             quote! {
@@ -136,7 +136,7 @@ fn direct_child_walk_arm(variant: &Variant) -> proc_macro2::TokenStream {
             });
             let visits = bindings.iter().flatten().map(|binding| {
                 quote! {
-                    ::plingo::component::semantic::AstWalkField::ast_children(#binding, visitor);
+                    ::plingo::component::parse::AstWalkField::ast_children(#binding, visitor);
                 }
             });
             quote! {

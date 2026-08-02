@@ -1,11 +1,21 @@
 use std::{collections::HashSet, hash::Hash, sync::Arc};
 
-use super::{ScopeDomain, ScopeEdge, ScopeId};
+use crate::{
+    component::{
+        api::{Component, Context, Error},
+        structural::{StructureEdges, StructureNode},
+    },
+    scheme::node::ReadGraph,
+};
+
+use super::{ScopeDomain, ScopeEdge, ScopeId, ScopeStructure};
 
 /// A regular path language used by scope-graph resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PathExpr<Label> {
+    /// A dead path: no continuation is possible.
     Empty,
+    /// Accept at the current scope without traversing an edge.
     Epsilon,
     Label(Label),
     Or(Arc<PathExpr<Label>>, Arc<PathExpr<Label>>),
@@ -84,69 +94,34 @@ where
     }
 }
 
-/// A path regular expression interpreted relative to a starting scope.
-/// Labels are typed by the domain rather than parsed from strings.
+/// A typed path pattern interpreted from an explicit starting scope.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RelativeRegex<Label>(PathExpr<Label>);
+pub struct ScopePath<Label>(PathExpr<Label>);
 
-impl<Label> RelativeRegex<Label>
+impl<Label> ScopePath<Label>
 where
     Label: Clone + Eq,
 {
-    /// Matches the starting scope without traversing an edge.
-    pub fn here() -> Self {
-        Self(PathExpr::Epsilon)
-    }
-
-    pub fn empty() -> Self {
-        Self(PathExpr::Empty)
-    }
-
-    pub fn label(label: Label) -> Self {
-        Self(PathExpr::label(label))
-    }
-
-    pub fn zero_or_more(label: Label) -> Self {
-        Self(PathExpr::zero_or_more(label))
-    }
-
-    pub fn or(self, other: Self) -> Self {
-        Self(self.0.or(other.0))
-    }
-
-    pub fn then(self, other: Self) -> Self {
-        Self(self.0.then(other.0))
-    }
-
-    pub fn star(self) -> Self {
-        Self(self.0.star())
-    }
-
     pub fn nullable(&self) -> bool {
         self.0.nullable()
     }
 
-    pub fn derivative(&self, label: &Label) -> Self {
-        Self(self.0.derivative(label))
+    pub fn derivative(&self, label: &Label) -> PathExpr<Label> {
+        self.0.derivative(label)
     }
 
-    pub(crate) fn into_path(self) -> PathExpr<Label> {
+    pub fn into_path(self) -> PathExpr<Label> {
         self.0
     }
 }
 
-impl<Label> From<PathExpr<Label>> for RelativeRegex<Label> {
-    fn from(path: PathExpr<Label>) -> Self {
-        Self(path)
+impl<Label> From<PathExpr<Label>> for ScopePath<Label> {
+    fn from(expression: PathExpr<Label>) -> Self {
+        Self(expression)
     }
 }
 
 /// A strict partial order over edge labels used to select visible paths.
-///
-/// `prefer(a, b)` means that a path using `a` at the first differing position
-/// outranks a path using `b`. Incomparable paths remain visible and therefore
-/// preserve ambiguity. A strict prefix is more specific than its extension,
-/// matching the calculus' end-of-path ordering.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PathOrder<Label> {
     preferred: Arc<[(Label, Label)]>,
@@ -229,12 +204,22 @@ where
     }
 }
 
-/// One dependency-tracked resolution witness returned by semantic queries.
+/// One dependency-tracked resolution witness returned by a scope query.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ResolutionPath<D: ScopeDomain> {
     pub scopes: Arc<[ScopeId<D>]>,
-    pub labels: Arc<[<D as ScopeDomain>::Label]>,
-    pub data: <D as ScopeDomain>::ScopeData,
+    pub labels: Arc<[D::Label]>,
+    pub data: D::ScopeData,
+}
+
+impl<D: ScopeDomain> ResolutionPath<D> {
+    pub fn data(&self) -> &D::ScopeData {
+        &self.data
+    }
+
+    pub fn into_data(self) -> D::ScopeData {
+        self.data
+    }
 }
 
 impl<D: ScopeDomain> std::fmt::Debug for ResolutionPath<D> {
@@ -248,12 +233,10 @@ impl<D: ScopeDomain> std::fmt::Debug for ResolutionPath<D> {
     }
 }
 
-/// Resolves a materialized query while observing only the edge buckets and
-/// mapped scope data reached by the traversal. The node runtime supplies
-/// readers that record dependencies even for empty frontiers.
+/// Resolves a materialized query while observing only reached edge buckets and data.
 pub(crate) fn resolve_indexed<D, Accepts, Lookup>(
     start: ScopeId<D>,
-    path: PathExpr<<D as ScopeDomain>::Label>,
+    path: PathExpr<D::Label>,
     accepts: Accepts,
     mut lookup: Lookup,
 ) -> HashSet<ResolutionPath<D>>
@@ -265,10 +248,10 @@ where
     #[derive(Clone)]
     struct Search<D: ScopeDomain> {
         scope: ScopeId<D>,
-        expression: PathExpr<<D as ScopeDomain>::Label>,
+        expression: PathExpr<D::Label>,
         scopes: Vec<ScopeId<D>>,
-        labels: Vec<<D as ScopeDomain>::Label>,
-        states: HashSet<(ScopeId<D>, PathExpr<<D as ScopeDomain>::Label>)>,
+        labels: Vec<D::Label>,
+        states: HashSet<(ScopeId<D>, PathExpr<D::Label>)>,
     }
 
     let initial = (start, path.clone());
@@ -316,6 +299,433 @@ where
         }
     }
     answers
+}
+
+/// A query assembled from an explicit scope and a component context.
+pub struct ScopeQuery<'cx, 'tx, C: Component, D: ScopeDomain> {
+    pub(crate) cx: &'cx mut Context<'tx, C>,
+    pub(crate) start: ScopeId<D>,
+}
+
+impl<'cx, 'tx, C: Component, D: ScopeDomain> ScopeQuery<'cx, 'tx, C, D> {
+    pub fn along(self, path: ScopePath<D::Label>) -> ScopePathQuery<'cx, 'tx, C, D> {
+        ScopePathQuery {
+            cx: self.cx,
+            start: self.start,
+            path,
+        }
+    }
+}
+
+/// A scope query with its start scope and path selected.
+pub struct ScopePathQuery<'cx, 'tx, C: Component, D: ScopeDomain> {
+    cx: &'cx mut Context<'tx, C>,
+    start: ScopeId<D>,
+    path: ScopePath<D::Label>,
+}
+
+impl<'cx, 'tx, C: Component, D: ScopeDomain> ScopePathQuery<'cx, 'tx, C, D> {
+    pub fn all(self) -> HashSet<ResolutionPath<D>> {
+        let Self { cx, start, path } = self;
+        resolve_paths(cx, start, path, |_| true)
+    }
+
+    pub fn filter<F>(self, filter: F) -> FilteredScopeQuery<'cx, 'tx, C, D, F>
+    where
+        F: Fn(&D::ScopeData) -> bool,
+    {
+        FilteredScopeQuery {
+            cx: self.cx,
+            start: self.start,
+            path: self.path,
+            filter,
+        }
+    }
+}
+
+/// A path query whose reached scope data is filtered.
+pub struct FilteredScopeQuery<'cx, 'tx, C: Component, D: ScopeDomain, F> {
+    cx: &'cx mut Context<'tx, C>,
+    start: ScopeId<D>,
+    path: ScopePath<D::Label>,
+    filter: F,
+}
+
+impl<'cx, 'tx, C: Component, D: ScopeDomain, F> FilteredScopeQuery<'cx, 'tx, C, D, F>
+where
+    F: Fn(&D::ScopeData) -> bool,
+{
+    pub fn all(self) -> HashSet<ResolutionPath<D>> {
+        let Self {
+            cx,
+            start,
+            path,
+            filter,
+        } = self;
+        resolve_paths(cx, start, path, filter)
+    }
+
+    pub fn visible_under(self, order: PathOrder<D::Label>) -> OrderedScopeQuery<'cx, 'tx, C, D, F> {
+        OrderedScopeQuery {
+            cx: self.cx,
+            start: self.start,
+            path: self.path,
+            filter: self.filter,
+            order,
+        }
+    }
+
+    pub fn with_context<Ctx>(
+        self,
+        context: Ctx,
+    ) -> ScopeResolution<'cx, 'tx, C, D, F, Ctx, Unset, Unset, Unset, Unset> {
+        ScopeResolution {
+            cx: self.cx,
+            start: self.start,
+            path: self.path,
+            filter: self.filter,
+            order: None,
+            context,
+            shadowed: None,
+            missing: None,
+            unique: None,
+            ambiguous: None,
+        }
+    }
+}
+
+/// A filtered query with an explicit partial order for visible paths.
+pub struct OrderedScopeQuery<'cx, 'tx, C: Component, D: ScopeDomain, F> {
+    cx: &'cx mut Context<'tx, C>,
+    start: ScopeId<D>,
+    path: ScopePath<D::Label>,
+    filter: F,
+    order: PathOrder<D::Label>,
+}
+
+impl<'cx, 'tx, C: Component, D: ScopeDomain, F> OrderedScopeQuery<'cx, 'tx, C, D, F>
+where
+    F: Fn(&D::ScopeData) -> bool,
+{
+    pub fn with_context<Ctx>(
+        self,
+        context: Ctx,
+    ) -> ScopeResolution<'cx, 'tx, C, D, F, Ctx, Unset, Unset, Unset, Unset> {
+        ScopeResolution {
+            cx: self.cx,
+            start: self.start,
+            path: self.path,
+            filter: self.filter,
+            order: Some(self.order),
+            context,
+            shadowed: None,
+            missing: None,
+            unique: None,
+            ambiguous: None,
+        }
+    }
+}
+
+/// Marker for a response that has not been installed yet.
+#[doc(hidden)]
+pub struct Unset;
+
+/// A filtered query with explicit visibility and cardinality responses.
+pub struct ScopeResolution<'cx, 'tx, C: Component, D: ScopeDomain, F, Ctx, S, M, U, A> {
+    cx: &'cx mut Context<'tx, C>,
+    start: ScopeId<D>,
+    path: ScopePath<D::Label>,
+    filter: F,
+    order: Option<PathOrder<D::Label>>,
+    context: Ctx,
+    shadowed: Option<S>,
+    missing: Option<M>,
+    unique: Option<U>,
+    ambiguous: Option<A>,
+}
+
+/// Runs one optional shadowing response for every dominated witness.
+pub trait ShadowResponse<C: Component, D: ScopeDomain, Ctx> {
+    fn run(
+        &mut self,
+        cx: &mut Context<'_, C>,
+        context: &mut Ctx,
+        shadowed: ResolutionPath<D>,
+        visible_by: &[ResolutionPath<D>],
+    ) -> Result<(), Error>;
+}
+
+impl<C: Component, D: ScopeDomain, Ctx> ShadowResponse<C, D, Ctx> for Unset {
+    fn run(
+        &mut self,
+        _cx: &mut Context<'_, C>,
+        _context: &mut Ctx,
+        _shadowed: ResolutionPath<D>,
+        _visible_by: &[ResolutionPath<D>],
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+impl<C, D, Ctx, F> ShadowResponse<C, D, Ctx> for F
+where
+    C: Component,
+    D: ScopeDomain,
+    F: for<'a, 'b, 'c> FnMut(
+        &'a mut Context<'b, C>,
+        &'c mut Ctx,
+        ResolutionPath<D>,
+        &'c [ResolutionPath<D>],
+    ) -> Result<(), Error>,
+{
+    fn run(
+        &mut self,
+        cx: &mut Context<'_, C>,
+        context: &mut Ctx,
+        shadowed: ResolutionPath<D>,
+        visible_by: &[ResolutionPath<D>],
+    ) -> Result<(), Error> {
+        self(cx, context, shadowed, visible_by)
+    }
+}
+
+impl<'cx, 'tx, C: Component, D: ScopeDomain, F, Ctx, S, M, U, A>
+    ScopeResolution<'cx, 'tx, C, D, F, Ctx, S, M, U, A>
+{
+    pub fn on_shadowed<N>(self, handler: N) -> ScopeResolution<'cx, 'tx, C, D, F, Ctx, N, M, U, A>
+    where
+        N: for<'a, 'b, 'c> FnMut(
+                &'a mut Context<'b, C>,
+                &'c mut Ctx,
+                ResolutionPath<D>,
+                &'c [ResolutionPath<D>],
+            ) -> Result<(), Error>
+            + ShadowResponse<C, D, Ctx>,
+    {
+        let Self {
+            cx,
+            start,
+            path,
+            filter,
+            order,
+            context,
+            missing,
+            unique,
+            ambiguous,
+            shadowed: _,
+        } = self;
+        ScopeResolution {
+            cx,
+            start,
+            path,
+            filter,
+            order,
+            context,
+            shadowed: Some(handler),
+            missing,
+            unique,
+            ambiguous,
+        }
+    }
+
+    pub fn on_missing<N>(self, handler: N) -> ScopeResolution<'cx, 'tx, C, D, F, Ctx, S, N, U, A> {
+        let Self {
+            cx,
+            start,
+            path,
+            filter,
+            order,
+            context,
+            shadowed,
+            unique,
+            ambiguous,
+            missing: _,
+        } = self;
+        ScopeResolution {
+            cx,
+            start,
+            path,
+            filter,
+            order,
+            context,
+            shadowed,
+            missing: Some(handler),
+            unique,
+            ambiguous,
+        }
+    }
+
+    pub fn on_unique<N, R>(self, handler: N) -> ScopeResolution<'cx, 'tx, C, D, F, Ctx, S, M, N, A>
+    where
+        N: FnOnce(&'cx mut Context<'tx, C>, Ctx, ResolutionPath<D>) -> Result<R, Error>,
+    {
+        let Self {
+            cx,
+            start,
+            path,
+            filter,
+            order,
+            context,
+            shadowed,
+            missing,
+            ambiguous,
+            unique: _,
+        } = self;
+        ScopeResolution {
+            cx,
+            start,
+            path,
+            filter,
+            order,
+            context,
+            shadowed,
+            missing,
+            unique: Some(handler),
+            ambiguous,
+        }
+    }
+
+    pub fn on_ambiguous<N>(
+        self,
+        handler: N,
+    ) -> ScopeResolution<'cx, 'tx, C, D, F, Ctx, S, M, U, N> {
+        let Self {
+            cx,
+            start,
+            path,
+            filter,
+            order,
+            context,
+            shadowed,
+            missing,
+            unique,
+            ambiguous: _,
+        } = self;
+        ScopeResolution {
+            cx,
+            start,
+            path,
+            filter,
+            order,
+            context,
+            shadowed,
+            missing,
+            unique,
+            ambiguous: Some(handler),
+        }
+    }
+}
+
+impl<'cx, 'tx, C: Component, D, F, Ctx, S, M, U, A>
+    ScopeResolution<'cx, 'tx, C, D, F, Ctx, S, M, U, A>
+where
+    D: ScopeDomain,
+{
+    pub fn resolve<R>(self) -> Result<R, Error>
+    where
+        F: Fn(&D::ScopeData) -> bool,
+        S: ShadowResponse<C, D, Ctx>,
+        M: FnOnce(&'cx mut Context<'tx, C>, Ctx) -> Result<R, Error>,
+        U: FnOnce(&'cx mut Context<'tx, C>, Ctx, ResolutionPath<D>) -> Result<R, Error>,
+        A: FnOnce(&'cx mut Context<'tx, C>, Ctx, usize) -> Result<R, Error>,
+    {
+        let Self {
+            cx,
+            start,
+            path,
+            filter,
+            order,
+            context,
+            shadowed,
+            missing,
+            unique,
+            ambiguous,
+        } = self;
+        let paths = resolve_paths(cx, start, path, filter);
+        let (visible, dominated) = match order.as_ref() {
+            Some(order) => partition_visible(paths, order),
+            None => (paths.into_iter().collect(), Vec::new()),
+        };
+        let mut shadowed = shadowed.expect("shadow response is required");
+        let mut context = context;
+        for (shadowed_path, visible_by) in dominated {
+            shadowed.run(cx, &mut context, shadowed_path, &visible_by)?;
+        }
+        match visible.len() {
+            0 => (missing.expect("missing response is required"))(cx, context),
+            1 => {
+                let path = visible.into_iter().next().expect("one resolution path");
+                (unique.expect("unique response is required"))(cx, context, path)
+            }
+            candidates => {
+                (ambiguous.expect("ambiguous response is required"))(cx, context, candidates)
+            }
+        }
+    }
+}
+
+fn resolve_paths<'tx, C, D, F>(
+    cx: &mut Context<'tx, C>,
+    start: ScopeId<D>,
+    path: ScopePath<D::Label>,
+    accepts: F,
+) -> HashSet<ResolutionPath<D>>
+where
+    C: Component,
+    D: ScopeDomain,
+    F: Fn(&D::ScopeData) -> bool,
+{
+    resolve_indexed(start, path.into_path(), accepts, |scope, needs| {
+        let edges = crate::scheme::node::ReadGraph::scan::<StructureEdges<ScopeStructure<D>>>(
+            &cx.derive, scope,
+        );
+        let data = if needs {
+            cx.derive
+                .get::<StructureNode<ScopeStructure<D>>>(scope)
+                .and_then(|artifact| artifact.deref::<D::ScopeData>())
+                .map(|value| (*value).clone())
+        } else {
+            None
+        };
+        (edges, data)
+    })
+}
+
+pub(crate) fn partition_visible<D: ScopeDomain>(
+    paths: HashSet<ResolutionPath<D>>,
+    order: &PathOrder<D::Label>,
+) -> (
+    Vec<ResolutionPath<D>>,
+    Vec<(ResolutionPath<D>, Vec<ResolutionPath<D>>)>,
+) {
+    let paths = paths.into_iter().collect::<Vec<_>>();
+    let mut visible = Vec::new();
+    let mut dominated = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        let dominated_by_any = paths.iter().enumerate().any(|(other_index, other)| {
+            other_index != index && order.compare(other, path) == Some(std::cmp::Ordering::Greater)
+        });
+        if dominated_by_any {
+            dominated.push(path.clone());
+        } else {
+            visible.push(path.clone());
+        }
+    }
+
+    let shadowed = dominated
+        .into_iter()
+        .map(|path| {
+            let visible_by = visible
+                .iter()
+                .filter(|candidate| {
+                    order.compare(candidate, &path) == Some(std::cmp::Ordering::Greater)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (path, visible_by)
+        })
+        .collect();
+    (visible, shadowed)
 }
 
 #[cfg(test)]

@@ -12,9 +12,6 @@ resolver = "3"
 # Miscellaneous utilities
 enum-iterator = "2.3.0"
 fluent-uri = "0.4.1"
-
-# For efficient data structures
-arc-swap = "1.7"
 smallvec = "1.15.1"
 ropey = "1.6.1"
 indexmap = "2.14.0"
@@ -28,9 +25,6 @@ rand_regex = "0.19.0"
 
 # For logging
 log = "0.4.29"
-env_logger = "0.11.10"
-color-print = "0.3.7"
-terminal_size = "0.4.4"
 
 # For error handling
 anyhow = "1.0.102"
@@ -42,15 +36,4 @@ reactive-macros = { path = "reactive-macros" }
 
 # For locking (engine, stores, visitor buffers)
 parking_lot = "0.12"
-
-[dependencies.tokio]
-features = ["sync", "rt", "rt-multi-thread", "macros"]
-version = "1.52.3"
-
-[dependencies.tokio-util]
-features = ["rt"]
-version = "0.7"
-
-[dev-dependencies]
-notify = "8.2.0"
-similar = "3.1.1"
+color-print = "0.3.7"

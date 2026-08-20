@@ -9,9 +9,7 @@
 
 use plingo_macros::{NonTerminal, PrettyNonTerminal, PrettyTerminal, Terminal};
 
-use plingo::component;
-
-use component::{
+use plingo::framework::{
     lex::LexErrorInfo,
     parse::{AstToken, ParseErrorInfo, data::AstBox},
 };

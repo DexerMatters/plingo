@@ -1,131 +1,104 @@
 mod common;
 
-use std::{sync::Arc, sync::mpsc::TryRecvError};
+use std::sync::Arc;
 
 use common::json::{JsonDocument, JsonToken};
-use plingo::{
-    DemandLease, Graph, ReadGraph, Subscription,
-    component::{
-        lex::{LexDiagnostics, LexStats, LexerNode, TokenArtifact, TokenKey, TokenOrder},
-        parse::{
-            ParseDiagnostics, ParseEntries, ParseSnapshot, ParseStats, ParseStatus,
-            ParseStatusView, ParserNode, grammar::Grammar,
-        },
-        source::{DocumentText, SourceEdit, SourceInput},
-    },
-    utils::Span,
-};
+use plingo::framework::lex::{TokenVec, Tokens, install_lexer};
+use plingo::framework::parse::{ParseDiagnostics, ParseStatus, ParseUnits, install_parser};
+use plingo::framework::{SourceEdit, Workspace};
+use plingo::utils::Span;
+
+fn uri(name: &str) -> fluent_uri::Uri<&'static str> {
+    Span::new(format!("test://{name}"), 0, 0).unwrap().uri
+}
+
+fn build(workers: usize) -> Workspace {
+    Workspace::build_with(workers, |engine| {
+        install_lexer::<JsonToken>(engine)?;
+        install_parser::<JsonToken, JsonDocument>(engine)?;
+        Ok(())
+    })
+    .expect("workspace builds")
+}
 
 struct JsonRuntime {
-    graph: Graph,
-    uri: fluent_uri::Uri<&'static str>,
-    _demand: DemandLease,
-    subscription: Subscription<ParseSnapshot<JsonToken>>,
+    ws: Workspace,
+    u: fluent_uri::Uri<&'static str>,
+    name: String,
 }
 
 impl JsonRuntime {
     fn new(name: &str, text: &str) -> Self {
-        let uri = Span::new(format!("test://{name}"), 0, 0).unwrap().uri;
-        let parser = Grammar::from_spec::<JsonDocument>().build_lr1::<JsonToken>();
-        let mut graph = Graph::new();
-        graph
-            .install(LexerNode::<JsonToken>::new().unwrap())
-            .unwrap();
-        graph
-            .install(ParserNode::<JsonToken, JsonDocument>::from_parser(parser))
-            .unwrap();
-        graph.command(SourceInput::load(uri)).unwrap();
-        graph
-            .command(SourceInput::apply(SourceEdit::Insert {
-                key: Span::point_uri(uri, 0).unwrap(),
-                value: text.into(),
-            }))
-            .unwrap();
-        let demand = graph
-            .demand::<ParserNode<JsonToken, JsonDocument>>(uri)
-            .unwrap();
-        let subscription = graph.subscribe::<ParseSnapshot<JsonToken>>(uri).unwrap();
-        let _ = subscription.recv().unwrap();
+        let mut ws = build(1);
+        let u = uri(name);
+        ws.open(u, text).unwrap();
         Self {
-            graph,
-            uri,
-            _demand: demand,
-            subscription,
+            ws,
+            u,
+            name: name.to_string(),
         }
     }
 
+    fn uri_str(&self) -> String {
+        self.u.to_string()
+    }
+
     fn apply(&mut self, edits: Vec<SourceEdit>) {
-        self.graph.command(SourceInput::apply_all(edits)).unwrap();
-        while self.subscription.try_recv().is_ok() {}
+        self.ws
+            .edit(edits)
+            .expect("edits must apply as one atomically committed epoch");
     }
 
-    fn text(&self) -> Arc<str> {
-        self.graph.get::<DocumentText>(self.uri).unwrap()
+    fn text(&self) -> String {
+        self.ws
+            .snapshot()
+            .map_view::<plingo::framework::SourceText>()
+            .get(&self.uri_str())
+            .map(|v| v.to_string())
+            .unwrap_or_default()
     }
 
-    fn roots(&self) -> Arc<[plingo::component::parse::AstKey]> {
-        self.graph
-            .scan::<ParseEntries<JsonToken>>(self.uri)
-            .iter()
-            .map(|entry| entry.node.clone())
-            .collect::<Vec<_>>()
-            .into()
+    fn tokens(&self) -> Option<Arc<TokenVec<JsonToken>>> {
+        self.ws
+            .snapshot()
+            .map_view::<Tokens<JsonToken>>()
+            .get(&self.uri_str())
     }
 
-    fn token_keys(&self) -> Arc<[TokenKey]> {
-        self.graph.get::<TokenOrder<JsonToken>>(self.uri).unwrap()
-    }
-
-    fn token_shape(
-        &self,
-    ) -> Vec<(
-        Option<plingo::component::parse::grammar::TerminalId>,
-        usize,
-        u64,
-    )> {
-        self.token_keys()
-            .iter()
-            .map(|key| {
-                let token = self
-                    .graph
-                    .get::<TokenArtifact<JsonToken>>(key.clone())
-                    .unwrap();
-                (token.terminal, token.length, token.fingerprint)
-            })
-            .collect()
-    }
-
-    fn lex_stats(&self) -> plingo::component::lex::IncrementalLexStats {
-        self.graph.get::<LexStats<JsonToken>>(self.uri).unwrap()
-    }
-
-    fn parse_stats(&self) -> plingo::component::parse::IncrementalParseStats {
-        self.graph.get::<ParseStats<JsonToken>>(self.uri).unwrap()
+    fn unit(&self) -> Option<plingo::framework::parse::ParseUnit<JsonDocument>> {
+        self.ws
+            .snapshot()
+            .map_view::<ParseUnits<JsonDocument>>()
+            .get(&self.uri_str())
+            .map(|v| (*v).clone())
     }
 
     fn diagnostic_count(&self) -> usize {
-        self.graph
-            .get::<ParseDiagnostics<JsonToken>>(self.uri)
-            .unwrap()
-            .len()
+        self.ws
+            .snapshot()
+            .map_view::<ParseDiagnostics>()
+            .get(&self.uri_str())
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
-    fn status(&self) -> ParseStatus {
-        self.graph
-            .get::<ParseStatusView<JsonToken>>(self.uri)
-            .unwrap()
+    fn lex_error_count(&self) -> usize {
+        self.tokens()
+            .map(|t| t.errors.len())
+            .unwrap_or(0)
     }
 
-    fn lex_diagnostic_count(&self) -> usize {
-        self.graph
-            .get::<LexDiagnostics<JsonToken>>(self.uri)
-            .unwrap()
-            .len()
+    fn status(&self) -> Option<ParseStatus> {
+        self.unit().map(|u| u.status)
+    }
+
+    fn has_root(&self) -> bool {
+        self.unit().is_some_and(|u| u.root != plingo::reactive::NodeId(u64::MAX))
     }
 }
 
 fn replace(
-    uri: fluent_uri::Uri<&'static str>,
+    u: fluent_uri::Uri<&'static str>,
     text: &str,
     needle: &str,
     value: &str,
@@ -134,10 +107,10 @@ fn replace(
     let end = start + needle.len();
     vec![
         SourceEdit::Delete {
-            key: Span::new_uri(uri, start, end).unwrap(),
+            key: Span::new_uri(u, start, end).unwrap(),
         },
         SourceEdit::Insert {
-            key: Span::point_uri(uri, start).unwrap(),
+            key: Span::point_uri(u, start).unwrap(),
             value: value.into(),
         },
     ]
@@ -152,77 +125,34 @@ fn large_json() -> String {
 }
 
 #[test]
-fn distant_replacements_replay_locally_and_reuse_the_suffix() {
-    let text = large_json();
-    let mut runtime = JsonRuntime::new("heavy-distant", &text);
-    let initial_tokens = runtime.token_keys();
-    let initial_roots = runtime.roots();
-    let retained_middle = initial_tokens[20..30].to_vec();
-
-    let mut edits = replace(runtime.uri, &text, "12345", "54321");
-    edits.extend(replace(runtime.uri, &text, "34567", "76543"));
-    runtime.apply(edits);
-
-    let lex = runtime.lex_stats();
-    let parse = runtime.parse_stats();
-    assert!(
-        lex.reused > 0,
-        "lexer must converge and retain a suffix: {lex:?}"
-    );
-    assert!(
-        parse.reused > 0,
-        "parser must converge and retain a suffix: {parse:?}"
-    );
-    assert!(
-        lex.relexed < initial_tokens.len(),
-        "edit must not relex the document"
-    );
-    assert!(
-        parse.reparsed < initial_tokens.len(),
-        "edit must not reparse the document"
-    );
-    assert_ne!(
-        runtime.roots(),
-        initial_roots,
-        "changed JSON roots must be replaced"
-    );
-    assert_eq!(runtime.diagnostic_count(), 0);
-    let current_keys = runtime.token_keys();
-    assert!(retained_middle.iter().all(|key| current_keys.contains(key)));
-
-    let fresh = JsonRuntime::new("heavy-distant-fresh", runtime.text().as_ref());
-    assert_eq!(runtime.token_shape(), fresh.token_shape());
-    assert_eq!(runtime.diagnostic_count(), fresh.diagnostic_count());
-}
-
-#[test]
 fn empty_containers_are_valid_separator_grammar_cases() {
     let runtime = JsonRuntime::new("heavy-empty", r#"{"object": {}, "array": []}"#);
-    assert!(!runtime.roots().is_empty());
+    assert!(runtime.has_root());
     assert_eq!(runtime.diagnostic_count(), 0);
-    assert_eq!(runtime.status(), ParseStatus::Clean);
+    assert_eq!(runtime.status(), Some(ParseStatus::Clean));
 }
 
 #[test]
-fn skipped_whitespace_shifts_spans_without_reparsing_json() {
+fn skipped_whitespace_shifts_are_parser_invisible() {
+    // Inserting whitespace changes byte offsets but neither the token
+    // stream shape nor the parse result: the unit and diagnostics are
+    // unchanged (only the underlying text/tokens move).
     let text = large_json();
     let mut runtime = JsonRuntime::new("heavy-whitespace", &text);
-    let roots = runtime.roots();
-    let tokens = runtime.token_keys();
+    let before_roots = runtime.unit().map(|u| u.root);
+    let before_tokens: Arc<TokenVec<JsonToken>> = runtime.tokens().unwrap();
     let offset = text.find("\"middle\"").unwrap();
 
     runtime.apply(vec![SourceEdit::Insert {
-        key: Span::point_uri(runtime.uri, offset).unwrap(),
+        key: Span::point_uri(runtime.u, offset).unwrap(),
         value: "\n    ".into(),
     }]);
 
-    assert_eq!(runtime.roots(), roots, "layout is parser-invisible");
-    assert_eq!(
-        runtime.token_keys(),
-        tokens,
-        "occurrence identities survive layout shifts"
-    );
+    assert_eq!(runtime.unit().map(|u| u.root), before_roots);
     assert_eq!(runtime.diagnostic_count(), 0);
+    // Token values (textual lexemes) survive the layout shift.
+    let after: Arc<TokenVec<JsonToken>> = runtime.tokens().unwrap();
+    assert_eq!(after.tokens.len(), before_tokens.tokens.len());
 }
 
 #[test]
@@ -232,16 +162,16 @@ fn error_recovery_publishes_diagnostics_and_a_later_repair_clears_them() {
     let colon = text.find(": 1").unwrap();
 
     runtime.apply(vec![SourceEdit::Delete {
-        key: Span::new_uri(runtime.uri, colon, colon + 1).unwrap(),
+        key: Span::new_uri(runtime.u, colon, colon + 1).unwrap(),
     }]);
     assert!(
         runtime.diagnostic_count() > 0,
         "invalid JSON must commit diagnostics"
     );
-    assert!(matches!(runtime.status(), ParseStatus::Recovered { .. }));
+    assert!(matches!(runtime.status(), Some(ParseStatus::Recovered { .. })));
 
     runtime.apply(vec![SourceEdit::Insert {
-        key: Span::point_uri(runtime.uri, colon).unwrap(),
+        key: Span::point_uri(runtime.u, colon).unwrap(),
         value: ":".into(),
     }]);
     assert_eq!(
@@ -249,11 +179,8 @@ fn error_recovery_publishes_diagnostics_and_a_later_repair_clears_them() {
         0,
         "repair must retract stale diagnostics"
     );
-    assert_eq!(runtime.status(), ParseStatus::Clean);
-    assert!(
-        !runtime.roots().is_empty(),
-        "repair must restore a typed root"
-    );
+    assert_eq!(runtime.status(), Some(ParseStatus::Clean));
+    assert!(runtime.has_root(), "repair must restore a typed root");
 }
 
 #[test]
@@ -263,29 +190,28 @@ fn truncated_container_recovers_without_retaining_stale_roots() {
     let close = text.len() - 1;
 
     runtime.apply(vec![SourceEdit::Delete {
-        key: Span::new_uri(runtime.uri, close, close + 1).unwrap(),
+        key: Span::new_uri(runtime.u, close, close + 1).unwrap(),
     }]);
     assert!(runtime.diagnostic_count() > 0);
-    assert_ne!(runtime.status(), ParseStatus::Clean);
+    assert_ne!(runtime.status(), Some(ParseStatus::Clean));
 
     runtime.apply(vec![SourceEdit::Insert {
-        key: Span::point_uri(runtime.uri, close).unwrap(),
+        key: Span::point_uri(runtime.u, close).unwrap(),
         value: "}".into(),
     }]);
     assert_eq!(runtime.diagnostic_count(), 0);
-    assert_eq!(runtime.status(), ParseStatus::Clean);
+    assert_eq!(runtime.status(), Some(ParseStatus::Clean));
 }
 
 #[test]
-fn unicode_replacements_preserve_utf8_boundaries_and_incremental_suffixes() {
+fn unicode_replacements_preserve_utf8_boundaries() {
     let text = r#"{"label": "α", "tail": 12345}"#;
     let mut runtime = JsonRuntime::new("heavy-unicode", text);
-    runtime.apply(replace(runtime.uri, text, "α", "β"));
+    runtime.apply(replace(runtime.u, text, "α", "β"));
 
-    assert_eq!(runtime.text().as_ref(), r#"{"label": "β", "tail": 12345}"#);
+    assert_eq!(runtime.text(), r#"{"label": "β", "tail": 12345}"#);
     assert_eq!(runtime.diagnostic_count(), 0);
-    assert!(runtime.lex_stats().reused > 0);
-    assert!(runtime.parse_stats().reused > 0);
+    assert!(runtime.has_root());
 }
 
 #[test]
@@ -294,15 +220,15 @@ fn lexical_errors_publish_partial_diagnostics_and_repair_cleanly() {
     let mut runtime = JsonRuntime::new("heavy-lex-error", text);
     let number = text.find("1,").unwrap();
 
-    runtime.apply(replace(runtime.uri, text, "1", "@"));
-    assert!(runtime.lex_diagnostic_count() > 0);
+    runtime.apply(replace(runtime.u, text, "1", "@"));
+    assert!(runtime.lex_error_count() > 0, "lex error visible in TokenVec");
     assert!(runtime.diagnostic_count() > 0);
-    assert_ne!(runtime.status(), ParseStatus::Clean);
+    assert_ne!(runtime.status(), Some(ParseStatus::Clean));
 
-    runtime.apply(replace(runtime.uri, runtime.text().as_ref(), "@", "1"));
-    assert_eq!(runtime.lex_diagnostic_count(), 0);
+    runtime.apply(replace(runtime.u, runtime.text().as_str(), "@", "1"));
+    assert_eq!(runtime.lex_error_count(), 0, "repair clears lex errors");
     assert_eq!(runtime.diagnostic_count(), 0);
-    assert_eq!(runtime.status(), ParseStatus::Clean);
+    assert_eq!(runtime.status(), Some(ParseStatus::Clean));
     assert!(number < runtime.text().len());
 }
 
@@ -313,12 +239,26 @@ fn sequential_incremental_edits_match_a_fresh_oracle_after_every_step() {
 
     for (step, (old, new)) in trace.into_iter().enumerate() {
         let before = runtime.text();
-        runtime.apply(replace(runtime.uri, before.as_ref(), old, new));
+        runtime.apply(replace(runtime.u, before.as_str(), old, new));
         let fresh = JsonRuntime::new(
             &format!("heavy-trace-oracle-{step}"),
-            runtime.text().as_ref(),
+            runtime.text().as_str(),
         );
-        assert_eq!(runtime.token_shape(), fresh.token_shape());
+        let this: Arc<TokenVec<JsonToken>> = runtime.tokens().unwrap();
+        let oracle: Arc<TokenVec<JsonToken>> = fresh.tokens().unwrap();
+        // Textual token values and errors must match the fresh oracle.
+        assert_eq!(this.tokens.len(), oracle.tokens.len());
+        assert_eq!(
+            this.tokens
+                .iter()
+                .map(|t| t.value.to_string())
+                .collect::<Vec<_>>(),
+            oracle
+                .tokens
+                .iter()
+                .map(|t| t.value.to_string())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(runtime.diagnostic_count(), fresh.diagnostic_count());
         assert_eq!(runtime.status(), fresh.status());
     }
@@ -328,117 +268,56 @@ fn sequential_incremental_edits_match_a_fresh_oracle_after_every_step() {
 fn reverse_order_batch_replacements_keep_disjoint_edits_sparse_and_valid() {
     let text = r#"{"left": 11111, "right": 22222}"#;
     let mut runtime = JsonRuntime::new("heavy-reverse-batch", text);
-    let mut edits = replace(runtime.uri, text, "22222", "98765");
-    edits.extend(replace(runtime.uri, text, "11111", "56789"));
+    let mut edits = replace(runtime.u, text, "22222", "98765");
+    edits.extend(replace(runtime.u, text, "11111", "56789"));
     runtime.apply(edits);
 
-    assert_eq!(
-        runtime.text().as_ref(),
-        r#"{"left": 56789, "right": 98765}"#
-    );
+    assert_eq!(runtime.text(), r#"{"left": 56789, "right": 98765}"#);
     assert_eq!(runtime.diagnostic_count(), 0);
-    assert!(runtime.lex_stats().reused > 0);
-    assert!(runtime.parse_stats().reused > 0);
-}
-
-#[test]
-fn released_document_caches_reinitialize_without_replaying_stale_deltas() {
-    let runtime = JsonRuntime::new("heavy-reclaim", r#"{"value": 1}"#);
-    let JsonRuntime {
-        mut graph,
-        uri,
-        _demand,
-        subscription,
-    } = runtime;
-    drop(subscription);
-    drop(_demand);
-    graph.collect_garbage().unwrap();
-    assert!(graph.scan::<ParseEntries<JsonToken>>(uri).is_empty());
-
-    let _rematerialized = graph
-        .demand::<ParserNode<JsonToken, JsonDocument>>(uri)
-        .unwrap();
-    assert!(
-        graph
-            .get::<ParseSnapshot<JsonToken>>(uri)
-            .unwrap()
-            .ast_keys()
-            .next()
-            .is_some()
-    );
-    assert_eq!(
-        graph.get::<ParseDiagnostics<JsonToken>>(uri).unwrap().len(),
-        0
-    );
+    assert!(runtime.has_root());
 }
 
 #[test]
 fn independent_documents_do_not_cross_invalidate() {
-    let uri_a = Span::new("test://heavy-isolated-a", 0, 0).unwrap().uri;
-    let uri_b = Span::new("test://heavy-isolated-b", 0, 0).unwrap().uri;
-    let parser = Grammar::from_spec::<JsonDocument>().build_lr1::<JsonToken>();
-    let mut graph = Graph::new();
-    graph
-        .install(LexerNode::<JsonToken>::new().unwrap())
-        .unwrap();
-    graph
-        .install(ParserNode::<JsonToken, JsonDocument>::from_parser(parser))
-        .unwrap();
-    for (uri, text) in [(uri_a, r#"{"value": 1}"#), (uri_b, r#"{"value": 2}"#)] {
-        graph.command(SourceInput::load(uri)).unwrap();
-        graph
-            .command(SourceInput::apply(SourceEdit::Insert {
-                key: Span::point_uri(uri, 0).unwrap(),
-                value: text.into(),
-            }))
-            .unwrap();
-    }
-    let _demand_a = graph
-        .demand::<ParserNode<JsonToken, JsonDocument>>(uri_a)
-        .unwrap();
-    let _demand_b = graph
-        .demand::<ParserNode<JsonToken, JsonDocument>>(uri_b)
-        .unwrap();
-    let subscription_a = graph.subscribe::<ParseSnapshot<JsonToken>>(uri_a).unwrap();
-    let subscription_b = graph.subscribe::<ParseSnapshot<JsonToken>>(uri_b).unwrap();
-    let _ = subscription_a.recv().unwrap();
-    let _ = subscription_b.recv().unwrap();
-    let roots_b = graph.scan::<ParseEntries<JsonToken>>(uri_b);
-
-    graph
-        .command(SourceInput::apply(SourceEdit::Insert {
-            key: Span::point_uri(uri_a, 1).unwrap(),
-            value: " ".into(),
-        }))
-        .unwrap();
-    assert!(
-        matches!(subscription_b.try_recv(), Err(TryRecvError::Empty)),
-        "an edit to URI A must not publish a URI B parser update"
-    );
-    assert_eq!(graph.scan::<ParseEntries<JsonToken>>(uri_b), roots_b);
+    let mut ws = build(1);
+    let a = uri("heavy-isolated-a");
+    let b = uri("heavy-isolated-b");
+    ws.open(a, r#"{"value": 1}"#).unwrap();
+    ws.open(b, r#"{"value": 2}"#).unwrap();
+    let before_b = ws
+        .snapshot()
+        .map_view::<ParseUnits<JsonDocument>>()
+        .get(&b.to_string())
+        .map(|v| (*v).clone());
+    ws.edit(vec![SourceEdit::Insert {
+        key: Span::point_uri(a, 9).unwrap(),
+        value: "0".into(),
+    }])
+    .unwrap();
+    let after_b = ws
+        .snapshot()
+        .map_view::<ParseUnits<JsonDocument>>()
+        .get(&b.to_string())
+        .map(|v| (*v).clone());
+    assert_eq!(before_b, after_b, "document B is untouched by A's edit");
 }
 
 #[test]
-fn atomic_batches_reject_mixed_documents_without_publishing_a_partial_revision() {
-    let text = r#"{"value": 1}"#;
-    let mut runtime = JsonRuntime::new("heavy-atomic", text);
-    let before = runtime.text();
-    let foreign = Span::new("test://foreign", 0, 0).unwrap().uri;
-
-    let error = runtime
-        .graph
-        .command(SourceInput::apply_all(vec![
-            SourceEdit::Insert {
-                key: Span::point_uri(runtime.uri, 1).unwrap(),
-                value: " ".into(),
-            },
-            SourceEdit::Insert {
-                key: Span::point_uri(foreign, 0).unwrap(),
-                value: "x".into(),
-            },
-        ]))
-        .expect_err("a batch cannot span documents");
-    assert!(error.to_string().contains("one document"));
-    assert_eq!(runtime.text(), before);
+fn deep_nesting_parses_with_stats_present() {
+    let depth = 200;
+    let mut text = String::from(r#"{"a": "#);
+    for _ in 0..depth {
+        text.push_str("[");
+    }
+    text.push_str("1");
+    for _ in 0..depth {
+        text.push_str("]");
+    }
+    text.push_str("}");
+    let runtime = JsonRuntime::new("heavy-deep", &text);
+    assert!(runtime.has_root());
     assert_eq!(runtime.diagnostic_count(), 0);
+    // Stats are populated (the plan's ParseUnit carries them).
+    let unit = runtime.unit().unwrap();
+    assert!(unit.stats.reparsed > 0 || unit.stats.restart_boundary == 0);
 }

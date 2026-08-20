@@ -84,7 +84,7 @@ pub fn expand_pretty_terminal_derive(item: ItemEnum) -> syn::Result<proc_macro::
     Ok(quote! {
         impl ::plingo::visual::ast::PrettyTerminal for #enum_ident {
             fn pretty_terminal(
-                terminal: ::std::option::Option<::plingo::component::parse::grammar::TerminalId>,
+                terminal: ::std::option::Option<::plingo::framework::parse::grammar::TerminalId>,
                 source: &str,
             ) -> ::std::string::String {
                 let name = terminal

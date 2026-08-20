@@ -39,7 +39,7 @@ pub fn expand_scope_domain(input: DeriveInput) -> Result<TokenStream> {
     let request = required(request, "request")?;
 
     Ok(quote! {
-        impl ::plingo::component::scope::ScopeDomain for #domain {
+        impl ::plingo::framework::scope::ScopeDomain for #domain {
             type ScopeKey = #scope_key;
             type ScopeData = #scope_data;
             type Label = #label;

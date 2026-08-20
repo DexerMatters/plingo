@@ -241,16 +241,16 @@ pub fn field_parse_expr(
 
         let expr = attr.parse_args::<Expr>()?;
         parse_expr = Some(quote! {
-            ::plingo::component::lex::__macro_private::IntoLexemeResult::into_lexeme_result((#expr)(#input_ident))
-                .map_err(|source| ::plingo::component::lex::LexInterrupt::token_parse_failed(#token_name, #input_ident, source))?
+            ::plingo::framework::lex::__macro_private::IntoLexemeResult::into_lexeme_result((#expr)(#input_ident))
+                .map_err(|source| ::plingo::framework::lex::LexInterrupt::token_parse_failed(#token_name, #input_ident, source))?
         });
     }
 
     Ok(match parse_expr {
         Some(expr) => expr,
         None => quote! {
-            <#field_ty as ::plingo::component::lex::FromLexeme>::from_lexeme(#input_ident)
-                .map_err(|source| ::plingo::component::lex::LexInterrupt::token_parse_failed(#token_name, #input_ident, source))?
+            <#field_ty as ::plingo::framework::lex::FromLexeme>::from_lexeme(#input_ident)
+                .map_err(|source| ::plingo::framework::lex::LexInterrupt::token_parse_failed(#token_name, #input_ident, source))?
         },
     })
 }

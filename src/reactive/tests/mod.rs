@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 mod matrix;
+mod sugar;
 mod t1_consistency;
 mod t2_glitch;
 mod t3_determinism;

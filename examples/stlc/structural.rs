@@ -1,22 +1,18 @@
-//! User-authored components that publish composable STLC structural views.
+//! User-authored components that publish composable STLC structural views
+//! (reactive rewrite, plan Phase 6). The lowering pass classifies every
+//! syntax node, publishes its untyped lowered value, its origin, its
+//! diagnostics, and a downstream summary — with per-node child visitor
+//! granularity.
 
-use std::{marker::PhantomData, sync::Arc};
+use std::sync::{Arc, Mutex};
 
-use fluent_uri::Uri;
-use plingo::{
-    Component, Context, NodeError, Result, Table,
-    component::writes,
-    component::{
-        parse::{AstKey, AstWalk},
-        structural::{
-            ChildRef, NoEdge, OrderedChildren, Structure, StructureChildren, StructureEntries,
-            StructureEntry, StructureNode,
-        },
-    },
-    scheme::node::Graph,
-};
+use plingo::framework::parse::ParseUnits;
+use plingo::reactive::prelude::*;
+use plingo::reactive::view::NodeId;
+use plingo::reactive_component as component;
+use plingo::reactive_view as view;
 
-use super::syntax::{StlcDeclaration, StlcDocument, StlcExpr, StlcToken, StlcType};
+use super::syntax::{StlcCase, StlcDocument, StlcObservedExt, StlcTree};
 
 /// A compact typed classification of parser artifacts.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -28,384 +24,207 @@ pub enum StlcNodeKind {
     Other,
 }
 
-/// Structural product of the parser-to-index component.
-pub struct StlcNodeIndex(PhantomData<fn() -> ()>);
+// ---------------------------------------------------------------------------
+// Views
+// ---------------------------------------------------------------------------
 
-impl Structure for StlcNodeIndex {
-    type NodeKey = AstKey;
-    type NodeMetadata = ();
-    type Edge = NoEdge<Self>;
-    type Topology = OrderedChildren;
-}
+/// Per-node structural kind (the parser-to-index product).
+#[view(map, key = String, value = Vec<NodeFact>)]
+pub struct StlcNodeIndex;
 
-/// Structural product of the index-to-summary component.
-pub struct StlcNodeSummary(PhantomData<fn() -> ()>);
-
-impl Structure for StlcNodeSummary {
-    type NodeKey = AstKey;
-    type NodeMetadata = ();
-    type Edge = NoEdge<Self>;
-    type Topology = OrderedChildren;
-}
-
-/// The one document coordinator for the parser-to-index component.
+/// One per-node structural fact.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct IndexCoordinator {
-    pub uri: Uri<&'static str>,
+pub struct NodeFact {
+    pub node: NodeId,
+    pub kind: StlcNodeKind,
 }
 
-/// One indexed AST item.
+/// Per-node lowered values (untyped).
+#[view(map, key = String, value = Vec<LoweredFact>)]
+pub struct StlcLowered;
+
+/// One per-node lowered fact.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct IndexTask {
-    pub ast: AstKey,
-}
-
-impl Component for IndexCoordinator {
-    type Output = ();
-    type Writes = writes!(StructureEntries<StlcNodeIndex, Uri<&'static str>, usize>);
-
-    fn run(&self, cx: &mut Context<'_, Self>) -> Result<()> {
-        let uri = self.uri;
-        let mut parsed = cx.view::<plingo::component::Parsed<StlcToken, StlcDocument>>();
-        let entries = parsed.entries(uri);
-        if let Some(candidates) = parsed.candidates::<StlcDocument>(uri) {
-            assert_eq!(
-                candidates.len(),
-                entries.len(),
-                "parser candidates and structural entries describe one parse",
-            );
-        }
-        drop(parsed);
-        for entry in entries {
-            cx.keep(IndexTask {
-                ast: entry.node.clone(),
-            });
-            cx.view::<StlcNodeIndex>()
-                .support_entry::<Uri<&'static str>, usize>(StructureEntry::new(
-                    entry.entry,
-                    entry.node,
-                    entry.metadata,
-                ))?;
-        }
-        Ok(())
-    }
-}
-
-impl Component for IndexTask {
-    type Output = Option<AstKey>;
-    type Writes = writes!(
-        StructureNode<StlcNodeIndex>,
-        StructureChildren<StlcNodeIndex>,
-    );
-
-    fn run(&self, cx: &mut Context<'_, Self>) -> Result<Self::Output> {
-        let ast = self.ast.clone();
-        let Some(artifact) = cx
-            .view::<plingo::component::Parsed<StlcToken, StlcDocument>>()
-            .raw_artifact(ast.clone())
-        else {
-            return Ok(None);
-        };
-        if artifact.deref::<StlcDocument>().is_some() {
-            let mut children = Vec::new();
-            let document = artifact.deref::<StlcDocument>().expect("document artifact");
-            document.direct_children(&mut |child| children.push(child));
-            cx.view::<StlcNodeIndex>()
-                .define_artifact(ast.clone(), StlcNodeKind::Document)?;
-            cx.view::<StlcNodeIndex>().define_children(
-                ast.clone(),
-                children
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(slot, target)| ChildRef { slot, target })
-                    .collect::<Vec<_>>()
-                    .into(),
-            )?;
-            for child in children {
-                cx.keep(IndexTask { ast: child });
-            }
-            return Ok(Some(ast));
-        }
-        let kind = if artifact.deref::<StlcDeclaration>().is_some() {
-            StlcNodeKind::Declaration
-        } else if artifact.deref::<StlcExpr>().is_some() {
-            StlcNodeKind::Expression
-        } else if artifact.deref::<StlcType>().is_some() {
-            StlcNodeKind::Type
-        } else {
-            StlcNodeKind::Other
-        };
-        cx.view::<StlcNodeIndex>()
-            .define_artifact(ast.clone(), kind)?;
-        Ok(Some(ast))
-    }
-}
-
-/// The one document coordinator for the index-to-summary component.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SummaryCoordinator {
-    pub uri: Uri<&'static str>,
-}
-
-/// One summarized indexed item.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SummaryTask {
-    pub ast: AstKey,
-}
-
-impl Component for SummaryCoordinator {
-    type Output = ();
-    type Writes = writes!(StructureEntries<StlcNodeSummary, Uri<&'static str>, usize>);
-
-    fn run(&self, cx: &mut Context<'_, Self>) -> Result<()> {
-        cx.call(IndexCoordinator { uri: self.uri })?;
-        for entry in cx
-            .view::<StlcNodeIndex>()
-            .entries::<Uri<&'static str>, usize>(self.uri)
-        {
-            cx.keep(SummaryTask {
-                ast: entry.node.clone(),
-            });
-            cx.view::<StlcNodeSummary>()
-                .support_entry::<Uri<&'static str>, usize>(StructureEntry::new(
-                    entry.entry,
-                    entry.node,
-                    entry.metadata,
-                ))?;
-        }
-        Ok(())
-    }
-}
-
-impl Component for SummaryTask {
-    type Output = Option<AstKey>;
-    type Writes = writes!(
-        StructureNode<StlcNodeSummary>,
-        StructureChildren<StlcNodeSummary>,
-    );
-
-    fn run(&self, cx: &mut Context<'_, Self>) -> Result<Self::Output> {
-        let ast = self.ast.clone();
-        cx.call(IndexTask { ast: ast.clone() })?;
-        let Some(artifact) = cx
-            .view::<StlcNodeIndex>()
-            .artifact::<StlcNodeKind>(ast.clone())
-        else {
-            return Ok(None);
-        };
-        let kind = &*artifact;
-        cx.view::<StlcNodeSummary>()
-            .define_artifact(ast.clone(), format!("{kind:?}"))?;
-        if let Some(children) = cx.view::<StlcNodeIndex>().children(ast.clone()) {
-            cx.view::<StlcNodeSummary>()
-                .define_children(ast.clone(), Arc::clone(&children))?;
-            for child in children.iter() {
-                cx.keep(SummaryTask {
-                    ast: child.target.clone(),
-                });
-            }
-        }
-        Ok(Some(ast))
-    }
-}
-
-/// Untyped lowered structural product derived from the indexed AST view.
-pub struct StlcLowered(PhantomData<fn() -> ()>);
-
-impl Structure for StlcLowered {
-    type NodeKey = AstKey;
-    type NodeMetadata = ();
-    type Edge = NoEdge<Self>;
-    type Topology = OrderedChildren;
+pub struct LoweredFact {
+    pub node: NodeId,
+    pub value: String,
 }
 
 /// Origin of one lowered node in the source AST.
+#[view(map, key = String, value = Vec<OriginFact>)]
 pub struct StlcLoweredOrigin;
 
-impl plingo::View for StlcLoweredOrigin {
-    type Key = AstKey;
-    type Value = AstKey;
+/// One per-node origin fact.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OriginFact {
+    pub node: NodeId,
+    pub origin: NodeId,
 }
 
 /// Lowering diagnostics owned by one AST item.
+#[view(map, key = String, value = Vec<LoweringDiag>)]
 pub struct StlcLoweringDiagnostics;
 
-impl plingo::View for StlcLoweringDiagnostics {
-    type Key = AstKey;
-    type Value = Arc<[String]>;
-}
-
-/// The one document coordinator for the lowering component.
+/// One per-node lowering diagnostic list.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LowerCoordinator {
-    pub uri: Uri<&'static str>,
-}
-
-/// One lowered indexed item.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LowerTask {
-    pub ast: AstKey,
-}
-
-impl Component for LowerCoordinator {
-    type Output = ();
-    type Writes = writes!(StructureEntries<StlcLowered, Uri<&'static str>, usize>);
-
-    fn run(&self, cx: &mut Context<'_, Self>) -> Result<()> {
-        cx.call(IndexCoordinator { uri: self.uri })?;
-        for entry in cx
-            .view::<StlcNodeIndex>()
-            .entries::<Uri<&'static str>, usize>(self.uri)
-        {
-            cx.keep(LowerTask {
-                ast: entry.node.clone(),
-            });
-            cx.view::<StlcLowered>()
-                .support_entry::<Uri<&'static str>, usize>(StructureEntry::new(
-                    entry.entry,
-                    entry.node,
-                    entry.metadata,
-                ))?;
-        }
-        Ok(())
-    }
-}
-
-impl Component for LowerTask {
-    type Output = Option<AstKey>;
-    type Writes = writes!(
-        StructureNode<StlcLowered>,
-        StructureChildren<StlcLowered>,
-        Table<StlcLoweredOrigin>,
-        Table<StlcLoweringDiagnostics>,
-    );
-
-    fn run(&self, cx: &mut Context<'_, Self>) -> Result<Self::Output> {
-        let ast = self.ast.clone();
-        cx.call(IndexTask { ast: ast.clone() })?;
-        let Some(index) = cx
-            .view::<StlcNodeIndex>()
-            .artifact::<StlcNodeKind>(ast.clone())
-        else {
-            return Ok(None);
-        };
-        let kind = &*index;
-        let lowered = format!("untyped::{kind:?}");
-        cx.view::<StlcLowered>()
-            .define_artifact(ast.clone(), lowered)?;
-        cx.view::<Table<StlcLoweredOrigin>>()
-            .set(ast.clone(), ast.clone())?;
-        let diagnostics: Arc<[String]> = if matches!(&*kind, StlcNodeKind::Other) {
-            vec![format!("unclassified source node {}", ast.id)].into()
-        } else {
-            Vec::new().into()
-        };
-        cx.view::<Table<StlcLoweringDiagnostics>>()
-            .set(ast.clone(), diagnostics)?;
-        if let Some(children) = cx.view::<StlcNodeIndex>().children(ast.clone()) {
-            cx.view::<StlcLowered>()
-                .define_children(ast.clone(), Arc::clone(&children))?;
-            for child in children.iter() {
-                cx.keep(LowerTask {
-                    ast: child.target.clone(),
-                });
-            }
-        }
-        Ok(Some(ast))
-    }
+pub struct LoweringDiag {
+    pub node: NodeId,
+    pub messages: Arc<[String]>,
 }
 
 /// A downstream consumer proving that lowered structural views compose.
-pub struct StlcLoweredSummary(PhantomData<fn() -> ()>);
+#[view(map, key = String, value = Vec<SummaryFact>)]
+pub struct StlcLoweredSummary;
 
-impl Structure for StlcLoweredSummary {
-    type NodeKey = AstKey;
-    type NodeMetadata = ();
-    type Edge = NoEdge<Self>;
-    type Topology = OrderedChildren;
-}
-
-/// The one document coordinator for the lowered-summary component.
+/// One per-node summary fact.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LoweredSummaryCoordinator {
-    pub uri: Uri<&'static str>,
+pub struct SummaryFact {
+    pub node: NodeId,
+    pub value: String,
 }
 
-/// One summarized lowered item.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LoweredSummaryTask {
-    pub ast: AstKey,
-}
+// ---------------------------------------------------------------------------
+// The lowering pass
+// ---------------------------------------------------------------------------
 
-impl Component for LoweredSummaryCoordinator {
-    type Output = ();
-    type Writes = writes!(StructureEntries<StlcLoweredSummary, Uri<&'static str>, usize>);
-
-    fn run(&self, cx: &mut Context<'_, Self>) -> Result<()> {
-        cx.call(LowerCoordinator { uri: self.uri })?;
-        for entry in cx
-            .view::<StlcLowered>()
-            .entries::<Uri<&'static str>, usize>(self.uri)
-        {
-            cx.keep(LoweredSummaryTask {
-                ast: entry.node.clone(),
-            });
-            cx.view::<StlcLoweredSummary>()
-                .support_entry::<Uri<&'static str>, usize>(StructureEntry::new(
-                    entry.entry,
-                    entry.node,
-                    entry.metadata,
-                ))?;
-        }
-        Ok(())
-    }
-}
-
-impl Component for LoweredSummaryTask {
-    type Output = Option<AstKey>;
-    type Writes = writes!(StructureNode<StlcLoweredSummary>);
-
-    fn run(&self, cx: &mut Context<'_, Self>) -> Result<Self::Output> {
-        let ast = self.ast.clone();
-        cx.call(LowerTask { ast: ast.clone() })?;
-        let Some(value) = cx.view::<StlcLowered>().artifact::<String>(ast.clone()) else {
-            return Ok(None);
+/// The structural pass: one child visitor per document over
+/// [`ParseUnits<StlcDocument>`], then per-node child visitors inside a
+/// document. Publishes the per-node index, lowered, origin, diagnostics,
+/// and summary maps.
+#[component]
+pub fn structural_pass(
+    units: ParseUnits<StlcDocument>,
+    syntax: StlcTree,
+) -> (
+    StlcNodeIndex,
+    StlcLowered,
+    StlcLoweredOrigin,
+    StlcLoweringDiagnostics,
+    StlcLoweredSummary,
+) {
+    let index = Emitted::<StlcNodeIndex>::new()?;
+    let lowered = Emitted::<StlcLowered>::new()?;
+    let origins = Emitted::<StlcLoweredOrigin>::new()?;
+    let lower_diags = Emitted::<StlcLoweringDiagnostics>::new()?;
+    let summaries = Emitted::<StlcLoweredSummary>::new()?;
+    let (index_c, lowered_c, origins_c, diags_c, summaries_c) = (
+        index.clone(), lowered.clone(), origins.clone(), lower_diags.clone(),
+        summaries.clone(),
+    );
+    units.visit_each(move |uri, unit| -> Result<()> {
+        let Some(unit) = unit else {
+            return Ok(());
         };
-        cx.view::<StlcLoweredSummary>()
-            .define_artifact(ast.clone(), format!("summary:{value}"))?;
-        Ok(Some(ast))
-    }
+        let facts: Arc<Mutex<Vec<(NodeId, StlcNodeKind)>>> = Arc::new(Mutex::new(Vec::new()));
+        let lowered_buf: Arc<Mutex<Vec<(NodeId, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let origin_buf: Arc<Mutex<Vec<(NodeId, NodeId)>>> = Arc::new(Mutex::new(Vec::new()));
+        let diag_buf: Arc<Mutex<Vec<(NodeId, Arc<[String]>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let summary_buf: Arc<Mutex<Vec<(NodeId, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Classify this node, then recurse per-child.
+        classify_node(
+            &uri,
+            &syntax,
+            &facts,
+            &lowered_buf,
+            &origin_buf,
+            &diag_buf,
+            &summary_buf,
+            unit.root,
+        )?;
+
+        let mut f = facts.lock().expect("facts lock");
+        index_c.set(uri.clone(), f.drain(..).map(|(n, k)| NodeFact { node: n, kind: k }).collect())?;
+        drop(f);
+        let mut l = lowered_buf.lock().expect("lowered lock");
+        lowered_c.set(uri.clone(), l.drain(..).map(|(n, v)| LoweredFact { node: n, value: v }).collect())?;
+        drop(l);
+        let mut o = origin_buf.lock().expect("origin lock");
+        origins_c.set(uri.clone(), o.drain(..).map(|(n, x)| OriginFact { node: n, origin: x }).collect())?;
+        drop(o);
+        let mut d = diag_buf.lock().expect("diag lock");
+        diags_c.set(uri.clone(), d.drain(..).map(|(n, m)| LoweringDiag { node: n, messages: m }).collect())?;
+        drop(d);
+        let mut s = summary_buf.lock().expect("summary lock");
+        summaries_c.set(uri.clone(), s.drain(..).map(|(n, v)| SummaryFact { node: n, value: v }).collect())?;
+        Ok(())
+    })?;
+    Ok((
+        index, lowered, origins, lower_diags, summaries,
+    ))
 }
 
-/// Installs parser, indexed, summary, lowering, and downstream structural
-/// components, connecting each coordinator after its source publishes.
-pub fn install_structural_pipeline(graph: &mut Graph) -> std::result::Result<(), NodeError> {
-    graph.register::<IndexCoordinator>()?;
-    graph.register::<IndexTask>()?;
-    graph.register::<SummaryCoordinator>()?;
-    graph.register::<SummaryTask>()?;
-    graph.register::<LowerCoordinator>()?;
-    graph.register::<LowerTask>()?;
-    graph.register::<LoweredSummaryCoordinator>()?;
-    graph.register::<LoweredSummaryTask>()?;
-    graph.connect_component::<plingo::component::parse::ParserNode<StlcToken, StlcDocument>, IndexCoordinator>(
-        |uri| IndexCoordinator { uri },
-    )?;
-    graph.connect_components::<IndexCoordinator, SummaryCoordinator>(|coordinator| {
-        SummaryCoordinator {
-            uri: coordinator.uri,
-        }
-    })?;
-    graph.connect_components::<IndexCoordinator, LowerCoordinator>(|coordinator| {
-        LowerCoordinator {
-            uri: coordinator.uri,
-        }
-    })?;
-    graph.connect_components::<LowerCoordinator, LoweredSummaryCoordinator>(|coordinator| {
-        LoweredSummaryCoordinator {
-            uri: coordinator.uri,
-        }
-    })?;
+/// Classifies one node and recurses into its children (each child its
+/// own visitor instance, so edits to one declaration re-run only that
+/// declaration's structural facts).
+fn classify_node(
+    uri: &str,
+    syntax: &ObservedHandle<StlcTree>,
+    facts: &Arc<Mutex<Vec<(NodeId, StlcNodeKind)>>>,
+    lowered: &Arc<Mutex<Vec<(NodeId, String)>>>,
+    origins: &Arc<Mutex<Vec<(NodeId, NodeId)>>>,
+    diags: &Arc<Mutex<Vec<(NodeId, Arc<[String]>)>>>,
+    summaries: &Arc<Mutex<Vec<(NodeId, String)>>>,
+    id: NodeId,
+) -> Result<()> {
+    let kind = match syntax.case(id)? {
+        Some(StlcCase::Document(_)) => StlcNodeKind::Document,
+        Some(StlcCase::Declaration(_)) => StlcNodeKind::Declaration,
+        Some(StlcCase::Expr(_)) => StlcNodeKind::Expression,
+        Some(StlcCase::Type(_)) | Some(StlcCase::TypeAtom(_)) => StlcNodeKind::Type,
+        _ => StlcNodeKind::Other,
+    };
+    let lowered_value = format!("untyped::{kind:?}");
+    facts
+        .lock()
+        .expect("facts lock")
+        .push((id, kind.clone()));
+    lowered
+        .lock()
+        .expect("lowered lock")
+        .push((id, lowered_value.clone()));
+    origins
+        .lock()
+        .expect("origin lock")
+        .push((id, id));
+    let messages: Arc<[String]> = if matches!(&kind, StlcNodeKind::Other) {
+        vec![format!("unclassified source node {id:?}")].into()
+    } else {
+        Vec::new().into()
+    };
+    diags
+        .lock()
+        .expect("diag lock")
+        .push((id, messages));
+    summaries
+        .lock()
+        .expect("summary lock")
+        .push((id, format!("summary:{lowered_value}")));
+
+    // Recurse per-child as separate visitor instances.
+    let children = TreeObservedExt::children(syntax, id)?;
+    for child in children {
+        let uri = uri.to_string();
+        let recursion = syntax.clone();
+        let facts = Arc::clone(facts);
+        let lowered = Arc::clone(lowered);
+        let origins = Arc::clone(origins);
+        let diags = Arc::clone(diags);
+        let summaries = Arc::clone(summaries);
+        TreeObservedExt::visit_node(&syntax.clone(), child, move |_id, _payload| {
+            classify_node(
+                &uri,
+                &recursion,
+                &facts,
+                &lowered,
+                &origins,
+                &diags,
+                &summaries,
+                child,
+            )
+        })?;
+    }
     Ok(())
 }
+
+use plingo::reactive::api::TreeObservedExt;

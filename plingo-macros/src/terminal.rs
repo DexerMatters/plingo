@@ -147,7 +147,7 @@ pub fn expand_terminal_derive(item: ItemEnum) -> syn::Result<proc_macro::TokenSt
     let parser_terminal_impl = build_parser_terminal_impl(&enum_ident, &variants, &configs)?;
 
     Ok(quote! {
-        impl ::plingo::component::lex::TokenState for #enum_ident {
+        impl ::plingo::framework::lex::TokenState for #enum_ident {
             fn display_name() -> &'static str {
                 stringify!(#enum_ident)
             }
@@ -157,12 +157,12 @@ pub fn expand_terminal_derive(item: ItemEnum) -> syn::Result<proc_macro::TokenSt
             }
         }
 
-        impl ::plingo::component::lex::LexerRoot for #enum_ident {
+        impl ::plingo::framework::lex::LexerRoot for #enum_ident {
             type SlotValue = #slot_value;
 
-            fn state_registrations() -> ::std::vec::Vec<::plingo::component::lex::__macro_private::ScopeRegistration<Self>> {
+            fn state_registrations() -> ::std::vec::Vec<::plingo::framework::lex::__macro_private::ScopeRegistration<Self>> {
                 let error_builder = ::std::sync::Arc::new(#error_builder_ident)
-                    as ::plingo::component::lex::__macro_private::BuildErrorToken<Self>;
+                    as ::plingo::framework::lex::__macro_private::BuildErrorToken<Self>;
                 let mut registrations = ::std::vec::Vec::new();
                 #(#scope_regs)*
                 registrations
@@ -173,7 +173,7 @@ pub fn expand_terminal_derive(item: ItemEnum) -> syn::Result<proc_macro::TokenSt
             }
 
             fn recover_key(
-                slots: &::plingo::component::lex::SlotStore<Self>,
+                slots: &::plingo::framework::lex::SlotStore<Self>,
             ) -> ::std::option::Option<&str> {
                 #recover_key
             }
@@ -271,8 +271,8 @@ fn build_slot_support(
         });
         slot_consts.push(quote! {
             #[allow(non_upper_case_globals)]
-            pub const #slot_name: ::plingo::component::lex::Slot<Self, #slot_ty> =
-                ::plingo::component::lex::Slot::new(#index, #pack_ident, #ref_ident);
+            pub const #slot_name: ::plingo::framework::lex::Slot<Self, #slot_ty> =
+                ::plingo::framework::lex::Slot::new(#index, #pack_ident, #ref_ident);
         });
     }
 
@@ -470,7 +470,7 @@ fn build_regex_builder(
         #[allow(non_snake_case)]
         fn #builder_ident(
             lexeme: &str,
-        ) -> ::std::result::Result<#root_ident, ::plingo::component::lex::LexInterrupt> {
+        ) -> ::std::result::Result<#root_ident, ::plingo::framework::lex::LexInterrupt> {
             #body
         }
     })
@@ -503,7 +503,7 @@ fn build_scope_specs_fn(
 
     Ok(quote! {
         #[allow(non_snake_case)]
-        fn #specs_fn_ident() -> ::std::vec::Vec<::plingo::component::lex::__macro_private::TokenSpec<#root_ident>> {
+        fn #specs_fn_ident() -> ::std::vec::Vec<::plingo::framework::lex::__macro_private::TokenSpec<#root_ident>> {
             let mut specs = ::std::vec::Vec::new();
             #(#spec_statements)*
             specs
@@ -519,14 +519,14 @@ fn build_scope_registration(
     let specs_fn_ident = format_ident!("__plingo_token_specs_for_{}_{}", root_ident, scope.name);
     let scope_name = &scope.name;
     let type_name = if scope.name == "root" {
-        quote! { <#root_ident as ::plingo::component::lex::TokenState>::state_key() }
+        quote! { <#root_ident as ::plingo::framework::lex::TokenState>::state_key() }
     } else {
         let state_key = scope_state_key_expr(root_ident, &scope.name);
         quote! { #state_key }
     };
 
     quote! {
-        registrations.push(::plingo::component::lex::__macro_private::ScopeRegistration::new(
+        registrations.push(::plingo::framework::lex::__macro_private::ScopeRegistration::new(
             stringify!(#scope_name),
             #type_name,
             #specs_fn_ident,
@@ -544,9 +544,9 @@ fn build_scope_token_spec(
     builder_ident: &syn::Ident,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let matcher = if let Some(regex) = &config.regex {
-        quote! { ::plingo::component::lex::__macro_private::TokenMatcher::Regex(#regex) }
+        quote! { ::plingo::framework::lex::__macro_private::TokenMatcher::Regex(#regex) }
     } else if config.empty {
-        quote! { ::plingo::component::lex::__macro_private::TokenMatcher::Empty }
+        quote! { ::plingo::framework::lex::__macro_private::TokenMatcher::Empty }
     } else {
         return Err(syn::Error::new(
             variant.span(),
@@ -562,18 +562,18 @@ fn build_scope_token_spec(
     let action = if let Some(child) = &config.enter {
         let child_state_key = scope_state_key_expr(root_ident, child);
         quote! {
-            ::plingo::component::lex::__macro_private::ScopeDirective::Enter {
+            ::plingo::framework::lex::__macro_private::ScopeDirective::Enter {
                 target: #child_state_key.to_string(),
             }
         }
     } else if config.exit {
-        quote! { ::plingo::component::lex::__macro_private::ScopeDirective::Exit }
+        quote! { ::plingo::framework::lex::__macro_private::ScopeDirective::Exit }
     } else {
-        quote! { ::plingo::component::lex::__macro_private::ScopeDirective::None }
+        quote! { ::plingo::framework::lex::__macro_private::ScopeDirective::None }
     };
 
     Ok(quote! {
-        ::plingo::component::lex::__macro_private::TokenSpec {
+        ::plingo::framework::lex::__macro_private::TokenSpec {
             matcher: #matcher,
             terminal: #terminal,
             precedence: #index,
@@ -632,8 +632,8 @@ fn build_error_builder(
         quote! {
             #[allow(non_snake_case)]
             fn #builder_ident(
-                info: ::plingo::component::lex::LexErrorInfo,
-            ) -> ::std::result::Result<#root_ident, ::plingo::component::lex::LexInterrupt> {
+                info: ::plingo::framework::lex::LexErrorInfo,
+            ) -> ::std::result::Result<#root_ident, ::plingo::framework::lex::LexInterrupt> {
                 #body
             }
         },
@@ -662,11 +662,11 @@ fn build_generate_impl(
                 variant: &'static str,
                 seed: u64,
                 dest: &mut W,
-            ) -> ::std::result::Result<(), ::plingo::component::lex::GenerateError> {
+            ) -> ::std::result::Result<(), ::plingo::framework::lex::GenerateError> {
                 match variant {
                     #(#arms),*,
                     _ => ::std::result::Result::Err(
-                        ::plingo::component::lex::GenerateError::UnknownVariant {
+                        ::plingo::framework::lex::GenerateError::UnknownVariant {
                             state: stringify!(#root_ident),
                             variant,
                         },
@@ -691,7 +691,7 @@ fn build_generate_arm(
     let Some(regex) = config.regex.as_ref() else {
         return Ok(quote! {
             stringify!(#variant_ident) => ::std::result::Result::Err(
-                ::plingo::component::lex::GenerateError::UnsupportedEmptyVariant {
+                ::plingo::framework::lex::GenerateError::UnsupportedEmptyVariant {
                     token: #label,
                 },
             )
@@ -700,7 +700,7 @@ fn build_generate_arm(
     if config.when.is_some() {
         return Ok(quote! {
             stringify!(#variant_ident) => ::std::result::Result::Err(
-                ::plingo::component::lex::GenerateError::UnsupportedWhenVariant {
+                ::plingo::framework::lex::GenerateError::UnsupportedWhenVariant {
                     token: #label,
                 },
             )
@@ -711,9 +711,9 @@ fn build_generate_arm(
     Ok(quote! {
         stringify!(#variant_ident) => {
             #[allow(non_upper_case_globals)]
-            static #generator_ident: ::plingo::component::lex::__macro_private::GeneratorCache =
-                ::plingo::component::lex::__macro_private::GeneratorCache::new();
-            ::plingo::component::lex::__macro_private::generate_token(
+            static #generator_ident: ::plingo::framework::lex::__macro_private::GeneratorCache =
+                ::plingo::framework::lex::__macro_private::GeneratorCache::new();
+            ::plingo::framework::lex::__macro_private::generate_token(
                 &#generator_ident,
                 #label,
                 #regex,
@@ -770,7 +770,7 @@ fn build_parser_terminal_impl(
         let label = format!("{}::{}", root_ident, variant_ident);
         let terminal = terminal_id_expr(root_ident, index);
         arms.push(quote! {
-            stringify!(#variant_ident) => ::plingo::component::parse::__macro_private::terminal_symbol(grammar,
+            stringify!(#variant_ident) => ::plingo::framework::parse::__macro_private::terminal_symbol(grammar,
                 #label,
                 #terminal,
                 ::std::option::Option::None,
@@ -779,11 +779,11 @@ fn build_parser_terminal_impl(
     }
 
     Ok(quote! {
-        impl ::plingo::component::parse::__macro_private::TokenVariantSpec for #root_ident {
+        impl ::plingo::framework::parse::__macro_private::TokenVariantSpec for #root_ident {
             fn register_terminal(
-                grammar: &mut ::plingo::component::parse::grammar::GrammarBuilder,
+                grammar: &mut ::plingo::framework::parse::grammar::GrammarBuilder,
                 variant: &'static str,
-            ) -> ::plingo::component::parse::grammar::Symbol {
+            ) -> ::plingo::framework::parse::grammar::Symbol {
                 match variant {
                     #(#arms,)*
                     _ => panic!("unknown token variant {}::{}", stringify!(#root_ident), variant),
@@ -795,8 +795,8 @@ fn build_parser_terminal_impl(
 
 fn terminal_id_expr(root_ident: &syn::Ident, index: usize) -> proc_macro2::TokenStream {
     quote! {
-        ::plingo::component::parse::grammar::TerminalId {
-            state_key: <#root_ident as ::plingo::component::lex::TokenState>::state_key(),
+        ::plingo::framework::parse::grammar::TerminalId {
+            state_key: <#root_ident as ::plingo::framework::lex::TokenState>::state_key(),
             token_id: #index as u32,
         }
     }
@@ -807,7 +807,7 @@ fn scope_state_key_expr(
     scope_ident: &syn::Ident,
 ) -> proc_macro2::TokenStream {
     if scope_ident == "root" {
-        quote! { <#root_ident as ::plingo::component::lex::TokenState>::state_key() }
+        quote! { <#root_ident as ::plingo::framework::lex::TokenState>::state_key() }
     } else {
         quote! {
             concat!(
@@ -827,10 +827,10 @@ fn guard_expr(root_ident: &syn::Ident, predicate: &Option<syn::Expr>) -> proc_ma
             ::std::option::Option::Some(
                 ::std::sync::Arc::new(
                     #predicate as fn(
-                        &::plingo::component::lex::WhenCx<#root_ident>
+                        &::plingo::framework::lex::WhenCx<#root_ident>
                     ) -> bool
                 )
-                    as ::plingo::component::lex::__macro_private::WhenGuard<#root_ident>
+                    as ::plingo::framework::lex::__macro_private::WhenGuard<#root_ident>
             )
         },
         None => quote! { ::std::option::Option::None },
@@ -842,7 +842,7 @@ fn recover_expr(predicate: &Option<syn::Expr>) -> proc_macro2::TokenStream {
         Some(predicate) => quote! {
             ::std::option::Option::Some(
                 ::std::sync::Arc::new(#predicate as fn(&str, ::std::option::Option<&str>) -> usize)
-                    as ::plingo::component::lex::__macro_private::RecoverWhen
+                    as ::plingo::framework::lex::__macro_private::RecoverWhen
             )
         },
         None => quote! { ::std::option::Option::None },
@@ -854,9 +854,9 @@ fn with_expr(root_ident: &syn::Ident, mapper: &Option<syn::Expr>) -> proc_macro2
         Some(mapper) => quote! {
             ::std::option::Option::Some(
                 ::std::sync::Arc::new(
-                    #mapper as fn(&mut ::plingo::component::lex::WithCx<#root_ident>)
+                    #mapper as fn(&mut ::plingo::framework::lex::WithCx<#root_ident>)
                 )
-                    as ::plingo::component::lex::__macro_private::WithHook<#root_ident>
+                    as ::plingo::framework::lex::__macro_private::WithHook<#root_ident>
             )
         },
         None => quote! { ::std::option::Option::None },

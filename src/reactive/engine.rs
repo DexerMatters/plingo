@@ -652,6 +652,7 @@ impl Engine {
         let (store, _, _) = self.shared.view_store::<V>().ok()?;
         store.debug_revision(fact)
     }
+
 }
 
 impl Shared {

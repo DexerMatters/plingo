@@ -196,8 +196,7 @@ impl<V: ViewSpec> PreviousHandle<V> {
 impl<V: ViewSpec> EmittedHandle<V> {
     /// Creates the handle for the active component's emitted view. The
     /// view must be registered (it is, during any run).
-    pub fn new() -> Result<Self> {
-        let shared = ACTIVE.with(|active| {
+    pub fn new() -> Result<Self> {        let shared = ACTIVE.with(|active| {
             let active = active.borrow();
             let frame = active.last().ok_or_else(|| {
                 Error::Internal("handle creation outside a visitor".into())

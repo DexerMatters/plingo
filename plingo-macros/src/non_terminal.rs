@@ -62,16 +62,16 @@ pub fn expand_non_terminal_derive(mut item: ItemEnum) -> syn::Result<proc_macro:
         .unwrap_or_default();
 
     Ok(quote! {
-        impl ::plingo::component::parse::__macro_private::NonTerminalSpec for #enum_ident {
-            fn register(grammar: &mut ::plingo::component::parse::grammar::GrammarBuilder) -> ::plingo::component::parse::grammar::Symbol {
+        impl ::plingo::framework::parse::__macro_private::NonTerminalSpec for #enum_ident {
+            fn register(grammar: &mut ::plingo::framework::parse::grammar::GrammarBuilder) -> ::plingo::framework::parse::grammar::Symbol {
                 #register_fn(grammar)
             }
         }
 
-        impl ::plingo::component::parse::AstWalk for #enum_ident {
+        impl ::plingo::framework::parse::AstWalk for #enum_ident {
             fn direct_children(
                 &self,
-                visitor: &mut dyn ::core::ops::FnMut(::plingo::component::parse::AstKey),
+                visitor: &mut dyn ::core::ops::FnMut(::plingo::framework::parse::AstKey),
             ) {
                 match self {
                     #(#walk_arms),*
@@ -81,9 +81,9 @@ pub fn expand_non_terminal_derive(mut item: ItemEnum) -> syn::Result<proc_macro:
 
         #[allow(non_snake_case)]
         fn #register_fn(
-            grammar: &mut ::plingo::component::parse::grammar::GrammarBuilder,
-        ) -> ::plingo::component::parse::grammar::Symbol {
-            let (lhs, fresh) = ::plingo::component::parse::__macro_private::begin_non_terminal(grammar, stringify!(#enum_ident));
+            grammar: &mut ::plingo::framework::parse::grammar::GrammarBuilder,
+        ) -> ::plingo::framework::parse::grammar::Symbol {
+            let (lhs, fresh) = ::plingo::framework::parse::__macro_private::begin_non_terminal(grammar, stringify!(#enum_ident));
             if !fresh {
                 return lhs;
             }
@@ -114,7 +114,7 @@ fn direct_child_walk_arm(variant: &Variant) -> proc_macro2::TokenStream {
                 .collect::<Vec<_>>();
             let visits = bindings.iter().map(|binding| {
                 quote! {
-                    ::plingo::component::parse::AstWalkField::ast_children(#binding, visitor);
+                    ::plingo::framework::parse::AstWalkField::ast_children(#binding, visitor);
                 }
             });
             quote! {
@@ -136,7 +136,7 @@ fn direct_child_walk_arm(variant: &Variant) -> proc_macro2::TokenStream {
             });
             let visits = bindings.iter().flatten().map(|binding| {
                 quote! {
-                    ::plingo::component::parse::AstWalkField::ast_children(#binding, visitor);
+                    ::plingo::framework::parse::AstWalkField::ast_children(#binding, visitor);
                 }
             });
             quote! {
@@ -282,7 +282,7 @@ impl TierPlan {
                     enum_ident.span(),
                 );
                 quote! {
-                    let #symbol = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #label);
+                    let #symbol = ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #label);
                 }
             })
             .collect();
@@ -290,7 +290,7 @@ impl TierPlan {
         let root_label = syn::LitStr::new(&format!("{enum_ident}::__tier_root"), enum_ident.span());
         let first = self.symbol(self.levels[0]);
         let mut promotions = vec![quote! {
-            ::plingo::component::parse::__macro_private::rule(
+            ::plingo::framework::parse::__macro_private::rule(
                 grammar,
                 #root_label,
                 lhs,
@@ -310,7 +310,7 @@ impl TierPlan {
                 enum_ident.span(),
             );
             promotions.push(quote! {
-                ::plingo::component::parse::__macro_private::rule(
+                ::plingo::framework::parse::__macro_private::rule(
                     grammar,
                     #label,
                     #lower,
@@ -324,11 +324,11 @@ impl TierPlan {
         Ok(TierLowering {
             builders: vec![quote! {
                 fn #passthrough(
-                    _: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                    _: ::plingo::component::parse::grammar::ProductionId,
-                    children: &[::plingo::component::parse::data::ProductId],
-                ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
-                    ::plingo::component::parse::__macro_private::production_child(children, 0)
+                    _: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                    _: ::plingo::framework::parse::grammar::ProductionId,
+                    children: &[::plingo::framework::parse::data::ProductId],
+                ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
+                    ::plingo::framework::parse::__macro_private::production_child(children, 0)
                 }
             }],
             bindings,
@@ -395,12 +395,12 @@ impl<'a> LowerCtx<'a> {
         builders.push(quote! {
             #[allow(non_snake_case)]
             fn #builder_ident(
-                cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                production: ::plingo::component::parse::grammar::ProductionId,
-                children: &[::plingo::component::parse::data::ProductId],
-            ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
+                cx: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                production: ::plingo::framework::parse::grammar::ProductionId,
+                children: &[::plingo::framework::parse::data::ProductId],
+            ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
                 let value = #ctor;
-                ::plingo::component::parse::__macro_private::production_node(cx, production, children, value)
+                ::plingo::framework::parse::__macro_private::production_node(cx, production, children, value)
             }
         });
 
@@ -423,7 +423,7 @@ impl<'a> LowerCtx<'a> {
 
         registrations.push(quote! {
             #(#rhs_bindings)*
-            ::plingo::component::parse::__macro_private::rule(grammar,
+            ::plingo::framework::parse::__macro_private::rule(grammar,
                 #label,
                 #lhs,
                 ::std::vec![#(#rhs_idents),*],
@@ -508,11 +508,11 @@ impl<'a> LowerCtx<'a> {
                 let inner_type = inner_kind.ty_tokens();
                 let inner_extract = if let Some((_, index, kind)) = &projected {
                     kind.extract_expr(quote! {
-                        ::plingo::component::parse::__macro_private::production_child(children, #index)?
+                        ::plingo::framework::parse::__macro_private::production_child(children, #index)?
                     })
                 } else {
                     inner_kind.extract_expr(
-                        quote! { ::plingo::component::parse::__macro_private::production_child(children, 0)? },
+                        quote! { ::plingo::framework::parse::__macro_private::production_child(children, 0)? },
                     )
                 };
                 let inner_symbols = lowered.symbol_exprs;
@@ -538,11 +538,11 @@ impl<'a> LowerCtx<'a> {
 
                 builders.push(quote! {
                     fn #builder_none(
-                        cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                        production: ::plingo::component::parse::grammar::ProductionId,
-                        children: &[::plingo::component::parse::data::ProductId],
-                    ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
-                        ::plingo::component::parse::__macro_private::production_node(
+                        cx: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                        production: ::plingo::framework::parse::grammar::ProductionId,
+                        children: &[::plingo::framework::parse::data::ProductId],
+                    ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
+                        ::plingo::framework::parse::__macro_private::production_node(
                             cx,
                             production,
                             children,
@@ -552,12 +552,12 @@ impl<'a> LowerCtx<'a> {
                 });
                 builders.push(quote! {
                     fn #builder_some(
-                        cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                        production: ::plingo::component::parse::grammar::ProductionId,
-                        children: &[::plingo::component::parse::data::ProductId],
-                    ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
+                        cx: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                        production: ::plingo::framework::parse::grammar::ProductionId,
+                        children: &[::plingo::framework::parse::data::ProductId],
+                    ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
                         let value: #inner_type = #inner_extract;
-                        ::plingo::component::parse::__macro_private::production_node(
+                        ::plingo::framework::parse::__macro_private::production_node(
                             cx,
                             production,
                             children,
@@ -567,15 +567,15 @@ impl<'a> LowerCtx<'a> {
                 });
 
                 registrations.push(quote! {
-                    let opt_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
+                    let opt_lhs = ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
                     #(#inner_bindings)*
-                    ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, opt_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_none));
-                    ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, opt_lhs, ::std::vec![#(#inner_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_some));
+                    ::plingo::framework::parse::__macro_private::rule(grammar, #synthetic, opt_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_none));
+                    ::plingo::framework::parse::__macro_private::rule(grammar, #synthetic, opt_lhs, ::std::vec![#(#inner_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_some));
                 });
 
                 Ok(LoweredExpr {
                     symbol_exprs: vec![
-                        quote! { ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
+                        quote! { ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
                     ],
                     value_kind: ValueKind::Option(Box::new(inner_kind)),
                     name: capture_name,
@@ -604,15 +604,15 @@ impl<'a> LowerCtx<'a> {
                     let builder_empty = self.synthetic_builder("rep_empty");
                     builders.push(quote! {
                         fn #builder_empty(
-                            cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                            production: ::plingo::component::parse::grammar::ProductionId,
-                            children: &[::plingo::component::parse::data::ProductId],
-                        ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
-                            ::plingo::component::parse::__macro_private::production_node(
+                            cx: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                            production: ::plingo::framework::parse::grammar::ProductionId,
+                            children: &[::plingo::framework::parse::data::ProductId],
+                        ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
+                            ::plingo::framework::parse::__macro_private::production_node(
                                 cx,
                                 production,
                                 children,
-                                ::plingo::component::parse::__macro_private::repeat_empty::<#item_type>(),
+                                ::plingo::framework::parse::__macro_private::repeat_empty::<#item_type>(),
                             )
                         }
                     });
@@ -676,39 +676,39 @@ impl<'a> LowerCtx<'a> {
                             self.repeat_item_extract_expr(&item_kind, 1 + sep_symbols.len());
                         builders.push(quote! {
                             fn #builder_item(
-                                cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                                production: ::plingo::component::parse::grammar::ProductionId,
-                                children: &[::plingo::component::parse::data::ProductId],
-                            ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
+                                cx: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                                production: ::plingo::framework::parse::grammar::ProductionId,
+                                children: &[::plingo::framework::parse::data::ProductId],
+                            ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
                                 let item: #item_type = #item_extract;
-                                let tail: ::plingo::component::parse::__macro_private::Repeat<#item_type> = cx.expect_value(
-                                    ::plingo::component::parse::__macro_private::production_child(children, #item_stride)?,
+                                let tail: ::plingo::framework::parse::__macro_private::Repeat<#item_type> = cx.expect_value(
+                                    ::plingo::framework::parse::__macro_private::production_child(children, #item_stride)?,
                                 )?;
-                                let value = ::plingo::component::parse::__macro_private::repeat_prepend(item, tail);
-                                ::plingo::component::parse::__macro_private::production_node(cx, production, children, value)
+                                let value = ::plingo::framework::parse::__macro_private::repeat_prepend(item, tail);
+                                ::plingo::framework::parse::__macro_private::production_node(cx, production, children, value)
                             }
                         });
                         builders.push(quote! {
                             fn #builder_tail(
-                                cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                                production: ::plingo::component::parse::grammar::ProductionId,
-                                children: &[::plingo::component::parse::data::ProductId],
-                            ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
-                                let value: ::plingo::component::parse::__macro_private::Repeat<#item_type> = cx.expect_value(
-                                    ::plingo::component::parse::__macro_private::production_child(children, 0)?,
+                                cx: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                                production: ::plingo::framework::parse::grammar::ProductionId,
+                                children: &[::plingo::framework::parse::data::ProductId],
+                            ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
+                                let value: ::plingo::framework::parse::__macro_private::Repeat<#item_type> = cx.expect_value(
+                                    ::plingo::framework::parse::__macro_private::production_child(children, 0)?,
                                 )?;
-                                let value = ::plingo::component::parse::__macro_private::repeat_push(value, #tail_extract);
-                                ::plingo::component::parse::__macro_private::production_node(cx, production, children, value)
+                                let value = ::plingo::framework::parse::__macro_private::repeat_push(value, #tail_extract);
+                                ::plingo::framework::parse::__macro_private::production_node(cx, production, children, value)
                             }
                         });
                         registrations.push(quote! {
-                            let rep_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
-                            let tail_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #tail_synthetic);
+                            let rep_lhs = ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
+                            let tail_lhs = ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #tail_synthetic);
                             #(#item_bindings)*
-                            ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![#(#item_idents),*, tail_lhs], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
+                            ::plingo::framework::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![#(#item_idents),*, tail_lhs], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
                             #(#tail_bindings)*
-                            ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, tail_lhs, ::std::vec![#(#tail_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_tail));
-                            ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, tail_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
+                            ::plingo::framework::parse::__macro_private::rule(grammar, #synthetic, tail_lhs, ::std::vec![#(#tail_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_tail));
+                            ::plingo::framework::parse::__macro_private::rule(grammar, #synthetic, tail_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
                         });
                     } else {
                         let item_bindings = inner_symbols
@@ -738,28 +738,28 @@ impl<'a> LowerCtx<'a> {
                         let builder_item = self.synthetic_builder("rep_item");
                         builders.push(quote! {
                             fn #builder_item(
-                                cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                                production: ::plingo::component::parse::grammar::ProductionId,
-                                children: &[::plingo::component::parse::data::ProductId],
-                            ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
-                                let value: ::plingo::component::parse::__macro_private::Repeat<#item_type> = cx.expect_value(
-                                    ::plingo::component::parse::__macro_private::production_child(children, 0)?,
+                                cx: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                                production: ::plingo::framework::parse::grammar::ProductionId,
+                                children: &[::plingo::framework::parse::data::ProductId],
+                            ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
+                                let value: ::plingo::framework::parse::__macro_private::Repeat<#item_type> = cx.expect_value(
+                                    ::plingo::framework::parse::__macro_private::production_child(children, 0)?,
                                 )?;
-                                let value = ::plingo::component::parse::__macro_private::repeat_push(value, #item_extract);
-                                ::plingo::component::parse::__macro_private::production_node(cx, production, children, value)
+                                let value = ::plingo::framework::parse::__macro_private::repeat_push(value, #item_extract);
+                                ::plingo::framework::parse::__macro_private::production_node(cx, production, children, value)
                             }
                         });
                         registrations.push(quote! {
-                            let rep_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
+                            let rep_lhs = ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
                             #(#item_bindings)*
-                            ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![rep_lhs, #(#item_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
-                            ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
+                            ::plingo::framework::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![rep_lhs, #(#item_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder_item));
+                            ::plingo::framework::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
                         });
                     }
 
                     return Ok(LoweredExpr {
                         symbol_exprs: vec![
-                            quote! { ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
+                            quote! { ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
                         ],
                         value_kind: ValueKind::Repeat(Box::new(item_kind)),
                         name: capture_name,
@@ -773,11 +773,11 @@ impl<'a> LowerCtx<'a> {
                     let builder_empty = self.synthetic_builder("rep_empty");
                     builders.push(quote! {
                         fn #builder_empty(
-                            cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                            production: ::plingo::component::parse::grammar::ProductionId,
-                            children: &[::plingo::component::parse::data::ProductId],
-                        ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
-                            ::plingo::component::parse::__macro_private::production_node(
+                            cx: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                            production: ::plingo::framework::parse::grammar::ProductionId,
+                            children: &[::plingo::framework::parse::data::ProductId],
+                        ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
+                            ::plingo::framework::parse::__macro_private::production_node(
                                 cx,
                                 production,
                                 children,
@@ -786,12 +786,12 @@ impl<'a> LowerCtx<'a> {
                         }
                     });
                     registrations.push(quote! {
-                        let rep_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
-                        ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
+                        let rep_lhs = ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
+                        ::plingo::framework::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![], ::std::option::Option::None, ::std::option::Option::Some(#builder_empty));
                     });
                 } else {
                     registrations.push(quote! {
-                        let rep_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
+                        let rep_lhs = ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
                     });
                 }
 
@@ -847,14 +847,14 @@ impl<'a> LowerCtx<'a> {
                                     let parts: Vec<_> = kinds.iter().enumerate().map(|(i, k)| {
                                         let offset = base + i;
                                         k.extract_expr(quote! {
-                                            ::plingo::component::parse::__macro_private::production_child(children, #offset)?
+                                            ::plingo::framework::parse::__macro_private::production_child(children, #offset)?
                                         })
                                     }).collect();
                                     quote! { value.push((#(#parts),*)); }
                                 }
                                 _ => {
                                     let extract = item_kind.extract_expr(quote! {
-                                        ::plingo::component::parse::__macro_private::production_child(children, #base)?
+                                        ::plingo::framework::parse::__macro_private::production_child(children, #base)?
                                     });
                                     quote! { value.push(#extract); }
                                 }
@@ -863,24 +863,24 @@ impl<'a> LowerCtx<'a> {
                         .collect::<Vec<_>>();
                     builders.push(quote! {
                         fn #builder(
-                            cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                            production: ::plingo::component::parse::grammar::ProductionId,
-                            children: &[::plingo::component::parse::data::ProductId],
-                        ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
+                            cx: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                            production: ::plingo::framework::parse::grammar::ProductionId,
+                            children: &[::plingo::framework::parse::data::ProductId],
+                        ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
                             let mut value = ::std::vec::Vec::<#item_type>::new();
                             #(#pushes)*
-                            ::plingo::component::parse::__macro_private::production_node(cx, production, children, value)
+                            ::plingo::framework::parse::__macro_private::production_node(cx, production, children, value)
                         }
                     });
                     registrations.push(quote! {
                         #(#seq_bindings)*
-                        ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![#(#seq_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder));
+                        ::plingo::framework::parse::__macro_private::rule(grammar, #synthetic, rep_lhs, ::std::vec![#(#seq_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#builder));
                     });
                 }
 
                 Ok(LoweredExpr {
                     symbol_exprs: vec![
-                        quote! { ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
+                        quote! { ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
                     ],
                     value_kind: ValueKind::Vec(Box::new(item_kind)),
                     name: capture_name,
@@ -904,10 +904,10 @@ impl<'a> LowerCtx<'a> {
                 let left_type = left_kind.ty_tokens();
                 let right_type = right_kind.ty_tokens();
                 let left_extract = left_kind.extract_expr(
-                    quote! { ::plingo::component::parse::__macro_private::production_child(children, 0)? },
+                    quote! { ::plingo::framework::parse::__macro_private::production_child(children, 0)? },
                 );
                 let right_extract = right_kind.extract_expr(
-                    quote! { ::plingo::component::parse::__macro_private::production_child(children, 0)? },
+                    quote! { ::plingo::framework::parse::__macro_private::production_child(children, 0)? },
                 );
                 let left_symbols = left.symbol_exprs;
                 let right_symbols = right.symbol_exprs;
@@ -960,12 +960,12 @@ impl<'a> LowerCtx<'a> {
 
                 builders.push(quote! {
                     fn #left_builder(
-                        cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                        production: ::plingo::component::parse::grammar::ProductionId,
-                        children: &[::plingo::component::parse::data::ProductId],
-                    ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
+                        cx: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                        production: ::plingo::framework::parse::grammar::ProductionId,
+                        children: &[::plingo::framework::parse::data::ProductId],
+                    ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
                         let value: #left_type = #left_extract;
-                        ::plingo::component::parse::__macro_private::production_node(
+                        ::plingo::framework::parse::__macro_private::production_node(
                             cx,
                             production,
                             children,
@@ -975,12 +975,12 @@ impl<'a> LowerCtx<'a> {
                 });
                 builders.push(quote! {
                     fn #right_builder(
-                        cx: &mut ::plingo::component::parse::grammar::BuildCx<'_>,
-                        production: ::plingo::component::parse::grammar::ProductionId,
-                        children: &[::plingo::component::parse::data::ProductId],
-                    ) -> ::std::result::Result<::plingo::component::parse::data::ProductId, ::plingo::component::parse::grammar::BuildError> {
+                        cx: &mut ::plingo::framework::parse::grammar::BuildCx<'_>,
+                        production: ::plingo::framework::parse::grammar::ProductionId,
+                        children: &[::plingo::framework::parse::data::ProductId],
+                    ) -> ::std::result::Result<::plingo::framework::parse::data::ProductId, ::plingo::framework::parse::grammar::BuildError> {
                         let value: #right_type = #right_extract;
-                        ::plingo::component::parse::__macro_private::production_node(
+                        ::plingo::framework::parse::__macro_private::production_node(
                             cx,
                             production,
                             children,
@@ -990,16 +990,16 @@ impl<'a> LowerCtx<'a> {
                 });
 
                 registrations.push(quote! {
-                    let alt_lhs = ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
+                    let alt_lhs = ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic);
                     #(#left_bindings)*
-                    ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, alt_lhs, ::std::vec![#(#left_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#left_builder));
+                    ::plingo::framework::parse::__macro_private::rule(grammar, #synthetic, alt_lhs, ::std::vec![#(#left_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#left_builder));
                     #(#right_bindings)*
-                    ::plingo::component::parse::__macro_private::rule(grammar, #synthetic, alt_lhs, ::std::vec![#(#right_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#right_builder));
+                    ::plingo::framework::parse::__macro_private::rule(grammar, #synthetic, alt_lhs, ::std::vec![#(#right_idents),*], ::std::option::Option::None, ::std::option::Option::Some(#right_builder));
                 });
 
                 Ok(LoweredExpr::new(
                     vec![
-                        quote! { ::plingo::component::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
+                        quote! { ::plingo::framework::parse::__macro_private::begin_internal_non_terminal(grammar, #synthetic) },
                     ],
                     ValueKind::Either(Box::new(left_kind), Box::new(right_kind)),
                 ))
@@ -1044,14 +1044,14 @@ impl<'a> LowerCtx<'a> {
                     .map(|(index, kind)| {
                         let offset = base + index;
                         kind.extract_expr(quote! {
-                            ::plingo::component::parse::__macro_private::production_child(children, #offset)?
+                            ::plingo::framework::parse::__macro_private::production_child(children, #offset)?
                         })
                     })
                     .collect();
                 quote! { (#(#parts),*) }
             }
             _ => item_kind.extract_expr(quote! {
-                ::plingo::component::parse::__macro_private::production_child(children, #base)?
+                ::plingo::framework::parse::__macro_private::production_child(children, #base)?
             }),
         }
     }
@@ -1059,7 +1059,7 @@ impl<'a> LowerCtx<'a> {
     fn atom_symbol_expr(&self, atom: &Atom) -> syn::Result<proc_macro2::TokenStream> {
         match atom {
             Atom::NonTerminal(ty) => Ok(quote! {
-                <#ty as ::plingo::component::parse::__macro_private::NonTerminalSpec>::register(grammar)
+                <#ty as ::plingo::framework::parse::__macro_private::NonTerminalSpec>::register(grammar)
             }),
             Atom::TieredNonTerminal { level, .. } => {
                 let Some(symbols) = self.tier_symbols else {
@@ -1077,14 +1077,14 @@ impl<'a> LowerCtx<'a> {
                 Ok(quote! { #symbol })
             }
             Atom::Token { root, variant } => Ok(quote! {
-                <#root as ::plingo::component::parse::__macro_private::TokenVariantSpec>::register_terminal(
+                <#root as ::plingo::framework::parse::__macro_private::TokenVariantSpec>::register_terminal(
                     grammar,
                     stringify!(#variant),
                 )
             }),
             Atom::Error => Ok(quote! {
-                ::plingo::component::parse::grammar::Symbol::T(
-                    ::plingo::component::parse::grammar::ERROR_TERMINAL,
+                ::plingo::framework::parse::grammar::Symbol::T(
+                    ::plingo::framework::parse::grammar::ERROR_TERMINAL,
                 )
             }),
         }
@@ -1127,8 +1127,8 @@ impl ValueKind {
     fn ty_tokens(&self) -> proc_macro2::TokenStream {
         match self {
             Self::Unit => quote! { () },
-            Self::Node(ty) => quote! { ::plingo::component::parse::data::AstBox<#ty> },
-            Self::Token(ty) => quote! { ::plingo::component::parse::data::AstToken<#ty> },
+            Self::Node(ty) => quote! { ::plingo::framework::parse::data::AstBox<#ty> },
+            Self::Token(ty) => quote! { ::plingo::framework::parse::data::AstToken<#ty> },
             Self::Option(inner) => {
                 let inner = inner.ty_tokens();
                 quote! { ::std::option::Option<#inner> }
@@ -1160,27 +1160,27 @@ impl ValueKind {
             Self::Repeat(inner) => {
                 let inner = inner.ty_tokens();
                 quote! {
-                    ::plingo::component::parse::__macro_private::repeat_from_product::<#inner>(cx, #child)?
+                    ::plingo::framework::parse::__macro_private::repeat_from_product::<#inner>(cx, #child)?
                 }
             }
             Self::Node(_) | Self::Option(_) | Self::Vec(_) | Self::Either(_, _) | Self::Error => {
                 let ty = self.ty_tokens();
                 quote! {
-                    <#ty as ::plingo::component::parse::__macro_private::BuildField>::from_product(cx, #child)?
+                    <#ty as ::plingo::framework::parse::__macro_private::BuildField>::from_product(cx, #child)?
                 }
             }
             Self::Token(ty) => {
                 quote! {
-                    <::plingo::component::parse::data::AstToken<#ty> as ::plingo::component::parse::__macro_private::TokenField>::from_token_entry(
+                    <::plingo::framework::parse::data::AstToken<#ty> as ::plingo::framework::parse::__macro_private::TokenField>::from_token_entry(
                         cx,
-                        ::plingo::component::parse::__macro_private::BuildField::from_product(cx, #child)?,
+                        ::plingo::framework::parse::__macro_private::BuildField::from_product(cx, #child)?,
                     )?
                 }
             }
             Self::Tuple(kinds) => {
                 let fields = kinds.iter().enumerate().map(|(i, k)| {
                     k.extract_expr(quote! {
-                        ::plingo::component::parse::__macro_private::production_child(children, #i)?
+                        ::plingo::framework::parse::__macro_private::production_child(children, #i)?
                     })
                 });
                 quote! { (#(#fields),*) }
@@ -1576,7 +1576,7 @@ fn build_variant_field_expr(
         ));
     }
     let child =
-        quote! { ::plingo::component::parse::__macro_private::production_child(children, #index)? };
+        quote! { ::plingo::framework::parse::__macro_private::production_child(children, #index)? };
     Ok(
         if is_ast_box(field_ty)
             || is_option(field_ty)
@@ -1585,16 +1585,16 @@ fn build_variant_field_expr(
             || is_parse_error_info(field_ty)
         {
             quote! {
-                <#field_ty as ::plingo::component::parse::__macro_private::BuildField>::from_product(
+                <#field_ty as ::plingo::framework::parse::__macro_private::BuildField>::from_product(
                     cx,
                     #child,
                 )?
             }
         } else {
             quote! {
-                <#field_ty as ::plingo::component::parse::__macro_private::TokenField>::from_token_entry(
+                <#field_ty as ::plingo::framework::parse::__macro_private::TokenField>::from_token_entry(
                     cx,
-                    <::plingo::component::parse::data::TokenEntryId as ::plingo::component::parse::__macro_private::BuildField>::from_product(
+                    <::plingo::framework::parse::data::TokenEntryId as ::plingo::framework::parse::__macro_private::BuildField>::from_product(
                         cx,
                         #child,
                     )?,

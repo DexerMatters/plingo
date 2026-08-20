@@ -10,7 +10,7 @@ use std::fmt;
 use color_print::cformat;
 
 use crate::{
-    component::parse::{AstLookupError, AstSnapshot, AstToken, data::AstBox, grammar::TerminalId},
+    framework::parse::{AstLookupError, AstSnapshot, AstToken, data::AstBox, grammar::TerminalId},
     utils::PrettyDisplay,
 };
 

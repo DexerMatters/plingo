@@ -2,11 +2,12 @@
 
 #![allow(dead_code)]
 
-use plingo::component::{
+use plingo::framework::{
     lex::LexErrorInfo,
     parse::{AstToken, ParseErrorInfo, data::AstBox},
 };
 use plingo_macros::{NonTerminal, PrettyNonTerminal, PrettyTerminal, Terminal};
+use plingo::reactive_abstract_tree as abstract_tree;
 
 #[derive(Terminal, PrettyTerminal, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StlcToken {
@@ -82,6 +83,7 @@ impl std::fmt::Display for StlcToken {
 }
 
 #[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
+#[abstract_tree(members(StlcDocument, StlcDeclaration, StlcPath, StlcParam, StlcType, StlcTypeAtom, StlcExpr))]
 pub enum StlcDocument {
     #[rule($declarations({StlcDeclaration}{StlcToken::Newline}), [StlcToken::Newline])]
     Lines(#[from(declarations)] Vec<AstBox<StlcDeclaration>>),
@@ -90,14 +92,15 @@ pub enum StlcDocument {
 }
 
 #[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
+#[abstract_tree(members(StlcDocument, StlcDeclaration, StlcPath, StlcParam, StlcType, StlcTypeAtom, StlcExpr))]
 pub enum StlcDeclaration {
     // A declaration is curried over zero or more parameters.
     #[rule($name(StlcToken::Ident), $parameters({StlcParam}), [StlcToken::Colon, $annotation(StlcType)], StlcToken::Assign, $body(StlcExpr))]
     Value(
         #[from(name)] AstToken<StlcToken>,
-        #[from(parameters)] Vec<AstBox<StlcParam>>,
         #[from(annotation)] Option<AstBox<StlcType>>,
         #[from(body)] AstBox<StlcExpr>,
+        #[from(parameters)] Vec<AstBox<StlcParam>>,
     ),
     // import a.b.c
     #[rule(StlcToken::Import, StlcPath)]
@@ -110,6 +113,7 @@ pub enum StlcDeclaration {
 }
 
 #[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
+#[abstract_tree(members(StlcDocument, StlcDeclaration, StlcPath, StlcParam, StlcType, StlcTypeAtom, StlcExpr))]
 pub enum StlcPath {
     #[rule({StlcToken::Ident}{StlcToken::Dot})]
     Segments(#[from(0)] Vec<AstToken<StlcToken>>),
@@ -124,6 +128,7 @@ pub enum StlcPath {
 /// (a : Nat)
 /// ```
 #[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
+#[abstract_tree(members(StlcDocument, StlcDeclaration, StlcPath, StlcParam, StlcType, StlcTypeAtom, StlcExpr))]
 pub enum StlcParam {
     #[rule($name(StlcToken::Ident), [StlcToken::Colon, $annotation(StlcType)])]
     Bare(
@@ -143,6 +148,7 @@ pub enum StlcParam {
 }
 
 #[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
+#[abstract_tree(members(StlcDocument, StlcDeclaration, StlcPath, StlcParam, StlcType, StlcTypeAtom, StlcExpr))]
 pub enum StlcType {
     // Right-associative: Nat -> Nat -> Nat
     #[rule(StlcTypeAtom, StlcToken::Arrow, StlcType)]
@@ -154,6 +160,7 @@ pub enum StlcType {
 }
 
 #[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
+#[abstract_tree(members(StlcDocument, StlcDeclaration, StlcPath, StlcParam, StlcType, StlcTypeAtom, StlcExpr))]
 pub enum StlcTypeAtom {
     #[rule(StlcToken::Nat)]
     Nat(#[from(0)] AstToken<StlcToken>),
@@ -166,6 +173,7 @@ pub enum StlcTypeAtom {
 }
 
 #[derive(NonTerminal, PrettyNonTerminal, Debug, Clone)]
+#[abstract_tree(members(StlcDocument, StlcDeclaration, StlcPath, StlcParam, StlcType, StlcTypeAtom, StlcExpr))]
 pub enum StlcExpr {
     // if condition then when_true else when_false
     #[rule(

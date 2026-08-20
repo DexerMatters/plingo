@@ -25,8 +25,8 @@ impl Regex {
 
     fn expand(&self) -> TokenStream {
         match self {
-            Self::Epsilon => quote!(::plingo::component::scope::PathExpr::Epsilon),
-            Self::Label(label) => quote!(::plingo::component::scope::PathExpr::label(#label)),
+            Self::Epsilon => quote!(::plingo::framework::scope::PathExpr::Epsilon),
+            Self::Label(label) => quote!(::plingo::framework::scope::PathExpr::label(#label)),
             Self::Or(left, right) => {
                 let left = left.expand();
                 let right = right.expand();
@@ -138,5 +138,5 @@ pub fn expand_label_regex(input: TokenStream) -> Result<TokenStream> {
 pub fn expand_scope_path(input: TokenStream) -> Result<TokenStream> {
     let RegexInput(regex) = syn::parse2(input)?;
     let expression = regex.expand();
-    Ok(quote!(::plingo::component::scope::ScopePath::from(#expression)))
+    Ok(quote!(::plingo::framework::scope::ScopePath::from(#expression)))
 }

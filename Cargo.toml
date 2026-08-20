@@ -3,6 +3,10 @@ name = "plingo"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["plingo-macros", "reactive-macros"]
+resolver = "3"
+
 [dependencies]
 
 # Miscellaneous utilities
@@ -34,6 +38,10 @@ thiserror = "2.0.18"
 
 # For macro development
 plingo-macros = { path = "plingo-macros" }
+reactive-macros = { path = "reactive-macros" }
+
+# For locking (engine, stores, visitor buffers)
+parking_lot = "0.12"
 
 [dependencies.tokio]
 features = ["sync", "rt", "rt-multi-thread", "macros"]
@@ -46,4 +54,3 @@ version = "0.7"
 [dev-dependencies]
 notify = "8.2.0"
 similar = "3.1.1"
-parking_lot = "0.12"

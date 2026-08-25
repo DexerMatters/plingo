@@ -1,187 +1,323 @@
-//! The reactive lexer component (plan §8.2): [`Tokens`] map view and
-//! [`install_lexer`].
+//! Reactive publication of persistent lexer roots.
 //!
-//! One child visitor per uri over [`SourceText`] keeps an edit to document
-//! A from scheduling document B's child (matrix 1). Each child re-lexes its
-//! document from the committed text and publishes an immutable
-//! [`TokenVec`]. Lex errors ride inside the [`TokenVec`] (not a separate
-//! view); parse errors are the parser's concern.
+//! `SemanticTokenDocuments` is the parser boundary and changes only for token
+//! structure. `TokenLayoutDocuments` changes for source coordinates. `Tokens`
+//! remains a lazy snapshot façade for callers that explicitly request an
+//! ordered token stream; it is not an internal semantic dependency.
 
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
-use std::sync::Mutex;
+use std::{
+    collections::BTreeSet,
+    ops::Deref,
+    sync::{Arc, OnceLock},
+};
 
 use fluent_uri::Uri;
+use parking_lot::Mutex;
+use reactive_macros::view;
 
-use crate::framework::change::AddressChange;
-use crate::framework::lex::{LexErrorInfo, LexToken, Lexer, LexerCreationError, LexerRoot};
-use crate::framework::parse::TokenData;
-use crate::framework::source::{SourceDelta, SourceSplice, SourceText};
-use crate::reactive::prelude::*;
-use crate::reactive_view as view;
+use crate::{
+    framework::{
+        lex::{
+            LexErrorInfo, LexToken, Lexer, LexerCreationError, LexerRoot, LexicalDocument,
+            SemanticTokenDocument, SemanticTokenDocuments, TokenFact, TokenFactId, TokenFactKey,
+            TokenFacts, TokenLayoutDocument, TokenLayoutDocuments, TokenOccurrenceId,
+        },
+        source::SourceRevisions,
+    },
+    reactive::{
+        Engine, Error, Result,
+        kind::{Map, emit_patch, emit_view, observe_view},
+    },
+};
 
-// ---------------------------------------------------------------------------
-// TokenVec and the Tokens view
-// ---------------------------------------------------------------------------
-
-/// One immutable lexer publication per document. `tokens` are the
-/// public-facing token occurrences in document order; `errors` the lex
-/// errors encountered during scanning (already populated in `tokens` as
-/// error tokens); `data`/`changes`/`source` are the exact replay input the
-/// parser component consumes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenVec<T: LexerRoot + Clone + std::fmt::Debug> {
-    /// Token occurrences in source order (error tokens included).
-    pub tokens: Vec<LexToken<T>>,
-    /// The lex errors of this revision, in occurrence order.
-    pub errors: Vec<LexErrorInfo>,
-    /// Parser-facing coordinate data (occurrence ids, fingerprints).
-    pub(crate) data: Arc<[TokenData]>,
-    /// The sparse token delta from the previous revision.
-    pub(crate) changes: Arc<[AddressChange<Uri<&'static str>, TokenData>]>,
-    /// The source text this revision was lexed from.
-    pub(crate) source: Arc<str>,
+/// Lazy, snapshot-scoped public token sequence.  It materializes only when a
+/// caller iterates/indexes the façade; lexer commands never rebuild it.
+#[derive(Clone)]
+pub struct TokenList<T: LexerRoot + Clone + std::fmt::Debug> {
+    document: Arc<LexicalDocument<T>>,
+    cache: Arc<OnceLock<Arc<[LexToken<T>]>>>,
 }
 
-/// The ordered token stream of each open document (built-in lexer).
-#[view(map, key = String, value = TokenVec<T>)]
-pub struct Tokens<T: LexerRoot + Clone + std::fmt::Debug>(PhantomData<fn() -> T>);
+impl<T: LexerRoot + Clone + std::fmt::Debug> TokenList<T> {
+    fn new(document: Arc<LexicalDocument<T>>) -> Self {
+        Self {
+            document,
+            cache: Arc::new(OnceLock::new()),
+        }
+    }
 
-// ---------------------------------------------------------------------------
-// The component
-// ---------------------------------------------------------------------------
+    fn values(&self) -> &[LexToken<T>] {
+        self.cache
+            .get_or_init(|| {
+                let mut tokens = Vec::with_capacity(self.document.semantic.len());
+                for rank in 0..self.document.lexical.len() {
+                    let Some(occurrence) = self.document.lexical_at(rank) else {
+                        continue;
+                    };
+                    if !occurrence.is_semantic() {
+                        continue;
+                    }
+                    if let Some(token) = occurrence.materialize(self.document.lexical_start(rank)) {
+                        tokens.push(token);
+                    }
+                }
+                tokens.into()
+            })
+            .as_ref()
+    }
+}
+
+impl<T: LexerRoot + Clone + std::fmt::Debug> Deref for TokenList<T> {
+    type Target = [LexToken<T>];
+
+    fn deref(&self) -> &Self::Target {
+        self.values()
+    }
+}
+
+impl<T: LexerRoot + Clone + std::fmt::Debug> std::fmt::Debug for TokenList<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_list().entries(self.values()).finish()
+    }
+}
+
+impl<T: LexerRoot + Clone + std::fmt::Debug> PartialEq for TokenList<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.document.layout_revision == other.document.layout_revision
+            && self.document.lexical.exact_eq(&other.document.lexical)
+    }
+}
+impl<T: LexerRoot + Clone + std::fmt::Debug> Eq for TokenList<T> {}
+
+/// Lazy snapshot list of lex errors.
+#[derive(Clone)]
+pub struct TokenErrors<T: LexerRoot + Clone + std::fmt::Debug> {
+    document: Arc<LexicalDocument<T>>,
+    cache: Arc<OnceLock<Arc<[LexErrorInfo]>>>,
+}
+
+impl<T: LexerRoot + Clone + std::fmt::Debug> TokenErrors<T> {
+    fn new(document: Arc<LexicalDocument<T>>) -> Self {
+        Self {
+            document,
+            cache: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn values(&self) -> &[LexErrorInfo] {
+        self.cache
+            .get_or_init(|| {
+                let mut errors = Vec::new();
+                for rank in 0..self.document.lexical.len() {
+                    let Some(token) = self.document.lexical_at(rank) else {
+                        continue;
+                    };
+                    if let Some(kind) = token.error {
+                        let start = self.document.lexical_start(rank);
+                        errors.push(LexErrorInfo {
+                            kind,
+                            start,
+                            end: start.saturating_add(token.byte_len as usize),
+                        });
+                    }
+                }
+                errors.into()
+            })
+            .as_ref()
+    }
+}
+
+impl<T: LexerRoot + Clone + std::fmt::Debug> Deref for TokenErrors<T> {
+    type Target = [LexErrorInfo];
+
+    fn deref(&self) -> &Self::Target {
+        self.values()
+    }
+}
+
+impl<T: LexerRoot + Clone + std::fmt::Debug> std::fmt::Debug for TokenErrors<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_list().entries(self.values()).finish()
+    }
+}
+
+impl<T: LexerRoot + Clone + std::fmt::Debug> PartialEq for TokenErrors<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.document.layout_revision == other.document.layout_revision
+            && self.document.lexical.exact_eq(&other.document.lexical)
+    }
+}
+impl<T: LexerRoot + Clone + std::fmt::Debug> Eq for TokenErrors<T> {}
+
+/// Editor-facing lazy ordered-token façade.  The fields intentionally preserve
+/// the old ergonomic API (`tokens.iter()`, indexing, `errors.len()`) without
+/// making either list a command-time reactive payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenVec<T: LexerRoot + Clone + std::fmt::Debug> {
+    pub tokens: TokenList<T>,
+    pub errors: TokenErrors<T>,
+}
+
+impl<T: LexerRoot + Clone + std::fmt::Debug> TokenVec<T> {
+    fn new(document: Arc<LexicalDocument<T>>) -> Self {
+        Self {
+            tokens: TokenList::new(Arc::clone(&document)),
+            errors: TokenErrors::new(document),
+        }
+    }
+
+    /// Resolves a parser token through the lazy snapshot façade.
+    pub fn token(&self, token: crate::framework::parse::AstToken<T>) -> Option<&LexToken<T>> {
+        self.tokens.iter().find(|entry| entry.id == token.raw_id())
+    }
+}
+
+/// Public snapshot façade map.  Internal parser/lower components never
+/// observe this view.
+#[view]
+pub struct Tokens<T: LexerRoot + Clone + std::fmt::Debug>(Map<String, TokenVec<T>>);
 
 struct LexerMachine<R: LexerRoot + Clone + std::fmt::Debug> {
     lexer: Lexer<R>,
-    /// The pure lexer is keyed by `Uri<&'static str>` while the workspace
-    /// channel is `String`; keep one leaked `'static` uri per document.
-    uris: HashMap<String, Uri<&'static str>>,
 }
 
 impl<R: LexerRoot + Clone + std::fmt::Debug> LexerMachine<R> {
     fn new(lexer: Lexer<R>) -> Self {
-        Self {
-            lexer,
-            uris: HashMap::new(),
-        }
+        Self { lexer }
     }
 
-    fn static_uri(&mut self, uri: &str) -> Uri<&'static str> {
-        if let Some(cached) = self.uris.get(uri) {
-            return *cached;
-        }
-        let leaked: &'static str = Box::leak(uri.to_string().into_boxed_str());
-        let parsed = Uri::parse(leaked).expect("workspace uris are valid");
-        self.uris.insert(uri.to_string(), parsed);
-        parsed
-    }
-
-    /// Forgets one document: drops its leaked uri and its lexer state.
     fn forget(&mut self, uri: &str) {
-        if let Some(static_uri) = self.uris.remove(uri) {
-            self.lexer.forget_document(static_uri);
+        let uri: Uri<String> = uri.parse().expect("workspace URIs are valid");
+        self.lexer.forget_document(uri);
+    }
+}
+
+fn patch_token_facts<R>(document: &LexicalDocument<R>, patch: &crate::framework::lex::TokenPatch) -> Result<()>
+where
+    R: LexerRoot + Clone + std::fmt::Debug,
+{
+    let facts = emit_patch::<TokenFacts<R>>()?;
+    for occurrence in patch.removed.iter().copied() {
+        facts.remove(TokenFactKey {
+            document_id: document.document.0,
+            token: TokenFactId::Source(occurrence),
+        })?;
+    }
+    let changed: BTreeSet<_> = patch
+        .inserted
+        .iter()
+        .chain(patch.updated.iter())
+        .copied()
+        .collect();
+    for occurrence in changed {
+        let Some(rank) = document.lexical_rank_of(occurrence) else {
+            continue;
+        };
+        let Some(token) = document.lexical_at(rank) else {
+            continue;
+        };
+        if !token.is_semantic() {
+            continue;
         }
+        facts.upsert(
+            TokenFactKey {
+                document_id: document.document.0,
+                token: TokenFactId::Source(occurrence),
+            },
+            TokenFact {
+                terminal_id: token.terminal_key(),
+                fingerprint: token.fingerprint(),
+                value: Arc::clone(&token.value),
+            },
+        )?;
     }
+    Ok(())
 }
 
-/// The built-in lexer component: observes [`SourceText`], emits
-/// [`Tokens`] with one child visitor per uri.
-pub struct LexerComponent<R: LexerRoot + Clone + std::fmt::Debug> {
-    machine: Arc<Mutex<LexerMachine<R>>>,
+/// Lexes one source child and publishes only its persistent root handles and
+/// direct fact patch.  No complete token vector is built here.
+fn lex_document<R>(machine: Arc<Mutex<LexerMachine<R>>>, uri: String) -> Result<()>
+where
+    R: LexerRoot + Clone + std::fmt::Debug,
+{
+    crate::framework::workspace::record_lexer_work(&uri, |work| {
+        work.component_runs += 1;
+    });
+    let revisions = observe_view::<SourceRevisions>()?;
+    let revision = revisions.get(&uri)?;
+    let Some(revision) = revision.map(|revision| (*revision).clone()) else {
+        let previous = crate::reactive::peek_committed::<TokenLayoutDocuments<R>>(uri.clone())?
+            .map(|document| Arc::clone(&document.document));
+        if let Some(document) = previous {
+            let facts = emit_patch::<TokenFacts<R>>()?;
+            // Closing is lifecycle reclamation, not a local edit; walk only the
+            // document-owned semantic root to retract its owned fact domain.
+            for token in document.semantic.iter() {
+                facts.remove(TokenFactKey {
+                    document_id: document.document.0,
+                    token: TokenFactId::Source(token.occurrence),
+                })?;
+            }
+        }
+        machine.lock().forget(&uri);
+        emit_view::<Tokens<R>>()?.remove(uri.clone())?;
+        emit_view::<SemanticTokenDocuments<R>>()?.remove(uri.clone())?;
+        return emit_view::<TokenLayoutDocuments<R>>()?.remove(uri);
+    };
+
+    let mut machine = machine.lock();
+    let static_uri: Uri<String> = uri.parse().expect("workspace URI is valid");
+    let derived = machine
+        .lexer
+        .derive_document(static_uri, Arc::clone(revision.text()), &revision.delta)
+        .map_err(|error| Error::Internal(error.to_string().into()))?;
+    let document = derived.document;
+    patch_token_facts(document.as_ref(), &derived.patch)?;
+
+    emit_view::<Tokens<R>>()?.insert(uri.clone(), TokenVec::new(Arc::clone(&document)))?;
+    emit_view::<TokenLayoutDocuments<R>>()?.insert(
+        uri.clone(),
+        TokenLayoutDocument {
+            document_uri: uri.clone(),
+            document_id: document.document.0,
+            layout_revision: document.layout_revision,
+            document: Arc::clone(&document),
+        },
+    )?;
+    emit_view::<SemanticTokenDocuments<R>>()?.insert(
+        uri.clone(),
+        SemanticTokenDocument {
+            document_uri: uri,
+            document_id: document.document.0,
+            revision: document.semantic_revision,
+            structure_revision: document.structure_revision,
+            patch: derived.patch,
+            document,
+        },
+    )?;
+    Ok(())
 }
 
-impl<R: LexerRoot + Clone + std::fmt::Debug> LexerComponent<R> {
-    pub fn new() -> Result<Self, LexerCreationError> {
-        Ok(Self {
-            machine: Arc::new(Mutex::new(LexerMachine::new(Lexer::new()?))),
-        })
-    }
-}
-
-impl<R: LexerRoot + Clone + std::fmt::Debug> Component for LexerComponent<R> {
-    fn name(&self) -> &'static str {
-        "framework::lex::lexer"
-    }
-
-    fn install(&self, builder: &mut EngineBuilder) -> Result<()> {
-        builder.observe::<SourceText>()?;
-        builder.emit::<Tokens<R>>()?;
-        Ok(())
-    }
-
-    fn run(&self, cx: &RunContext) -> Result<()> {
-        let text = cx.observed::<SourceText>()?; // Working state (T2)
-        let out = cx.emitted::<Tokens<R>>()?;
-        let machine = Arc::clone(&self.machine);
-        text.visit_each(move |uri, value| -> Result<()> {
-            let Some(source) = value else {
-                // Retirement: the source document is gone; retract the
-                // token publication and forget this document's state.
-                out.remove(uri.clone())?;
-                machine.lock().expect("lexer machine lock").forget(&uri);
-                return Ok(());
-            };
-            let mut machine = machine.lock().expect("lexer machine lock");
-            let static_uri = machine.static_uri(&uri);
-            let previous = machine
-                .lexer
-                .latest
-                .sources
-                .get(&static_uri)
-                .cloned()
-                .unwrap_or_default();
-            // Re-lex the whole committed document. The pure layer's
-            // incremental machinery computes the exact sparse token delta
-            // from the previous revision itself.
-            let delta = SourceDelta {
-                replace: true,
-                splices: Arc::from([SourceSplice {
-                    old_range: 0..previous.len(),
-                    new_range: 0..source.len(),
-                    removed: Arc::clone(&previous),
-                    inserted: Arc::clone(&source),
-                }]),
-            };
-            let document = machine
-                .lexer
-                .derive_document(static_uri, Arc::clone(&source), &delta)
-                .map_err(|interrupt| Error::Internal(interrupt.to_string()))?;
-            let errors = document
-                .tokens
-                .iter()
-                .filter_map(|data| machine.lexer.token(data.id).and_then(|t| t.error))
-                .collect::<Vec<_>>();
-            let tokens = document
-                .tokens
-                .iter()
-                .filter_map(|data| machine.lexer.token(data.id).cloned())
-                .collect::<Vec<_>>();
-            let changes: Arc<[AddressChange<Uri<&'static str>, TokenData>]> =
-                document.changes.into();
-            let source: Arc<str> = Arc::clone(&source);
-            out.set(
-                uri,
-                TokenVec {
-                    tokens,
-                    errors,
-                    data: document.tokens.into(),
-                    changes,
-                    source,
-                },
-            )?;
-            Ok(())
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Installation
-// ---------------------------------------------------------------------------
-
-/// Installs the built-in lexer pipeline: the [`Tokens`] publication and
-/// the lexer component observing [`SourceText`].
+/// Installs one keyed lexer child per source URI.
 pub fn install_lexer<R>(engine: &mut Engine) -> Result<()>
 where
     R: LexerRoot + Clone + std::fmt::Debug,
 {
-    engine.install(LexerComponent::<R>::new().map_err(|error| Error::Internal(error.to_string()))?)
+    let machine = Arc::new(Mutex::new(LexerMachine::new(
+        Lexer::new().map_err(|error: LexerCreationError| Error::Internal(error.to_string().into()))?,
+    )));
+    let planned = engine.plan(
+        {
+            let machine = Arc::clone(&machine);
+            move |()| {
+                let child_machine = Arc::clone(&machine);
+                crate::reactive::run_each_key::<SourceRevisions, _>(move |uri| {
+                    lex_document::<R>(Arc::clone(&child_machine), uri)
+                })
+            }
+        },
+        (),
+    )?;
+    let _running = engine.run(&planned)?;
+    Ok(())
 }

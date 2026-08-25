@@ -19,7 +19,9 @@ pub trait TokenState: Send + Sync + 'static {
     fn state_key() -> &'static str;
 }
 
-pub trait LexerRoot: TokenState + Hash + Eq + PartialEq + Sized + Send + Sync + 'static {
+pub trait LexerRoot:
+    TokenState + Hash + Eq + PartialEq + Clone + Sized + Send + Sync + 'static
+{
     type SlotValue: Clone + Eq + Hash + Send + Sync + 'static;
 
     fn state_registrations() -> Vec<ScopeRegistration<Self>>;
@@ -41,6 +43,99 @@ pub struct IncrementalLexStats {
     pub reused: usize,
     pub old_tokens: usize,
     pub new_tokens: usize,
+}
+
+/// Deterministic lexer work counters for one document command (plan §10.1).
+/// Counters roll back with their command and never enter reactive facts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LexerWork {
+    /// Lexer component invocations for this document.
+    pub component_runs: u64,
+    /// Checkpoint/occurrence-index lookups.
+    pub checkpoint_lookups: u64,
+    /// Cumulative lookup depth (entries inspected by index searches).
+    pub checkpoint_lookup_depth: u64,
+    /// Restart byte offsets chosen for replay.
+    pub restart_bytes: u64,
+    /// Restart occurrence indexes chosen for replay.
+    pub restart_occurrences: u64,
+    /// Source bytes examined by DFA scanning or replay decisions.
+    pub source_bytes_examined: u64,
+    /// DFA transitions executed.
+    pub dfa_transitions: u64,
+    /// Lexical entries decoded inside replay windows.
+    pub lexical_entries_visited: u64,
+    /// Semantic entries inspected while constructing an exact patch.
+    pub semantic_entries_visited: u64,
+    /// Tokens re-lexed inside replay windows.
+    pub tokens_replayed: u64,
+    /// New tokens inserted into the publication.
+    pub tokens_inserted: u64,
+    /// Old tokens removed from the publication.
+    pub tokens_removed: u64,
+    /// Suffix tokens reused without re-lexing.
+    pub tokens_reused: u64,
+    /// Retained suffix entries physically visited after convergence.
+    pub retained_suffix_entries_visited: u64,
+    /// Exact token-fact candidate writes.
+    pub token_fact_writes: u64,
+    /// Convergence candidates considered.
+    pub convergence_candidates: u64,
+    /// Convergence proofs tested against retained state.
+    pub convergence_checks: u64,
+    /// Replays that ran to document EOF without converging.
+    pub eof_replays: u64,
+    /// Tape intervals transferred unchanged.
+    pub transferred_tape_intervals: u64,
+    /// Scratch bytes requested from reusable buffers.
+    pub scratch_bytes_requested: u64,
+    /// Persistent tape nodes created.
+    pub tape_nodes_created: u64,
+    /// Persistent tape nodes reused by pointer.
+    pub tape_nodes_reused: u64,
+    /// Persistent radix/HAMT nodes created.
+    pub radix_nodes_created: u64,
+    /// Persistent radix/HAMT nodes reused by pointer.
+    pub radix_nodes_reused: u64,
+    /// Explicit forbidden complete-tape walks on a local edit.
+    pub full_tape_iterations: u64,
+    /// Explicit forbidden complete semantic projections on a local edit.
+    pub full_projection_fallbacks: u64,
+    /// Explicit forbidden document-vector reconstructions on a local edit.
+    pub document_vector_rebuilds: u64,
+}
+
+impl LexerWork {
+    /// Merges another counter set into this one (checked addition).
+    pub fn merge(&mut self, other: &Self) {
+        self.component_runs += other.component_runs;
+        self.checkpoint_lookups += other.checkpoint_lookups;
+        self.checkpoint_lookup_depth += other.checkpoint_lookup_depth;
+        self.restart_bytes += other.restart_bytes;
+        self.restart_occurrences += other.restart_occurrences;
+        self.source_bytes_examined += other.source_bytes_examined;
+        self.dfa_transitions += other.dfa_transitions;
+        self.lexical_entries_visited += other.lexical_entries_visited;
+        self.semantic_entries_visited += other.semantic_entries_visited;
+        self.tokens_replayed += other.tokens_replayed;
+        self.tokens_inserted += other.tokens_inserted;
+        self.tokens_removed += other.tokens_removed;
+        self.tokens_reused += other.tokens_reused;
+        self.retained_suffix_entries_visited += other.retained_suffix_entries_visited;
+        self.token_fact_writes += other.token_fact_writes;
+        self.convergence_candidates += other.convergence_candidates;
+        self.convergence_checks += other.convergence_checks;
+        self.eof_replays += other.eof_replays;
+        self.transferred_tape_intervals += other.transferred_tape_intervals;
+        self.scratch_bytes_requested += other.scratch_bytes_requested;
+        self.tape_nodes_created += other.tape_nodes_created;
+        self.tape_nodes_reused += other.tape_nodes_reused;
+        self.radix_nodes_created += other.radix_nodes_created;
+        self.radix_nodes_reused += other.radix_nodes_reused;
+        self.full_tape_iterations += other.full_tape_iterations;
+        self.full_projection_fallbacks += other.full_projection_fallbacks;
+        self.document_vector_rebuilds += other.document_vector_rebuilds;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -124,17 +219,32 @@ where
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct LexToken<Root>
 where
     Root: LexerRoot,
 {
-    pub id: usize,
+    pub(crate) id: usize,
     pub start: usize,
     pub length: usize,
     pub terminal: Option<TerminalId>,
     pub error: Option<LexErrorInfo>,
     pub value: Root,
+}
+impl<Root> fmt::Debug for LexToken<Root>
+where
+    Root: LexerRoot + fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LexToken")
+            .field("start", &self.start)
+            .field("length", &self.length)
+            .field("terminal", &self.terminal)
+            .field("error", &self.error)
+            .field("value", &self.value)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +259,22 @@ where
     pub moment: LexMoment,
     pub value: Root,
     pub transition: StateAction<Root>,
+}
+
+/// One scanner output before it receives a document-local occurrence identity.
+/// Scanner output is deliberately transient; the persistent lexical tape owns
+/// the committed value and checkpoint state.
+#[derive(Debug)]
+pub(crate) struct ScannedToken<Root>
+where
+    Root: LexerRoot,
+{
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) terminal: Option<TerminalId>,
+    pub(crate) skip: bool,
+    pub(crate) error: Option<LexErrorKind>,
+    pub(crate) value: Root,
 }
 
 #[derive(Debug, Error, Clone)]

@@ -1,800 +1,428 @@
-//! Incremental bidirectional typechecking for the STLC example (reactive
-//! rewrite, plan Phase 6).
-//!
-//! The `check` pass types every declaration and expression with per-node
-//! child-visitor granularity, publishing per-node [`TypeFact`]s and
-//! per-document [`StlcTypeDiagnostic`]s. Its type contributions ride in
-//! [`StlcTypeFacts`]/[`StlcTypeScopes`] (owned by this pass), so the
-//! shared [`ScopeGraph<StlcScope>`] is written only by `name_pass` —
-//! deterministic single-writer, no cross-producer retirement churn.
+//! Plain reactive bidirectional typechecking for the STLC example
+//! (plan §6.2): one visitor per syntax node, joined to the SAME scope graph
+//! as name resolution. Inferred types flow up as graph facts (`type_scope`
+//! nodes); expected types flow down through the `run` recursion input.
+//! Diagnostics live in per-node list slots.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use plingo::framework::lex::Tokens;
-use plingo::framework::parse::{AstToken, ParseUnits};
-use plingo::framework::scope::{ScopeGraph, ScopeGraphObservedExt, ScopeId};
+use plingo::framework::parse::TreeParseUnits;
+use plingo::framework::scope::{ScopeNode, outgoing};
 use plingo::reactive::prelude::*;
-use plingo::reactive::view::NodeId;
-use plingo::reactive_component as component;
-use plingo::reactive_view as view;
-use plingo::reactive::api::TreeObservedExt;
+use plingo::reactive::view::Node;
+use reactive_macros::view;
 
 use super::name_resolve::{
-    StlcScope, StlcTypeError, StlcTypeValue, case_successor_scope, declaration_scope,
-    lexical_scope, token_text, type_scope,
+    Scope, ScopeGraph, StlcResolution, StlcResolvedReferences, StlcScope, StlcScopeData,
+    StlcScopeLabel, StlcTypeError, StlcTypeValue, declaration_scope, type_scope,
 };
 use super::syntax::{
-    StlcCase, StlcDeclarationCase, StlcDocument, StlcExprCase, StlcObservedExt, StlcParamCase,
-    StlcToken, StlcTypeCase, StlcTypeAtomCase, StlcTree,
+    StlcCase, StlcDeclarationCase, StlcDocument, StlcExprCase, StlcTree, StlcTypeAtomCase,
+    StlcTypeCase,
 };
 
-/// Input mode is part of a type judgment.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum StlcTypeMode {
     #[default]
     Infer,
     Check(StlcTypeValue),
 }
 
-impl StlcTypeMode {
-    fn expected(&self) -> Option<StlcTypeValue> {
-        match self {
-            Self::Infer => None,
-            Self::Check(ty) => Some(ty.clone()),
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StlcTypeDiagnostic {
-    pub expression: NodeId,
+    pub expression: Node<StlcTree>,
     pub error: StlcTypeError,
 }
 
+/// Per-node diagnostics: each node's visitor replaces its own slots under
+/// its own key, so writers never collide (T5) and a consumer of one node's
+/// diagnostics wakes only on that node's slots (plan §6.2 item 5).
+#[view]
+pub struct StlcTypeDiagnostics(List<Node<StlcTree>, StlcTypeDiagnostic>);
+
 // ---------------------------------------------------------------------------
-// Views
+// Stable identities for check-owned scope-graph facts
 // ---------------------------------------------------------------------------
 
-/// Per-node typing judgments.
-#[view(map, key = String, value = Vec<TypeFact>)]
-pub struct StlcTypeFacts;
-
-/// One per-node type fact.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TypeFact {
-    pub node: NodeId,
-    pub ty: StlcTypeValue,
-}
-
-/// Per-document type diagnostics.
-#[view(map, key = String, value = Vec<StlcTypeDiagnostic>)]
-pub struct StlcTypeDiagnostics;
-
-/// The type scope for one definition (parity with the legacy
-/// `StlcScopeKey::Type` allocations).
-#[view(map, key = String, value = Vec<TypeScopeFact>)]
-pub struct StlcTypeScopes;
-
-/// One definition's type scope.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TypeScopeFact {
-    pub definition: NodeId,
-    pub ty: StlcTypeValue,
+/// The scope-graph payload carrying an inferred type.
+fn type_payload(ty: &StlcTypeValue) -> StlcScopeData {
+    StlcScopeData::Type(ty.clone())
 }
 
 // ---------------------------------------------------------------------------
 // The check pass
 // ---------------------------------------------------------------------------
 
-/// The check pass: one child visitor per document over
-/// [`ParseUnits<StlcDocument>`], then per-node child visitors inside a
-/// document (per-declaration isolation, matrix 4).
-#[component]
-pub fn check_pass(
-    units: ParseUnits<StlcDocument>,
-    syntax: StlcTree,
-    scopes: ScopeGraph<StlcScope>,
-    tokens: Tokens<StlcToken>,
-) -> (
-    StlcTypeFacts,
-    StlcTypeDiagnostics,
-    StlcTypeScopes,
-) {
-    let facts = Emitted::<StlcTypeFacts>::new()?;
-    let diagnostics = Emitted::<StlcTypeDiagnostics>::new()?;
-    let type_scopes = Emitted::<StlcTypeScopes>::new()?;
-    let facts_handle = facts.clone();
-    let diagnostics_handle = diagnostics.clone();
-    let type_scopes_handle = type_scopes.clone();
-    units.visit_each(move |uri, unit| -> Result<()> {
-        let Some(unit) = unit else {
-            return Ok(());
-        };
-        let docs: Arc<Mutex<Vec<StlcTypeDiagnostic>>> = Arc::new(Mutex::new(Vec::new()));
-        let facts_buf: Arc<Mutex<Vec<TypeFact>>> = Arc::new(Mutex::new(Vec::new()));
-        let scopes_buf: Arc<Mutex<Vec<TypeScopeFact>>> = Arc::new(Mutex::new(Vec::new()));
-        let incoming = lexical_scope(&uri, unit.root);
-        // Type each top-level declaration (the document's children).
-        let doc_children = TreeObservedExt::children(&syntax, unit.root)?;
-        for declaration in doc_children {
-            let _ = type_node(
-                &uri,
-                &syntax,
-                &scopes,
-                &tokens,
-                &facts_buf,
-                &docs,
-                &scopes_buf,
-                declaration,
-                incoming,
-                StlcTypeMode::Infer,
-            )?;
-        }
-        let mut local_facts = facts_buf.lock().expect("facts lock");
-        let collected_facts = std::mem::take(&mut *local_facts);
-        let mut local_scopes = scopes_buf.lock().expect("scopes lock");
-        let collected_scopes = std::mem::take(&mut *local_scopes);
-        let mut diags = docs.lock().expect("docs lock");
-        let diags = std::mem::take(&mut *diags);
-        diagnostics_handle.set(uri.clone(), diags)?;
-        facts_handle.set(uri.clone(), collected_facts)?;
-        type_scopes_handle.set(uri, collected_scopes)?;
-        Ok(())
-    })?;
-    Ok((facts, diagnostics, type_scopes))
+pub fn check_pass(_: ()) -> Result<()> {
+    run_each_key::<TreeParseUnits<StlcDocument>, _>(check_document)
 }
 
-// ---------------------------------------------------------------------------
-// The dispatch
-// ---------------------------------------------------------------------------
-
-/// Types one node under `incoming` with `mode`. Returns the node's type.
-#[allow(clippy::too_many_arguments)]
-fn type_node(
-    uri: &str,
-    syntax: &ObservedHandle<StlcTree>,
-    scopes: &ObservedHandle<ScopeGraph<StlcScope>>,
-    tokens: &ObservedHandle<Tokens<StlcToken>>,
-    facts: &Arc<Mutex<Vec<TypeFact>>>,
-    diagnostics: &Arc<Mutex<Vec<StlcTypeDiagnostic>>>,
-    type_scopes: &Arc<Mutex<Vec<TypeScopeFact>>>,
-    id: NodeId,
-    incoming: ScopeId<StlcScope>,
-    mode: StlcTypeMode,
-) -> Result<Option<StlcTypeValue>> {
-    let result = match syntax.case(id)? {
-        None => None,
-        Some(StlcCase::Document(_)) => None,
-        Some(StlcCase::Declaration(declaration)) => match declaration {
-            StlcDeclarationCase::Value {
-                f0: _name,
-                f1: annotation,
-                f2: body,
-                f3: parameters,
-            } => type_declaration(
-                uri, syntax, scopes, tokens, facts, diagnostics, type_scopes, id, incoming,
-                annotation, body, parameters,
-            )?,
-            StlcDeclarationCase::Import { .. }
-            | StlcDeclarationCase::Export { .. }
-            | StlcDeclarationCase::Error { .. } => None,
-        },
-        Some(StlcCase::Expr(expression)) => match expression {
-            StlcExprCase::If {
-                f0: condition,
-                f1: then_branch,
-                f2: else_branch,
-                ..
-            } => {
-                let condition = check_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    condition, incoming, StlcTypeValue::Bool,
-                )?;
-                let then_ty = infer_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    then_branch, incoming,
-                )?;
-                let else_ty = infer_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    else_branch, incoming,
-                )?;
-                agree_branches(diagnostics, id, condition, then_ty, else_ty)
-            }
-            StlcExprCase::Case {
-                f0: scrutinee,
-                f1: zero_branch,
-                f2: _successor,
-                f3: successor_branch,
-                ..
-            } => type_case(
-                uri, syntax, scopes, tokens, facts, diagnostics, type_scopes, id, incoming,
-                scrutinee, zero_branch, successor_branch,
-            )?,
-            StlcExprCase::Let {
-                f0: _name,
-                f1: value,
-                f2: body,
-                ..
-            } => {
-                let value_ty = infer_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    value, incoming,
-                )?;
-                let Some(value_ty) = value_ty else {
-                    return Ok(None);
-                };
-                emit_binding_type(type_scopes, id, value_ty.clone());
-                let body_scope = lexical_scope(uri, id);
-                infer_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    body, body_scope,
-                )?
-            }
-            StlcExprCase::Lambda { f0: parameter, f1: body, .. } => {
-                let parameter_ty = parameter_annotation(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    parameter, incoming,
-                )?;
-                let Some(parameter_ty) = parameter_ty else {
-                    return Ok(None);
-                };
-                let lambda_scope = lexical_scope(uri, id);
-                emit_binding_type(type_scopes, parameter, parameter_ty.clone());
-                let Some(body_ty) = infer_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    body, lambda_scope,
-                )?
-                else {
-                    return Ok(None);
-                };
-                Some(StlcTypeValue::Arrow(Box::new(parameter_ty), Box::new(body_ty)))
-            }
-            StlcExprCase::Add { f0: left, f1: right, .. } => {
-                let left = check_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    left, incoming, StlcTypeValue::Nat,
-                )?;
-                let right = check_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    right, incoming, StlcTypeValue::Nat,
-                )?;
-                (left.is_some() && right.is_some()).then_some(StlcTypeValue::Nat)
-            }
-            StlcExprCase::Apply { f0: fun, f1: arg, .. } => {
-                let function_ty = infer_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    fun, incoming,
-                )?;
-                let Some(function_ty) = function_ty else {
-                    return Ok(None);
-                };
-                let StlcTypeValue::Arrow(domain, codomain) = function_ty else {
-                    emit_diagnostic(
-                        diagnostics,
-                        id,
-                        StlcTypeError::NonFunctionApplication { found: function_ty },
-                    );
-                    return Ok(None);
-                };
-                check_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    arg, incoming, *domain,
-                )?
-                .map(|_| *codomain)
-            }
-            StlcExprCase::Succ { f0: inner, .. } => check_child(
-                uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                inner, incoming, StlcTypeValue::Nat,
-            )?
-            .map(|_| StlcTypeValue::Nat),
-            StlcExprCase::Group { f0: inner, .. } => infer_child(
-                uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                inner, incoming,
-            )?,
-            StlcExprCase::True { .. } | StlcExprCase::False { .. } => {
-                Some(StlcTypeValue::Bool)
-            }
-            StlcExprCase::Number { .. } => Some(StlcTypeValue::Nat),
-            StlcExprCase::Unit { .. } => Some(StlcTypeValue::Unit),
-            StlcExprCase::Variable { f0: name, .. } => infer_variable(
-                syntax, scopes, tokens, diagnostics, id, incoming, name,
-            )?,
-            StlcExprCase::Error { .. } => None,
-        },
-        Some(StlcCase::Type(ty)) => match ty {
-            StlcTypeCase::Arrow { f0: domain, f1: codomain, .. } => {
-                let domain = infer_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    domain, incoming,
-                )?;
-                let codomain = infer_child(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    codomain, incoming,
-                )?;
-                match (domain, codomain) {
-                    (Some(domain), Some(codomain)) => Some(StlcTypeValue::Arrow(
-                        Box::new(domain),
-                        Box::new(codomain),
-                    )),
-                    _ => None,
-                }
-            }
-            StlcTypeCase::Atom { f0: atom, .. } => infer_child(
-                uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                atom, incoming,
-            )?,
-            StlcTypeCase::Error { .. } => None,
-        },
-        Some(StlcCase::TypeAtom(atom)) => match atom {
-            StlcTypeAtomCase::Nat { .. } => Some(StlcTypeValue::Nat),
-            StlcTypeAtomCase::Bool { .. } => Some(StlcTypeValue::Bool),
-            StlcTypeAtomCase::Unit { .. } => Some(StlcTypeValue::Unit),
-            StlcTypeAtomCase::Parenthesized { f0: inner, .. } => infer_child(
-                uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                inner, incoming,
-            )?,
-        },
-        Some(StlcCase::Path(_)) | Some(StlcCase::Param(_)) => None,
+pub fn check_document(uri: String) -> Result<()> {
+    let Some(unit) = observe_view::<TreeParseUnits<StlcDocument>>()?.get(&uri)? else {
+        return Ok(());
     };
-    // Check-mode: non-structural expressions are checked by
-    // inference-then-agreement (legacy `check_inferred`).
-    match mode.expected() {
-        Some(expected) => Ok(check_inferred(diagnostics, id, expected, result)),
-        None => Ok(result),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Declarations, cases, helpers
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-fn type_declaration(
-    uri: &str,
-    syntax: &ObservedHandle<StlcTree>,
-    scopes: &ObservedHandle<ScopeGraph<StlcScope>>,
-    tokens: &ObservedHandle<Tokens<StlcToken>>,
-    facts: &Arc<Mutex<Vec<TypeFact>>>,
-    diagnostics: &Arc<Mutex<Vec<StlcTypeDiagnostic>>>,
-    type_scopes: &Arc<Mutex<Vec<TypeScopeFact>>>,
-    id: NodeId,
-    incoming: ScopeId<StlcScope>,
-    annotation: Option<NodeId>,
-    body: NodeId,
-    parameters: Vec<NodeId>,
-) -> Result<Option<StlcTypeValue>> {
-    let declared = match annotation {
-        Some(node) => match infer_child(
-            uri, syntax, scopes, tokens, facts, diagnostics, type_scopes, node, incoming,
-        )? {
-            Some(ty) => Some(ty),
-            None => {
-                emit_diagnostic(diagnostics, id, StlcTypeError::InvalidAnnotation);
-                return Ok(None);
-            }
-        },
-        None => None,
+    let Some(root) = unit.root else {
+        return Ok(());
     };
-    let (parameter_types, body_expected) = match declared.as_ref() {
-        Some(signature) => {
-            let Some((types, body_ty)) = split_function_type(signature, parameters.len()) else {
-                emit_diagnostic(diagnostics, id, StlcTypeError::InvalidAnnotation);
-                return Ok(None);
-            };
-            for (parameter, expected) in parameters.iter().zip(&types) {
-                if !parameter_matches(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    *parameter, incoming, expected,
-                )? {
-                    return Ok(None);
-                }
-            }
-            (types, Some(body_ty))
-        }
-        None => {
-            let mut types = Vec::with_capacity(parameters.len());
-            for parameter in parameters.iter() {
-                let Some(ty) = parameter_annotation(
-                    uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-                    *parameter, incoming,
-                )?
-                else {
-                    emit_diagnostic(
-                        diagnostics,
-                        *parameter,
-                        StlcTypeError::MissingParameterAnnotation,
-                    );
-                    return Ok(None);
-                };
-                types.push(ty);
-            }
-            (types, None)
-        }
-    };
-
-    if let Some(signature) = &declared {
-        emit_binding_type(type_scopes, id, signature.clone());
-    }
-    for (parameter, ty) in parameters.iter().zip(&parameter_types) {
-        emit_binding_type(type_scopes, *parameter, ty.clone());
-    }
-    let body_scope = lexical_scope(uri, id);
-    let body_ty = match body_expected {
-        Some(expected) => match check_child(
-            uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-            body, body_scope, expected,
-        )? {
-            Some(ty) => ty,
-            None => return Ok(None),
+    run(
+        |(uri, id, mode): (String, Node<StlcTree>, StlcTypeMode)| {
+            type_node(uri, id, mode)
         },
-        None => match infer_child(
-            uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-            body, body_scope,
-        )? {
-            Some(ty) => ty,
-            None => return Ok(None),
-        },
-    };
-    let binding_ty = declared.unwrap_or_else(|| curry_type(&parameter_types, body_ty));
-    if annotation.is_none() {
-        emit_binding_type(type_scopes, id, binding_ty.clone());
-    }
-    Ok(Some(binding_ty))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn type_case(
-    uri: &str,
-    syntax: &ObservedHandle<StlcTree>,
-    scopes: &ObservedHandle<ScopeGraph<StlcScope>>,
-    tokens: &ObservedHandle<Tokens<StlcToken>>,
-    facts: &Arc<Mutex<Vec<TypeFact>>>,
-    diagnostics: &Arc<Mutex<Vec<StlcTypeDiagnostic>>>,
-    type_scopes: &Arc<Mutex<Vec<TypeScopeFact>>>,
-    id: NodeId,
-    incoming: ScopeId<StlcScope>,
-    scrutinee: NodeId,
-    zero_branch: NodeId,
-    successor_branch: NodeId,
-) -> Result<Option<StlcTypeValue>> {
-    let scrutinized = check_child(
-        uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-        scrutinee, incoming, StlcTypeValue::Nat,
+        (uri, root, StlcTypeMode::Infer),
     )?;
-    let zero_ty = infer_child(
-        uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-        zero_branch, incoming,
-    )?;
-    let successor_scope = case_successor_scope(uri, id);
-    emit_binding_type(type_scopes, id, StlcTypeValue::Nat);
-    let successor_ty = infer_child(
-        uri, syntax, scopes, tokens, facts, diagnostics, type_scopes,
-        successor_branch, successor_scope,
-    )?;
-    Ok(agree_branches(diagnostics, id, scrutinized, zero_ty, successor_ty))
+    Ok(())
 }
 
-/// Infers one child's type as its own visitor instance.
-#[allow(clippy::too_many_arguments)]
-fn infer_child(
-    uri: &str,
-    syntax: &ObservedHandle<StlcTree>,
-    scopes: &ObservedHandle<ScopeGraph<StlcScope>>,
-    tokens: &ObservedHandle<Tokens<StlcToken>>,
-    facts: &Arc<Mutex<Vec<TypeFact>>>,
-    diagnostics: &Arc<Mutex<Vec<StlcTypeDiagnostic>>>,
-    type_scopes: &Arc<Mutex<Vec<TypeScopeFact>>>,
-    child: NodeId,
-    incoming: ScopeId<StlcScope>,
-) -> Result<Option<StlcTypeValue>> {
-    let uri = uri.to_string();
-    let recursion = syntax.clone();
-    let scopes = scopes.clone();
-    let tokens = tokens.clone();
-    let facts_for_tail = Arc::clone(facts);
-    let diagnostics_for_tail = Arc::clone(diagnostics);
-    let type_scopes_for_tail = Arc::clone(type_scopes);
-    let facts = Arc::clone(facts);
-    let diagnostics = Arc::clone(diagnostics);
-    let type_scopes = Arc::clone(type_scopes);
-    let result: Arc<Mutex<Option<StlcTypeValue>>> = Arc::new(Mutex::new(None));
-    let result_handle = Arc::clone(&result);
-    let closure_handle = recursion.clone();
-    TreeObservedExt::visit_node(&recursion, child, move |_id, _payload| -> Result<(), Error> {
-        let value = type_node(
-            &uri,
-            &closure_handle,
-            &scopes,
-            &tokens,
-            &facts,
-            &diagnostics,
-            &type_scopes,
-            child,
-            incoming,
-            StlcTypeMode::Infer,
-        )?;
-        *result_handle.lock().expect("result lock") = value;
-        Ok(())
-    })?;
-    let mut guard = result.lock().expect("result lock");
-    let value = guard.take();
-    if let Some(ty) = &value {
-        facts_for_tail
-            .lock()
-            .expect("facts lock")
-            .push(TypeFact { node: child, ty: ty.clone() });
-    }
-    let _ = (diagnostics_for_tail, type_scopes_for_tail);
-    Ok(value)
+/// Reads one node's inferred type from its graph fact.
+fn observed_type(uri: &str, id: Node<StlcTree>) -> Result<Option<StlcTypeValue>> {
+    let observe = ::plingo::reactive::kind::observe_view::<ScopeGraph<StlcScope>>()?;
+    Ok(match observe.payload(type_scope(uri, id).node())?.as_deref() {
+        Some(ScopeNode::Scope(StlcScopeData::Type(ty))) => Some(ty.clone()),
+        _ => None,
+    })
 }
-
-/// Checks one child against `expected` as its own visitor instance.
-#[allow(clippy::too_many_arguments)]
-fn check_child(
-    uri: &str,
-    syntax: &ObservedHandle<StlcTree>,
-    scopes: &ObservedHandle<ScopeGraph<StlcScope>>,
-    tokens: &ObservedHandle<Tokens<StlcToken>>,
-    facts: &Arc<Mutex<Vec<TypeFact>>>,
-    diagnostics: &Arc<Mutex<Vec<StlcTypeDiagnostic>>>,
-    type_scopes: &Arc<Mutex<Vec<TypeScopeFact>>>,
-    child: NodeId,
-    incoming: ScopeId<StlcScope>,
-    expected: StlcTypeValue,
-) -> Result<Option<StlcTypeValue>> {
-    let uri = uri.to_string();
-    let recursion = syntax.clone();
-    let scopes = scopes.clone();
-    let tokens = tokens.clone();
-    let facts_for_tail = Arc::clone(facts);
-    let diagnostics_for_tail = Arc::clone(diagnostics);
-    let type_scopes_for_tail = Arc::clone(type_scopes);
-    let facts = Arc::clone(facts);
-    let diagnostics = Arc::clone(diagnostics);
-    let type_scopes = Arc::clone(type_scopes);
-    let result: Arc<Mutex<Option<StlcTypeValue>>> = Arc::new(Mutex::new(None));
-    let result_handle = Arc::clone(&result);
-    let closure_handle = recursion.clone();
-    TreeObservedExt::visit_node(&recursion, child, move |_id, _payload| -> Result<(), Error> {
-        let value = type_node(
-            &uri,
-            &closure_handle,
-            &scopes,
-            &tokens,
-            &facts,
-            &diagnostics,
-            &type_scopes,
-            child,
-            incoming,
-            StlcTypeMode::Check(expected.clone()),
-        )?;
-        *result_handle.lock().expect("result lock") = value;
-        Ok(())
-    })?;
-    let mut guard = result.lock().expect("result lock");
-    let value = guard.take();
-    if let Some(ty) = &value {
-        facts_for_tail
-            .lock()
-            .expect("facts lock")
-            .push(TypeFact { node: child, ty: ty.clone() });
-    }
-    let _ = (diagnostics_for_tail, type_scopes_for_tail);
-    Ok(value)
-}
-
-fn emit_diagnostic(
-    diagnostics: &Arc<Mutex<Vec<StlcTypeDiagnostic>>>,
-    expression: NodeId,
-    error: StlcTypeError,
-) {
-    diagnostics
-        .lock()
-        .expect("docs lock")
-        .push(StlcTypeDiagnostic { expression, error });
-}
-
-fn emit_binding_type(
-    type_scopes: &Arc<Mutex<Vec<TypeScopeFact>>>,
-    definition: NodeId,
-    ty: StlcTypeValue,
-) {
-    type_scopes
-        .lock()
-        .expect("type scopes lock")
-        .push(TypeScopeFact { definition, ty });
-}
-
-fn infer_variable(
-    _syntax: &ObservedHandle<StlcTree>,
-    scopes: &ObservedHandle<ScopeGraph<StlcScope>>,
-    tokens: &ObservedHandle<Tokens<StlcToken>>,
-    diagnostics: &Arc<Mutex<Vec<StlcTypeDiagnostic>>>,
-    current: NodeId,
-    incoming: ScopeId<StlcScope>,
-    name: AstToken<StlcToken>,
-) -> Result<Option<StlcTypeValue>> {
-    let Some(name) = token_text(tokens, "", name)? else {
+fn resolved_type(declaration: Scope<StlcScope>) -> Result<Option<StlcTypeValue>> {
+    let Some(type_node) = outgoing(declaration, &StlcScopeLabel::Type)?.first().copied() else {
         return Ok(None);
     };
-    // Resolve through the scope graph: Lexical* followed by Declaration,
-    // reading exactly the touched buckets.
-    let path = plingo::framework::scope::ScopePath::from(
-        plingo::framework::scope::PathExpr::label(super::name_resolve::StlcScopeLabel::Lexical)
-            .star()
-            .then(plingo::framework::scope::PathExpr::label(
-                super::name_resolve::StlcScopeLabel::Declaration,
-            )),
-    );
-    let resolved = scopes.resolve(incoming, path, |payload| match payload {
-        plingo::framework::scope::ScopeNode::Scope(
-            super::name_resolve::StlcScopeData::Declaration { name: binding, .. },
-        ) => **binding == *name,
-        _ => false,
-    })?;
-    let mut best: Option<StlcTypeValue> = None;
-    for path in resolved {
-        let nodes = path.scopes;
-        let last = nodes[nodes.len() - 1];
-        if let Some(ty) = binding_type_at(scopes, "", last.node())? {
-            if best.is_none() {
-                best = Some(ty);
-            }
-        }
-    }
-    match best {
-        Some(ty) => Ok(Some(ty)),
-        None => {
-            emit_diagnostic(diagnostics, current, StlcTypeError::UnboundVariable { name });
-            Ok(None)
-        }
-    }
-}
-
-fn check_inferred(
-    diagnostics: &Arc<Mutex<Vec<StlcTypeDiagnostic>>>,
-    current: NodeId,
-    expected: StlcTypeValue,
-    found: Option<StlcTypeValue>,
-) -> Option<StlcTypeValue> {
-    let Some(found) = found else {
-        emit_diagnostic(
-            diagnostics,
-            current,
-            StlcTypeError::Mismatch {
-                expected: expected.clone(),
-                found: StlcTypeValue::Unit,
-            },
-        );
-        return None;
-    };
-    if found == expected {
-        Some(expected)
-    } else {
-        emit_diagnostic(diagnostics, current, StlcTypeError::Mismatch { expected, found });
-        None
-    }
-}
-
-fn agree_branches(
-    diagnostics: &Arc<Mutex<Vec<StlcTypeDiagnostic>>>,
-    current: NodeId,
-    prerequisite: Option<StlcTypeValue>,
-    left: Option<StlcTypeValue>,
-    right: Option<StlcTypeValue>,
-) -> Option<StlcTypeValue> {
-    if prerequisite.is_none() {
-        return None;
-    }
-    match (left, right) {
-        (Some(left), Some(right)) if left == right => Some(left),
-        (Some(then_ty), Some(else_ty)) => {
-            emit_diagnostic(
-                diagnostics,
-                current,
-                StlcTypeError::BranchMismatch { then_ty, else_ty },
-            );
-            None
-        }
+    let observe = observe_view::<ScopeGraph<StlcScope>>()?;
+    Ok(match observe.payload(type_node.node())?.as_deref() {
+        Some(ScopeNode::Scope(StlcScopeData::Type(ty))) => Some(ty.clone()),
         _ => None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn parameter_annotation(
-    uri: &str,
-    syntax: &ObservedHandle<StlcTree>,
-    scopes: &ObservedHandle<ScopeGraph<StlcScope>>,
-    tokens: &ObservedHandle<Tokens<StlcToken>>,
-    facts: &Arc<Mutex<Vec<TypeFact>>>,
-    diagnostics: &Arc<Mutex<Vec<StlcTypeDiagnostic>>>,
-    type_scopes: &Arc<Mutex<Vec<TypeScopeFact>>>,
-    parameter: NodeId,
-    incoming: ScopeId<StlcScope>,
-) -> Result<Option<StlcTypeValue>> {
-    let annotation = match syntax.case(parameter)? {
-        Some(StlcCase::Param(StlcParamCase::Bare { f1: annotation, .. }))
-        | Some(StlcCase::Param(StlcParamCase::Parenthesized { f1: annotation, .. })) => annotation,
-        _ => None,
-    };
-    match annotation {
-        Some(node) => infer_child(
-            uri, syntax, scopes, tokens, facts, diagnostics, type_scopes, node, incoming,
-        ),
-        None => Ok(None),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn parameter_matches(
-    uri: &str,
-    syntax: &ObservedHandle<StlcTree>,
-    scopes: &ObservedHandle<ScopeGraph<StlcScope>>,
-    tokens: &ObservedHandle<Tokens<StlcToken>>,
-    facts: &Arc<Mutex<Vec<TypeFact>>>,
-    diagnostics: &Arc<Mutex<Vec<StlcTypeDiagnostic>>>,
-    type_scopes: &Arc<Mutex<Vec<TypeScopeFact>>>,
-    parameter: NodeId,
-    incoming: ScopeId<StlcScope>,
-    expected: &StlcTypeValue,
-) -> Result<bool> {
-    let Some(found) = parameter_annotation(
-        uri, syntax, scopes, tokens, facts, diagnostics, type_scopes, parameter, incoming,
-    )?
-    else {
-        return Ok(true);
-    };
-    if found == *expected {
-        return Ok(true);
-    }
-    emit_diagnostic(
-        diagnostics,
-        parameter,
-        StlcTypeError::Mismatch {
-            expected: expected.clone(),
-            found,
-        },
-    );
-    Ok(false)
-}
-
-fn split_function_type(
-    signature: &StlcTypeValue,
-    parameters: usize,
-) -> Option<(Vec<StlcTypeValue>, StlcTypeValue)> {
-    let mut remaining = signature;
-    let mut parameter_types = Vec::with_capacity(parameters);
-    for _ in 0..parameters {
-        let StlcTypeValue::Arrow(domain, codomain) = remaining else {
-            return None;
-        };
-        parameter_types.push((**domain).clone());
-        remaining = codomain;
-    }
-    Some((parameter_types, remaining.clone()))
-}
-
-fn curry_type(parameters: &[StlcTypeValue], result: StlcTypeValue) -> StlcTypeValue {
-    parameters.iter().rev().fold(result, |result, parameter| {
-        StlcTypeValue::Arrow(Box::new(parameter.clone()), Box::new(result))
     })
 }
 
-/// Reads the committed type scope of one definition (stored in the
-/// separate [`StlcTypeScopes`] view, queried here from a snapshot).
-pub fn binding_type_at(
-    scopes: &ObservedHandle<ScopeGraph<StlcScope>>,
-    _uri: &str,
-    definition: NodeId,
+/// One syntax node's bidirectional check. Parents read each child's type
+/// from the child's own graph fact — one fact read per child, exactly the
+/// dependency the engine needs (plan §6.2 item 4).
+fn type_node(
+    uri: String,
+    id: Node<StlcTree>,
+    mode: StlcTypeMode,
 ) -> Result<Option<StlcTypeValue>> {
-    let type_scope = type_scope(_uri, definition);
-    match scopes.node(type_scope.node())? {
-        Some(payload) => match &*payload {
-            plingo::framework::scope::ScopeNode::Scope(
-                super::name_resolve::StlcScopeData::Type(ty),
-            ) => Ok(Some(ty.clone())),
-            _ => Ok(None),
+    let case = StlcTree::observe_case(id)?;
+    let children = StlcTree::observe_children(id)?.to_vec();
+    let graph = ::plingo::reactive::kind::emit_view::<ScopeGraph<StlcScope>>()?;
+
+    // Recurse into immediate children so each child publishes its own
+    // diagnostics and type fact. The type READS are not pro read: a child's
+    // type is observed only when a variant arm needs it (plan §16), so the
+    // parent's own type depends on exactly the children its case reads.
+    for child in &children {
+        run(
+            |(uri, child, mode): (String, Node<StlcTree>, StlcTypeMode)| {
+                type_node(uri, child, mode)
+            },
+            (uri.clone(), *child, StlcTypeMode::Infer),
+        )?;
+    }
+
+    let child_type = |id: &Node<StlcTree>| -> Option<StlcTypeValue> {
+        observed_type(&uri, *id).ok().flatten()
+    };
+
+    let mut diagnostics: Vec<StlcTypeDiagnostic> = Vec::new();
+    let ty = match &case {
+        Some(StlcCase::Document(_)) | Some(StlcCase::Path(_)) => None,
+        Some(StlcCase::Type(StlcTypeCase::Arrow { f0, f1 })) => match (
+            child_type(f0),
+            child_type(f1),
+        ) {
+            (Some(parameter), Some(result)) => {
+                Some(StlcTypeValue::Arrow(Box::new(parameter), Box::new(result)))
+            }
+            _ => None,
         },
-        None => Ok(None),
+        Some(StlcCase::Type(StlcTypeCase::Atom { f0 })) => child_type(f0),
+        Some(StlcCase::TypeAtom(StlcTypeAtomCase::Nat { .. })) => Some(StlcTypeValue::Nat),
+        Some(StlcCase::TypeAtom(StlcTypeAtomCase::Bool { .. })) => Some(StlcTypeValue::Bool),
+        Some(StlcCase::TypeAtom(StlcTypeAtomCase::Unit { .. })) => Some(StlcTypeValue::Unit),
+        Some(StlcCase::TypeAtom(StlcTypeAtomCase::Parenthesized { f0 })) => child_type(f0),
+        Some(StlcCase::Expr(StlcExprCase::True { .. }))
+        | Some(StlcCase::Expr(StlcExprCase::False { .. })) => Some(StlcTypeValue::Bool),
+        Some(StlcCase::Expr(StlcExprCase::Number { .. })) => Some(StlcTypeValue::Nat),
+        Some(StlcCase::Expr(StlcExprCase::Unit { .. })) => Some(StlcTypeValue::Unit),
+        Some(StlcCase::Expr(StlcExprCase::Group { f0 })) => child_type(f0),
+        Some(StlcCase::Expr(StlcExprCase::Succ { f0 })) => {
+            let found = child_type(f0);
+            if found != Some(StlcTypeValue::Nat)
+                && let Some(found) = found.clone() {
+                    diagnostics.push(StlcTypeDiagnostic {
+                        expression: *f0,
+                        error: StlcTypeError::Mismatch {
+                            expected: StlcTypeValue::Nat,
+                            found,
+                        },
+                    });
+                }
+            Some(StlcTypeValue::Nat)
+        }
+        Some(StlcCase::Expr(StlcExprCase::Add { f0, f1 })) => {
+            for child in [f0, f1] {
+                if let Some(found) = child_type(child)
+                    && found != StlcTypeValue::Nat
+                {
+                    diagnostics.push(StlcTypeDiagnostic {
+                        expression: *child,
+                        error: StlcTypeError::Mismatch {
+                            expected: StlcTypeValue::Nat,
+                            found,
+                        },
+                    });
+                }
+            }
+            Some(StlcTypeValue::Nat)
+        }
+        Some(StlcCase::Expr(StlcExprCase::If {
+            f0: condition,
+            f1: then_branch,
+            f2: else_branch,
+        })) => {
+            if let Some(found) = child_type(condition)
+                && found != StlcTypeValue::Bool
+            {
+                diagnostics.push(StlcTypeDiagnostic {
+                    expression: *condition,
+                    error: StlcTypeError::Mismatch {
+                        expected: StlcTypeValue::Bool,
+                        found,
+                    },
+                });
+            }
+            let then_ty = child_type(then_branch);
+            let else_ty = child_type(else_branch);
+            if let (Some(then_ty), Some(else_ty)) = (&then_ty, &else_ty)
+                && then_ty != else_ty
+            {
+                diagnostics.push(StlcTypeDiagnostic {
+                    expression: id,
+                    error: StlcTypeError::BranchMismatch {
+                        then_ty: then_ty.clone(),
+                        else_ty: else_ty.clone(),
+                    },
+                });
+            }
+            then_ty.or(else_ty)
+        }
+        Some(StlcCase::Expr(StlcExprCase::Lambda {
+            f0: parameter,
+            f1: body,
+        })) => {
+            let parameter_ty =
+                child_type(parameter).unwrap_or_else(|| parameter_default(parameter));
+            let body_ty = child_type(body).unwrap_or(StlcTypeValue::Unit);
+            Some(StlcTypeValue::Arrow(
+                Box::new(parameter_ty),
+                Box::new(body_ty),
+            ))
+        }
+        Some(StlcCase::Expr(StlcExprCase::Apply { f0, f1 })) => {
+            let function_ty = child_type(f0);
+            let argument_ty = child_type(f1);
+            match function_ty {
+                Some(StlcTypeValue::Arrow(parameter, result)) => {
+                    if let Some(argument_ty) = argument_ty
+                        && *parameter != argument_ty
+                    {
+                        diagnostics.push(StlcTypeDiagnostic {
+                            expression: *f1,
+                            error: StlcTypeError::Mismatch {
+                                expected: *parameter,
+                                found: argument_ty,
+                            },
+                        });
+                    }
+                    Some(*result)
+                }
+                Some(found) => {
+                    diagnostics.push(StlcTypeDiagnostic {
+                        expression: *f0,
+                        error: StlcTypeError::NonFunctionApplication { found },
+                    });
+                    None
+                }
+                None => None,
+            }
+        }
+        Some(StlcCase::Expr(StlcExprCase::Let {
+            f0: _,
+            f1: value,
+            f2: body,
+        })) => {
+            let _ = child_type(value);
+            child_type(body)
+        }
+        Some(StlcCase::Expr(StlcExprCase::Case {
+            f0: scrutinee,
+            f1: zero_branch,
+            f2: _,
+            f3: successor_branch,
+        })) => {
+            if let Some(found) = child_type(scrutinee)
+                && found != StlcTypeValue::Nat
+            {
+                diagnostics.push(StlcTypeDiagnostic {
+                    expression: *scrutinee,
+                    error: StlcTypeError::Mismatch {
+                        expected: StlcTypeValue::Nat,
+                        found,
+                    },
+                });
+            }
+            let zero_ty = child_type(zero_branch);
+            let successor_ty = child_type(successor_branch);
+            if let (Some(zero_ty), Some(successor_ty)) = (&zero_ty, &successor_ty)
+                && zero_ty != successor_ty
+            {
+                diagnostics.push(StlcTypeDiagnostic {
+                    expression: id,
+                    error: StlcTypeError::BranchMismatch {
+                        then_ty: zero_ty.clone(),
+                        else_ty: successor_ty.clone(),
+                    },
+                });
+            }
+            zero_ty.or(successor_ty)
+        }
+        Some(StlcCase::Expr(StlcExprCase::Variable { .. })) => {
+            match observe_view::<StlcResolvedReferences>()?.get(&id)?.as_deref() {
+                Some(StlcResolution::Resolved { declaration }) => resolved_type(*declaration)?,
+                Some(StlcResolution::Unbound { name }) => {
+                    diagnostics.push(StlcTypeDiagnostic {
+                        expression: id,
+                        error: StlcTypeError::UnboundVariable {
+                            name: Arc::clone(name),
+                        },
+                    });
+                    None
+                }
+                None => None,
+            }
+        }
+        Some(StlcCase::Declaration(StlcDeclarationCase::Value {
+            f0: _,
+            f1: annotation,
+            f2: body,
+            f3: parameters,
+        })) => {
+            // Literal bodies are typed from their OWN payload variant
+            // (plan §16: observe exactly the variant-required facts), so a
+            // terminal-kind change wakes this declaration through the
+            // payload fact itself.
+            let literal_ty: Option<StlcTypeValue> = (|| {
+                match StlcTree::observe_case(*body).ok()? {
+                    Some(StlcCase::Expr(StlcExprCase::True { .. }))
+                    | Some(StlcCase::Expr(StlcExprCase::False { .. })) => {
+                        Some(StlcTypeValue::Bool)
+                    }
+                    Some(StlcCase::Expr(StlcExprCase::Number { .. })) => {
+                        Some(StlcTypeValue::Nat)
+                    }
+                    Some(StlcCase::Expr(StlcExprCase::Unit { .. })) => {
+                        Some(StlcTypeValue::Unit)
+                    }
+                    _ => None,
+                }
+            })();
+            let body_ty = literal_ty
+                .or_else(|| child_type(body))
+                .unwrap_or(StlcTypeValue::Unit);
+            let mut result = body_ty;
+            for parameter in parameters.iter().rev() {
+                let parameter_ty = child_type(parameter)
+                    .unwrap_or_else(|| parameter_default(parameter));
+                result = StlcTypeValue::Arrow(Box::new(parameter_ty), Box::new(result));
+            }
+            if let Some(annotation) = annotation
+                && let Some(expected) = child_type(annotation) {
+                    if expected != result {
+                        diagnostics.push(StlcTypeDiagnostic {
+                            expression: id,
+                            error: StlcTypeError::Mismatch {
+                                expected: expected.clone(),
+                                found: result.clone(),
+                            },
+                        });
+                    }
+                    result = expected;
+                }
+            Some(result)
+        }
+        Some(StlcCase::Declaration(StlcDeclarationCase::Import { .. }))
+        | Some(StlcCase::Declaration(StlcDeclarationCase::Export { .. }))
+        | Some(StlcCase::Declaration(StlcDeclarationCase::Error { .. }))
+        | Some(StlcCase::Expr(StlcExprCase::Error { .. }))
+        | Some(StlcCase::Type(StlcTypeCase::Error { .. }))
+        | Some(StlcCase::Param(_))
+        | None => None,
+    };
+
+    if let (Some(expected), Some(found)) = (mode_expected(&mode), ty.clone())
+        && expected != found
+    {
+        diagnostics.push(StlcTypeDiagnostic {
+            expression: id,
+            error: StlcTypeError::Mismatch {
+                expected: expected.clone(),
+                found: found.clone(),
+            },
+        });
+    }
+
+    // Publish this node's type as a graph fact and, for binders, the Type
+    // edge from the name pass's declaration node (disjoint fact sets:
+    // multi-producer by ownership, plan §6.2 item 2).
+    if let Some(ty) = &ty {
+        graph.set_node(
+            type_scope(&uri, id).node(),
+            ScopeNode::Scope(type_payload(ty)),
+        )?;
+    }
+    match &case {
+        Some(StlcCase::Declaration(StlcDeclarationCase::Value { .. })) => {
+            if ty.is_some() {
+                graph.link(
+                    declaration_scope(&uri, id).node(),
+                    StlcScopeLabel::Type,
+                    type_scope(&uri, id).node(),
+                )?;
+            }
+        }
+        Some(StlcCase::Param(_)) => {
+            if ty.is_some() {
+                graph.link(
+                    declaration_scope(&uri, id).node(),
+                    StlcScopeLabel::Type,
+                    type_scope(&uri, id).node(),
+                )?;
+            }
+        }
+        Some(StlcCase::Expr(StlcExprCase::Let { .. }))
+            if ty.is_some() => {
+                graph.link(
+                    declaration_scope(&uri, id).node(),
+                    StlcScopeLabel::Type,
+                    type_scope(&uri, id).node(),
+                )?;
+            }
+        _ => {}
+    }
+
+    // This node's own diagnostic slots (replace diff; equal stays cold).
+    emit_view::<StlcTypeDiagnostics>()?.replace(&id, diagnostics)?;
+
+    Ok(ty)
+}
+
+fn parameter_default(_parameter: &Node<StlcTree>) -> StlcTypeValue {
+    // Missing annotations default to `Nat` plus a diagnostic (plan §6.2).
+    StlcTypeValue::Nat
+}
+
+fn mode_expected(mode: &StlcTypeMode) -> Option<StlcTypeValue> {
+    match mode {
+        StlcTypeMode::Infer => None,
+        StlcTypeMode::Check(expected) => Some(expected.clone()),
     }
 }
+

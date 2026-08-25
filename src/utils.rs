@@ -247,9 +247,9 @@ impl PartialEq for OwnedRopeSlice {
 impl Eq for OwnedRopeSlice {}
 
 /// A span in a source file, represented by a URI and a range of byte offsets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Span {
-    pub uri: Uri<&'static str>,
+    pub uri: Uri<String>,
     pub range: RangeOrPoint<usize>,
 }
 
@@ -268,17 +268,21 @@ impl Span {
         if start > end {
             return Err(SpanError::IllegalSpan { start, end });
         }
-        let uri =
-            Uri::parse(uri.to_string().leak() as &'static str).map_err(SpanError::InvalidUri)?;
+        // Interning bounds leaked allocations to one per distinct URI string
+        // rather than one per Span construction (plan §6 interim improvement).
+        let uri: Uri<String> = uri
+            .to_string()
+            .parse()
+            .map_err(SpanError::InvalidUri)?;
         Ok(Span {
             uri,
-            range: RangeOrPoint::Range(start, end),
+            range: RangeOrPoint::from_range(start, end),
         })
     }
 
     /// Creates a new `Span` with the given URI and byte offsets, using a
     /// pre-parsed URI.
-    pub fn new_uri(uri: Uri<&'static str>, start: usize, end: usize) -> Result<Self, SpanError> {
+    pub fn new_uri(uri: Uri<String>, start: usize, end: usize) -> Result<Self, SpanError> {
         if start > end {
             return Err(SpanError::IllegalSpan { start, end });
         }
@@ -296,7 +300,7 @@ impl Span {
 
     /// Creates a `Span` that represents a single point (i.e., where start and
     /// end are the same), using a pre-parsed URI.
-    pub fn point_uri(uri: Uri<&'static str>, offset: usize) -> Result<Self, SpanError> {
+    pub fn point_uri(uri: Uri<String>, offset: usize) -> Result<Self, SpanError> {
         Self::new_uri(uri, offset, offset)
     }
 
@@ -324,7 +328,7 @@ impl Span {
             return None;
         }
         Some(Span {
-            uri: self.uri,
+            uri: self.uri.clone(),
             range: self.range.union(&other.range),
         })
     }
@@ -335,7 +339,7 @@ impl Span {
             return None;
         }
         self.range.intersection(&other.range).map(|range| Span {
-            uri: self.uri,
+            uri: self.uri.clone(),
             range,
         })
     }
@@ -343,7 +347,7 @@ impl Span {
     /// Trims the span to fit within the bounds of the given source text.
     pub fn trim(&self, source: &Rope) -> Span {
         Span {
-            uri: self.uri,
+            uri: self.uri.clone(),
             range: self.range.trim_to(source.len_bytes()),
         }
     }
@@ -361,7 +365,7 @@ impl Span {
 
     pub fn map_range(&self, f: impl FnOnce(RangeOrPoint<usize>) -> RangeOrPoint<usize>) -> Self {
         Span {
-            uri: self.uri,
+            uri: self.uri.clone(),
             range: f(self.range),
         }
     }
@@ -403,7 +407,7 @@ pub enum SpanError {
 }
 
 /// A value with an associated span
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Spanned<T> {
     pub span: Span,
     pub value: T,

@@ -1,423 +1,496 @@
-//! Sparse source transactions are relexed from a stable checkpoint and emit only
-//! changed token segments; occurrence identities carry the unchanged suffix.
+//! Bounded lexer replay over persistent lexical and semantic tapes.
+//!
+//! Every source splice preserves the old prefix/suffix root by pointer and
+//! scans only until an exact canonical-state boundary converges.  The replay
+//! window itself constructs the token patch directly; there is no post-hoc
+//! whole-vector projection or diff.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
+    ops::Range,
     sync::Arc,
-    time::{Duration, Instant},
 };
 
-use crate::{
-    framework::{
-        lex::{
-            IncrementalLexStats, LexInterrupt, Lexer, LexerRoot, LexerSnapshotState, LexerState,
-        },
-        source::SourceSplice,
+use fluent_uri::Uri;
+
+use crate::framework::{
+    lex::{
+        CanonicalLexerState, IncrementalLexStats, LexInterrupt, Lexer, LexerRoot,
+        LexicalDocument, LexicalOccurrence, ParseTokenRef, ScannedToken, TapeSplice,
+        TokenLayoutEntry, TokenOccurrenceId, TokenPatch,
+        cursor::RopeCursor,
     },
-    framework::change::{AddressChange, Splice},
+    source::SourceSplice,
+    tape::StableTape,
 };
 
-use super::token::TokenOccurrence;
+#[derive(Default)]
+pub(crate) struct LocalPatch {
+    pub(crate) splices: Vec<TapeSplice>,
+    pub(crate) inserted: BTreeSet<TokenOccurrenceId>,
+    pub(crate) updated: BTreeSet<TokenOccurrenceId>,
+    pub(crate) removed: BTreeSet<TokenOccurrenceId>,
+    pub(crate) replayed: usize,
+    pub(crate) reused: usize,
+}
 
-fn shift_occurrence(occurrence: TokenOccurrence, shift: isize) -> TokenOccurrence {
-    TokenOccurrence {
-        id: occurrence.id,
-        column: occurrence.column,
-        start: occurrence.start.saturating_add_signed(shift),
-        end: occurrence.end.saturating_add_signed(shift),
+impl LocalPatch {
+    fn structure_changed(&self) -> bool {
+        !self.splices.is_empty()
     }
 }
 
-fn shift_state<Root: LexerRoot>(state: &LexerState<Root>, shift: isize) -> LexerState<Root> {
-    let mut shifted = state.clone();
-    shifted.offset = shifted.offset.saturating_add_signed(shift);
-    shifted
+/// Command-local coalescer.  Source normalization keeps unrelated splice
+/// windows disjoint.  Adjacent windows are joined only when their retained
+/// anchors prove adjacency; all identifier sets are canonicalized on freeze.
+pub(crate) struct PatchBuilder {
+    old_structure: crate::framework::lex::TokenStructureRevisionId,
+    splices: Vec<TapeSplice>,
+    inserted: BTreeSet<TokenOccurrenceId>,
+    updated: BTreeSet<TokenOccurrenceId>,
+    removed: BTreeSet<TokenOccurrenceId>,
+}
+
+impl PatchBuilder {
+    pub(crate) fn new(structure: crate::framework::lex::TokenStructureRevisionId) -> Self {
+        Self {
+            old_structure: structure,
+            splices: Vec::new(),
+            inserted: BTreeSet::new(),
+            updated: BTreeSet::new(),
+            removed: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn absorb(&mut self, local: LocalPatch) {
+        for splice in local.splices {
+            if let Some(previous) = self.splices.last_mut()
+                && previous.after == splice.before
+            {
+                let mut removed = Vec::with_capacity(previous.removed.len() + splice.removed.len());
+                removed.extend(previous.removed.iter().copied());
+                removed.extend(splice.removed.iter().copied());
+                let mut inserted = Vec::with_capacity(previous.inserted.len() + splice.inserted.len());
+                inserted.extend(previous.inserted.iter().copied());
+                inserted.extend(splice.inserted.iter().copied());
+                previous.removed = removed.into();
+                previous.inserted = inserted.into();
+                previous.after = splice.after;
+                continue;
+            }
+            self.splices.push(splice);
+        }
+        self.inserted.extend(local.inserted);
+        self.updated.extend(local.updated);
+        self.removed.extend(local.removed);
+    }
+
+    pub(crate) fn freeze(
+        self,
+        structure: crate::framework::lex::TokenStructureRevisionId,
+    ) -> TokenPatch {
+        let mut inserted = self.inserted;
+        let mut updated = self.updated;
+        let mut removed = self.removed;
+        // A retained occurrence can be structurally replaced in-place (same
+        // ID, new terminal).  That is a fact update plus an order splice, not
+        // both insertion and removal.  Newly inserted then removed IDs cancel.
+        let cancelled: Vec<_> = inserted.intersection(&removed).copied().collect();
+        for occurrence in cancelled {
+            inserted.remove(&occurrence);
+            removed.remove(&occurrence);
+        }
+        for occurrence in inserted.iter().chain(removed.iter()) {
+            updated.remove(occurrence);
+        }
+        TokenPatch {
+            old_structure: self.old_structure,
+            new_structure: structure,
+            order_splices: self.splices.into(),
+            inserted: inserted.into_iter().collect::<Vec<_>>().into(),
+            updated: updated.into_iter().collect::<Vec<_>>().into(),
+            removed: removed.into_iter().collect::<Vec<_>>().into(),
+        }
+    }
 }
 
 impl<Root> Lexer<Root>
 where
-    Root: LexerRoot,
+    Root: LexerRoot + Clone,
 {
-    pub(crate) fn lex_uri(
+    pub(crate) fn relex_splice(
         &mut self,
-        state: &mut LexerSnapshotState<Root>,
-        uri: fluent_uri::Uri<&'static str>,
-        snapshot: String,
-        source_splices: &[SourceSplice],
-    ) -> Result<
-        Option<AddressChange<fluent_uri::Uri<&'static str>, crate::framework::parse::TokenData>>,
-        LexInterrupt,
-    > {
-        let total_start = Instant::now();
-        self.relex(
-            state,
-            uri,
-            snapshot,
-            source_splices,
-            total_start,
-            Duration::ZERO,
+        uri: &Uri<String>,
+        document: &mut LexicalDocument<Root>,
+        next_source: Arc<ropey::Rope>,
+        splice: &SourceSplice,
+    ) -> Result<LocalPatch, LexInterrupt> {
+        let old_source = Arc::clone(&document.source);
+        let old_lexical_len = document.lexical.len();
+        let old_semantic_len = document.semantic.len();
+        let (restart_rank, restart_lookup_depth) = document
+            .lexical
+            .lexical_rank_at_byte_detailed(splice.old_range.start as u64);
+        let restart_offset = document.lexical_start(restart_rank);
+        let old_semantic_start = usize::try_from(
+            document.lexical.metric_before(restart_rank).semantic_count,
         )
-    }
+        .expect("semantic rank exceeds usize");
+        let start_state = document.state_before_rank(restart_rank);
+        let old_suffix_source_start = splice.old_range.end;
+        let new_change_end = splice.new_range.end;
+        let net_shift = isize::try_from(next_source.len_bytes())
+            .ok()
+            .and_then(|next| isize::try_from(old_source.len_bytes()).ok().and_then(|old| next.checked_sub(old)))
+            .ok_or_else(|| LexInterrupt::InternalError("source length delta overflows isize".to_string()))?;
 
-    fn relex(
-        &mut self,
-        snapshot_state: &mut LexerSnapshotState<Root>,
-        uri: fluent_uri::Uri<&'static str>,
-        snapshot: String,
-        source_splices: &[SourceSplice],
-        total_start: Instant,
-        fetch_source_elapsed: Duration,
-    ) -> Result<
-        Option<AddressChange<fluent_uri::Uri<&'static str>, crate::framework::parse::TokenData>>,
-        LexInterrupt,
-    > {
-        let root_state = self
-            .state_id_of::<Root>()
-            .ok_or(LexInterrupt::MissingState)?;
-
-        snapshot_state
-            .state_instances
-            .entry(uri)
-            .or_insert_with(|| Arc::new(vec![LexerState::new(root_state)]));
-        snapshot_state.occurrences.entry(uri).or_default();
-
-        let old_source = snapshot_state
-            .sources
-            .get(&uri)
-            .cloned()
-            .unwrap_or_else(|| Arc::from(""));
-        if old_source.as_ref() == snapshot {
-            return Ok(None);
-        }
-
-        let old_visible_start = Instant::now();
-        let old_visible_tokens = self.token_data_for_uri(snapshot_state, uri);
-        let old_visible_elapsed = old_visible_start.elapsed();
-
-        let delta_scan_start = Instant::now();
-        let Some(first_splice) = source_splices.first() else {
-            return Err(LexInterrupt::InternalError(
-                "changed source revision has no source delta".to_string(),
-            ));
+        // Take the interner without cloning its buckets: replay interns only
+        // the states it actually visits, and the original entries remain
+        // present because `take` moves the whole cache out and back.
+        let mut interner = std::mem::take(&mut document.state_interner);
+        let mut provisional = Vec::new();
+        let mut convergence: Option<usize> = None;
+        let mut convergence_checks = 0u64;
+        let input = RopeCursor::new(Arc::clone(&next_source));
+        let final_state = match self.lex_cont(start_state, &input, |scanned, state| {
+            let canonical = interner.intern(state);
+            let width = match u32::try_from(scanned.end.saturating_sub(scanned.start)) {
+                Ok(width) => width,
+                Err(_) => return false,
+            };
+            provisional.push(LexicalOccurrence {
+                id: TokenOccurrenceId(0),
+                byte_len: width,
+                terminal: scanned.terminal,
+                skip: scanned.skip,
+                value: Arc::new(scanned.value),
+                error: scanned.error,
+                state_after: Arc::clone(&canonical),
+            });
+            if state.offset < new_change_end {
+                return true;
+            }
+            convergence_checks = convergence_checks.saturating_add(1);
+            let Some(old_offset) = state.offset.checked_add_signed(-net_shift) else {
+                return true;
+            };
+            if old_offset < old_suffix_source_start {
+                return true;
+            }
+            let candidate_rank = document.lexical.lexical_rank_at_byte(old_offset as u64);
+            if document.lexical_start(candidate_rank) != old_offset {
+                return true;
+            }
+            let old_state = document.state_before_rank(candidate_rank);
+            let old_canonical = CanonicalLexerState::from_state(&old_state);
+            if canonical.as_ref() == &old_canonical {
+                convergence = Some(candidate_rank);
+                return false;
+            }
+            true
+        }) {
+            Ok(final_state) => final_state,
+            Err(error) => {
+                // Restore the (growth-only) cache before propagating.
+                document.state_interner = interner;
+                return Err(error);
+            }
         };
-        let Some(last_splice) = source_splices.last() else {
-            unreachable!("first source splice implies a last splice");
-        };
-        // Source owns the exact ordered old/new coordinate map. Replay starts
-        // before the first changed byte and convergence is considered only
-        // beyond the final changed byte, retaining untouched islands between
-        // distant splices for token re-anchoring below.
-        let restart_point = first_splice.old_range.start;
-        let new_change_end = last_splice.new_range.end;
-        let net_shift = snapshot.len() as isize - old_source.len() as isize;
-        let delta_scan_elapsed = delta_scan_start.elapsed();
 
-        let restart_lookup_start = Instant::now();
-        let restart_token_pos = {
-            let states = &snapshot_state.state_instances[&uri];
-            let occurrences = &snapshot_state.occurrences[&uri];
-            debug_assert_eq!(states.len(), occurrences.len() + 1);
-            // Restart before the first affected token; this is the last state
-            // whose input and scope stack are certainly unchanged.
-            states[1..].partition_point(|state| state.offset < restart_point)
-        };
-        let restart_lookup_elapsed = restart_lookup_start.elapsed();
-
-        let old_suffix_snapshot_start = Instant::now();
-        let (start_state, old_states, old_occurrences) = {
-            let states = snapshot_state
-                .state_instances
-                .get(&uri)
-                .ok_or(LexInterrupt::MissingState)?;
-            let occurrences = snapshot_state
-                .occurrences
-                .get(&uri)
-                .ok_or(LexInterrupt::MissingState)?;
-            debug_assert_eq!(states.len(), occurrences.len() + 1);
-
-            let start_state = states[restart_token_pos].clone();
-            let old_states = states[restart_token_pos + 1..].to_vec();
-            let old_occurrences = occurrences[restart_token_pos..].to_vec();
-            (start_state, old_states, old_occurrences)
-        };
-        let restart_offset = start_state.offset;
-        let old_suffix_snapshot_elapsed = old_suffix_snapshot_start.elapsed();
-
-        let mut new_occurrences = Vec::new();
-        let mut new_states = Vec::new();
-        // The exact source suffix and complete lexer state stack are the
-        // convergence proof. Error tokens are ordinary deterministic outputs
-        // of that state/input pair and may therefore be reused as well.
-        let old_suffix_is_clean = vec![true; old_occurrences.len() + 1];
-
-        let mut convergence: Option<(usize, usize)> = None;
-        let occurrence_start = snapshot_state
-            .next_occurrence
-            .get(&uri)
-            .copied()
-            .unwrap_or(0);
-        let mut next_occurrence = occurrence_start;
-        let mut occurrence_overflow = false;
-        let replay_start = Instant::now();
-        let final_state =
-            self.lex_cont(start_state, &snapshot, |token_id, state, start, end| {
-                if next_occurrence == usize::MAX {
-                    occurrence_overflow = true;
-                    return false;
-                }
-                new_occurrences.push(TokenOccurrence {
-                    id: token_id,
-                    column: next_occurrence,
-                    start,
-                    end,
-                });
-                next_occurrence += 1;
-                new_states.push(state.clone());
-                if state.offset >= new_change_end {
-                    // Offset alignment plus the complete state stack is the exact
-                    // lexical convergence proof; token text is not guessed here.
-                    let old_offset = if net_shift >= 0 {
-                        state.offset.checked_sub(net_shift as usize)
-                    } else {
-                        state.offset.checked_add((-net_shift) as usize)
-                    };
-                    if let Some(old_offset) = old_offset {
-                        let first = old_states.partition_point(|old| old.offset < old_offset);
-                        let end = old_states.partition_point(|old| old.offset <= old_offset);
-                        if let Some(index) = (first..end).rev().find(|&index| {
-                            old_states[index].state_stack == state.state_stack
-                                && old_suffix_is_clean[index + 1]
-                        }) {
-                            convergence = Some((new_occurrences.len(), index + 1));
-                            return false;
-                        }
+        // A zero-token suffix can converge at EOF or immediately after an
+        // empty source replacement.  The exact boundary/state proof is the
+        // same as the callback path.
+        if convergence.is_none() && final_state.offset >= new_change_end {
+            convergence_checks = convergence_checks.saturating_add(1);
+            if let Some(old_offset) = final_state.offset.checked_add_signed(-net_shift)
+                && old_offset >= old_suffix_source_start
+            {
+                let candidate_rank = document.lexical.lexical_rank_at_byte(old_offset as u64);
+                if document.lexical_start(candidate_rank) == old_offset {
+                    let old_state = document.state_before_rank(candidate_rank);
+                    let current = CanonicalLexerState::from_state(&final_state);
+                    if current == CanonicalLexerState::from_state(&old_state) {
+                        convergence = Some(candidate_rank);
                     }
                 }
-                true
-            })?;
-        if occurrence_overflow {
-            return Err(LexInterrupt::InternalError(
-                "token occurrence identity space exhausted".to_string(),
-            ));
-        }
-        if convergence.is_none() && final_state.offset >= new_change_end {
-            let old_offset = if net_shift >= 0 {
-                final_state.offset.checked_sub(net_shift as usize)
-            } else {
-                final_state.offset.checked_add((-net_shift) as usize)
-            };
-            if let Some(old_offset) = old_offset {
-                let first = old_states.partition_point(|old| old.offset < old_offset);
-                let end = old_states.partition_point(|old| old.offset <= old_offset);
-                if let Some(index) = (first..end).rev().find(|&index| {
-                    old_states[index].state_stack == final_state.state_stack
-                        && old_suffix_is_clean[index + 1]
-                }) {
-                    convergence = Some((new_occurrences.len(), index + 1));
-                }
             }
         }
 
-        // No convergence means replay reached EOF. This remains an exact
-        // incremental replay from the edit checkpoint.
-        let replay_elapsed = replay_start.elapsed();
+        let old_suffix_rank = convergence.unwrap_or(old_lexical_len);
+        let old_semantic_end = usize::try_from(
+            document.lexical.metric_before(old_suffix_rank).semantic_count,
+        )
+        .expect("semantic rank exceeds usize");
+        let old_range = restart_rank..old_suffix_rank;
+        let old_window: Vec<_> = document.lexical_range(old_range.clone()).cloned().collect();
+        let old_semantic_window: Vec<_> = document
+            .semantic
+            .iter_range(old_semantic_start..old_semantic_end)
+            .cloned()
+            .collect();
 
-        let (new_prefix_len, old_suffix_start_index) =
-            convergence.unwrap_or((new_occurrences.len(), old_occurrences.len()));
-
-        let snapshot_len = snapshot.len();
-        let new_visible_start = Instant::now();
-        let mut old_window =
-            self.token_data_from_occurrences(&old_occurrences[..old_suffix_start_index], None);
-        let mut new_window =
-            self.token_data_from_occurrences(&new_occurrences[..new_prefix_len], None);
-        old_window.pop();
-        new_window.pop();
-        let new_visible_elapsed = new_visible_start.elapsed();
-        let batch_diff_start = Instant::now();
-        let mut anchors = Vec::new();
-        let mut old_index = 0;
-        let mut new_index = 0;
-        let mut old_gap_start = 0;
-        let mut new_gap_start = 0;
-        for (gap, (old_gap_end, new_gap_end, final_gap)) in source_splices
-            .iter()
-            .map(|splice| (splice.old_range.start, splice.new_range.start, false))
-            .chain(std::iter::once((old_source.len(), snapshot_len, true)))
-            .enumerate()
+        if let Err(error) =
+            Self::reconcile_occurrence_ids(document, &old_window, &mut provisional)
         {
-            while old_index < old_window.len() {
-                let old = &old_window[old_index];
-                let old_end = old.start + old.length;
-                if old.start < old_gap_start {
-                    old_index += 1;
-                    continue;
-                }
-                if old.start > old_gap_end
-                    || (old.start == old_gap_end && (!final_gap || old.length != 0))
-                {
-                    break;
-                }
-                if old_end > old_gap_end {
-                    old_index += 1;
-                    continue;
-                }
-                let expected_start = new_gap_start + old.start - old_gap_start;
-                while new_index < new_window.len() && new_window[new_index].start < expected_start {
-                    new_index += 1;
-                }
-                if let Some(found) = (new_index..new_window.len())
-                    .take_while(|&index| new_window[index].start == expected_start)
-                    .find(|&index| {
-                        new_window[index].length == old.length
-                            && new_window[index].start + new_window[index].length <= new_gap_end
-                            && self.token_data_semantically_equal(old, &new_window[index])
-                    })
-                {
-                    anchors.push((old_index, found));
-                    new_index = found + 1;
-                }
-                old_index += 1;
-            }
-            if let Some(splice) = source_splices.get(gap) {
-                old_gap_start = splice.old_range.end;
-                new_gap_start = splice.new_range.end;
-            }
+            document.state_interner = interner;
+            return Err(error);
+        }
+        let new_semantic_window: Vec<_> = provisional
+            .iter()
+            .filter(|token| token.is_semantic())
+            .map(ParseTokenRef::from)
+            .collect();
+        let new_semantic_len = new_semantic_window.len();
+        let mut local = Self::direct_patch(
+            document,
+            &old_window,
+            &provisional,
+            &old_semantic_window,
+            &new_semantic_window,
+            old_semantic_start,
+            old_semantic_end,
+        );
+
+        let tape_checkpoint = document.tape_ids.checkpoint();
+        let lexical_replacement = StableTape::from_entries(provisional.clone(), &mut document.tape_ids);
+        let (lexical, lexical_index) = document.lexical.splice_with_index(
+            &document.lexical_index,
+            old_range.clone(),
+            &lexical_replacement,
+            &mut document.tape_ids,
+        );
+        let layout_replacement = StableTape::from_entries(
+            provisional.iter().map(TokenLayoutEntry::from).collect::<Vec<_>>(),
+            &mut document.tape_ids,
+        );
+        let (layout, layout_index) = document.layout.splice_with_index(
+            &document.layout_index,
+            old_range.clone(),
+            &layout_replacement,
+            &mut document.tape_ids,
+        );
+        let semantic_replacement =
+            StableTape::from_entries(new_semantic_window.clone(), &mut document.tape_ids);
+        let (semantic, semantic_index) = document.semantic.splice_with_index(
+            &document.semantic_index,
+            old_semantic_start..old_semantic_end,
+            &semantic_replacement,
+            &mut document.tape_ids,
+        );
+        document.lexical = lexical;
+        document.lexical_index = lexical_index;
+        document.semantic = semantic;
+        document.layout = layout;
+        document.layout_index = layout_index;
+        document.semantic_index = semantic_index;
+        document.source = next_source;
+        document.state_interner = interner;
+        document.layout_revision = crate::framework::lex::LayoutRevisionId(
+            document
+                .layout_revision
+                .0
+                .checked_add(1)
+                .expect("layout revision overflow"),
+        );
+        if !local.updated.is_empty() {
+            document.value_revision = crate::framework::lex::TokenValueRevisionId(
+                document
+                    .value_revision
+                    .0
+                    .checked_add(1)
+                    .expect("token value revision overflow"),
+            );
+        }
+        // Structure advances only when the ordered semantic sequence
+        // (terminal / membership / error kind) actually differs — a
+        // same-shape value replacement bumps value+layout revisions but
+        // keeps the parser cold (plan §7 revision domains, §18 row
+        // `Number 1 -> 7`).
+        let structure_unchanged = old_semantic_window.len() == new_semantic_window.len()
+            && old_semantic_window
+                .iter()
+                .zip(new_semantic_window.iter())
+                .all(
+                    |(old_entry, new_entry)| {
+                        old_entry.terminal == new_entry.terminal
+                            && old_entry.error == new_entry.error
+                    },
+                );
+        if !structure_unchanged {
+            document.structure_revision = crate::framework::lex::TokenStructureRevisionId(
+                document
+                    .structure_revision
+                    .0
+                    .checked_add(1)
+                    .expect("structure revision overflow"),
+            );
         }
 
-        let occurrence_by_id = new_occurrences[..new_prefix_len]
-            .iter()
-            .enumerate()
-            .map(|(index, occurrence)| (occurrence.id, index))
-            .collect::<HashMap<_, _>>();
-        for &(old, new) in &anchors {
-            if let Some(&occurrence) = occurrence_by_id.get(&new_window[new].id) {
-                new_occurrences[occurrence].id = old_window[old].id;
-                new_occurrences[occurrence].column = old_window[old].column;
-                new_window[new].id = old_window[old].id;
-                new_window[new].column = old_window[old].column;
-            }
-        }
-
-        let old_visible_len = old_visible_tokens.len();
-        let base = old_visible_tokens[..old_visible_len.saturating_sub(1)]
-            .partition_point(|token| token.start < restart_offset);
-        let new_visible_len = old_visible_len - old_window.len() + new_window.len();
-        let mut splices = Vec::new();
-        let mut old_cursor = 0;
-        let mut new_cursor = 0;
-        for (old, new) in anchors
-            .iter()
-            .copied()
-            .chain(std::iter::once((old_window.len(), new_window.len())))
-        {
-            if old_cursor != old || new_cursor != new {
-                splices.push(Splice {
-                    old_range: base + old_cursor..base + old,
-                    new_range: base + new_cursor..base + new,
-                    removed: Arc::from(old_window[old_cursor..old].to_vec()),
-                    inserted: Arc::from(new_window[new_cursor..new].to_vec()),
-                });
-            }
-            old_cursor = old + usize::from(old < old_window.len());
-            new_cursor = new + usize::from(new < new_window.len());
-        }
-        let prefix_len = splices
-            .first()
-            .map_or(old_visible_len, |splice| splice.old_range.start);
-        let suffix_len = splices.last().map_or(old_visible_len, |splice| {
-            old_visible_len - splice.old_range.end
+        let (dfa_transitions, source_bytes_examined) = self.dfa_scratch.replace((0, 0));
+        let replayed = provisional.len();
+        let reused = old_lexical_len.saturating_sub(old_suffix_rank);
+        let created = document.tape_ids.created_since(tape_checkpoint);
+        crate::framework::workspace::record_lexer_work(&uri.to_string(), |work| {
+            work.checkpoint_lookups += 2;
+            // One B-tree descent for byte->rank plus one cached prefix-metric
+            // read for the byte offset (plan §19: measured, not fabricated).
+            work.checkpoint_lookup_depth += (restart_lookup_depth + 1) as u64;
+            work.restart_bytes += restart_offset as u64;
+            work.restart_occurrences += restart_rank as u64;
+            work.dfa_transitions += dfa_transitions;
+            work.source_bytes_examined += source_bytes_examined;
+            work.lexical_entries_visited += (old_window.len() + replayed) as u64;
+            work.semantic_entries_visited +=
+                (old_semantic_window.len() + new_semantic_len) as u64;
+            work.tokens_replayed += replayed as u64;
+            work.tokens_reused += reused as u64;
+            work.tokens_inserted += local.inserted.len() as u64;
+            work.tokens_removed += local.removed.len() as u64;
+            work.token_fact_writes += (local.inserted.len() + local.updated.len()) as u64;
+            work.convergence_checks += convergence_checks;
+            work.convergence_candidates += convergence_checks;
+            work.eof_replays += u64::from(convergence.is_none());
+            work.transferred_tape_intervals += u64::from(old_suffix_rank < old_lexical_len);
+            work.tape_nodes_created += created;
+            work.tape_nodes_reused += u64::from(old_suffix_rank < old_lexical_len);
         });
-        let changed = !splices.is_empty();
-        let batch_diff_elapsed = batch_diff_start.elapsed();
+        local.replayed = replayed;
+        local.reused = reused;
+        Ok(local)
+    }
 
-        let state_splice_start = Instant::now();
+    fn reconcile_occurrence_ids(
+        document: &mut LexicalDocument<Root>,
+        old: &[LexicalOccurrence<Root>],
+        new: &mut [LexicalOccurrence<Root>],
+    ) -> Result<(), LexInterrupt> {
+        let mut pairs = vec![None; new.len()];
+        let mut prefix = 0usize;
+        while prefix < old.len()
+            && prefix < new.len()
+            && Self::exact_segment_eq(&old[prefix], &new[prefix])
         {
-            let states = snapshot_state
-                .state_instances
-                .get_mut(&uri)
-                .map(Arc::make_mut)
-                .ok_or(LexInterrupt::MissingState)?;
-            let occurrences = snapshot_state
-                .occurrences
-                .get_mut(&uri)
-                .map(Arc::make_mut)
-                .ok_or(LexInterrupt::MissingState)?;
-            states.truncate(restart_token_pos + 1);
-            occurrences.truncate(restart_token_pos);
-            states.extend(new_states.iter().take(new_prefix_len).cloned());
-            states.extend(
-                old_states
-                    .iter()
-                    .skip(old_suffix_start_index)
-                    .map(|state| shift_state(state, net_shift)),
-            );
-            occurrences.extend(new_occurrences.iter().take(new_prefix_len).copied());
-            occurrences.extend(
-                old_occurrences
-                    .iter()
-                    .skip(old_suffix_start_index)
-                    .copied()
-                    .map(|occurrence| shift_occurrence(occurrence, net_shift)),
-            );
-            debug_assert_eq!(states.len(), occurrences.len() + 1);
+            pairs[prefix] = Some(prefix);
+            prefix += 1;
         }
-        let state_splice_elapsed = state_splice_start.elapsed();
-        snapshot_state.sources.insert(uri, Arc::from(snapshot));
-        snapshot_state.next_occurrence.insert(uri, next_occurrence);
-        snapshot_state.incremental_stats.insert(
-            uri,
-            IncrementalLexStats {
-                restart_byte: restart_point,
-                restart_occurrence: restart_token_pos,
-                relexed: new_prefix_len,
-                reused: old_occurrences.len().saturating_sub(old_suffix_start_index),
-                old_tokens: old_visible_len,
-                new_tokens: new_visible_len,
-            },
-        );
-        let total_elapsed = total_start.elapsed();
+        let mut old_end = old.len();
+        let mut new_end = new.len();
+        while old_end > prefix
+            && new_end > prefix
+            && Self::exact_segment_eq(&old[old_end - 1], &new[new_end - 1])
+        {
+            old_end -= 1;
+            new_end -= 1;
+            pairs[new_end] = Some(old_end);
+        }
+        if old_end - prefix == new_end - prefix
+            && old[prefix..old_end]
+                .iter()
+                .zip(&new[prefix..new_end])
+                .all(|(old, new)| old.structural_eq(new))
+        {
+            for (old_index, new_index) in (prefix..old_end).zip(prefix..new_end) {
+                pairs[new_index] = Some(old_index);
+            }
+        }
 
-        log::debug!(
-            "[lex-replay] uri={} total={:?} fetch_source={:?} old_visible={:?} delta_scan={:?} restart_lookup={:?} old_suffix={:?} replay={:?} splice={:?} new_visible={:?} batch_diff={:?} status={} changed={} restart_byte={} restart_token={} change_end={} net_shift={} relexed={} reused={} old_tokens={} new_tokens={} prefix={} suffix={}",
-            uri,
-            total_elapsed,
-            fetch_source_elapsed,
-            old_visible_elapsed,
-            delta_scan_elapsed,
-            restart_lookup_elapsed,
-            old_suffix_snapshot_elapsed,
-            replay_elapsed,
-            state_splice_elapsed,
-            new_visible_elapsed,
-            batch_diff_elapsed,
-            if convergence.is_some() {
-                "converged"
+        for (new_index, token) in new.iter_mut().enumerate() {
+            if let Some(old_index) = pairs[new_index] {
+                token.id = old[old_index].id;
+                continue;
+            }
+            let id = document.next_occurrence;
+            document.next_occurrence = document.next_occurrence.checked_add(1).ok_or_else(|| {
+                LexInterrupt::InternalError("token occurrence identity space exhausted".to_string())
+            })?;
+            token.id = TokenOccurrenceId(id);
+        }
+        Ok(())
+    }
+
+    fn exact_segment_eq(left: &LexicalOccurrence<Root>, right: &LexicalOccurrence<Root>) -> bool {
+        left.exact_payload_eq(right)
+            && CanonicalLexerState::ptr_or_exact_eq(&left.state_after, &right.state_after)
+    }
+
+    fn direct_patch(
+        document: &LexicalDocument<Root>,
+        old_lexical: &[LexicalOccurrence<Root>],
+        new_lexical: &[LexicalOccurrence<Root>],
+        old_semantic: &[ParseTokenRef],
+        new_semantic: &[ParseTokenRef],
+        old_semantic_start: usize,
+        old_semantic_end: usize,
+    ) -> LocalPatch {
+        let mut patch = LocalPatch::default();
+        let mut prefix = 0usize;
+        while prefix < old_semantic.len()
+            && prefix < new_semantic.len()
+            && old_semantic[prefix] == new_semantic[prefix]
+        {
+            prefix += 1;
+        }
+        let mut old_end = old_semantic.len();
+        let mut new_end = new_semantic.len();
+        while old_end > prefix
+            && new_end > prefix
+            && old_semantic[old_end - 1] == new_semantic[new_end - 1]
+        {
+            old_end -= 1;
+            new_end -= 1;
+        }
+        if prefix != old_end || prefix != new_end {
+            let before = if prefix > 0 {
+                Some(old_semantic[prefix - 1].occurrence)
             } else {
-                "eof"
-            },
-            changed,
-            restart_point,
-            restart_token_pos,
-            new_change_end,
-            net_shift,
-            new_prefix_len,
-            old_occurrences.len().saturating_sub(old_suffix_start_index),
-            old_visible_len,
-            new_visible_len,
-            prefix_len,
-            suffix_len,
-        );
-
-        if changed {
-            Ok(Some(AddressChange {
-                address: uri,
-                old_extent: old_visible_len,
-                new_extent: new_visible_len,
-                splices,
-            }))
-        } else {
-            Ok(None)
+                old_semantic_start
+                    .checked_sub(1)
+                    .and_then(|rank| document.semantic.get(rank))
+                    .map(|token| token.occurrence)
+            };
+            let after = if old_end < old_semantic.len() {
+                Some(old_semantic[old_end].occurrence)
+            } else {
+                document
+                    .semantic
+                    .get(old_semantic_end)
+                    .map(|token| token.occurrence)
+            };
+            patch.splices.push(TapeSplice {
+                before,
+                removed: old_semantic[prefix..old_end]
+                    .iter()
+                    .map(|token| token.occurrence)
+                    .collect::<Vec<_>>()
+                    .into(),
+                inserted: new_semantic[prefix..new_end]
+                    .iter()
+                    .map(|token| token.occurrence)
+                    .collect::<Vec<_>>()
+                    .into(),
+                after,
+            });
         }
+
+        let old_semantic_ids: BTreeSet<_> = old_semantic.iter().map(|token| token.occurrence).collect();
+        let new_semantic_ids: BTreeSet<_> = new_semantic.iter().map(|token| token.occurrence).collect();
+        patch.inserted.extend(new_semantic_ids.difference(&old_semantic_ids).copied());
+        patch.removed.extend(old_semantic_ids.difference(&new_semantic_ids).copied());
+
+        let old_by_id: HashMap<_, _> = old_lexical.iter().map(|token| (token.id, token)).collect();
+        for token in new_lexical {
+            if !token.is_semantic() || !old_semantic_ids.contains(&token.id) {
+                continue;
+            }
+            let Some(old) = old_by_id.get(&token.id) else {
+                continue;
+            };
+            if !old.exact_payload_eq(token) {
+                patch.updated.insert(token.id);
+            }
+        }
+        patch
     }
 }
+
+

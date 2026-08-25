@@ -1,13 +1,25 @@
-//! Cached local frontier shape used to reject impossible reuse candidates cheaply.
+//! Anchor-based frontier checkpoints (plan §8.5): a checkpoint is keyed by
+//! its stable token-occurrence anchor so its identity survives prefix edits
+//! and column-index shifts. It is purely a fast-reject filter; the exact
+//! graph correspondence still proves reuse.
 
 use super::ParseColumn;
 use crate::framework::parse::data::gss::{GssArena, GssNodeId};
+use crate::framework::parse::types::TokenOccurrenceId;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FrontierCheckpoint {
+    /// Stable token-occurrence anchor identifying this checkpoint.
+    pub(crate) anchor: Option<TokenOccurrenceId>,
     base: Vec<(usize, usize)>,
     active: Vec<(usize, usize)>,
     error_derived: bool,
+}
+
+impl FrontierCheckpoint {
+    pub(crate) fn anchor(&self) -> Option<TokenOccurrenceId> {
+        self.anchor
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -37,6 +49,7 @@ pub(crate) fn frontier_checkpoint_for_column<'a>(
         let base = frontier_shape(column.base_active_nodes(), gss);
         let active = frontier_shape(column.active_nodes(), gss);
         column.cache_frontier_checkpoint(FrontierCheckpoint {
+            anchor: column.token,
             base,
             active,
             error_derived: column.error_derived,

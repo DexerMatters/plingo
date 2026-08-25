@@ -71,7 +71,6 @@ pub fn derive_non_terminal(item: TokenStream) -> TokenStream {
     }
 }
 
-
 #[proc_macro_derive(PrettyNonTerminal)]
 pub fn derive_pretty_non_terminal(item: TokenStream) -> TokenStream {
     match pretty::expand_pretty_non_terminal_derive(parse_macro_input!(item as ItemEnum)) {

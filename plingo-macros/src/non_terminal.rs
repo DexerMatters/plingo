@@ -13,10 +13,6 @@ pub fn expand_non_terminal_derive(mut item: ItemEnum) -> syn::Result<proc_macro:
     push_missing_derives(&mut item, &["Debug"])?;
     let enum_ident = item.ident.clone();
     let variants = item.variants.clone();
-    let walk_arms = variants
-        .iter()
-        .map(direct_child_walk_arm)
-        .collect::<Vec<_>>();
     strip_non_terminal_attrs(&mut item);
 
     let register_fn = format_ident!("__plingo_register_non_terminal_{}", enum_ident);
@@ -68,16 +64,6 @@ pub fn expand_non_terminal_derive(mut item: ItemEnum) -> syn::Result<proc_macro:
             }
         }
 
-        impl ::plingo::framework::parse::AstWalk for #enum_ident {
-            fn direct_children(
-                &self,
-                visitor: &mut dyn ::core::ops::FnMut(::plingo::framework::parse::AstKey),
-            ) {
-                match self {
-                    #(#walk_arms),*
-                }
-            }
-        }
 
         #[allow(non_snake_case)]
         fn #register_fn(
@@ -96,76 +82,6 @@ pub fn expand_non_terminal_derive(mut item: ItemEnum) -> syn::Result<proc_macro:
         }
     }
     .into())
-}
-
-fn direct_child_walk_arm(variant: &Variant) -> proc_macro2::TokenStream {
-    let variant_ident = &variant.ident;
-    match &variant.fields {
-        Fields::Named(fields) => {
-            let children = fields
-                .named
-                .iter()
-                .filter(|field| contains_ast_box(&field.ty))
-                .map(|field| field.ident.as_ref().expect("named field"))
-                .collect::<Vec<_>>();
-            let bindings = children
-                .iter()
-                .map(|field| format_ident!("__plingo_child_{field}"))
-                .collect::<Vec<_>>();
-            let visits = bindings.iter().map(|binding| {
-                quote! {
-                    ::plingo::framework::parse::AstWalkField::ast_children(#binding, visitor);
-                }
-            });
-            quote! {
-                Self::#variant_ident { #(#children: #bindings,)* .. } => { #(#visits)* }
-            }
-        }
-        Fields::Unnamed(fields) => {
-            let bindings = fields
-                .unnamed
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    contains_ast_box(&field.ty).then(|| format_ident!("__plingo_child_{index}"))
-                })
-                .collect::<Vec<_>>();
-            let patterns = bindings.iter().map(|binding| match binding {
-                Some(binding) => quote! { #binding },
-                None => quote! { _ },
-            });
-            let visits = bindings.iter().flatten().map(|binding| {
-                quote! {
-                    ::plingo::framework::parse::AstWalkField::ast_children(#binding, visitor);
-                }
-            });
-            quote! {
-                Self::#variant_ident(#(#patterns),*) => { #(#visits)* }
-            }
-        }
-        Fields::Unit => quote! { Self::#variant_ident => {} },
-    }
-}
-
-fn contains_ast_box(ty: &Type) -> bool {
-    let Type::Path(path) = ty else {
-        return false;
-    };
-    let Some(segment) = path.path.segments.last() else {
-        return false;
-    };
-    if segment.ident == "AstBox" {
-        return true;
-    }
-    if !matches!(segment.ident.to_string().as_str(), "Option" | "Vec" | "Box") {
-        return false;
-    }
-    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-        return false;
-    };
-    arguments.args.iter().any(
-        |argument| matches!(argument, syn::GenericArgument::Type(inner) if contains_ast_box(inner)),
-    )
 }
 
 fn strip_non_terminal_attrs(item: &mut ItemEnum) {
@@ -1594,7 +1510,7 @@ fn build_variant_field_expr(
             quote! {
                 <#field_ty as ::plingo::framework::parse::__macro_private::TokenField>::from_token_entry(
                     cx,
-                    <::plingo::framework::parse::data::TokenEntryId as ::plingo::framework::parse::__macro_private::BuildField>::from_product(
+                    <::plingo::framework::parse::__macro_private::TokenEntryId as ::plingo::framework::parse::__macro_private::BuildField>::from_product(
                         cx,
                         #child,
                     )?,

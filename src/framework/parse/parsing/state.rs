@@ -2,24 +2,11 @@ use indexmap::IndexSet;
 
 use super::{ParseColumn, ParserSessionState, checkpoint::FrontierCheckpoint};
 use crate::framework::parse::{
-    TokenOccurrenceId,
     data::{gss::GssNodeId, product::ProductId},
+    types::TokenOccurrenceId,
 };
 
 impl ParseColumn {
-    pub(crate) fn new(token: Option<TokenOccurrenceId>, active: IndexSet<GssNodeId>) -> Self {
-        Self {
-            token,
-            base_active: active.clone(),
-            active,
-            accepted: Vec::new(),
-            products: Vec::new(),
-            diagnostics: Vec::new(),
-            error_derived: false,
-            checkpoint_cache: Default::default(),
-        }
-    }
-
     pub(crate) fn active_nodes(&self) -> impl Iterator<Item = GssNodeId> + '_ {
         self.active.iter().copied()
     }
@@ -96,10 +83,6 @@ impl ParserSessionState {
 
     pub fn current_column(&self) -> usize {
         self.columns.len().saturating_sub(1)
-    }
-
-    pub fn column_before_token(&self, token: TokenOccurrenceId) -> Option<usize> {
-        self.token_columns.get(&token).map(|c| c.saturating_sub(1))
     }
 
     pub fn truncate_to_column(&mut self, column: usize) {

@@ -1,28 +1,20 @@
-//! Phase 5 acceptance — the reactive scope graph (plan §7).
-//!
-//! Emission/observation APIs, multi-producer disjoint payloads, path
-//! resolution reading exactly the touched buckets, Requirements map, and
-//! determinism.
+//! Scope graph coverage for plain effects and typed committed snapshots.
 
 use std::sync::Arc;
 
 use plingo::framework::scope::{
-    PathExpr, PathOrder, ResolutionPath, ScopeDomain, ScopeGraph,
-    ScopeGraphEmittedExt, ScopeGraphObservedExt, ScopeGraphSnapshot, ScopeId, ScopeNode,
-    ScopePath, ScopeRequirements, partition_visible,
+    PathExpr, PathOrder, ResolutionPath, ScopeDomain, ScopeGraph, ScopeNode,
+    ScopeRequirements, declare, edge, partition_visible, scope,
+    snapshot_declarations, snapshot_node, snapshot_nodes, snapshot_outgoing, snapshot_scope,
 };
 use plingo::reactive::prelude::*;
-use plingo::reactive_component as component;
-use plingo::reactive_view as view;
 
-/// A toy scope domain: names resolve through `use`-edges.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LabelKind {
     Declare,
     Use,
 }
 
-/// Scope data: a module or a name binding.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Data {
     Module,
@@ -38,63 +30,89 @@ pub enum Request {
 pub struct Domain;
 
 impl ScopeDomain for Domain {
-    type ScopeKey = String;
     type ScopeData = Data;
     type Label = LabelKind;
     type Request = Request;
 }
 
-#[test]
-fn emission_and_observation_round_trip() {
-    let mut engine = Engine::new();
-    engine.install(emitter).unwrap();
-    engine.command(vec![]).unwrap();
-    let snapshot = engine.snapshot();
-    let graph = snapshot.graph_view::<ScopeGraph<Domain>>();
-    let scopes = <ScopeGraphSnapshot<Domain>>::new(&graph);
-
-    // The emitter created 2 scopes, 2 declarations, 1 use-edge.
-    let nodes = graph.nodes();
-    assert_eq!(nodes.len(), 4, "module + lex scope + 2 declarations");
-    let data: Vec<String> = nodes
-        .iter()
-        .filter_map(|id| scopes.scope(ScopeId::new(*id)).map(|d| format!("{d:?}")))
-        .collect();
-    assert!(data.contains(&format!("{:?}", Data::Module)));
+fn install<F>(engine: &mut Engine, function: F) -> Running<()>
+where
+    F: Fn(()) -> Result<()> + Clone + Send + Sync + 'static,
+{
+    let plan = engine.plan(function, ()).expect("plan");
+    engine.run(&plan).expect("run")
 }
 
 #[test]
-fn resolve_walks_buckets_and_accepts() {
+fn emission_and_typed_snapshot_round_trip() {
     let mut engine = Engine::new();
-    engine.install(emitter).unwrap();
-    engine.install(resolver).unwrap();
-    engine.command(vec![]).unwrap();
+    let _running = install(&mut engine, emitter);
     let snapshot = engine.snapshot();
-    let graph = snapshot.graph_view::<ScopeGraph<Domain>>();
-    let scopes = <ScopeGraphSnapshot<Domain>>::new(&graph);
+    let nodes = snapshot_nodes::<Domain>(&snapshot);
 
-    // The module's Declare edge targets the lex scope; declarations live
-    // under the lex scope.
-    let nodes = graph.nodes();
     assert_eq!(nodes.len(), 4, "module + lex scope + 2 declarations");
-    let module = nodes[0];
-    let mut lex_targets = scopes.outgoing(ScopeId::new(module), &LabelKind::Declare);
-    assert_eq!(lex_targets.len(), 1, "module -> lex edge");
-    let lex = lex_targets.pop().unwrap();
-    let decls = scopes.declarations(lex, &LabelKind::Declare);
-    assert_eq!(decls.len(), 2, "two declarations under the lex scope");
-    let data: Vec<_> = decls
+    let data: Vec<String> = nodes
         .iter()
-        .filter_map(|id| scopes.node_data(*id).map(|d| (*d).clone()))
+        .filter_map(|node| snapshot_scope(&snapshot, *node).map(|data| format!("{data:?}")))
         .collect();
-    assert_eq!(
-        data,
-        vec![Data::Bound("a".into()), Data::Bound("b".into())]
-    );
-    // Resolve a use-path from the lex scope: the reachable Scope(Module)
-    // witnesses are the lex scope itself (the module is not reachable
-    // back).
-    let _ = (scopes, lex);
+    assert!(data.contains(&format!("{:?}", Data::Module)));
+    assert!(nodes.iter().any(|node| {
+        matches!(
+            snapshot_node(&snapshot, *node).as_deref(),
+            Some(ScopeNode::Declaration(_))
+        )
+    }));
+}
+
+#[test]
+fn identical_scope_construction_is_shared_across_roots() {
+    let mut engine = Engine::new();
+    let first_plan = engine.plan(emitter, ()).expect("first plan");
+    let first = engine.run(&first_plan).expect("first run");
+    let second_plan = engine.plan(emitter, ()).expect("second plan");
+    let second = engine.run(&second_plan).expect("second run");
+
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot_nodes::<Domain>(&snapshot).len(), 4);
+
+    engine.remove(&first).expect("remove first root");
+    assert_eq!(snapshot_nodes::<Domain>(&engine.snapshot()).len(), 4);
+
+    engine.remove(&second).expect("remove second root");
+    assert!(snapshot_nodes::<Domain>(&engine.snapshot()).is_empty());
+}
+
+#[test]
+fn typed_snapshot_reads_outgoing_and_declaration_buckets() {
+    let mut engine = Engine::new();
+    let _running = install(&mut engine, emitter);
+    let snapshot = engine.snapshot();
+    let nodes = snapshot_nodes::<Domain>(&snapshot);
+    // Node enumeration is canonical, not first-created order; locate the
+    // module scope structurally: the Scope(Module) node whose Declare
+    // bucket owns exactly the document lexical scope.
+    let module = nodes
+        .iter()
+        .copied()
+        .find(|node| {
+            matches!(
+                snapshot.graph_node::<ScopeGraph<Domain>>(node.node()).as_deref(),
+                Some(ScopeNode::Scope(Data::Module))
+            ) && snapshot_outgoing(&snapshot, *node, &LabelKind::Declare).len() == 1
+        })
+        .expect("module scope present");
+    let lex = snapshot_outgoing(&snapshot, module, &LabelKind::Declare)[0];
+    let declarations = snapshot_declarations(&snapshot, lex, &LabelKind::Declare);
+    assert_eq!(declarations.len(), 2);
+    let data: Vec<_> = declarations
+        .iter()
+        .filter_map(|node| snapshot_node(&snapshot, *node))
+        .filter_map(|node| match node.as_ref() {
+            ScopeNode::Declaration(data) => Some(data.clone()),
+            ScopeNode::Scope(_) | ScopeNode::Reference(_) => None,
+        })
+        .collect();
+    assert_eq!(data, vec![Data::Bound("a".into()), Data::Bound("b".into())]);
 }
 
 #[test]
@@ -102,22 +120,14 @@ fn path_expr_algebra_is_unchanged() {
     let p = PathExpr::Label(LabelKind::Declare)
         .star()
         .then(PathExpr::Label(LabelKind::Use));
-    // star is nullable; the then-chain is not.
     assert!(PathExpr::Label(LabelKind::Declare).star().nullable());
     assert!(!p.nullable());
     let d = p.derivative(&LabelKind::Declare);
-    assert_eq!(
-        d.labels(),
-        vec![LabelKind::Declare, LabelKind::Use],
-        "derivative keeps the remaining labels"
-    );
-    // After consuming one Declare, the star remains plus the Use branch.
+    assert_eq!(d.labels(), vec![LabelKind::Declare, LabelKind::Use]);
     let d2 = d.derivative(&LabelKind::Declare);
-    assert!(!d2.nullable(), "the Use branch is not nullable");
+    assert!(!d2.nullable());
     assert_eq!(d2.labels(), vec![LabelKind::Declare, LabelKind::Use]);
-    // Consuming the Use now reaches epsilon.
-    let d3 = d2.derivative(&LabelKind::Use);
-    assert!(d3.nullable(), "after Use the path accepts");
+    assert!(d2.derivative(&LabelKind::Use).nullable());
 }
 
 #[test]
@@ -131,77 +141,51 @@ fn partition_visible_honors_path_order() {
     let visible = make(vec![LabelKind::Use]);
     let shadowed = make(vec![LabelKind::Declare]);
     let set: std::collections::HashSet<_> = [visible.clone(), shadowed.clone()].into();
-    let (vis, dom) = partition_visible(set, &order);
-    assert_eq!(vis, vec![visible]);
-    assert_eq!(dom.len(), 1);
-    assert_eq!(dom[0].0, shadowed);
+    let (visible_paths, dominated) = partition_visible(set, &order);
+    assert_eq!(visible_paths, vec![visible]);
+    assert_eq!(dominated.len(), 1);
+    assert_eq!(dominated[0].0, shadowed);
 }
 
 #[test]
 fn requirements_map_is_observable() {
     let mut engine = Engine::new();
-    engine.install(req_emitter).unwrap();
-    engine.command(vec![]).unwrap();
-    let snapshot = engine.snapshot();
-    let reqs = snapshot.map_view::<ScopeRequirements<Domain>>();
+    let _running = install(&mut engine, req_emitter);
+    let request = engine
+        .snapshot()
+        .observe::<ScopeRequirements<Domain>>("a://doc".to_string());
     assert_eq!(
-        reqs.get(&"a://doc".to_string()).map(|v| v.to_vec()),
+        request.map(|value| (*value).clone()),
         Some(vec![Request::Load("other".into())])
     );
 }
-
-// ---------------------------------------------------------------------------
-// Components
-// ---------------------------------------------------------------------------
-
-/// Emits a tiny scope graph: module → lex scope, two declarations, and a
-/// use edge.
-#[component]
-fn emitter() -> (ScopeGraph<Domain>,) {
-    let graph = Emitted::<ScopeGraph<Domain>>::new()?;
-    let module = graph.new_scope()?;
-    graph.ensure_scope(module, Data::Module)?;
-    let lex = graph.new_scope()?;
-    graph.ensure_scope(lex, Data::Module)?;
-    graph.edge(module, LabelKind::Declare, lex)?;
-    let a = graph.declare(lex, LabelKind::Declare, Data::Bound("a".into()))?;
-    let b = graph.declare(lex, LabelKind::Declare, Data::Bound("b".into()))?;
-    graph.edge(lex, LabelKind::Use, a)?;
-    graph.edge(lex, LabelKind::Use, b)?;
-    Ok((graph,))
+#[test]
+fn resolver_effect_reads_graph_during_a_reactive_run() {
+    let mut engine = Engine::new();
+    let _emitter = install(&mut engine, emitter);
+    let _resolver = install(&mut engine, resolver);
+    assert!(engine.snapshot().inputs::<ScopeGraph<Domain>>().len() >= 4);
+}
+fn emitter(_: ()) -> Result<()> {
+    let module = scope::<Domain>(Data::Module)?;
+    let lex = scope::<Domain>(Data::Module)?;
+    edge(module, LabelKind::Declare, lex)?;
+    let a = declare(lex, LabelKind::Declare, Data::Bound("a".into()))?;
+    let b = declare(lex, LabelKind::Declare, Data::Bound("b".into()))?;
+    edge(lex, LabelKind::Use, a)?;
+    edge(lex, LabelKind::Use, b)?;
+    Ok(())
 }
 
-/// Reads the committed graph back (a resolver pass).
-#[component]
-fn resolver(scopes: Observed<ScopeGraph<Domain>>) -> (ScopeGraph<Domain>,) {
-    let graph = Emitted::<ScopeGraph<Domain>>::new()?;
-    // Observe the topological read set deterministically: resolve a use
-    // path from every scope node and re-emit the data under a label.
-    let nodes = scopes.nodes()?;
-    for node in nodes {
-        let id = ScopeId::new(node);
-        let Some(Data::Module) = scopes.scope(id)?.as_deref() else {
-            continue;
-        };
-        let resolved = scopes.resolve(
-            id,
-            ScopePath::from(PathExpr::label(LabelKind::Declare).star()),
-            |payload| matches!(payload, ScopeNode::Scope(Data::Module)),
-        )?;
-        for path in resolved {
-            let scope = path.target_scope();
-            if let Some(Data::Bound(name)) = scopes.scope(scope)?.as_deref() {
-                graph.ensure_scope(scope, Data::Bound(name.clone()))?;
-            }
-        }
-    }
-    Ok((graph,))
+fn resolver(_: ()) -> Result<()> {
+    let observe = plingo::reactive::kind::observe_view::<ScopeGraph<Domain>>()?;
+    assert!(!observe.nodes()? .is_empty());
+    Ok(())
 }
 
-/// Emits one requirements entry.
-#[component]
-fn req_emitter() -> (ScopeRequirements<Domain>,) {
-    let out = Emitted::<ScopeRequirements<Domain>>::new()?;
-    out.set("a://doc".to_string(), vec![Request::Load("other".into())])?;
-    Ok((out,))
+fn req_emitter(_: ()) -> Result<()> {
+    plingo::reactive::kind::emit_view::<ScopeRequirements<Domain>>()?.insert(
+        "a://doc".to_string(),
+        vec![Request::Load("other".into())],
+    )
 }

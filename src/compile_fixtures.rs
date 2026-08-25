@@ -1,71 +1,116 @@
-//! Compile-time rejection fixtures (verification matrix row 11).
+//! Compile-time rejection fixtures for the transparent reactive API.
 //!
-//! Each doctest is a `compile_fail` gate: the authoring macros must reject
-//! these programs at compile time with a macro error. The module is hidden
-//! from the public API; it exists only so rustdoc collects the gates.
-
-//! `#[component]` rejects duplicate views in one signature, except one
-//! `Observed<V>`/`Previous<V>` pair.
+//! Each doctest is a `compile_fail` gate. The module is hidden from the
+//! public API; it exists only so rustdoc collects the gates.
+//!
+//! `#[view]` takes no arguments; the kind witness is the tuple field.
 //!
 //! ```compile_fail
-//! use plingo::reactive::prelude::*;
-//! use plingo::{reactive_component as component, reactive_view as view};
+//! use plingo::view;
 //!
-//! #[view(box, value = u64)] pub struct A;
-//! #[view(box, value = u64)] pub struct B;
-//!
-//! #[component]
-//! fn bad_duplicate(a: A, b: A) -> () { Ok(()) }
+//! #[view(input = u64, output = u64)]
+//! pub struct BadView;
 //! ```
-
-//! `#[component]` rejects `self` receivers.
+//!
+//! The removed component macro is no longer exported.
 //!
 //! ```compile_fail
-//! use plingo::{reactive_component as component, reactive_view as view};
-//!
-//! #[view(box, value = u64)] pub struct A;
+//! use plingo::component;
 //!
 //! #[component]
-//! fn bad_self(self: u32) -> () { Ok(()) }
+//! fn removed(_: ()) -> plingo::reactive::Result<()> {
+//!     Ok(())
+//! }
 //! ```
-
-//! `#[component]` rejects `Emitted<V>` in argument position.
+//!
+//! A view declares exactly one kind-witness tuple field.
 //!
 //! ```compile_fail
-//! use plingo::reactive::prelude::*;
-//! use plingo::{reactive_component as component, reactive_view as view};
+//! use plingo::view;
 //!
-//! #[view(box, value = u64)] pub struct A;
-//!
-//! #[component]
-//! fn bad_emitted(out: Emitted<A>) -> () { Ok(()) }
+//! #[view]
+//! pub struct NoWitness;
 //! ```
-
-//! `#[component]` rejects non-tuple, non-unit returns.
+//!
+//! Witness kinds must be known (`Map`, `List`, `Tree`, `Graph`, or `Box`).
 //!
 //! ```compile_fail
-//! use plingo::{reactive_component as component, reactive_view as view};
+//! use plingo::view;
 //!
-//! #[view(box, value = u64)] pub struct A;
-//! #[view(box, value = u64)] pub struct B;
-//!
-//! #[component]
-//! fn bad_return(a: A) -> u64 { 1 }
+//! #[view]
+//! pub struct BadWitness(std::collections::HashMap<u64, u64>);
 //! ```
-
+//!
+//! View inputs must satisfy the cache-key bounds.
+//!
+//! ```compile_fail
+//! use plingo::reactive::kind::Map;
+//! use plingo::view;
+//!
+//! #[view]
+//! struct BadInput(Map<std::sync::Mutex<u64>, u64>);
+//! ```
+//!
+//! View outputs must be shared, comparable payloads.
+//!
+//! ```compile_fail
+//! use plingo::reactive::kind::Map;
+//! use plingo::view;
+//!
+//! #[view]
+//! struct BadOutput(Map<u64, std::cell::Cell<u64>>);
+//! ```
+//!
+//! Planned results must be cacheable across the engine boundary.
+//!
+//! ```compile_fail
+//! use plingo::reactive::{Engine, Result};
+//!
+//! fn bad(_: ()) -> Result<std::rc::Rc<u64>> {
+//!     Ok(std::rc::Rc::new(1))
+//! }
+//!
+//! let mut engine = Engine::new();
+//! let _ = engine.plan(bad, ());
+//! ```
+//!
+//! `#[view]` rejects duplicate kind witnesses.
+//!
+//! ```compile_fail
+//! use plingo::reactive::kind::Map;
+//! use plingo::view;
+//!
+//! #[view]
+//! pub struct TwoFields(Map<u64, u64>, Map<u32, u32>);
+//! ```
+//!
+//! `#[view]` accepts only structs.
+//!
+//! ```compile_fail
+//! use plingo::reactive::kind::Map;
+//! use plingo::view;
+//!
+//! #[view]
+//! pub enum BadView {
+//!     Item,
+//! }
+//! ```
+//!
 //! `#[abstract_tree]` rejects non-enum items.
 //!
 //! ```compile_fail
-//! use plingo::reactive_abstract_tree as abstract_tree;
+//! use plingo::abstract_tree;
 //!
 //! #[abstract_tree]
-//! pub struct NotAnEnum { x: u8 }
+//! pub struct NotAnEnum {
+//!     x: u8,
+//! }
 //! ```
-
+//!
 //! `#[abstract_tree]` rejects `#[tree(child)]` on a non-family field.
 //!
 //! ```compile_fail
-//! use plingo::reactive_abstract_tree as abstract_tree;
+//! use plingo::abstract_tree;
 //!
 //! #[abstract_tree]
 //! pub enum Family {
@@ -74,15 +119,6 @@
 //!         bad: String,
 //!     },
 //! }
-//! ```
-
-//! `#[view]` rejects a missing value type.
-//!
-//! ```compile_fail
-//! use plingo::reactive_view as view;
-//!
-//! #[view(box)]
-//! pub struct BadView;
 //! ```
 
 /// The compile-time rejection gates live in this module's documentation.

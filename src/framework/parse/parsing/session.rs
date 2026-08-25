@@ -1,6 +1,9 @@
 use indexmap::IndexSet;
 
-use super::{ParseColumn, ParseError, ParseToken, ReductionKey, ReductionPath, SessionContext};
+use super::{
+    ParseColumn, ParseError, ParseToken, ReductionKey, ReductionPath, SessionContext,
+    product_direct_record,
+};
 use crate::framework::parse::{
     TokenData,
     build::Action,
@@ -40,6 +43,7 @@ impl SessionContext<'_> {
             trees: self.trees,
             products: self.products,
             ast: self.ast,
+            lineage: &mut self.state.lineage,
             boundary,
         }
     }
@@ -138,8 +142,21 @@ impl SessionContext<'_> {
         Ok(product)
     }
 
+    /// Records one product into a column's segment and adopts its direct
+    /// AST record into that segment's live set (plan §9.2). Only the
+    /// product's own record enters the segment — the transitive closure
+    /// is implied by the parent chain, so the cost is O(1) per product.
     fn record_column_product(&mut self, product: ProductId, column: usize) -> bool {
-        self.state.columns[column].push_product(product)
+        let direct_record = product_direct_record(self.products, product);
+        let inserted = self.state.columns[column].push_product(product);
+        if inserted
+            && let Some(record) = direct_record
+            && !self.state.columns[column].records.contains(&record)
+        {
+            self.state.columns[column].records.push(record);
+            self.state.record_became_live(record);
+        }
+        inserted
     }
 
     pub(crate) fn reduce_until_stable(
@@ -204,6 +221,12 @@ impl SessionContext<'_> {
                                     changed = true;
                                 }
                                 if self.state.columns[column].push_accepted(product) {
+                                    if let Some(record) = product_direct_record(self.products, product)
+                                        && !self.state.columns[column].records.contains(&record)
+                                    {
+                                        self.state.columns[column].records.push(record);
+                                        self.state.record_became_live(record);
+                                    }
                                     changed = true;
                                 }
                             }
@@ -326,7 +349,6 @@ impl SessionContext<'_> {
                             token.terminal,
                             token.entry,
                             token.column,
-                            token.fingerprint,
                         );
                         self.state.token_products.insert(token.column, product);
                     }
@@ -489,13 +511,13 @@ impl SessionContext<'_> {
     pub(crate) fn recover_tokens(
         &mut self,
         start: usize,
-        tokens: &[ParseToken],
+        tail: &mut crate::framework::parse::parsing::TokenTail,
     ) -> Result<Option<usize>, ParseError> {
         if !self.error_recovery {
             return Ok(None);
         }
         let column = self.state.current_column();
-        let Some(result) = recovery::find_recovery(self, column, &tokens[start..]) else {
+        let Some(result) = recovery::find_recovery(self, column, tail) else {
             return Ok(None);
         };
 
@@ -505,44 +527,63 @@ impl SessionContext<'_> {
 
         let start_column = self.state.current_column();
         let mut index = start;
+        // Plan §14: synthetic tokens carry a deterministic identity beyond
+        // this command — a per-document recovery-segment serial plus a
+        // within-segment action ordinal. Each repair allocates its identity
+        // against the token occurrence it synthesizes or deletes.
+        let recovery_segment = self.state.begin_recovery_segment();
         for repair in result.repairs {
             let column = self.state.current_column();
             match repair {
                 Repair::Insert(terminal) => {
+                    let synthetic = tail.get(index).map(|token| token.column);
+                    if let Some(anchor_occ) = tail.get(index).map(|token| token.column) {
+                        self.state.record_witness(anchor_occ, recovery_segment);
+                        crate::framework::workspace::record_parser_work(&self.uri.to_string(), |work| {
+                            work.recovery_witness_tokens += 1;
+                        });
+                    }
                     self.reduce_until_stable(
                         column,
                         terminal,
-                        tokens.get(index).map_or(0, |token| token.column),
+                        tail.get(index).map_or(0, |token| token.column),
                     )?;
-                    let unexpected = tokens.get(index).map(|token| Symbol::T(token.terminal));
-                    let location = tokens.get(index).map(|token| token.column);
+                    let unexpected = tail.get(index).map(|token| Symbol::T(token.terminal));
+                    let location = tail.get(index).map(|token| token.column);
+                    let _ = synthetic_anchor(synthetic, column, self);
                     self.shift_synthetic_terminal(column, terminal, unexpected, location)?;
                 }
                 Repair::Delete => {
-                    let Some(token) = tokens.get(index) else {
+                    let Some(token) = tail.get(index) else {
                         return Ok(None);
                     };
+                    self.state.record_witness(token.column, recovery_segment);
+                    crate::framework::workspace::record_parser_work(&self.uri.to_string(), |work| {
+                        work.recovery_witness_tokens += 1;
+                    });
+                    let _ = synthetic_anchor(Some(token.column), column, self);
                     self.delete_parse_token(column, token)?;
                     index += 1;
                 }
                 Repair::Shift => {
-                    let Some(token) = tokens.get(index) else {
+                    let Some(token) = tail.get(index) else {
                         return Ok(None);
                     };
+                    self.state.record_witness(token.column, recovery_segment);
                     self.reduce_until_stable(column, token.terminal, token.column)?;
                     self.shift_parse_token(column, token)?;
                     index += 1;
                 }
                 Repair::ShiftAsError => {
-                    let Some(token) = tokens.get(index) else {
+                    let Some(token) = tail.get(index) else {
                         return Ok(None);
                     };
+                    self.state.record_witness(token.column, recovery_segment);
                     let modified = ParseToken {
                         entry: token.entry,
                         column: token.column,
                         start: token.start,
                         terminal: self.grammar.error_terminal,
-                        fingerprint: token.fingerprint,
                         merge_source_terminal: Some(token.terminal),
                         ..*token
                     };
@@ -557,6 +598,21 @@ impl SessionContext<'_> {
             return Ok(None);
         }
 
+        crate::framework::workspace::record_parser_work(&self.uri.to_string(), |work| {
+            work.recovery_interval_probes += 1;
+        });
         Ok(Some(index))
     }
+}
+
+/// Records a deterministic synthetic-token identity for one recovery
+/// action, anchored at the token occurrence it synthesizes or removes.
+fn synthetic_anchor(
+    occurrence: Option<usize>,
+    fallback_column: usize,
+    ctx: &mut SessionContext<'_>,
+) -> u64 {
+    let anchor = occurrence.unwrap_or(fallback_column);
+    let identity = ctx.state.next_synthetic_identity(anchor);
+    identity
 }

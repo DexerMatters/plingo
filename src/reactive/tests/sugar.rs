@@ -1,134 +1,203 @@
-//! Phase 1 acceptance — the §4 authoring sugar.
-//!
-//! `#[component]` with bare observed args, bare return tuples, `Previous`
-//! args, and sink components; `#[view]` for all five shapes; duplicate-view
-//! rejection is a compile error (trybuild-style fixtures live in
-//! `tests/compile/`).
+//! Uniform view/effect contract coverage.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::reactive::kind::Map;
 use crate::reactive::prelude::*;
-use crate::reactive::tests::{Current, Diff, Half, Output, Source, Sum};
-use crate::reactive_component as component;
+use crate::view;
 
-// ---------------------------------------------------------------------------
-// #[view] — every shape, including a generic view
-// ---------------------------------------------------------------------------
+#[view]
+struct Source(Map<u64, i64>);
 
-#[crate::reactive_view(box, value = i32)]
-pub struct Config;
+#[view]
+struct Doubled(Map<u64, i64>);
 
-#[crate::reactive_view(map, key = u32, value = String)]
-pub struct StringMap;
+#[view]
+struct Conditional(Map<u64, i64>);
 
-#[crate::reactive_view(tree, value = u64)]
-pub struct NumTree;
+#[view]
+struct Delta(Map<u64, i64>);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GraphNode(pub u64);
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GraphEdge(pub u64);
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct GraphLabel(pub String);
+#[view]
+struct Singleton(Map<(), i64>);
 
-#[crate::reactive_view(graph, value = GraphNode, edge = GraphEdge, label = GraphLabel)]
-pub struct GraphView;
+#[view]
+struct DomainCount(Map<(), i64>);
 
-#[crate::reactive_view(map, key = String, value = u32)]
-pub struct GenericMap {
-    pub _marker: std::marker::PhantomData<u32>,
+fn double(input: u64) -> Result<i64> {
+    let value = observe_view::<Source>()?.get(&input)?
+        .map(|value| *value)
+        .unwrap_or_default();
+    emit_view::<Doubled>()?.insert(input, value * 2)?;
+    Ok(value * 2)
 }
 
-// ---------------------------------------------------------------------------
-// Sugar components
-// ---------------------------------------------------------------------------
-
-/// Bare observed arg, bare tuple return — the §4.1 check shape.
-#[component]
-pub fn sugar_doubler(source: Source) -> (Output,) {
-    let out = Emitted::<Output>::new()?;
-    let value = source.get()?;
-    out.set(value.map(|v| *v).unwrap_or(0) * 2)?;
-    Ok((out,))
+fn conditional(input: u64) -> Result<i64> {
+    let Some(value) = observe_view::<Source>()?.get(&input)? else {
+        return Ok(0);
+    };
+    emit_view::<Conditional>()?.insert(input, *value)?;
+    Ok(*value)
 }
 
-/// Previous arg + bare return.
-#[component]
-pub fn sugar_delta(current: Current, prev: Previous<Current>) -> (Diff,) {
-    let out = Emitted::<Diff>::new()?;
-    let current = current.get()?.map(|v| *v).unwrap_or(0);
-    let previous = prev.get()?.map(|v| *v).unwrap_or(0);
-    out.set(current - previous)?;
-    Ok((out,))
+fn previous(input: u64) -> Result<i64> {
+    let prior = observe_view::<Source>()?.get_previous(&input)?
+        .map(|value| *value)
+        .unwrap_or_default();
+    emit_view::<Delta>()?.insert(input, prior)?;
+    Ok(prior)
 }
 
-/// A sink component: observes and emits nothing.
-#[component]
-pub fn sugar_sink(source: Source) -> () {
-    let value = source.get()?;
-    let _ = value;
-    Ok(())
+fn singleton_count(_: ()) -> Result<i64> {
+    let count = observe_view::<Singleton>()?.keys()?.len() as i64;
+    emit_view::<DomainCount>()?.insert((), count)?;
+    Ok(count)
 }
-
-/// Multi-emit return.
-#[component]
-pub fn sugar_multi(source: Source) -> (Sum, Half) {
-    let sum = Emitted::<Sum>::new()?;
-    let half = Emitted::<Half>::new()?;
-    let value = source.get()?.map(|v| *v).unwrap_or(0);
-    sum.set(value * 3)?;
-    half.set(value / 2)?;
-    Ok((sum, half))
-}
-
-// ---------------------------------------------------------------------------
-// Runs
-// ---------------------------------------------------------------------------
 
 #[test]
-fn sugar_components_run_identically_to_explicit_handles() {
+fn owned_outputs_and_deterministic_domains() {
     let mut engine = Engine::new();
-    engine.external::<Source>().unwrap();
-    engine.install(sugar_doubler).unwrap();
-    engine.install(sugar_multi).unwrap();
+    let planned = engine.plan(double, 7).expect("plan");
+    let running = engine.run(&planned).expect("run");
+    assert_eq!(*running.output(), 0);
 
+    engine
+        .command(|| {
+            emit_view::<Source>()?.insert(7, 3)?;
+            emit_view::<Source>()?.insert(2, 8)?;
+            Ok(())
+        })
+        .expect("source command");
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.observe::<Doubled>(7).as_deref(), Some(&6));
+    assert_eq!(snapshot.inputs::<Source>(), vec![7, 2]);
+    assert_eq!(*running.output(), 6);
+}
+
+#[test]
+fn singleton_absence_and_presence_are_distinct() {
+    let mut engine = Engine::new();
+    let planned = engine.plan(singleton_count, ()).expect("plan");
+    let running = engine.run(&planned).expect("run");
+    assert_eq!(*running.output(), 0);
+    assert!(engine.snapshot().inputs::<Singleton>().is_empty());
+
+    engine
+        .command(|| {
+            emit_view::<Singleton>()?.insert((), 9)?;
+            Ok(())
+        })
+        .expect("singleton command");
+    assert_eq!(*running.output(), 1);
+    assert_eq!(engine.snapshot().inputs::<Singleton>(), vec![()]);
+}
+
+#[test]
+fn current_previous_and_omitted_writes_use_one_contract() {
+    let mut engine = Engine::new();
+    let previous_plan = engine.plan(previous, 4).expect("previous plan");
+    let previous_running = engine.run(&previous_plan).expect("previous run");
+    let conditional_plan = engine.plan(conditional, 4).expect("conditional plan");
+    let conditional_running = engine.run(&conditional_plan).expect("conditional run");
+
+    engine
+        .command(|| {
+            emit_view::<Source>()?.insert(4, 6)?;
+            Ok(())
+        })
+        .expect("first source command");
+    assert_eq!(*conditional_running.output(), 6);
+    assert_eq!(*previous_running.output(), 0);
+
+    engine
+        .command(|| {
+            emit_view::<Source>()?.insert(9, 1)?;
+            Ok(())
+        })
+        .expect("next epoch");
+    assert_eq!(*previous_running.output(), 6);
+
+    engine
+        .command(|| {
+            emit_view::<Source>()?.remove(4)?;
+            Ok(())
+        })
+        .expect("retraction command");
+    assert!(engine.snapshot().observe::<Conditional>(4).is_none());
+    assert_eq!(*previous_running.output(), 6);
+}
+
+#[test]
+fn command_panic_rolls_back_and_subscriptions_read_snapshots() {
+    let mut engine = Engine::new();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen_subscription = Arc::clone(&seen);
+    engine
+        .subscribe::<Source>(move |snapshot, count| {
+            assert_eq!(count, 1);
+            assert_eq!(snapshot.observe::<Source>(3).as_deref(), Some(&5));
+            seen_subscription.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect("subscription");
+
+    let panic_result = engine.command(|| -> Result<()> {
+        emit_view::<Source>()?.insert(3, 4)?;
+        panic!("rollback");
+    });
+    assert!(matches!(panic_result, Err(Error::Panic(_))));
+    assert!(engine.snapshot().observe::<Source>(3).is_none());
+
+    engine
+        .command(|| {
+            emit_view::<Source>()?.insert(3, 5)?;
+            Ok(())
+        })
+        .expect("source command");
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn an_empty_domain_observation_wakes_when_a_writer_appears() {
+    let mut engine = Engine::new();
+    let planned = engine.plan(singleton_count, ()).expect("plan");
+    let running = engine.run(&planned).expect("run");
+    engine
+        .command(|| {
+            emit_view::<Singleton>()?.insert((), 1)?;
+            Ok(())
+        })
+        .expect("late writer");
+    assert_eq!(*running.output(), 1);
+}
+
+#[test]
+fn equal_writes_are_cold_and_do_not_run_subscribers() {
+    let runs = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = {
+        let runs = std::sync::Arc::clone(&runs);
+        move |input: u64| -> Result<i64> {
+            runs.fetch_add(1, Ordering::SeqCst);
+            double(input)
+        }
+    };
+    let mut engine = Engine::new();
+    let planned = engine.plan(counted, 2).expect("plan");
+    let _running = engine.run(&planned).expect("run");
+    engine
+        .command(|| {
+            emit_view::<Source>()?.insert(2, 3)?;
+            Ok(())
+        })
+        .expect("first write");
+    let before = runs.load(Ordering::SeqCst);
     let report = engine
-        .command(vec![ExternalOp::box_set::<Source>(21)])
-        .unwrap();
-    let snapshot = engine.snapshot();
-    assert_eq!(snapshot.box_view::<Output>().get().map(|v| *v), Some(42));
-    assert_eq!(snapshot.box_view::<Sum>().get().map(|v| *v), Some(63));
-    assert_eq!(snapshot.box_view::<Half>().get().map(|v| *v), Some(10));
-    // No epoch work on an equal re-command.
-    let report2 = engine
-        .command(vec![ExternalOp::box_set::<Source>(21)])
-        .unwrap();
-    assert_eq!(report2.runs, 0);
-    let _ = report;
-}
-
-#[test]
-fn sugar_sink_observes_without_emitting() {
-    let mut engine = Engine::new();
-    engine.external::<Source>().unwrap();
-    engine.install(sugar_sink).unwrap();
-    engine
-        .command(vec![ExternalOp::box_set::<Source>(1)])
-        .unwrap();
-    let snapshot = engine.snapshot();
-    // The sink wrote nothing; the external source is the only fact.
-    assert_eq!(snapshot.box_view::<Source>().get().map(|v| *v), Some(1));
-}
-
-#[test]
-fn sugar_previous_reads_committed_state() {
-    let mut engine = Engine::new();
-    engine.external::<Current>().unwrap();
-    engine.install(sugar_delta).unwrap();
-    engine
-        .command(vec![ExternalOp::box_set::<Current>(10)])
-        .unwrap();
-    engine
-        .command(vec![ExternalOp::box_set::<Current>(13)])
-        .unwrap();
-    let snapshot = engine.snapshot();
-    assert_eq!(snapshot.box_view::<Diff>().get().map(|v| *v), Some(3));
+        .command(|| {
+            emit_view::<Source>()?.insert(2, 3)?;
+            Ok(())
+        })
+        .expect("equal write");
+    assert_eq!(report.rounds, 0);
+    assert_eq!(report.changed::<Source>(), 0);
+    assert_eq!(runs.load(Ordering::SeqCst), before);
 }

@@ -95,7 +95,7 @@ impl<'snapshot, 'formatter> AstRenderer<'snapshot, 'formatter> {
         label: &str,
         render_fields: impl FnOnce(&mut Self) -> fmt::Result,
     ) -> fmt::Result {
-        self.line(label, self.active_span)?;
+        self.line(label, self.active_span.clone())?;
         self.depth += 1;
         let result = render_fields(self);
         self.depth -= 1;
@@ -154,24 +154,23 @@ impl<'snapshot, 'formatter> AstRenderer<'snapshot, 'formatter> {
                     "{}",
                     cformat!(
                         "<green>{}</>",
-                        T::pretty_terminal(token.terminal, &self.snapshot.source_text(token.span))
+                        T::pretty_terminal(token.terminal, &self.snapshot.source_text(token.span.clone()))
                     )
                 )
             }
             None => {
                 self.indent()?;
-                writeln!(self.formatter, "<missing token#{}>", token.id)
+                writeln!(self.formatter, "<missing token>")
             }
         }
     }
 
-    fn missing_node<T>(&mut self, node: AstBox<T>, error: AstLookupError) -> fmt::Result {
+    fn missing_node<T>(&mut self, _node: AstBox<T>, error: AstLookupError) -> fmt::Result {
         self.indent()?;
         writeln!(
             self.formatter,
-            "<missing {} node#{}: {error}>",
+            "<missing {} node: {error}>",
             std::any::type_name::<T>(),
-            node.id
         )
     }
 
@@ -184,7 +183,7 @@ impl<'snapshot, 'formatter> AstRenderer<'snapshot, 'formatter> {
                 cformat!(
                     "<bold,blue>{label}</> <dim>@{}</> <cyan>{:?}</>",
                     span,
-                    self.snapshot.source_text(span)
+                    self.snapshot.source_text(span.clone())
                 )
             ),
             None => writeln!(self.formatter, "{}", cformat!("<bold,blue>{label}</>")),

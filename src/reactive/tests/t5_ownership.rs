@@ -1,62 +1,50 @@
-//! T5 — Ownership merge: two producers committing disjoint fact sets
-//! commute and both commit; an overlapping write is a deterministic
-//! validation error that aborts the epoch; equal re-emission is a no-op
-//! (matrix 8).
+//! T5 — concrete facts have one writer.
 
+use crate::reactive::kind::Map;
 use crate::reactive::prelude::*;
-use crate::reactive::tests::{Shared, Tick, run_scenario, run_scenario_engine};
+use crate::view;
 
-#[test]
-fn disjoint_producer_facts_both_commit() {
-    let outcome = run_scenario(1, &[vec![ExternalOp::box_set::<Tick>(true)]]);
-    assert_eq!(outcome.errors, Vec::<String>::new());
-    assert!(
-        outcome.dump.contains("shared=[1->Some(\"a1\"),2->Some(\"b2\"),3->Some(\"a3\")]")
-            || outcome
-                .dump
-                .contains("shared=[1->Some(\"a1\"),3->Some(\"a3\"),2->Some(\"b2\")]"),
-        "{}",
-        outcome.dump
-    );
+#[view]
+struct T5Fact(Map<u64, i64>);
+
+fn first(_: ()) -> Result<i64> {
+    emit_view::<T5Fact>()?.insert(1, 10)?;
+    Ok(10)
+}
+
+fn second(_: ()) -> Result<i64> {
+    emit_view::<T5Fact>()?.insert(1, 20)?;
+    Ok(20)
+}
+
+fn disjoint(_: ()) -> Result<i64> {
+    emit_view::<T5Fact>()?.insert(2, 30)?;
+    Ok(30)
 }
 
 #[test]
-fn overlapping_producer_write_is_a_deterministic_error() {
-    let outcome = run_scenario_engine(1, &[vec![ExternalOp::box_set::<Tick>(true)]], true);
-    assert_eq!(outcome.errors.len(), 1);
-    assert!(
-        outcome.errors[0].contains("ownership violation"),
-        "{}",
-        outcome.errors[0]
-    );
-    assert!(outcome.dump.contains("shared=[]"), "{}", outcome.dump);
+fn overlapping_root_writes_fail_without_partial_commit() {
+    let mut engine = Engine::new();
+    let first_plan = engine.plan(first, ()).expect("first plan");
+    let second_plan = engine.plan(second, ()).expect("second plan");
+    let first = engine.run(&first_plan).expect("first run");
+    let error = match engine.run(&second_plan) {
+        Ok(_) => panic!("overlap must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, Error::ConflictingWrites { .. }));
+    assert_eq!(engine.snapshot().observe::<T5Fact>(1).as_deref(), Some(&10));
+    assert_eq!(*first.output(), 10);
+    assert!(engine.run(&second_plan).is_err());
 }
 
 #[test]
-fn equal_re_emission_publishes_nothing() {
-    // Every toggle re-runs the producers; re-emitting the same values
-    // publishes nothing and enqueues nothing downstream (T4/T5).
-    let outcome = run_scenario(1, &[
-        vec![ExternalOp::box_set::<Tick>(true)],
-        vec![ExternalOp::box_set::<Tick>(false)],
-        vec![ExternalOp::box_set::<Tick>(true)],
-    ]);
-    // The shared map's facts appear in the changed sequence exactly once:
-    // their first command's creation. Re-emissions are equal and silent.
-    let shared_changes = outcome
-        .changes
-        .iter()
-        .flatten()
-        .filter(|change| change.contains("tests::Shared"))
-        .count();
-    // Three entry creations plus the Keys registry change, all in the
-    // first command; re-emissions are equal and silent.
-    assert_eq!(shared_changes, 4, "three entries + the keys registry: {:?}", outcome.changes);
-    let tick_changes = outcome
-        .changes
-        .iter()
-        .flatten()
-        .filter(|change| change.contains("tests::Tick"))
-        .count();
-    assert_eq!(tick_changes, 3, "every toggle still changes Tick: {:?}", outcome.changes);
+fn disjoint_writes_remain_valid() {
+    let mut engine = Engine::new();
+    let first_plan = engine.plan(first, ()).expect("first plan");
+    let _first = engine.run(&first_plan).expect("first run");
+    let disjoint_plan = engine.plan(disjoint, ()).expect("disjoint plan");
+    let disjoint = engine.run(&disjoint_plan).expect("disjoint run");
+    assert_eq!(*disjoint.output(), 30);
+    assert_eq!(engine.snapshot().observe::<T5Fact>(2).as_deref(), Some(&30));
 }

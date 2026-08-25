@@ -3,10 +3,9 @@ use std::{any::Any, marker::PhantomData, sync::Arc};
 use fluent_uri::Uri;
 
 use super::product::ProductId;
-use crate::framework::parse::AstKey;
 
-pub type AstId = usize;
-pub type TokenEntryId = usize;
+pub(crate) type AstId = usize;
+pub(crate) type TokenEntryId = usize;
 
 /// A source extent expressed in stable token-occurrence coordinates.
 ///
@@ -55,10 +54,9 @@ impl AnchoredSpan {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct AstBox<T> {
-    pub id: AstId,
-    pub uri: Uri<&'static str>,
+    id: AstId,
+    document: u64,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -69,27 +67,64 @@ impl<T> Clone for AstBox<T> {
     }
 }
 
+impl<T> PartialEq for AstBox<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.document == other.document
+    }
+}
+
+impl<T> Eq for AstBox<T> {}
+
+impl<T> std::hash::Hash for AstBox<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.document.hash(state);
+    }
+}
+
+impl<T> std::fmt::Debug for AstBox<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AstBox")
+    }
+}
+
+pub(crate) fn document_key(uri: &Uri<String>) -> u64 {
+    // Must agree with the lexer's per-document fact domain (FNV-1a over the
+    // URI string). Divided hashers here would make TokenFacts lookups miss.
+    crate::framework::lex::lexed::document_id(uri.to_string().as_str()).0
+}
+
 impl<T> AstBox<T> {
-    pub fn new(id: AstId, uri: Uri<&'static str>) -> Self {
+    pub(crate) const fn new(id: AstId, document: u64) -> Self {
         Self {
             id,
-            uri,
+            document,
             _marker: PhantomData,
         }
     }
 
-    /// Erases the AST value type while retaining this artifact's stable key.
-    pub fn key(self) -> AstKey {
-        AstKey {
-            uri: self.uri,
-            id: self.id,
-        }
+    pub(crate) fn from_uri(id: AstId, uri: &Uri<String>) -> Self {
+        Self::new(id, document_key(uri))
+    }
+
+    pub(crate) const fn raw_id(self) -> AstId {
+        self.id
+    }
+
+    /// Stable parser-record identity, independent of current source offsets.
+    pub fn identity(self) -> u64 {
+        self.id as u64
+    }
+
+    pub(crate) const fn document_id(self) -> u64 {
+        self.document
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct AstToken<T> {
-    pub id: TokenEntryId,
+    id: TokenEntryId,
+    occurrence: usize,
+    document: u64,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -100,12 +135,50 @@ impl<T> Clone for AstToken<T> {
     }
 }
 
+impl<T> PartialEq for AstToken<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.occurrence == other.occurrence
+            && self.document == other.document
+    }
+}
+
+impl<T> Eq for AstToken<T> {}
+
+impl<T> std::hash::Hash for AstToken<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.occurrence.hash(state);
+        self.document.hash(state);
+    }
+}
+
+impl<T> std::fmt::Debug for AstToken<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AstToken")
+    }
+}
+
 impl<T> AstToken<T> {
-    pub fn new(id: TokenEntryId) -> Self {
+    pub(crate) const fn new(id: TokenEntryId, occurrence: usize, document: u64) -> Self {
         Self {
             id,
+            occurrence,
+            document,
             _marker: PhantomData,
         }
+    }
+
+    pub(crate) const fn raw_id(self) -> TokenEntryId {
+        self.id
+    }
+
+    pub(crate) const fn occurrence(self) -> usize {
+        self.occurrence
+    }
+
+    pub(crate) const fn document_id(self) -> u64 {
+        self.document
     }
 }
 
@@ -113,21 +186,31 @@ impl<T> AstToken<T> {
 struct AstRecord {
     value: Arc<dyn Any + Send + Sync>,
     owner: Option<ProductId>,
+    parent: Option<AstId>,
     extent: AnchoredSpan,
 }
 
 #[derive(Clone)]
 pub struct AstArena {
     records: Vec<AstRecord>,
-    uri: Uri<&'static str>,
+    uri: Uri<String>,
 }
 
 impl AstArena {
-    pub fn new(uri: Uri<&'static str>) -> Self {
+    pub fn new(uri: Uri<String>) -> Self {
         Self {
             records: Vec::new(),
             uri,
         }
+    }
+
+    pub(crate) fn document_id(&self) -> u64 {
+        document_key(&self.uri)
+    }
+
+    /// Number of live AST records (work instrumentation).
+    pub(crate) fn len(&self) -> usize {
+        self.records.len()
     }
 
     /// Allocates an AST value together with the source extent determined by
@@ -140,21 +223,30 @@ impl AstArena {
         self.records.push(AstRecord {
             value: Arc::new(value),
             owner: None,
+            parent: None,
             extent,
         });
-        AstBox::new(id, self.uri)
+        AstBox::from_uri(id, &self.uri)
     }
 
     pub fn get<T: 'static>(&self, node: AstBox<T>) -> Option<&T> {
-        self.records.get(node.id)?.value.downcast_ref()
+        self.records.get(node.raw_id())?.value.downcast_ref()
     }
 
-    pub fn expect<T: 'static>(&self, id: AstId) -> Option<AstBox<T>> {
+    /// Resolves one stable arena record by raw record identity. This is the
+    /// parser-to-tree publication seam; callers still need a typed AST value
+    /// before exposing it publicly.
+    #[doc(hidden)]
+    pub fn get_id<T: 'static>(&self, id: AstId) -> Option<&T> {
+        self.records.get(id)?.value.downcast_ref()
+    }
+
+    pub(crate) fn expect<T: 'static>(&self, id: AstId) -> Option<AstBox<T>> {
         self.records.get(id)?.value.downcast_ref::<T>()?;
-        Some(AstBox::new(id, self.uri))
+        Some(AstBox::from_uri(id, &self.uri))
     }
 
-    pub fn cloned<T>(&self, id: AstId) -> Option<T>
+    pub(crate) fn cloned<T>(&self, id: AstId) -> Option<T>
     where
         T: Clone + 'static,
     {
@@ -165,8 +257,14 @@ impl AstArena {
         self.records.get(id).map(|record| Arc::clone(&record.value))
     }
 
-    pub fn extent_of(&self, id: AstId) -> Option<AnchoredSpan> {
+    pub(crate) fn extent_of_id(&self, id: AstId) -> Option<AnchoredSpan> {
         self.records.get(id).map(|record| record.extent)
+    }
+
+    /// Returns the anchored extent of an opaque AST reference.
+    #[doc(hidden)]
+    pub fn extent<T>(&self, node: AstBox<T>) -> Option<AnchoredSpan> {
+        self.extent_of_id(node.raw_id())
     }
 
     pub(crate) fn type_of(&self, id: AstId) -> Option<std::any::TypeId> {
@@ -175,13 +273,24 @@ impl AstArena {
             .map(|record| record.value.as_ref().type_id())
     }
 
-    pub fn bind_product(&mut self, id: AstId, product: ProductId) {
+    pub(crate) fn bind_product(&mut self, id: AstId, product: ProductId) {
         if let Some(record) = self.records.get_mut(id) {
             record.owner = Some(product);
         }
     }
 
-    pub fn product_of(&self, id: AstId) -> Option<ProductId> {
+    pub(crate) fn set_parent(&mut self, id: AstId, parent: Option<AstId>) {
+        if let Some(record) = self.records.get_mut(id) {
+            record.parent = parent;
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn parent_of(&self, id: AstId) -> Option<AstId> {
+        self.records.get(id).and_then(|record| record.parent)
+    }
+
+    pub(crate) fn product_of(&self, id: AstId) -> Option<ProductId> {
         self.records.get(id).and_then(|record| record.owner)
     }
 }

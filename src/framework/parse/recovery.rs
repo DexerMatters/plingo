@@ -136,10 +136,13 @@ struct RecoverySearchCache {
 pub(crate) fn find_recovery(
     ctx: &SessionContext<'_>,
     column: usize,
-    tokens: &[ParseToken],
+    tail: &mut crate::framework::parse::parsing::TokenTail,
 ) -> Option<RecoveryResult> {
+    crate::framework::workspace::record_parser_work(&ctx.uri.to_string(), |work| {
+        work.recovery_searches += 1;
+    });
     let stacks = active_stack_paths(ctx, column);
-    if stacks.is_empty() || tokens.is_empty() {
+    if stacks.is_empty() || tail.get(0).is_none() {
         return None;
     }
 
@@ -175,7 +178,7 @@ pub(crate) fn find_recovery(
             continue;
         }
 
-        let lookahead = token_at(ctx.grammar, tokens, item.config.input);
+        let lookahead = tail.terminal(item.config.input);
         let closed = close_stacks(
             ctx.grammar,
             ctx.actions,
@@ -186,14 +189,7 @@ pub(crate) fn find_recovery(
         );
         // Reductions do not consume source input; explore recovery actions from
         // every stack that is reachable under the current lookahead first.
-        if is_viable_completion(
-            ctx,
-            tokens,
-            item.config.input,
-            &closed,
-            &item.config,
-            &mut cache,
-        ) {
+        if is_viable_completion(ctx, tail, item.config.input, &closed, &item.config, &mut cache) {
             let repairs = item.config.repairs.clone();
             if solution_cost.is_none() {
                 solution_cost = Some(item.cost);
@@ -210,7 +206,7 @@ pub(crate) fn find_recovery(
         for closed_stack in closed.iter() {
             push_shift_neighbours(
                 ctx,
-                tokens,
+                tail,
                 &item.config,
                 &closed_stack.stack,
                 item.cost,
@@ -220,7 +216,7 @@ pub(crate) fn find_recovery(
             );
             push_shift_as_error_neighbours(
                 ctx,
-                tokens,
+                tail,
                 &item.config,
                 &closed_stack.stack,
                 item.cost,
@@ -240,7 +236,7 @@ pub(crate) fn find_recovery(
             );
             push_delete_neighbour(
                 ctx,
-                tokens,
+                tail,
                 &item.config,
                 &closed_stack.stack,
                 item.cost,
@@ -307,7 +303,7 @@ fn repair_rank(repair: &Repair) -> (u8, u32) {
 
 fn is_viable_completion(
     ctx: &SessionContext<'_>,
-    tokens: &[ParseToken],
+    tail: &mut crate::framework::parse::parsing::TokenTail,
     input: usize,
     closed: &Arc<[ClosedStack]>,
     config: &SearchConfig,
@@ -318,7 +314,7 @@ fn is_viable_completion(
     }
     for stack in closed.iter() {
         if stack.accepted
-            || can_shift_suffix(ctx, tokens, input, &stack.stack, MIN_REAL_SHIFTS, cache)
+            || can_shift_suffix(ctx, tail, input, &stack.stack, MIN_REAL_SHIFTS, cache)
         {
             return true;
         }
@@ -328,7 +324,7 @@ fn is_viable_completion(
 
 fn can_shift_suffix(
     ctx: &SessionContext<'_>,
-    tokens: &[ParseToken],
+    tail: &mut crate::framework::parse::parsing::TokenTail,
     input: usize,
     stack: &[usize],
     remaining_shifts: usize,
@@ -348,7 +344,7 @@ fn can_shift_suffix(
         return true;
     }
 
-    let lookahead = token_at(ctx.grammar, tokens, input);
+    let lookahead = tail.terminal(input);
     let result = close_stacks(ctx.grammar, ctx.actions, ctx.gotos, stack, lookahead, cache)
         .iter()
         .any(|closed| {
@@ -372,7 +368,7 @@ fn can_shift_suffix(
                 };
                 if can_shift_suffix(
                     ctx,
-                    tokens,
+                    tail,
                     input.saturating_add(1),
                     &next_stack,
                     next_remaining,
@@ -390,7 +386,7 @@ fn can_shift_suffix(
 
 fn push_shift_neighbours(
     ctx: &SessionContext<'_>,
-    tokens: &[ParseToken],
+    tail: &mut crate::framework::parse::parsing::TokenTail,
     config: &SearchConfig,
     stack: &[usize],
     cost: usize,
@@ -398,7 +394,7 @@ fn push_shift_neighbours(
     best_seen: &mut HashMap<SearchKey, SearchRecord>,
     enqueue_order: &mut usize,
 ) {
-    let terminal = token_at(ctx.grammar, tokens, config.input);
+    let terminal = tail.terminal(config.input);
     let Some(&state) = stack.last() else {
         return;
     };
@@ -417,7 +413,7 @@ fn push_shift_neighbours(
 
 fn push_shift_as_error_neighbours(
     ctx: &SessionContext<'_>,
-    tokens: &[ParseToken],
+    tail: &mut crate::framework::parse::parsing::TokenTail,
     config: &SearchConfig,
     stack: &[usize],
     cost: usize,
@@ -425,7 +421,7 @@ fn push_shift_as_error_neighbours(
     best_seen: &mut HashMap<SearchKey, SearchRecord>,
     enqueue_order: &mut usize,
 ) {
-    if token_at(ctx.grammar, tokens, config.input) == ctx.grammar.eof {
+    if tail.terminal(config.input) == ctx.grammar.eof {
         return;
     }
     let Some(&state) = stack.last() else {
@@ -479,7 +475,7 @@ fn push_insert_neighbours(
 
 fn push_delete_neighbour(
     ctx: &SessionContext<'_>,
-    tokens: &[ParseToken],
+    tail: &mut crate::framework::parse::parsing::TokenTail,
     config: &SearchConfig,
     stack: &[usize],
     cost: usize,
@@ -487,7 +483,7 @@ fn push_delete_neighbour(
     best_seen: &mut HashMap<SearchKey, SearchRecord>,
     enqueue_order: &mut usize,
 ) {
-    if token_at(ctx.grammar, tokens, config.input) == ctx.grammar.eof {
+    if tail.terminal(config.input) == ctx.grammar.eof {
         return;
     }
 
@@ -726,8 +722,3 @@ fn pushed(stack: &[usize], state: usize) -> Vec<usize> {
     next
 }
 
-fn token_at(grammar: &Grammar, tokens: &[ParseToken], input: usize) -> TerminalId {
-    tokens
-        .get(input)
-        .map_or(grammar.eof, |token| token.terminal)
-}

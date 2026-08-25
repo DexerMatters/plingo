@@ -5,7 +5,6 @@ use crate::framework::parse::{
         ast::{AnchoredSpan, AstBox, AstId, TokenEntryId},
         green::GreenId,
     },
-    identity::TokenFingerprint,
 };
 
 pub type ProductId = usize;
@@ -50,12 +49,11 @@ impl Product {
         Self::new(green, ProductData::Error { children })
     }
 
-    pub fn token(green: GreenId, entry: TokenEntryId, fingerprint: TokenFingerprint) -> Self {
+    pub fn token(green: GreenId, entry: TokenEntryId) -> Self {
         Self::new(
             green,
             ProductData::Token {
                 entry,
-                fingerprint,
                 ast: None,
                 ty: TypeId::of::<()>(),
             },
@@ -65,15 +63,13 @@ impl Product {
     pub fn typed_token<T: 'static>(
         green: GreenId,
         entry: TokenEntryId,
-        fingerprint: TokenFingerprint,
         ast: AstBox<T>,
     ) -> Self {
         Self::new(
             green,
             ProductData::Token {
                 entry,
-                fingerprint,
-                ast: Some(ast.id),
+                ast: Some(ast.raw_id()),
                 ty: TypeId::of::<T>(),
             },
         )
@@ -83,7 +79,7 @@ impl Product {
         Self::new(
             green,
             ProductData::Node {
-                ast: ast.id,
+                ast: ast.raw_id(),
                 ty: TypeId::of::<T>(),
                 children,
             },
@@ -98,7 +94,6 @@ pub enum ProductData {
     },
     Token {
         entry: TokenEntryId,
-        fingerprint: TokenFingerprint,
         ast: Option<AstId>,
         ty: TypeId,
     },

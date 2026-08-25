@@ -2,8 +2,8 @@
 //!
 //! [`ScopeGraph<D>`] is a reactive Graph view whose nodes carry
 //! [`ScopeNode<D>`] payloads (scopes, declarations, references) and whose
-//! edges are labelled by `D::Label`. [`ScopeId<D>`] is a newtype over
-//! [`NodeId`]; allocation is `fresh_node_id()`.
+//! edges are labelled by `D::Label`. [`Scope<D>`] is an opaque typed identity
+//! allocated by the reactive dispatcher.
 //!
 //! The API range (§7.2): emitters create scopes/declarations/references
 //! and labelled edges; observers read nodes, declaration buckets,
@@ -16,60 +16,66 @@
 //! topology.
 //!
 //! `PathExpr`/`ScopePath`/`PathOrder`/`ResolutionPath`/`partition_visible`
-//! move here engine-free from `component::scope::query`; the
-//! `scope_path!`/`lregex!` macros re-root to this module.
+//! remain engine-free in this module; `scope_path!`/`lregex!` macros re-root
+//! to the public framework path.
 
 use std::fmt;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::reactive::api::{GraphObservedExt, GraphPreviousExt};
-use crate::reactive::prelude::*;
-use crate::reactive_view as view;
-
-// ---------------------------------------------------------------------------
+use crate::reactive::kind::{Graph, Map};
+use crate::reactive::view::Node;
+use crate::reactive::{Result, Snapshot};
+use reactive_macros::view;
 // Domain
 // ---------------------------------------------------------------------------
 
 /// Types owned by one independent scope-graph domain. The engine-free
 /// contract: no graph-kernel bounds, just data.
 pub trait ScopeDomain: Clone + Eq + Hash + Debug + Send + Sync + 'static {
-    type ScopeKey: Clone + Eq + Hash + Debug + Send + Sync + 'static;
     type ScopeData: Clone + Eq + Hash + Debug + Send + Sync + 'static;
     type Label: Clone + Eq + Hash + Debug + Send + Sync + 'static;
     type Request: Clone + Eq + Hash + Debug + Send + Sync + 'static;
 }
 
-/// A stable identity for one semantic scope: a newtype over the reactive
-/// [`NodeId`].
-#[derive(PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ScopeId<D: ScopeDomain>(NodeId, PhantomData<fn() -> D>);
+#[derive(PartialEq, Eq, Hash)]
+pub struct Scope<D: ScopeDomain>(Node<ScopeGraph<D>>);
 
-impl<D: ScopeDomain> Copy for ScopeId<D> {}
+impl<D: ScopeDomain> Copy for Scope<D> {}
 
-impl<D: ScopeDomain> Clone for ScopeId<D> {
+impl<D: ScopeDomain> Clone for Scope<D> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<D: ScopeDomain> ScopeId<D> {
-    /// Wraps a reactive node identity.
-    pub const fn new(node: NodeId) -> Self {
-        Self(node, PhantomData)
-    }
-
-    /// The underlying reactive node identity.
-    pub const fn node(self) -> NodeId {
-        self.0
+impl<D: ScopeDomain> fmt::Debug for Scope<D> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Scope")
     }
 }
 
-impl<D: ScopeDomain> fmt::Debug for ScopeId<D> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("ScopeId").field(&self.0).finish()
+impl<D: ScopeDomain> Scope<D> {
+    #[doc(hidden)]
+    pub fn from_node(node: Node<ScopeGraph<D>>) -> Self {
+        Self(node)
+    }
+}
+
+impl<D: ScopeDomain> Scope<D> {
+    /// Derives a stable anchored scope identity from any hashable seed.
+    ///
+    /// The identity mixes the graph domain so equal seeds in different
+    /// domains never collide; the hash is fixed-seed and therefore stable
+    /// across warm/cold builds and worker counts (T3).
+    #[doc(hidden)]
+    pub fn anchored(seed: &impl std::hash::Hash) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::any::TypeId::of::<ScopeGraph<D>>().hash(&mut hasher);
+        seed.hash(&mut hasher);
+        Self(Node::from_raw(hasher.finish()))
     }
 }
 
@@ -85,19 +91,257 @@ pub enum ScopeNode<D: ScopeDomain> {
     Reference(D::ScopeData),
 }
 
-/// The scope graph of one domain: nodes = scopes/declarations/references,
-/// edges labelled by `D::Label`. Multi-producer by construction (§7.3):
-/// distinct passes write disjoint payloads into one graph.
-#[view(graph, value = ScopeNode<D>, edge = (), label = D::Label)]
-pub struct ScopeGraph<D: ScopeDomain>(PhantomData<D>);
+/// Cross-document source requirements of one domain.
+#[view]
+pub struct ScopeRequirements<D: ScopeDomain>(Map<String, Vec<D::Request>>);
 
-/// Cross-document source requirements of one domain (plan §7.3): a Map so
-/// the workspace can decide what to load without depending on topology.
-#[view(map, key = String, value = Vec<D::Request>)]
-pub struct ScopeRequirements<D: ScopeDomain>(PhantomData<D>);
+/// The scope graph of one domain: nodes = scopes, declarations, references,
+/// and labelled edge buckets (one fact per node payload, one per bucket).
+#[view]
+pub struct ScopeGraph<D: ScopeDomain>(Graph<ScopeNode<D>, D::Label>);
+
+impl<D: ScopeDomain> Scope<D> {
+    /// The underlying graph identity.
+    #[doc(hidden)]
+    pub fn node(self) -> Node<ScopeGraph<D>> {
+        self.0
+    }
+}
 
 // ---------------------------------------------------------------------------
-// Path data (ported engine-free from `component::scope::query`)
+
+/// Allocates and publishes one scope node.
+pub fn scope<D: ScopeDomain>(data: D::ScopeData) -> Result<Scope<D>> {
+    let graph = crate::reactive::kind::emit_view::<ScopeGraph<D>>()?;
+    let node = graph.mint(ScopeNode::Scope(data))?;
+    Ok(Scope::from_node(node))
+}
+
+/// Publishes or replaces the payload of an existing scope.
+pub fn ensure_scope<D: ScopeDomain>(id: Scope<D>, data: D::ScopeData) -> Result<()> {
+    let graph = crate::reactive::kind::emit_view::<ScopeGraph<D>>()?;
+    graph.set_node(id.node(), ScopeNode::Scope(data))
+}
+
+/// Publishes a declaration node and its labelled edge from `owner`.
+pub fn declare<D: ScopeDomain>(
+    owner: Scope<D>,
+    name: D::Label,
+    data: D::ScopeData,
+) -> Result<Scope<D>> {
+    let graph = crate::reactive::kind::emit_view::<ScopeGraph<D>>()?;
+    let declaration = Scope::from_node(graph.mint(ScopeNode::Declaration(data))?);
+    graph.link(owner.node(), name, declaration.node())?;
+    Ok(declaration)
+}
+
+/// Publishes a reference node, its name edge, and its target edge.
+pub fn reference<D: ScopeDomain>(
+    owner: Scope<D>,
+    name: D::Label,
+    data: D::ScopeData,
+    target: Scope<D>,
+) -> Result<()> {
+    let graph = crate::reactive::kind::emit_view::<ScopeGraph<D>>()?;
+    let reference = Scope::from_node(graph.mint(ScopeNode::Reference(data))?);
+    graph.link(owner.node(), name.clone(), reference.node())?;
+    graph.link(reference.node(), name, target.node())
+}
+
+/// Publishes one labelled graph edge.
+pub fn edge<D: ScopeDomain>(source: Scope<D>, label: D::Label, target: Scope<D>) -> Result<()> {
+    let graph = crate::reactive::kind::emit_view::<ScopeGraph<D>>()?;
+    graph.link(source.node(), label, target.node())
+}
+
+/// Retracts one scope node. Buckets referencing it keep their owners.
+pub fn remove_scope<D: ScopeDomain>(id: Scope<D>) -> Result<()> {
+    let graph = crate::reactive::kind::emit_view::<ScopeGraph<D>>()?;
+    graph.remove_node(id.node())
+}
+
+/// Reads one scope payload.
+pub fn observe_scope<D: ScopeDomain>(id: Scope<D>) -> Result<Option<Arc<D::ScopeData>>> {
+    let observe = crate::reactive::kind::observe_view::<ScopeGraph<D>>()?;
+    Ok(match observe.payload(id.node())?.as_deref() {
+        Some(ScopeNode::Scope(data)) => Some(Arc::new(data.clone())),
+        _ => None,
+    })
+}
+
+/// Reads one node payload, including declarations and references.
+pub fn observe_node<D: ScopeDomain>(id: Scope<D>) -> Result<Option<Arc<ScopeNode<D>>>> {
+    let observe = crate::reactive::kind::observe_view::<ScopeGraph<D>>()?;
+    observe.payload(id.node())
+}
+
+/// Reads all targets in one labelled edge bucket — exactly one fact read,
+/// replacing the legacy full-domain scan (plan §5.3).
+pub fn outgoing<D: ScopeDomain>(source: Scope<D>, label: &D::Label) -> Result<Vec<Scope<D>>> {
+    let observe = crate::reactive::kind::observe_view::<ScopeGraph<D>>()?;
+    Ok(observe
+        .outgoing(source.node(), label)?
+        .into_iter()
+        .map(Scope::from_node)
+        .collect())
+}
+
+/// Reads declaration nodes reachable under one name.
+pub fn declarations<D: ScopeDomain>(source: Scope<D>, label: &D::Label) -> Result<Vec<Scope<D>>> {
+    let mut result: Vec<Scope<D>> = Vec::new();
+    for target in outgoing(source, label)? {
+        if matches!(
+            observe_node(target)?.as_deref(),
+            Some(ScopeNode::Declaration(_))
+        ) {
+            result.push(target);
+        }
+    }
+    Ok(result)
+}
+
+/// Reads declaration payloads reachable under one name.
+pub fn resolve_name<D: ScopeDomain>(
+    source: Scope<D>,
+    label: &D::Label,
+) -> Result<Vec<Arc<D::ScopeData>>> {
+    let mut result: Vec<Arc<D::ScopeData>> = Vec::new();
+    for target in declarations(source, label)? {
+        if let Some(ScopeNode::Declaration(data)) = observe_node(target)?.as_deref() {
+            result.push(Arc::new(data.clone()));
+        }
+    }
+    Ok(result)
+}
+
+/// Resolves a regular path over the exact node and edge facts it touches.
+pub fn resolve<D: ScopeDomain, F>(
+    start: Scope<D>,
+    path: ScopePath<D::Label>,
+    accepts: F,
+) -> Result<std::collections::HashSet<ResolutionPath<D>>>
+where
+    F: Fn(&ScopeNode<D>) -> bool,
+{
+    #[derive(Clone)]
+    struct Search<D: ScopeDomain> {
+        scope: Scope<D>,
+        expression: PathExpr<D::Label>,
+        scopes: Vec<Scope<D>>,
+        labels: Vec<D::Label>,
+        states: std::collections::HashSet<(Scope<D>, PathExpr<D::Label>)>,
+    }
+
+    let expression: PathExpr<D::Label> = path.into_path();
+    let mut states = std::collections::HashSet::new();
+    states.insert((start, expression.clone()));
+    let mut pending = vec![Search {
+        scope: start,
+        expression,
+        scopes: vec![start],
+        labels: Vec::new(),
+        states,
+    }];
+    let mut answers = std::collections::HashSet::new();
+
+    while let Some(search) = pending.pop() {
+        if search.expression.nullable()
+            && let Some(node) = observe_node(search.scope)?
+            && accepts(&node)
+            && let ScopeNode::Scope(data) = &*node
+        {
+            answers.insert(ResolutionPath {
+                scopes: search.scopes.clone().into(),
+                labels: search.labels.clone().into(),
+                data: data.clone(),
+            });
+        }
+        for label in search.expression.labels() {
+            let residual = search.expression.derivative(&label);
+            if residual == PathExpr::Empty {
+                continue;
+            }
+            for target in outgoing(search.scope, &label)? {
+                let state = (target, residual.clone());
+                if search.states.contains(&state) {
+                    continue;
+                }
+                let mut next = search.clone();
+                next.scope = target;
+                next.expression = residual.clone();
+                next.scopes.push(target);
+                next.labels.push(label.clone());
+                next.states.insert(state);
+                pending.push(next);
+            }
+        }
+    }
+    Ok(answers)
+}
+
+/// Returns the committed scope identities in registration order.
+pub fn snapshot_nodes<D: ScopeDomain>(snapshot: &Snapshot) -> Vec<Scope<D>> {
+    snapshot
+        .inputs::<ScopeGraph<D>>()
+        .into_iter()
+        .filter_map(|input| match input {
+            crate::reactive::kind::GraphKey::Node(id) => Some(Scope::from_node(id)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Reads one committed scope-graph node.
+pub fn snapshot_node<D: ScopeDomain>(
+    snapshot: &Snapshot,
+    node: Scope<D>,
+) -> Option<Arc<ScopeNode<D>>> {
+    snapshot.graph_node::<ScopeGraph<D>>(node.node())
+}
+
+/// Reads one committed scope payload.
+pub fn snapshot_scope<D: ScopeDomain>(
+    snapshot: &Snapshot,
+    node: Scope<D>,
+) -> Option<Arc<D::ScopeData>> {
+    snapshot_node::<D>(snapshot, node).and_then(|payload| match payload.as_ref() {
+        ScopeNode::Scope(data) => Some(Arc::new(data.clone())),
+        ScopeNode::Declaration(_) | ScopeNode::Reference(_) => None,
+    })
+}
+
+/// Reads the committed targets of one labelled edge bucket.
+pub fn snapshot_outgoing<D: ScopeDomain>(
+    snapshot: &Snapshot,
+    source: Scope<D>,
+    label: &D::Label,
+) -> Vec<Scope<D>> {
+    snapshot
+        .outgoing::<ScopeGraph<D>>(source.node(), label)
+        .into_iter()
+        .map(Scope::from_node)
+        .collect()
+}
+
+/// Reads committed declaration nodes in one labelled edge bucket.
+pub fn snapshot_declarations<D: ScopeDomain>(
+    snapshot: &Snapshot,
+    source: Scope<D>,
+    label: &D::Label,
+) -> Vec<Scope<D>> {
+    snapshot_outgoing::<D>(snapshot, source, label)
+        .into_iter()
+        .filter(|node| {
+            matches!(
+                snapshot_node::<D>(snapshot, *node).as_deref(),
+                Some(ScopeNode::Declaration(_))
+            )
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Path data (ported engine-free from the former scope implementation)
 // ---------------------------------------------------------------------------
 
 /// A regular path language used by scope-graph resolution.
@@ -325,7 +569,7 @@ where
 /// One dependency-tracked resolution witness.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ResolutionPath<D: ScopeDomain> {
-    pub scopes: Arc<[ScopeId<D>]>,
+    pub scopes: Arc<[Scope<D>]>,
     pub labels: Arc<[D::Label]>,
     pub data: D::ScopeData,
 }
@@ -339,8 +583,7 @@ impl<D: ScopeDomain> ResolutionPath<D> {
         self.data
     }
 
-    /// The target scope of this witness (the last scope on the path).
-    pub fn target_scope(&self) -> ScopeId<D> {
+    pub fn target_scope(&self) -> Scope<D> {
         self.scopes[self.scopes.len() - 1]
     }
 }
@@ -357,7 +600,7 @@ impl<D: ScopeDomain> fmt::Debug for ResolutionPath<D> {
 }
 
 /// Partitions resolved paths into visible vs shadowed witnesses under a
-/// [`PathOrder`] (ported unchanged from `component::scope::query`).
+/// [`PathOrder`].
 pub fn partition_visible<D: ScopeDomain>(
     paths: std::collections::HashSet<ResolutionPath<D>>,
     order: &PathOrder<D::Label>,
@@ -393,376 +636,4 @@ pub fn partition_visible<D: ScopeDomain>(
         })
         .collect();
     (visible, shadowed)
-}
-
-// ---------------------------------------------------------------------------
-// Emission surface (§7.2)
-// ---------------------------------------------------------------------------
-
-/// Emitted-handle surface for a scope graph.
-pub trait ScopeGraphEmittedExt<D: ScopeDomain> {
-    /// Allocates a fresh scope node (deterministic `fresh_node_id`).
-    fn new_scope(&self) -> Result<ScopeId<D>>;
-    /// Ensures a scope node exists with `data` (upsert).
-    fn ensure_scope(&self, id: ScopeId<D>, data: D::ScopeData) -> Result<()>;
-    /// Declares `name` in `scope`: a `Declaration` node with a `name` edge
-    /// from the scope. Returns the declaration's id.
-    fn declare(
-        &self,
-        scope: ScopeId<D>,
-        name: D::Label,
-        decl: D::ScopeData,
-    ) -> Result<ScopeId<D>>;
-    /// Adds a reference: a `Reference` node under `name`, linked to the
-    /// target scope by an `edge`.
-    fn reference(
-        &self,
-        from: ScopeId<D>,
-        name: D::Label,
-        reference: D::ScopeData,
-        target: ScopeId<D>,
-    ) -> Result<()>;
-    /// Inserts one labelled edge between two scope nodes.
-    fn edge(&self, source: ScopeId<D>, label: D::Label, target: ScopeId<D>) -> Result<()>;
-    /// Removes a scope node.
-    fn remove_scope(&self, id: ScopeId<D>) -> Result<()>;
-}
-
-impl<D: ScopeDomain> ScopeGraphEmittedExt<D> for EmittedHandle<ScopeGraph<D>> {
-    fn new_scope(&self) -> Result<ScopeId<D>> {
-        // The caller ensures the node; `new_scope` only mints the identity
-        // (the scope payload arrives via `ensure_scope`).
-        Ok(ScopeId::<D>::new(self.fresh_node_id()?))
-    }
-
-    fn ensure_scope(&self, id: ScopeId<D>, data: D::ScopeData) -> Result<()> {
-        self.upsert_node(id.node(), ScopeNode::Scope(data))
-    }
-
-    fn declare(
-        &self,
-        scope: ScopeId<D>,
-        name: D::Label,
-        decl: D::ScopeData,
-    ) -> Result<ScopeId<D>> {
-        let id = ScopeId::<D>::new(self.fresh_node_id()?);
-        self.insert_node(id.node(), ScopeNode::Declaration(decl))?;
-        self.insert_edge(scope.node(), name, id.node(), ())?;
-        Ok(id)
-    }
-
-    fn reference(
-        &self,
-        from: ScopeId<D>,
-        name: D::Label,
-        reference: D::ScopeData,
-        target: ScopeId<D>,
-    ) -> Result<()> {
-        let id = ScopeId::<D>::new(self.fresh_node_id()?);
-        self.insert_node(id.node(), ScopeNode::Reference(reference))?;
-        self.insert_edge(from.node(), name.clone(), id.node(), ())?;
-        self.insert_edge(id.node(), name, target.node(), ())?;
-        Ok(())
-    }
-
-    fn edge(&self, source: ScopeId<D>, label: D::Label, target: ScopeId<D>) -> Result<()> {
-        self.insert_edge(source.node(), label, target.node(), ())
-    }
-
-    fn remove_scope(&self, id: ScopeId<D>) -> Result<()> {
-        self.remove_node(id.node())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Observed surface (§7.2)
-// ---------------------------------------------------------------------------
-
-/// Observed-handle surface for a scope graph.
-pub trait ScopeGraphObservedExt<D: ScopeDomain> {
-    /// Reads one scope node's data.
-    fn scope(&self, id: ScopeId<D>) -> Result<Option<Arc<D::ScopeData>>>;
-    /// The declaration ids reachable from `scope` under `name`.
-    fn declarations(&self, scope: ScopeId<D>, name: &D::Label) -> Result<Vec<ScopeId<D>>>;
-    /// Resolves `name` from `scope`: the declarations reachable directly
-    /// by one `name` edge.
-    fn resolve_name(
-        &self,
-        scope: ScopeId<D>,
-        name: &D::Label,
-    ) -> Result<Vec<Arc<D::ScopeData>>>;
-    /// The targets of one labelled edge bucket.
-    fn outgoing(&self, scope: ScopeId<D>, label: &D::Label) -> Result<Vec<ScopeId<D>>>;
-    /// Resolves `path` from `start`, reading exactly the touched
-    /// `bucket(s, l)` and `node(i)` facts.
-    fn resolve(
-        &self,
-        start: ScopeId<D>,
-        path: ScopePath<D::Label>,
-        accepts: impl Fn(&ScopeNode<D>) -> bool,
-    ) -> Result<std::collections::HashSet<ResolutionPath<D>>>;
-    /// One child visitor per edge in `(scope, label)`.
-    fn visit_outgoing_each<F, E>(&self, scope: ScopeId<D>, label: D::Label, f: F) -> Result<()>
-    where
-        F: FnMut(ScopeId<D>, Option<Arc<D::ScopeData>>) -> Result<(), E> + Send + Sync + 'static,
-        E: Into<Error> + 'static;
-}
-
-impl<D: ScopeDomain> ScopeGraphObservedExt<D> for ObservedHandle<ScopeGraph<D>> {
-    fn scope(&self, id: ScopeId<D>) -> Result<Option<Arc<D::ScopeData>>> {
-        let payload = self.node(id.node())?;
-        match payload {
-            Some(payload) => match &*payload {
-                ScopeNode::Scope(data) => Ok(Some(Arc::new(data.clone()))),
-                _ => Ok(None),
-            },
-            None => Ok(None),
-        }
-    }
-
-    fn declarations(&self, scope: ScopeId<D>, name: &D::Label) -> Result<Vec<ScopeId<D>>> {
-        let mut out = Vec::new();
-        for edge in GraphObservedExt::outgoing(self, scope.node(), name)? {
-            let payload = self.node(edge.target)?;
-            if matches!(
-                payload.as_deref(),
-                Some(ScopeNode::Declaration(_))
-            ) {
-                out.push(ScopeId::new(edge.target));
-            }
-        }
-        Ok(out)
-    }
-
-    fn resolve_name(
-        &self,
-        scope: ScopeId<D>,
-        name: &D::Label,
-    ) -> Result<Vec<Arc<D::ScopeData>>> {
-        let mut out = Vec::new();
-        for edge in GraphObservedExt::outgoing(self, scope.node(), name)? {
-            let payload = self.node(edge.target)?;
-            if let Some(ScopeNode::Declaration(data)) = payload.as_deref() {
-                out.push(Arc::new(data.clone()));
-            }
-        }
-        Ok(out)
-    }
-
-    fn outgoing(&self, scope: ScopeId<D>, label: &D::Label) -> Result<Vec<ScopeId<D>>> {
-        Ok(GraphObservedExt::outgoing(self, scope.node(), label)?
-            .into_iter()
-            .map(|edge| ScopeId::new(edge.target))
-            .collect())
-    }
-
-    fn resolve(
-        &self,
-        start: ScopeId<D>,
-        path: ScopePath<D::Label>,
-        accepts: impl Fn(&ScopeNode<D>) -> bool,
-    ) -> Result<std::collections::HashSet<ResolutionPath<D>>> {
-        resolve_walk(self, start, path.into_path(), accepts)
-    }
-
-    fn visit_outgoing_each<F, E>(&self, scope: ScopeId<D>, label: D::Label, mut f: F) -> Result<()>
-    where
-        F: FnMut(ScopeId<D>, Option<Arc<D::ScopeData>>) -> Result<(), E> + Send + Sync + 'static,
-        E: Into<Error> + 'static,
-    {
-        let handle = ::std::clone::Clone::clone(self);
-        GraphObservedExt::visit_outgoing_each(
-            self,
-            scope.node(),
-            label,
-            move |edge, _| -> Result<(), Error> {
-                let data = handle.scope(ScopeId::new(edge.target))?;
-                f(ScopeId::new(edge.target), data).map_err(::std::convert::Into::into)?;
-                Ok(())
-            },
-        )
-    }
-}
-
-/// The bucket-at-a-time resolution walk (ported `resolve_indexed`):
-/// per reached state, reads exactly one `bucket(s, l)` per label named in
-/// the residual expression, and one `node(i)` per reached node.
-fn resolve_walk<D: ScopeDomain, F>(
-    graph: &ObservedHandle<ScopeGraph<D>>,
-    start: ScopeId<D>,
-    path: PathExpr<D::Label>,
-    accepts: F,
-) -> Result<std::collections::HashSet<ResolutionPath<D>>>
-where
-    F: Fn(&ScopeNode<D>) -> bool,
-{
-    #[derive(Clone)]
-    struct Search<D: ScopeDomain> {
-        scope: ScopeId<D>,
-        expression: PathExpr<D::Label>,
-        scopes: Vec<ScopeId<D>>,
-        labels: Vec<D::Label>,
-        states: std::collections::HashSet<(ScopeId<D>, PathExpr<D::Label>)>,
-    }
-
-    let initial = (start, path.clone());
-    let mut initial_states = std::collections::HashSet::new();
-    initial_states.insert(initial);
-    let mut pending = vec![Search {
-        scope: start,
-        expression: path,
-        scopes: vec![start],
-        labels: Vec::new(),
-        states: initial_states,
-    }];
-    let mut answers = std::collections::HashSet::new();
-
-    while let Some(search) = pending.pop() {
-        let nullable = search.expression.nullable();
-        // `node(i)` read for the reached scope when the path may accept
-        // here.
-        let data = if nullable {
-            match graph.node(search.scope.node())? {
-                Some(payload) => match &*payload {
-                    ScopeNode::Scope(data) => Some(data.clone()),
-                    _ => None,
-                },
-                None => None,
-            }
-        } else {
-            None
-        };
-        if nullable
-            && let Some(data) = &data
-            && accepts(&ScopeNode::Scope(data.clone()))
-        {
-            answers.insert(ResolutionPath {
-                scopes: search.scopes.clone().into(),
-                labels: search.labels.clone().into(),
-                data: data.clone(),
-            });
-        }
-
-        // One `bucket(s, l)` read per label the residual can consume.
-        for label in search.expression.labels() {
-            let targets = GraphObservedExt::outgoing(graph, search.scope.node(), &label)?;
-            for edge in targets {
-                let residual = search.expression.derivative(&label);
-                if residual == PathExpr::Empty {
-                    continue;
-                }
-                let state = (ScopeId::new(edge.target), residual.clone());
-                if search.states.contains(&state) {
-                    continue;
-                }
-                let mut next = search.clone();
-                next.scope = ScopeId::new(edge.target);
-                next.expression = residual;
-                next.scopes.push(ScopeId::new(edge.target));
-                next.labels.push(label.clone());
-                next.states.insert(state);
-                pending.push(next);
-            }
-        }
-    }
-    Ok(answers)
-}
-
-// ---------------------------------------------------------------------------
-// Previous surface (minimal committed reads)
-// ---------------------------------------------------------------------------
-
-/// Previous-handle surface: committed scope-graph reads.
-pub trait ScopeGraphPreviousExt<D: ScopeDomain> {
-    fn scope(&self, id: ScopeId<D>) -> Result<Option<Arc<D::ScopeData>>>;
-    fn outgoing(&self, scope: ScopeId<D>, label: &D::Label) -> Result<Vec<ScopeId<D>>>;
-}
-
-impl<D: ScopeDomain> ScopeGraphPreviousExt<D> for PreviousHandle<ScopeGraph<D>> {
-    fn scope(&self, id: ScopeId<D>) -> Result<Option<Arc<D::ScopeData>>> {
-        match GraphPreviousExt::node(self, id.node())? {
-            Some(payload) => match &*payload {
-                ScopeNode::Scope(data) => Ok(Some(Arc::new(data.clone()))),
-                _ => Ok(None),
-            },
-            None => Ok(None),
-        }
-    }
-
-    fn outgoing(&self, scope: ScopeId<D>, label: &D::Label) -> Result<Vec<ScopeId<D>>> {
-        Ok(GraphPreviousExt::outgoing(self, scope.node(), label)?
-            .into_iter()
-            .map(|edge| ScopeId::new(edge.target))
-            .collect())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot surface
-// ---------------------------------------------------------------------------
-
-/// Committed-state reads for a scope graph.
-pub struct ScopeGraphSnapshot<'a, D: ScopeDomain> {
-    graph: &'a crate::reactive::engine::SnapshotGraph<ScopeGraph<D>>,
-    _marker: PhantomData<D>,
-}
-
-impl<'a, D: ScopeDomain> ScopeGraphSnapshot<'a, D> {
-    pub fn new(graph: &'a crate::reactive::engine::SnapshotGraph<ScopeGraph<D>>) -> Self {
-        Self {
-            graph,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn scope(&self, id: ScopeId<D>) -> Option<Arc<D::ScopeData>> {
-        match self.graph.node(id.node())? {
-            payload => match &*payload {
-                ScopeNode::Scope(data) => Some(Arc::new(data.clone())),
-                _ => None,
-            },
-        }
-    }
-
-    /// Reads any node's data payload (Scope, Declaration, or Reference).
-    pub fn node_data(&self, id: ScopeId<D>) -> Option<Arc<D::ScopeData>> {
-        self.graph
-            .node(id.node())
-            .map(|payload| match &*payload {
-                ScopeNode::Scope(data) => Arc::new(data.clone()),
-                ScopeNode::Declaration(data) => Arc::new(data.clone()),
-                ScopeNode::Reference(data) => Arc::new(data.clone()),
-            })
-    }
-
-    /// The committed node registry (ordered).
-    pub fn node_ids(&self) -> Vec<ScopeId<D>> {
-        self.graph
-            .nodes()
-            .into_iter()
-            .map(ScopeId::new)
-            .collect()
-    }
-
-    pub fn outgoing(&self, scope: ScopeId<D>, label: &D::Label) -> Vec<ScopeId<D>> {
-        self.graph
-            .outgoing(scope.node(), label)
-            .into_iter()
-            .map(|edge| ScopeId::new(edge.target))
-            .collect()
-    }
-
-    pub fn declarations(&self, scope: ScopeId<D>, name: &D::Label) -> Vec<ScopeId<D>> {
-        self.graph
-            .outgoing(scope.node(), name)
-            .into_iter()
-            .filter(|edge| {
-                matches!(
-                    self.graph.node(edge.target).as_deref(),
-                    Some(ScopeNode::Declaration(_))
-                )
-            })
-            .map(|edge| ScopeId::new(edge.target))
-            .collect()
-    }
 }

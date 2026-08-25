@@ -1,1722 +1,786 @@
-//! The engine: installation, epochs, rounds, deterministic worklists,
-//! atomic commit, rollback, and cycle rejection (§5.5, T1–T6).
+//! Plain-function reactive engine.
 //!
-//! One external command opens one epoch (a transaction, §4.2). Round 0
-//! evaluates the readers of the normalized command delta (plus, on the
-//! first epoch, every component root, and the `Previous` readers of the
-//! previous epoch's delta). Each later round evaluates the readers of the
-//! previous round's delta, against the coherent state at the start of the
-//! round (T2). Rounds repeat until a round publishes an empty delta
-//! (quiescence); then one snapshot, the dynamic graph, ownership index,
-//! counters, and subscriptions commit atomically.
-//!
-//! Every ordering that can affect committed behavior comes from private
-//! stable ordinals: view registration order, component registration order,
-//! visitor paths, round application order, and first-change order of the
-//! deltas. No `HashMap`/`HashSet` iteration and no thread interleaving can
-//! influence committed order (T3).
+//! The engine owns committed view state and the set of installed opaque root
+//! computations. Authored code crosses the runtime only through the effects in
+//! [`crate::reactive::api`]; all invocation graphs, write ownership, and
+//! rollback state remain private.
 
-use std::any::{Any, TypeId};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::any::TypeId;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
-use crate::reactive::api::{RunContext};
-use crate::reactive::error::{Error, Producer, Result};
-use crate::reactive::store::{Change, DynStore, WriteKind};
-use crate::reactive::trace::{
-    ChildKey, FactRef, Instance, InstanceId, InstanceKind, PathStep, Registry, RunBuffer,
-    RunBufferHandle, ViewId, ACTIVE, Frame,
-};
+use crate::reactive::api::{Planned, Running};
+use crate::reactive::error::{Error, Result};
+use crate::reactive::kind::{BoxView, GraphFact, GraphKey, GraphView, ListFact, ListKey, ListView, MapView, TreeFact, TreeKey, TreeView};
 use crate::reactive::value::{KeyValue, Value};
-use crate::reactive::view::{
-    BoxView, GraphView, MapView, NodeId, TreeView, ViewSpec,
-};
+use crate::reactive::plain::{self, OutputSink, PlainRuntime};
+use crate::reactive::view::{Node, View};
 
-/// One raw fact change in deterministic (first-change) order.
-#[derive(Clone, Debug)]
-pub struct RawChange {
-    pub view: ViewId,
-    pub view_name: &'static str,
-    pub key: Arc<dyn KeyValue>,
-    pub prev: Option<Arc<dyn Value>>,
-    pub next: Option<Arc<dyn Value>>,
+/// Stable identity of one evaluated computation relationship.
+///
+/// The identity is derived from the authored function type, its `run`
+/// callsite (when it is nested), and the semantic input key. It deliberately
+/// excludes runtime invocation ids, which are allocation details and differ
+/// between cold and warm executions.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InvocationIdentity {
+    pub function: String,
+    pub file: Option<String>,
+    pub line: u32,
+    pub column: u32,
+    pub input_hash: u64,
 }
 
-impl RawChange {
-    /// Human-readable change for tests and diagnostics.
-    pub fn describe(&self) -> String {
-        format!(
-            "{} {:?}: {:?} -> {:?}",
-            self.view_name, self.key, self.prev, self.next
-        )
-    }
+/// Automatic per-command computation-evaluation counts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InvocationWork {
+    counts: BTreeMap<InvocationIdentity, u64>,
 }
 
-/// One external command: a batch of patch ops applied as one epoch.
-/// External patches are the one write path outside visitors and own their
-/// facts as `external` (§5.3).
-#[derive(Clone)]
-pub struct ExternalOp {
-    pub(crate) view: TypeId,
-    pub(crate) kind: WriteKind,
-}
+impl InvocationWork {
+    /// Returns every evaluated computation identity in deterministic order.
+    pub fn counts(&self) -> &BTreeMap<InvocationIdentity, u64> {
+        &self.counts
+    }
 
-impl ExternalOp {
-    pub fn box_set<V: BoxView>(value: V::Value) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::BoxSet(Arc::new(value)),
-        }
+    /// Returns the number of evaluations for one identity.
+    pub fn count(&self, identity: &InvocationIdentity) -> u64 {
+        self.counts.get(identity).copied().unwrap_or(0)
     }
-    pub fn box_clear<V: BoxView>() -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::BoxClear,
-        }
+
+    /// Returns the total number of evaluated computation invocations.
+    pub fn total(&self) -> u64 {
+        self.counts.values().copied().sum()
     }
-    pub fn map_set<V: MapView>(key: V::Key, value: V::Value) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::MapSet {
-                key: Arc::new(key),
-                value: Arc::new(value),
-            },
-        }
-    }
-    pub fn map_remove<V: MapView>(key: V::Key) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::MapRemove {
-                key: Arc::new(key),
-            },
-        }
-    }
-    pub fn map_rekey<V: MapView>(from: V::Key, to: V::Key) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::MapRekey {
-                from: Arc::new(from),
-                to: Arc::new(to),
-            },
-        }
-    }
-    pub fn tree_insert_node<V: TreeView>(id: NodeId, data: V::Value) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::TreeInsertNode {
-                id,
-                data: Some(Arc::new(data)),
-            },
-        }
-    }
-    /// Insert-or-update: re-ensuring a document's node payload replaces
-    /// it, so an edited rebuild updates the changed nodes in place.
-    pub fn tree_upsert_node<V: TreeView>(id: NodeId, data: V::Value) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::TreeUpsertNode {
-                id,
-                data: Arc::new(data),
-            },
-        }
-    }
-    pub fn tree_update_node<V: TreeView>(id: NodeId, data: V::Value) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::TreeUpdateNode {
-                id,
-                data: Arc::new(data),
-            },
-        }
-    }
-    pub fn tree_remove_node<V: TreeView>(id: NodeId) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::TreeRemoveNode { id },
-        }
-    }
-    pub fn tree_move_node<V: TreeView>(id: NodeId, parent: NodeId) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::TreeMoveNode { id, parent },
-        }
-    }
-    pub fn tree_reorder_children<V: TreeView>(parent: NodeId, order: Vec<NodeId>) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::TreeReorderChildren { parent, order },
-        }
-    }
-    pub fn graph_insert_node<V: GraphView>(id: NodeId, data: V::Value) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::GraphInsertNode {
-                id,
-                data: Some(Arc::new(data)),
-            },
-        }
-    }
-    pub fn graph_update_node<V: GraphView>(id: NodeId, data: V::Value) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::GraphUpdateNode {
-                id,
-                data: Arc::new(data),
-            },
-        }
-    }
-    pub fn graph_remove_node<V: GraphView>(id: NodeId) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::GraphRemoveNode { id },
-        }
-    }
-    pub fn graph_insert_edge<V: GraphView>(
-        source: NodeId,
-        label: V::Label,
-        target: NodeId,
-        data: V::Edge,
-    ) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::GraphInsertEdge {
-                source,
-                label: Arc::new(label),
-                target,
-                data: Arc::new(data),
-            },
-        }
-    }
-    pub fn graph_remove_edge<V: GraphView>(source: NodeId, label: V::Label, target: NodeId) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::GraphRemoveEdge {
-                source,
-                label: Arc::new(label),
-                target,
-            },
-        }
-    }
-    pub fn graph_replace_bucket<V: GraphView>(
-        source: NodeId,
-        label: V::Label,
-        targets: Vec<NodeId>,
-    ) -> Self {
-        ExternalOp {
-            view: TypeId::of::<V>(),
-            kind: WriteKind::GraphReplaceBucket {
-                source,
-                label: Arc::new(label),
-                targets,
-            },
-        }
+
+    pub(crate) fn record(&mut self, identity: InvocationIdentity) {
+        *self.counts.entry(identity).or_default() += 1;
     }
 }
 
-/// The report of one committed command.
+/// The report of one committed external command or root installation.
 #[derive(Clone, Debug)]
 pub struct CommandReport {
-    /// The committed epoch counter (0 when the command did no work).
+    /// The committed epoch counter. It is unchanged for a zero-work command.
     pub epoch: u64,
-    /// Rounds executed (0 when no work was needed).
+    /// Number of computation rounds evaluated by the command.
     pub rounds: u32,
-    /// Total visitor runs in this epoch.
-    pub runs: u64,
-    changed: Vec<RawChange>,
+    plain_changed: HashMap<TypeId, usize>,
+    /// Deterministic engine work performed by this command.
+    pub engine: EngineWork,
+    /// Automatic evaluation counts keyed by stable computation identity.
+    pub invocations: InvocationWork,
+    metrics: Arc<plain::MetricExtensions>,
 }
 
 impl CommandReport {
-    /// The epoch's changed facts in deterministic first-change order.
-    pub fn changed(&self) -> &[RawChange] {
-        &self.changed
+    /// Returns the number of changed facts for one typed view.
+    pub fn changed<V: View>(&self) -> usize {
+        self.plain_changed
+            .get(&TypeId::of::<V>())
+            .copied()
+            .unwrap_or(0)
     }
-    /// The changed facts of one view (by its registered name).
-    pub fn changed_view(&self, view_name: &'static str) -> Vec<&RawChange> {
-        self.changed
-            .iter()
-            .filter(|change| change.view_name == view_name)
-            .collect()
+
+    /// Deterministic engine work counters for this command.
+    pub fn engine_work(&self) -> &EngineWork {
+        &self.engine
+    }
+
+    /// Automatic computation-evaluation counts for this command.
+    pub fn invocation_work(&self) -> &InvocationWork {
+        &self.invocations
+    }
+
+    /// One typed command-local metric extension recorded by framework
+    /// components. Unknown types return `None`.
+    pub fn metric<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.metrics
+            .get::<T>()
     }
 }
-
-/// A subscription: called once per committed epoch with that view's
-/// changed facts, in deterministic order.
-pub type Subscriber = Box<dyn Fn(&[RawChange]) + Send + Sync>;
-
-pub(crate) struct ViewEntry {
-    pub name: &'static str,
-    pub store: Arc<dyn DynStore>,
-    pub rank: u32,
-    /// Producer names: components that emit this view, plus "external".
-    pub producers: Vec<String>,
-    pub external: bool,
+/// Deterministic engine work counters for one command. Counters are
+/// monotonic within the command and roll back with it. Fields introduced by
+/// later store generations stay at zero on earlier generations, so the
+/// schema is stable across the incremental-store migration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EngineWork {
+    /// Typed fact reads resolved through the store.
+    pub fact_reads: u64,
+    /// Exact-key lookups performed.
+    pub fact_lookups: u64,
+    /// Fact entries scanned by linear lookups and enumerations.
+    pub fact_scan_steps: u64,
+    /// Candidate fact writes applied.
+    pub fact_writes: u64,
+    /// Candidate fact retractions applied.
+    pub fact_retractions: u64,
+    /// Distinct facts touched by the committed journal.
+    pub facts_touched: u64,
+    /// Facts whose committed value changed.
+    pub facts_changed: u64,
+    /// Whole-view input enumerations.
+    pub view_enumerations: u64,
+    /// Whole-state diffs computed.
+    pub state_diffs: u64,
+    /// Fact entries visited by state diffs.
+    pub diff_scan_steps: u64,
+    /// Dirty-invocation selections performed.
+    pub dirty_selections: u64,
+    /// Invocation entries scanned while selecting or marking.
+    pub invocation_scans: u64,
+    /// Dirty-queue insertions.
+    pub queue_pushes: u64,
+    /// Dirty-queue pops.
+    pub queue_pops: u64,
+    /// Invocation evaluations executed.
+    pub invocation_evaluations: u64,
+    /// Dependency index entries replaced after successful evaluation.
+    pub dependency_entries_changed: u64,
+    /// Exact dependency marks (indexed store generation).
+    pub exact_marks: u64,
+    /// Wildcard dependency marks (indexed store generation).
+    pub wildcard_marks: u64,
+    /// Persistent index path nodes created (indexed store generation).
+    pub index_path_nodes: u64,
+    /// Persistent index probes (indexed store generation).
+    pub index_probes: u64,
+    /// Persistent owner-set nodes created (indexed store generation).
+    pub owner_set_nodes: u64,
+    /// Coalescing journal entries (indexed store generation).
+    pub journal_entries: u64,
+    /// Indexed patch-key bucket probes.
+    pub patch_key_lookups: u64,
+    /// Exact patch-key equality comparisons inside collision buckets.
+    pub patch_key_comparisons: u64,
+    /// Patch operations coalesced before commit.
+    pub patch_ops_coalesced: u64,
+    /// Ordered splice handles applied.
+    pub ordered_splices_applied: u64,
+    /// Explicit forbidden vector scans in patch processing.
+    pub full_patch_vector_scans: u64,
 }
 
-pub(crate) struct ComponentEntry {
-    pub name: &'static str,
-    pub component: Arc<dyn Component>,
-    /// (view, is_previous) — the observation edges.
-    pub observed: Vec<(ViewId, bool)>,
-    pub emitted: Vec<ViewId>,
+type Subscription = Arc<dyn Fn(Snapshot, usize) + Send + Sync>;
+
+/// A validated handle to one installed keyed component family (plan §5.4).
+/// Removal is borrowed and idempotent; ids are checked and never reused.
+pub struct KeyedFamily<V: MapView> {
+    pub(crate) engine_id: usize,
+    pub(crate) id: u64,
+    marker: std::marker::PhantomData<fn() -> V>,
 }
 
-/// A component: the authored dependency spec (G3). The `#[component]`
-/// macro implements this trait from the author's function signature.
-pub trait Component: Send + Sync {
-    /// The component's name (for diagnostics and identity derivation).
-    fn name(&self) -> &'static str;
-    /// Registers the observed/emitted views (authority validation input).
-    fn install(&self, builder: &mut EngineBuilder) -> Result<()>;
-    /// Runs the component body as the root visitor of this instance.
-    fn run(&self, cx: &RunContext) -> Result<()>;
-}
-
-pub(crate) struct Counters {
-    pub epoch: u64,
-    /// The committed delta of the previous epoch (for `Previous` readers).
-    pub last_epoch_changes: Vec<(ViewId, Arc<dyn KeyValue>)>,
-}
-
-struct Epoch {
-    round: u32,
-    /// Total runs this epoch (deduped).
-    runs: u64,
-    ran_this_round: HashSet<InstanceId>,
-    worklist: Vec<InstanceId>,
-    round_children_snapshot: HashMap<InstanceId, Vec<ChildKey>>,
-    results: Vec<(InstanceId, RunBufferHandle)>,
-    round_delta: Vec<RawChange>,
-    round_seen: HashSet<(ViewId, u64)>,
-    epoch_delta: Vec<RawChange>,
-    epoch_seen: HashSet<(ViewId, u64)>,
-    /// Rollback state.
-    created_instances: Vec<InstanceId>,
-    instances_len_at_start: usize,
-    children_at_start: HashMap<(InstanceId, u64), Vec<(ChildKey, InstanceId)>>,
-    reads_at_start: Vec<(InstanceId, Vec<FactRef>, Vec<(ViewId, Arc<dyn KeyValue>)>)>,
-}
-
-impl Epoch {
-    fn new() -> Self {
-        Epoch {
-            round: 0,
-            runs: 0,
-            ran_this_round: HashSet::new(),
-            worklist: Vec::new(),
-            round_children_snapshot: HashMap::new(),
-            results: Vec::new(),
-            round_delta: Vec::new(),
-            round_seen: HashSet::new(),
-            epoch_delta: Vec::new(),
-            epoch_seen: HashSet::new(),
-            created_instances: Vec::new(),
-            instances_len_at_start: 0,
-            children_at_start: HashMap::new(),
-            reads_at_start: Vec::new(),
+impl<V: MapView> Clone for KeyedFamily<V> {
+    fn clone(&self) -> Self {
+        Self {
+            engine_id: self.engine_id,
+            id: self.id,
+            marker: std::marker::PhantomData,
         }
     }
 }
 
-/// The engine's shared interior-mutable state.
-pub(crate) struct Shared {
-    pub views: Mutex<Vec<ViewEntry>>,
-    pub view_by_type: Mutex<HashMap<TypeId, ViewId>>,
-    pub components: Mutex<Vec<ComponentEntry>>,
-    pub registry: Mutex<Registry>,
-    pub epoch: Mutex<Epoch>,
-    pub subscriptions: Mutex<Vec<(ViewId, Subscriber)>>,
-    pub counters: Mutex<Counters>,
-    pub prepared: Mutex<bool>,
-    pub external_views: Mutex<HashSet<ViewId>>,
-    pub workers: usize,
-    /// Maximum rounds per epoch (safety net; cycles are rejected, so
-    /// legitimate epochs are bounded by the longest dependency chain).
-    pub max_rounds: u32,
-    /// Maximum total runs per epoch (safety net).
-    pub max_runs: u64,
+impl<V: MapView> std::fmt::Debug for KeyedFamily<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyedFamily").field("id", &self.id).finish()
+    }
 }
 
-/// The reactive engine. One engine owns all views, components, and
-/// subscriptions; commands run synchronously.
+/// A reactive engine with synchronous transactional commands.
 pub struct Engine {
-    pub(crate) shared: Arc<Shared>,
+    pub(crate) plain: Arc<Mutex<PlainRuntime>>,
+    pub(crate) plain_subscriptions: Arc<Mutex<Vec<(TypeId, Subscription)>>>,
+    engine_id: usize,
 }
 
 impl Default for Engine {
     fn default() -> Self {
-        Engine::new()
+        Self::new()
     }
 }
 
 impl Engine {
-    /// A new engine with one worker (deterministic by construction).
+    /// Creates a synchronous deterministic engine. There is no worker
+    /// parameter: committed behavior is defined by repeated identical traces,
+    /// never by a scheduling knob (plan §3.2).
     pub fn new() -> Self {
-        Self::with_workers(1)
-    }
-
-    /// A new engine with the given worker count. Committed results are
-    /// identical under any worker count (T3); `with_workers(0)` uses
-    /// `std::thread::available_parallelism()`.
-    pub fn with_workers(workers: usize) -> Self {
-        let workers = if workers == 0 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        } else {
-            workers
-        };
-        Engine {
-            shared: Arc::new(Shared {
-                views: Mutex::new(Vec::new()),
-                view_by_type: Mutex::new(HashMap::new()),
-                components: Mutex::new(Vec::new()),
-                registry: Mutex::new(Registry::new()),
-                epoch: Mutex::new(Epoch::new()),
-                subscriptions: Mutex::new(Vec::new()),
-                counters: Mutex::new(Counters {
-                    epoch: 0,
-                    last_epoch_changes: Vec::new(),
-                }),
-                prepared: Mutex::new(false),
-                external_views: Mutex::new(HashSet::new()),
-                workers,
-                max_rounds: 4096,
-                max_runs: 1_000_000,
-            }),
+        Self {
+            plain: Arc::new(Mutex::new(PlainRuntime::default())),
+            plain_subscriptions: Arc::new(Mutex::new(Vec::new())),
+            engine_id: plain::fresh_engine_id(),
         }
     }
 
-    /// Declares a view as externally owned: external commands may patch it.
-    pub fn external<V: ViewSpec>(&mut self) -> Result<()> {
-        let view = {
-            let mut builder = EngineBuilder {
-                shared: &self.shared,
-                component: None,
-            };
-            builder.register_view::<V>()?
-        };
-        self.shared.external_views.lock().insert(view);
-        let mut views = self.shared.views.lock();
-        views[view as usize].external = true;
-        views[view as usize].producers.push("external".to_string());
-        Ok(())
+    fn plain_engine_id(&self) -> usize {
+        self.engine_id
     }
 
-    /// Installs a component: registers its views (idempotently) and its
-    /// signature edges.
-    pub fn install(&mut self, component: impl Component + 'static) -> Result<()> {
-        let name = component.name();
-        let component: Arc<dyn Component> = Arc::new(component);
-        let component_id = {
-            let mut components = self.shared.components.lock();
-            let id = components.len() as u32;
-            components.push(ComponentEntry {
-                name,
-                component: Arc::clone(&component),
-                observed: Vec::new(),
-                emitted: Vec::new(),
-            });
-            id
-        };
-        let mut builder = EngineBuilder {
-            shared: &self.shared,
-            component: Some(component_id),
-        };
-        component.install(&mut builder)?;
-        Ok(())
-    }
-
-    /// Subscribes to one view's committed changes.
-    pub fn subscribe<V: ViewSpec>(&mut self, subscriber: Subscriber) -> Result<()> {
-        let view = {
-            let mut builder = EngineBuilder {
-                shared: &self.shared,
-                component: None,
-            };
-            builder.register_view::<V>()?
-        };
-        self.shared.subscriptions.lock().push((view, subscriber));
-        Ok(())
-    }
-
-    /// Runs one external command (one epoch).
-    pub fn command(&mut self, ops: Vec<ExternalOp>) -> Result<CommandReport> {
-        let shared = Arc::clone(&self.shared);
-        shared.prepare()?;
-        // Begin the epoch.
-        let first = shared.counters.lock().epoch == 0;
-        {
-            let registry = shared.registry.lock();
-            let mut epoch = shared.epoch.lock();
-            *epoch = Epoch::new();
-            epoch.instances_len_at_start = registry.instances.len();
-            epoch.children_at_start = registry.children.clone();
-            epoch.reads_at_start = registry
-                .instances
-                .iter()
-                .map(|instance| {
-                    (
-                        instance.id,
-                        instance.reads.clone(),
-                        instance.lifetime_writes.clone(),
-                    )
-                })
-                .collect();
-        }
-        let view_names: Vec<&'static str> = {
-            let views = shared.views.lock();
-            views.iter().map(|view| view.name).collect()
-        };
-        for view in shared.views.lock().iter() {
-            view.store.begin_epoch();
-        }
-        // Normalize: apply the external patches (round-0 delta).
-        {
-            let mut epoch = shared.epoch.lock();
-            for op in &ops {
-                let view = view_id_of(&shared, op.view)?;
-                if !shared.external_views.lock().contains(&view) {
-                    return Err(Error::ExternalPatchToNonExternal {
-                        view: view_names[view as usize].to_string(),
-                    });
-                }
-                let changes = shared.views.lock()[view as usize]
-                    .store
-                    .apply(Producer::External, u32::MAX, &op.kind)?;
-                for change in changes {
-                    accumulate(&mut epoch, view, view_names[view as usize], change);
-                }
-            }
-        }
-        // Build the round-0 worklist.
-        let delta0 = {
-            let mut epoch = shared.epoch.lock();
-            let delta = epoch.round_delta.clone();
-            epoch.round_delta.clear();
-            epoch.round_seen.clear();
-            delta
-        };
-        let mut extra: Vec<InstanceId> = Vec::new();
-        if first {
-            // Cold start: every component root evaluates once (T1).
-            let ranks: Vec<u32> = shared.views.lock().iter().map(|view| view.rank).collect();
-            let components = shared.components.lock();
-            let mut registry = shared.registry.lock();
-            for (component_id, entry) in components.iter().enumerate() {
-                let id = registry.instances.len() as InstanceId;
-                let rank = entry
-                    .observed
-                    .iter()
-                    .find(|(_, previous)| !*previous)
-                    .map(|(view, _)| ranks[*view as usize])
-                    .unwrap_or(0);
-                registry.instances.push(Instance {
-                    id,
-                    component: component_id as u32,
-                    path: vec![PathStep {
-                        kind: "root",
-                        elem: String::new(),
-                    }],
-                    rank,
-                    kind: InstanceKind::Root,
-                    parent: None,
-                    reads: Vec::new(),
-                    epoch_writes: Vec::new(),
-                    lifetime_writes: Vec::new(),
-                    retired: false,
-                });
-                extra.push(id);
-            }
-        }
-        // Previous readers of the previous epoch's delta.
-        {
-            let last = shared.counters.lock().last_epoch_changes.clone();
-            let registry = shared.registry.lock();
-            for (view, key) in last {
-                let fact = FactRef {
-                    view,
-                    key,
-                    temporal: true,
-                };
-                extra.extend(registry.readers_of(&fact, true).iter().copied());
-            }
-        }
-        let worklist = shared.build_worklist(&delta0, &extra)?;
-        let mut worklist = worklist;
-        let mut rounds = 0u32;
-        if worklist.is_empty() {
-            // No readers: if the normalized delta is also empty there is
-            // no epoch work at all; otherwise the external changes still
-            // commit (they are facts, even with no consumers).
-            if shared.epoch.lock().epoch_delta.is_empty() {
-                return Ok(CommandReport {
-                    epoch: shared.counters.lock().epoch,
-                    rounds: 0,
-                    runs: 0,
-                    changed: Vec::new(),
-                });
-            }
-        }
-        // Rounds to quiescence.
-        while !worklist.is_empty() {
-            if rounds >= shared.max_rounds {
-                shared.rollback_epoch();
-                return Err(Error::Internal(
-                    "round limit exceeded (possible engine bug)".into(),
-                ));
-            }
-            if shared.epoch.lock().runs >= shared.max_runs {
-                shared.rollback_epoch();
-                return Err(Error::Internal(
-                    "run limit exceeded (possible engine bug)".into(),
-                ));
-            }
-            shared.run_round(&worklist)?;
-            rounds += 1;
-            let delta = {
-                let mut epoch = shared.epoch.lock();
-                let delta = epoch.round_delta.clone();
-                epoch.round_delta.clear();
-                epoch.round_seen.clear();
-                delta
-            };
-            if delta.is_empty() {
-                break; // quiescence
-            }
-            worklist = shared.build_worklist(&delta, &[])?;
-        }
-        let runs = shared.epoch.lock().runs;
-        // Commit: one snapshot, dynamic graph, ownership index, counters,
-        // and subscriptions, atomically.
-        {
-            let mut registry = shared.registry.lock();
-            let retired: Vec<InstanceId> = registry
-                .instances
-                .iter()
-                .filter(|instance| instance.retired)
-                .map(|instance| instance.id)
-                .collect();
-            for id in retired {
-                registry.closures.remove(&id);
-            }
-            registry.compact();
-        }
-        let changed = shared.epoch.lock().epoch_delta.clone();
-        {
-            let mut counters = shared.counters.lock();
-            counters.epoch += 1;
-            counters.last_epoch_changes = changed
-                .iter()
-                .map(|change| (change.view, change.key.clone()))
-                .collect();
-        }
-        for view in shared.views.lock().iter() {
-            view.store.commit();
-        }
-        // Deliver subscriptions in deterministic order.
-        {
-            let subscriptions = shared.subscriptions.lock();
-            for (view, subscriber) in subscriptions.iter() {
-                let view_changes: Vec<RawChange> = changed
-                    .iter()
-                    .filter(|change| change.view == *view)
-                    .cloned()
-                    .collect();
-                if !view_changes.is_empty() {
-                    subscriber(&view_changes);
-                }
-            }
-        }
-        Ok(CommandReport {
-            epoch: shared.counters.lock().epoch,
-            rounds,
-            runs,
-            changed,
+    /// Captures one ordinary function in an isolated, scheduler-invisible
+    /// computation graph.
+    pub fn plan<F, A, B>(&mut self, function: F, input: A) -> Result<Planned<B>>
+    where
+        F: Fn(A) -> Result<B> + Clone + Send + Sync + 'static,
+        A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
+        B: Clone + PartialEq + std::fmt::Debug + Send + Sync + 'static,
+    {
+        let runtime = self.plain.lock();
+        let (plan, output) = plain::capture_plan(
+            runtime.state.lock().clone(),
+            runtime.epoch,
+            function,
+            input,
+        )?;
+        Ok(Planned {
+            engine_id: self.plain_engine_id(),
+            token: plan.root,
+            output: Arc::new(RwLock::new(output)),
+            plan: Mutex::new(Some(plan)),
         })
     }
 
-    /// Reads the committed state (test/observation surface).
-    pub fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            shared: Arc::clone(&self.shared),
+    /// Promotes an isolated plan into this engine and commits its initial
+    /// quiescent state. A failed promotion leaves the plan retryable.
+    pub fn run<B>(&mut self, planned: &Planned<B>) -> Result<Running<B>>
+    where
+        B: Clone + PartialEq + std::fmt::Debug + Send + Sync + 'static,
+    {
+        use crate::reactive::plain::{push_txn, take_txn_pub, rollback_txn_pub, with_txn_pub};
+
+        if planned.engine_id != self.plain_engine_id() {
+            return Err(Error::PlanForDifferentEngine);
         }
+
+        let mut plan_guard = planned.plan.lock();
+        let Some(plan) = plan_guard.as_mut() else {
+            return Err(Error::PlanAlreadyRun);
+        };
+        let plan_output_backup = Arc::clone(&plan.output);
+        let captured_backup = plan.captured_epoch;
+        let planned_output_backup = Arc::clone(&planned.output.read());
+
+        let mut runtime = self.plain.lock();
+        if plan.captured_epoch != runtime.epoch {
+            match plain::recapture_plan(plan, runtime.state.lock().clone(), runtime.epoch) {
+                Ok(output) => {
+                    *planned.output.write() = Arc::new(
+                        output
+                            .as_any()
+                            .downcast_ref::<B>()
+                            .cloned()
+                            .ok_or_else(|| Error::Internal("recaptured root result type mismatch".into()))?,
+                    );
+                }
+                Err(error) => {
+                    plan.output = plan_output_backup;
+                    plan.captured_epoch = captured_backup;
+                    *planned.output.write() = planned_output_backup;
+                    return Err(error);
+                }
+            }
+        }
+
+        let output_cell = Arc::clone(&planned.output);
+        let sink_cell = Arc::clone(&output_cell);
+        let sink = Arc::new(OutputSink {
+            update: Box::new(move |value| {
+                if let Some(value) = value.as_any().downcast_ref::<B>() {
+                    *sink_cell.write() = Arc::new(value.clone());
+                }
+            }),
+        });
+
+        let _txn_frame = push_txn();
+        macro_rules! abort {
+            ($error:expr) => {{
+                let txn = take_txn_pub();
+                drop(_txn_frame);
+                rollback_txn_pub(txn, &runtime.state.clone(), &mut runtime.roots);
+                plan.output = plan_output_backup;
+                plan.captured_epoch = captured_backup;
+                *planned.output.write() = Arc::clone(&planned_output_backup);
+                return Err($error);
+            }};
+        }
+
+        let installed = match plain::install_root(&mut runtime, plan.clone(), sink) {
+            Ok(output) => output,
+            Err(error) => abort!(error),
+        };
+        if installed.as_any().downcast_ref::<B>().is_none() {
+            abort!(Error::Internal("planned root result type mismatch".into()));
+        }
+
+        let initial_changes = with_txn_pub(|txn| txn.journal.commit_changes());
+        plain::initialize_dirty(&mut runtime, &initial_changes);
+        if let Err(error) = plain::quiesce(&mut runtime) {
+            abort!(error);
+        }
+        if let Some(views) = plain::dependency_cycle(&runtime) {
+            abort!(Error::DependencyCycle { views });
+        }
+
+        let final_changes = with_txn_pub(|txn| txn.journal.commit_changes());
+        {
+            let deltas = with_txn_pub(|txn| txn.journal.commit_deltas());
+            runtime.committed.apply(&deltas);
+        }
+        let token = planned.token;
+        plan_guard.take();
+        drop(_txn_frame);
+        runtime.epoch = runtime.epoch.saturating_add(1);
+        runtime.last_changed = final_changes.clone();
+        plain::update_sinks(&runtime);
+        drop(runtime);
+
+        let snapshot = self.snapshot();
+        let subscriptions = self.plain_subscriptions.lock().clone();
+        let mut counts = HashMap::new();
+        for change in &final_changes {
+            *counts.entry(change.view).or_insert(0usize) += 1;
+        }
+        for (view, subscriber) in subscriptions {
+            if let Some(count) = counts.get(&view).copied()
+                && count != 0 {
+                    subscriber(snapshot.clone(), count);
+                }
+        }
+
+        Ok(Running {
+            engine_id: self.plain_engine_id(),
+            token,
+            output: output_cell,
+            removed: Arc::new(AtomicBool::new(false)),
+        })
     }
 
-    /// Test hook: the committed revision of one fact.
-    #[allow(dead_code)]
-    pub(crate) fn debug_revision_of<V: ViewSpec>(&self, fact: &dyn KeyValue) -> Option<u64> {
-        let (store, _, _) = self.shared.view_store::<V>().ok()?;
-        store.debug_revision(fact)
-    }
+    /// Removes one committed root. Removal is borrowed and idempotent.
+    pub fn remove<B>(&mut self, running: &Running<B>) -> Result<()> {
+        use crate::reactive::plain::{push_txn, take_txn_pub, rollback_txn_pub, with_txn_pub};
 
-}
-
-impl Shared {
-    /// Test hook: an `Arc` to the shared state (for in-crate tests).
-    #[allow(dead_code)]
-    pub(crate) fn from_engine_for_tests(engine: &Engine) -> Arc<Shared> {
-        Arc::clone(&engine.shared)
-    }
-}
-
-impl Shared {
-    /// Validation + static ranks, once, before the first command (§5.4).
-    fn prepare(&self) -> Result<()> {
-        if *self.prepared.lock() {
+        if running.engine_id != self.plain_engine_id() {
+            return Err(Error::PlanForDifferentEngine);
+        }
+        if running.removed.load(Ordering::Acquire) {
             return Ok(());
         }
-        // Authority: every observed view has a producer.
-        let observed: Vec<Vec<ViewId>> = {
-            let components = self.components.lock();
-            components
-                .iter()
-                .map(|entry| entry.observed.iter().map(|(view, _)| *view).collect())
-                .collect()
-        };
-        let view_names: Vec<&'static str> = {
-            let views = self.views.lock();
-            views.iter().map(|view| view.name).collect()
-        };
-        {
-            let views = self.views.lock();
-            for entry in &observed {
-                for view in entry {
-                    if views[*view as usize].producers.is_empty() {
-                        return Err(Error::NoProducerForView {
-                            view: view_names[*view as usize].to_string(),
-                        });
-                    }
-                }
-            }
-        }
-        // Deterministic ranks: Kahn layering over observed → emitted edges
-        // (temporal edges excluded), tie-broken by view registration
-        // order; cycle leftovers ranked after in registration order.
-        let edges: Vec<(ViewId, ViewId)> = {
-            let components = self.components.lock();
-            let mut edges = Vec::new();
-            for entry in components.iter() {
-                for (u, previous) in &entry.observed {
-                    if *previous {
-                        continue;
-                    }
-                    for v in &entry.emitted {
-                        if u != v {
-                            edges.push((*u, *v));
-                        }
-                    }
-                }
-            }
-            edges
-        };
-        let n = view_names.len();
-        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
-        let mut indeg = vec![0u32; n];
-        for (u, v) in edges {
-            adj[u as usize].push(v);
-            indeg[v as usize] += 1;
-        }
-        let mut ranks = vec![0u32; n];
-        let mut queue: Vec<u32> = (0..n as u32).filter(|v| indeg[*v as usize] == 0).collect();
-        let mut next_rank = 0u32;
-        while !queue.is_empty() {
-            queue.sort_unstable();
-            let layer = std::mem::take(&mut queue);
-            for u in &layer {
-                ranks[*u as usize] = next_rank;
-            }
-            for u in &layer {
-                for v in &adj[*u as usize] {
-                    indeg[*v as usize] -= 1;
-                    if indeg[*v as usize] == 0 {
-                        queue.push(*v);
-                    }
-                }
-            }
-            next_rank += 1;
-        }
-        for (v, degree) in indeg.iter().enumerate() {
-            if *degree > 0 {
-                ranks[v] = next_rank + v as u32; // cycle leftover, registration order
-            }
-        }
-        let mut views = self.views.lock();
-        for (view, rank) in ranks.iter().enumerate() {
-            views[view].rank = *rank;
-        }
-        *self.prepared.lock() = true;
-        Ok(())
-    }
 
-    /// Runs one round's worklist, possibly in parallel, then applies the
-    /// results deterministically.
-    fn run_round(self: &Arc<Self>, worklist: &[InstanceId]) -> Result<()> {
-        {
-            let mut epoch = self.epoch.lock();
-            epoch.worklist = worklist.to_vec();
-            epoch.ran_this_round.clear();
-            epoch.round_children_snapshot.clear();
-        }
-        // Snapshot the worklist parents' children for retirement diffs.
-        {
-            let worklist: HashSet<InstanceId> = worklist.iter().copied().collect();
-            let registry = self.registry.lock();
-            let mut by_parent: HashMap<InstanceId, Vec<ChildKey>> = HashMap::new();
-            for ((parent, _), bucket) in registry.children.iter() {
-                if worklist.contains(parent) {
-                    let keys = by_parent.entry(*parent).or_default();
-                    for (key, id) in bucket {
-                        if !registry.instances[*id as usize].retired {
-                            keys.push(key.clone());
-                        }
-                    }
-                }
-            }
-            self.epoch.lock().round_children_snapshot = by_parent;
-        }
-        let n = worklist.len();
-        let workers = self.workers.min(n).max(1);
-        let next = AtomicUsize::new(0);
-        if workers == 1 {
-            for i in 0..n {
-                self.run_instance(worklist[i]);
-            }
-        } else {
-            std::thread::scope(|scope| {
-                for _ in 0..workers {
-                    scope.spawn(|| loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= n {
-                            break;
-                        }
-                        self.run_instance(worklist[i]);
-                    });
-                }
-            });
-        }
-        self.apply_round()
-    }
+        let mut runtime = self.plain.lock();
+        let _txn_frame = push_txn();
 
-    /// Runs one instance (at most once per round). Children created by a
-    /// running visitor run immediately on the same thread.
-    pub(crate) fn run_instance(self: &Arc<Self>, id: InstanceId) {
-        let mut epoch = self.epoch.lock();
-        if !epoch.ran_this_round.insert(id) {
-            return;
-        }
-        epoch.runs += 1;
-        drop(epoch);
-        let buffer: RunBufferHandle = Arc::new(Mutex::new(RunBuffer::new(id)));
-        let (component, mut closure, root_component) = {
-            let mut registry = self.registry.lock();
-            let instance = &registry.instances[id as usize];
-            let component = instance.component;
-            let closure = match instance.kind {
-                InstanceKind::Root => None,
-                InstanceKind::Child { .. } => registry.closures.remove(&id),
-            };
-            let root_component = if closure.is_none() {
-                Some(Arc::clone(
-                    &self.components.lock()[component as usize].component,
-                ))
-            } else {
-                None
-            };
-            (component, closure, root_component)
-        };
-        ACTIVE.with(|active| {
-            active.borrow_mut().push(Frame {
-                instance: id,
-                component,
-                buffer: Arc::clone(&buffer),
-                shared: Arc::clone(self),
-            });
-        });
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let cx = RunContext {
-                shared: self,
-                component,
-                instance: id,
-            };
-            match &mut closure {
-                Some(closure) => closure(),
-                None => root_component.as_ref().expect("root component").run(&cx),
-            }
-        }));
-        ACTIVE.with(|active| {
-            active.borrow_mut().pop();
-        });
-        {
-            let mut buffer = buffer.lock();
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => buffer.error = Some(error),
-                Err(panic) => buffer.error = Some(Error::Panic(panic_message(&panic))),
-            }
-        }
-        if let Some(closure) = closure {
-            self.registry.lock().closures.insert(id, closure);
-        }
-        self.epoch.lock().results.push((id, buffer));
-    }
+        plain::remove_root(&mut runtime, running.token)?;
 
-    /// Applies one round's results in deterministic order: reads refresh
-    /// the reverse index, writes validate ownership and accumulate the
-    /// round delta, and retired children leave the index. Retirement
-    /// (with retraction of the child's lifetime writes) runs as a second
-    /// phase after every result of the round has applied, so a retired
-    /// child's own same-round write cannot resurrect its facts.
-    fn apply_round(&self) -> Result<()> {
-        let results = std::mem::take(&mut self.epoch.lock().results);
-        // Deterministic order: (rank, path, id).
-        let registry = self.registry.lock();
-        let mut sorted = results;
-        // Deterministic: parallel spawn order must never leak into the
-        // application order, so instances with equal rank and path (e.g.
-        // two components' visitors over the same syntax node) tie-break
-        // on the component ordinal before the instance id.
-        sorted.sort_by(|(a, _), (b, _)| {
-            let ia = &registry.instances[*a as usize];
-            let ib = &registry.instances[*b as usize];
-            ia.rank
-                .cmp(&ib.rank)
-                .then_with(|| ia.path.cmp(&ib.path))
-                .then_with(|| ia.component.cmp(&ib.component))
-                .then_with(|| a.cmp(b))
-        });
-        drop(registry);
-        // The first error in deterministic order aborts the epoch.
-        for (_, buffer) in &sorted {
-            let mut buffer = buffer.lock();
-            if let Some(error) = buffer.error.take() {
+        let final_changes = with_txn_pub(|txn| txn.journal.commit_changes());
+        if !final_changes.is_empty() {
+            plain::initialize_dirty(&mut runtime, &final_changes);
+            let quiesce_error = plain::quiesce(&mut runtime).err();
+            if let Some(error) = quiesce_error {
+                let txn = take_txn_pub();
+                drop(_txn_frame);
+                rollback_txn_pub(txn, &runtime.state.clone(), &mut runtime.roots);
                 return Err(error);
             }
-        }
-        let worklist = self.epoch.lock().worklist.clone();
-        let stores: Vec<(Arc<dyn DynStore>, &'static str)> = {
-            let views = self.views.lock();
-            views
-                .iter()
-                .map(|view| (Arc::clone(&view.store), view.name))
-                .collect()
-        };
-        // Phase 1: apply every result in deterministic order.
-        let mut retirements: Vec<(InstanceId, ChildKey)> = Vec::new();
-        for (id, buffer) in sorted {
-            let (reads, writes, children) = {
-                let mut buffer = buffer.lock();
-                (
-                    std::mem::take(&mut buffer.reads),
-                    std::mem::take(&mut buffer.writes),
-                    std::mem::take(&mut buffer.children),
-                )
-            };
-            let old_children: Option<Vec<ChildKey>> = self
-                .epoch
-                .lock()
-                .round_children_snapshot
-                .get(&id)
-                .cloned();
-            let is_worklist_parent = worklist.contains(&id);
-            let (component, is_worklist_parent) = {
-                let mut registry = self.registry.lock();
-                let old_reads = registry.instances[id as usize].reads.clone();
-                for fact in &old_reads {
-                    registry.reverse_remove(id, fact);
-                }
-                registry.instances[id as usize].reads = reads;
-                let new_reads = registry.instances[id as usize].reads.clone();
-                for fact in &new_reads {
-                    registry.reverse_add(id, fact);
-                }
-                (
-                    registry.instances[id as usize].component,
-                    is_worklist_parent,
-                )
-            };
-            // Apply writes: ownership validation + deltas.
-            let mut applied: Vec<(ViewId, &'static str, Change)> = Vec::new();
-            for (view, kind) in &writes {
-                let (store, name) = &stores[*view as usize];
-                let changes = store
-                    .apply(Producer::Component(component), id, kind)
-                    .map_err(|error| {
-                        self.rollback_epoch();
-                        error
-                    })?;
-                for change in changes {
-                    applied.push((*view, name, change));
-                }
-            }
+            let downstream = with_txn_pub(|txn| txn.journal.commit_changes());
             {
-                let mut registry = self.registry.lock();
-                let instance = &mut registry.instances[id as usize];
-                for (view, _, change) in &applied {
-                    let key = change.key.clone();
-                    if !instance
-                        .epoch_writes
-                        .iter()
-                        .any(|(v, k)| *v == *view && k.eq_value(key.as_ref()))
-                    {
-                        instance.epoch_writes.push((*view, key.clone()));
-                    }
-                    if !instance
-                        .lifetime_writes
-                        .iter()
-                        .any(|(v, k)| *v == *view && k.eq_value(key.as_ref()))
-                    {
-                        instance.lifetime_writes.push((*view, key.clone()));
-                    }
-                }
+                let deltas = with_txn_pub(|txn| txn.journal.commit_deltas());
+                runtime.committed.apply(&deltas);
             }
-            {
-                let mut epoch = self.epoch.lock();
-                for (view, name, change) in applied {
-                    accumulate(&mut epoch, view, name, change);
-                }
+            let txn = take_txn_pub();
+            drop(_txn_frame);
+            runtime.epoch = runtime.epoch.saturating_add(1);
+            runtime.last_changed = downstream.clone();
+            plain::update_sinks(&runtime);
+            drop(runtime);
+
+            let snapshot = self.snapshot();
+            let subscriptions = self.plain_subscriptions.lock().clone();
+            let mut counts = HashMap::new();
+            for change in &downstream {
+                *counts.entry(change.view).or_insert(0usize) += 1;
             }
-            // Collect the retirement decisions (executed in phase 2).
-            if is_worklist_parent {
-                let old = old_children.unwrap_or_default();
-                for child_key in old {
-                    if children
-                        .iter()
-                        .any(|registered| registered.matches(&child_key))
-                    {
-                        continue;
+            for (view, subscriber) in subscriptions {
+                if let Some(count) = counts.get(&view).copied()
+                    && count != 0 {
+                        subscriber(snapshot.clone(), count);
                     }
-                    retirements.push((id, child_key));
-                }
             }
+        } else {
+            drop(_txn_frame);
         }
-        // Phase 2: retire the round's dead children: their reads leave
-        // the reverse index and their lifetime writes retract. Retirement
-        // cascades to the child's own children, so a removed subtree
-        // retracts entirely (a removed declaration's whole derived
-        // subtree dies with it, not just its root node).
-        let mut pending_retirements: VecDeque<(InstanceId, ChildKey)> = retirements.into();
-        while let Some((parent, child_key)) = pending_retirements.pop_front() {
-            let (retired_id, component, lifetime) = {
-                let mut registry = self.registry.lock();
-                let hash = child_key.hash();
-                let Some(bucket) = registry.children.get(&(parent, hash)) else {
-                    continue;
-                };
-                let Some((_, child)) = bucket
-                    .iter()
-                    .find(|(candidate, _)| candidate.matches(&child_key))
-                else {
-                    continue;
-                };
-                let child = *child;
-                {
-                    let instance = &mut registry.instances[child as usize];
-                    if instance.retired {
-                        continue;
-                    }
-                    instance.retired = true;
-                }
-                let reads = registry.instances[child as usize].reads.clone();
-                for fact in &reads {
-                    registry.reverse_remove(child, fact);
-                }
-                // The retired child's own children retire too.
-                for ((retired_parent, _), bucket) in registry.children.iter() {
-                    if *retired_parent == child {
-                        for (key, id) in bucket {
-                            if !registry.instances[*id as usize].retired {
-                                pending_retirements.push_back((child, key.clone()));
-                            }
-                        }
-                    }
-                }
-                (
-                    child,
-                    registry.instances[child as usize].component,
-                    std::mem::take(&mut registry.instances[child as usize].lifetime_writes),
-                )
-            };
-            let _ = retired_id;
-            for (view, key) in lifetime {
-                let (store, name) = &stores[view as usize];
-                let changes = store
-                    .retract(Producer::Component(component), key.as_ref())
-                    .map_err(|error| {
-                        self.rollback_epoch();
-                        error
-                    })?;
-                let mut epoch = self.epoch.lock();
-                for change in changes {
-                    accumulate(&mut epoch, view, name, change);
-                }
-            }
-        }
-        // Deferred (same-round topology) ops apply against the round's
-        // final candidate state; their changes join the round delta.
-        for (view, (store, name)) in stores.iter().enumerate() {
-            let changes = store.end_round().map_err(|error| {
-                self.rollback_epoch();
-                error
-            })?;
-            let mut epoch = self.epoch.lock();
-            for (instance, change) in changes {
-                let mut registry = self.registry.lock();
-                if let Some(instance) = registry.instances.get_mut(instance as usize) {
-                    let key = change.key.clone();
-                    if !instance
-                        .epoch_writes
-                        .iter()
-                        .any(|(v, k)| *v == view as u32 && k.eq_value(key.as_ref()))
-                    {
-                        instance.epoch_writes.push((view as u32, key.clone()));
-                    }
-                    if !instance
-                        .lifetime_writes
-                        .iter()
-                        .any(|(v, k)| *v == view as u32 && k.eq_value(key.as_ref()))
-                    {
-                        instance.lifetime_writes.push((view as u32, key.clone()));
-                    }
-                }
-                accumulate(&mut epoch, view as u32, name, change);
-            }
-        }
-        self.epoch.lock().round += 1;
+        running.removed.store(true, Ordering::Release);
         Ok(())
     }
 
-    /// Builds the next worklist: readers of the delta, deduped, cycle
-    /// checked, sorted by (rank, path, id).
-    fn build_worklist(&self, delta: &[RawChange], extra: &[InstanceId]) -> Result<Vec<InstanceId>> {
-        let registry = self.registry.lock();
-        let mut seen: HashSet<InstanceId> = HashSet::new();
-        let mut candidates: Vec<InstanceId> = Vec::new();
-        for change in delta {
-            let fact = FactRef {
-                view: change.view,
-                key: change.key.clone(),
-                temporal: false,
-            };
-            for reader in registry.readers_of(&fact, false) {
-                if seen.insert(*reader) {
-                    candidates.push(*reader);
-                }
-            }
-        }
-        for id in extra {
-            if seen.insert(*id) {
-                candidates.push(*id);
-            }
-        }
-        // Cycle rejection (T6): scheduling a visitor whose read set
-        // transitively includes a fact it (transitively) wrote.
-        let mut checked: Vec<InstanceId> = Vec::with_capacity(candidates.len());
-        for id in candidates {
-            if let Some(listing) = find_cycle(&registry, id) {
-                return Err(Error::FactCycle { listing });
-            }
-            checked.push(id);
-        }
-        checked.sort_by(|a, b| {
-            let ia = &registry.instances[*a as usize];
-            let ib = &registry.instances[*b as usize];
-            ia.rank
-                .cmp(&ib.rank)
-                .then_with(|| ia.path.cmp(&ib.path))
-                .then_with(|| ia.component.cmp(&ib.component))
-                .then_with(|| a.cmp(b))
-        });
-        Ok(checked)
-    }
-
-    /// Restores every store, instance, index, and counter to its
-    /// pre-epoch state (T6 rollback: nothing partial escapes).
-    fn rollback_epoch(&self) {
-        for view in self.views.lock().iter() {
-            view.store.rollback();
-        }
-        let mut registry = self.registry.lock();
-        let epoch = self.epoch.lock();
-        let created: HashSet<InstanceId> = epoch.created_instances.iter().copied().collect();
-        registry.closures.retain(|id, _| !created.contains(id));
-        registry.instances.truncate(epoch.instances_len_at_start);
-        for instance in &mut registry.instances {
-            instance.retired = false;
-            instance.epoch_writes.clear();
-            instance.lifetime_writes.clear();
-        }
-        for (id, reads, lifetime_writes) in &epoch.reads_at_start {
-            registry.instances[*id as usize].reads = reads.clone();
-            registry.instances[*id as usize].lifetime_writes = lifetime_writes.clone();
-        }
-        registry.children = epoch.children_at_start.clone();
-        registry.rebuild_reverse();
-    }
-
-    /// Registers (or reuses) a child visitor instance. Runs from the api
-    /// layer while the parent is executing.
-    pub(crate) fn register_child(
-        &self,
-        parent: InstanceId,
-        key: ChildKey,
-        rank: u32,
-        closure: Box<dyn FnMut() -> Result<()> + Send + Sync>,
-    ) -> Result<InstanceId> {
-        let new_id: Option<InstanceId>;
-        {
-            let mut registry = self.registry.lock();
-            let hash = key.hash();
-            let existing: Option<InstanceId> = registry
-                .children
-                .get(&(parent, hash))
-                .and_then(|bucket| {
-                    bucket
-                        .iter()
-                        .find(|(candidate, _)| candidate.matches(&key))
-                        .map(|(_, id)| *id)
-                });
-            match existing {
-                Some(id) if !registry.instances[id as usize].retired => {
-                    registry.closures.insert(id, closure);
-                    return Ok(id);
-                }
-                Some(id) => {
-                    // Retired: a re-creation starts a new lineage; replace the slot.
-                    let new_len = registry.instances.len() as InstanceId;
-                    if let Some((_, slot)) = registry
-                        .children
-                        .get_mut(&(parent, hash))
-                        .and_then(|bucket| {
-                            bucket
-                                .iter_mut()
-                                .find(|(candidate, _)| candidate.matches(&key))
-                        })
-                    {
-                        *slot = new_len;
-                    }
-                    let _ = id;
-                }
-                None => {
-                    let new_len = registry.instances.len() as InstanceId;
-                    registry
-                        .children
-                        .entry((parent, hash))
-                        .or_default()
-                        .push((key.clone(), new_len));
-                }
-            }
-            let (component, parent_path) = {
-                let parent_instance = &registry.instances[parent as usize];
-                (parent_instance.component, parent_instance.path.clone())
-            };
-            let id = registry.instances.len() as InstanceId;
-            let path = {
-                let mut path = parent_path;
-                path.push(key.path_step());
-                path
-            };
-            registry.instances.push(Instance {
-                id,
-                component,
-                path,
-                rank,
-                kind: InstanceKind::Child,
-                parent: Some(parent),
-                reads: Vec::new(),
-                epoch_writes: Vec::new(),
-                lifetime_writes: Vec::new(),
-                retired: false,
-            });
-            registry.closures.insert(id, closure);
-            new_id = Some(id);
-        }
-        if let Some(id) = new_id {
-            self.epoch.lock().created_instances.push(id);
-        }
-        Ok(new_id.expect("child registered"))
-    }
-
-    /// The rank of one view (for child instance ranks).
-    pub(crate) fn view_rank(&self, view: ViewId) -> u32 {
-        self.views.lock()[view as usize].rank
-    }
-
-    /// The active instance's path (for fresh-id derivation).
-    pub(crate) fn active_path(&self) -> Result<Vec<PathStep>> {
-        ACTIVE.with(|active| {
-            let active = active.borrow();
-            let Some(frame) = active.last() else {
-                return Err(Error::Internal(
-                    "identity allocation outside a visitor".into(),
-                ));
-            };
-            let registry = self.registry.lock();
-            Ok(registry.instances[frame.instance as usize].path.clone())
-        })
-    }
-
-    /// The active instance's component (for fresh-id derivation).
-    pub(crate) fn active_component(&self) -> Result<u32> {
-        ACTIVE.with(|active| {
-            let active = active.borrow();
-            let Some(frame) = active.last() else {
-                return Err(Error::Internal(
-                    "identity allocation outside a visitor".into(),
-                ));
-            };
-            Ok(frame.component)
-        })
-    }
-
-    /// The view id of one registered view type.
-
-    /// The store + name of one registered view.
-    pub(crate) fn view_store<V: ViewSpec>(&self) -> Result<(Arc<dyn DynStore>, ViewId, &'static str)> {
-        let view = view_id_of(&self, TypeId::of::<V>())?;
-        let views = self.views.lock();
-        Ok((Arc::clone(&views[view as usize].store), view, views[view as usize].name))
-    }
-}
-
-/// The deterministic identity derivation: component ordinal, view, the
-/// allocation site's visitor path, and the allocation lane (§5.6).
-pub(crate) fn fresh_identity(
-    component: u32,
-    view: TypeId,
-    path: &[PathStep],
-    lane: u64,
-) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    component.hash(&mut hasher);
-    view.hash(&mut hasher);
-    for step in path {
-        step.kind.hash(&mut hasher);
-        step.elem.hash(&mut hasher);
-    }
-    lane.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn view_id_of(shared: &Shared, ty: TypeId) -> Result<ViewId> {
-    shared
-        .view_by_type
-        .lock()
-        .get(&ty)
-        .copied()
-        .ok_or_else(|| Error::ViewNotRegistered {
-            view: format!("{ty:?}"),
-        })
-}
-
-fn accumulate(epoch: &mut Epoch, view: ViewId, view_name: &'static str, change: Change) {
-    let hash = change.key.hash_value();
-    if !epoch.round_seen.contains(&(view, hash)) {
-        epoch.round_seen.insert((view, hash));
-        epoch.round_delta.push(RawChange {
-            view,
-            view_name,
-            key: change.key.clone(),
-            prev: change.prev.clone(),
-            next: change.next.clone(),
-        });
-    } else if let Some(entry) = epoch
-        .round_delta
-        .iter_mut()
-        .find(|entry| entry.view == view && entry.key.eq_value(change.key.as_ref()))
+    /// Runs one external write-only effect closure as one atomic epoch.
+    pub fn command<F>(&mut self, effects: F) -> Result<CommandReport>
+    where
+        F: FnOnce() -> Result<()>,
     {
-        entry.next = change.next.clone();
-    }
-    if !epoch.epoch_seen.contains(&(view, hash)) {
-        epoch.epoch_seen.insert((view, hash));
-        epoch.epoch_delta.push(RawChange {
-            view,
-            view_name,
-            key: change.key,
-            prev: change.prev,
-            next: change.next,
-        });
-    } else if let Some(entry) = epoch
-        .epoch_delta
-        .iter_mut()
-        .find(|entry| entry.view == view && entry.key.eq_value(change.key.as_ref()))
-    {
-        entry.next = change.next;
-    }
-}
-
-/// Deterministic DFS from the instance's epoch writes to its read set,
-/// returning a cycle listing if one exists (T6).
-fn find_cycle(registry: &Registry, id: InstanceId) -> Option<Vec<String>> {
-    let instance = &registry.instances[id as usize];
-    if instance.epoch_writes.is_empty() {
-        return None;
-    }
-    let read_keys: Vec<FactRef> = instance
-        .reads
-        .iter()
-        .filter(|fact| !fact.temporal)
-        .cloned()
-        .collect();
-    if read_keys.is_empty() {
-        return None;
-    }
-    let mut writes = instance.epoch_writes.clone();
-    writes.sort_by(|(a_view, a_key), (b_view, b_key)| {
-        a_view
-            .cmp(b_view)
-            .then_with(|| format!("{:?}", a_key).cmp(&format!("{:?}", b_key)))
-    });
-    for (view, key) in writes {
-        let start = FactRef {
-            view,
-            key: key.clone(),
-            temporal: false,
+        let report = plain::run_command(&mut self.plain.lock(), effects)?;
+        let mut plain_changed = HashMap::new();
+        for change in &report.changes {
+            *plain_changed.entry(change.view).or_insert(0usize) += 1;
+        }
+        let mut engine = report.engine;
+        engine.facts_changed = report.changes.len() as u64;
+        engine.facts_touched = engine.fact_writes + engine.fact_retractions;
+        let report = CommandReport {
+            epoch: report.epoch,
+            rounds: report.rounds,
+            plain_changed,
+            engine,
+            invocations: report.invocation_work,
+            metrics: report.metrics,
         };
-        let mut visited: HashSet<(ViewId, u64)> = HashSet::new();
-        let mut stack: Vec<(FactRef, Vec<String>)> = vec![(
-            start.clone(),
-            vec![format!("fact {key:?} in view[{view}]")],
-        )];
-        while let Some((fact, path)) = stack.pop() {
-            if read_keys.iter().any(|read| {
-                read.view == fact.view && read.key.eq_value(fact.key.as_ref())
-            }) {
-                let mut listing = path.clone();
-                listing.push(format!(
-                    "fact {fact:?} read by visitor <{}>",
-                    path_of(registry, id)
-                ));
-                return Some(listing);
-            }
-            if !visited.insert((fact.view, fact.key.hash_value())) {
-                continue;
-            }
-            let readers: Vec<InstanceId> = registry
-                .readers_of(&fact, false)
-                .iter()
-                .copied()
-                .collect();
-            let mut next: Vec<(FactRef, Vec<String>)> = Vec::new();
-            for reader in readers {
-                let reader_path = path_of(registry, reader);
-                let mut writer_writes: Vec<(ViewId, Arc<dyn KeyValue>)> =
-                    registry.instances[reader as usize].epoch_writes.clone();
-                writer_writes.sort_by(|(a_view, a_key), (b_view, b_key)| {
-                    a_view
-                        .cmp(b_view)
-                        .then_with(|| format!("{:?}", a_key).cmp(&format!("{:?}", b_key)))
-                });
-                for (w_view, w_key) in writer_writes {
-                    let mut next_path = path.clone();
-                    next_path.push(format!("fact {fact:?} read by visitor <{reader_path}>"));
-                    next_path.push(format!("writes fact {w_key:?} in view[{w_view}]"));
-                    next.push((
-                        FactRef {
-                            view: w_view,
-                            key: w_key,
-                            temporal: false,
-                        },
-                        next_path,
-                    ));
+        let snapshot = self.snapshot();
+        let subscriptions = self.plain_subscriptions.lock().clone();
+        for (view, subscriber) in subscriptions {
+            if let Some(count) = report.plain_changed.get(&view).copied()
+                && count != 0 {
+                    subscriber(snapshot.clone(), count);
                 }
-            }
-            stack.extend(next);
         }
-    }
-    None
-}
-
-fn path_of(registry: &Registry, id: InstanceId) -> String {
-    let instance = &registry.instances[id as usize];
-    let mut path = String::new();
-    for step in &instance.path {
-        path.push_str(step.kind);
-        if !step.elem.is_empty() {
-            path.push('[');
-            path.push_str(&step.elem);
-            path.push(']');
-        }
-        path.push('/');
-    }
-    path
-}
-
-fn panic_message(panic: &Box<dyn Any + Send>) -> String {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_string()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The builder
-// ---------------------------------------------------------------------------
-
-/// Registers views and signature edges for one component (or for
-/// `external`/`subscribe` declarations).
-pub struct EngineBuilder<'a> {
-    pub(crate) shared: &'a Arc<Shared>,
-    pub(crate) component: Option<u32>,
-}
-
-impl EngineBuilder<'_> {
-    /// Registers (idempotently) and observes a view.
-    pub fn observe<V: ViewSpec>(&mut self) -> Result<()> {
-        let view = self.register_view::<V>()?;
-        if let Some(component) = self.component {
-            let mut components = self.shared.components.lock();
-            let entry = &mut components[component as usize];
-            if !entry.observed.iter().any(|(v, _)| *v == view) {
-                entry.observed.push((view, false));
-            }
-        }
-        Ok(())
+        Ok(report)
     }
 
-    /// Registers (idempotently) and observes a view temporally (`Previous`).
-    pub fn previous<V: ViewSpec>(&mut self) -> Result<()> {
-        let view = self.register_view::<V>()?;
-        if let Some(component) = self.component {
-            let mut components = self.shared.components.lock();
-            let entry = &mut components[component as usize];
-            if !entry.observed.iter().any(|(v, _)| *v == view) {
-                entry.observed.push((view, true));
-            }
-        }
-        Ok(())
-    }
-
-    /// Registers (idempotently) and emits into a view (joins its producer
-    /// set — multi-producer views are ordinary for every shape).
-    pub fn emit<V: ViewSpec>(&mut self) -> Result<()> {
-        let view = self.register_view::<V>()?;
-        if let Some(component) = self.component {
-            let mut components = self.shared.components.lock();
-            let entry = &mut components[component as usize];
-            if !entry.emitted.contains(&view) {
-                entry.emitted.push(view);
-            }
-            let label = format!("component[{}] ({})", component, entry.name);
-            let mut views = self.shared.views.lock();
-            let producers = &mut views[view as usize].producers;
-            if !producers.contains(&label) {
-                producers.push(label);
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn register_view<V: ViewSpec>(&mut self) -> Result<ViewId> {
-        let ty = TypeId::of::<V>();
-        {
-            let by_type = self.shared.view_by_type.lock();
-            if let Some(&view) = by_type.get(&ty) {
-                return Ok(view);
-            }
-        }
-        let store = V::new_store();
-        let view = {
-            let mut views = self.shared.views.lock();
-            let id = views.len() as ViewId;
-            views.push(ViewEntry {
-                name: V::view_name(),
-                store: Arc::from(store),
-                rank: 0,
-                producers: Vec::new(),
-                external: false,
-            });
-            id
+    /// Installs a keyed component family over one map view (plan §5.4).
+    ///
+    /// The function runs once per key, directly scheduled by that key's
+    /// changes; no discovery root enumerates the view afterwards. Existing
+    /// keys evaluate once during installation.
+    pub fn install_keyed<V, F>(&mut self, mut function: F) -> Result<KeyedFamily<V>>
+    where
+        V: MapView,
+        F: Fn(V::Input) -> Result<()> + Clone + Send + Sync + 'static,
+    {
+        use crate::reactive::plain::{
+            erased_call, push_txn_pub, rollback_txn_pub, take_txn_pub, with_txn_pub, PlainStatePub as PlainState,
         };
-        self.shared.view_by_type.lock().insert(ty, view);
-        Ok(view)
+        use crate::reactive::plain::ErasedCall;;
+
+        let mut runtime = self.plain.lock();
+        let _txn_frame = push_txn_pub();
+        let result = (|| -> Result<KeyedFamily<V>> {
+            let root = plain::fresh_token();
+            let graph = Arc::new(Mutex::new(plain::PlainGraph::new(
+                PlainState::default(),
+                plain::erased_noop_pub(),
+                root,
+            )));
+            // Keyed children read/write the shared committed store.
+            graph.lock().state = Arc::clone(&runtime.state);
+            let view = TypeId::of::<V>();
+            let build_call: Arc<dyn Fn(Arc<dyn KeyValue>) -> Arc<dyn ErasedCall> + Send + Sync> = {
+                let function = function.clone();
+                Arc::new(move |key| {
+                    let input = key
+                        .as_any()
+                        .downcast_ref::<V::Input>()
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            panic!("keyed family received an untyped key");
+                        });
+                    erased_call(function.clone(), input)
+                })
+            };
+            let install_ordinal = runtime.next_install_ordinal;
+            runtime.next_install_ordinal += 1;
+            let family_id = root;
+            runtime.families.insert(
+                family_id,
+                plain::FamilyRuntime {
+                    graph: Arc::clone(&graph),
+                    view,
+                    view_name: V::name(),
+                    install_ordinal,
+                    build_call,
+                },
+            );
+            runtime.family_by_root.insert(root, family_id);
+            with_txn_pub(|txn| {
+                txn.push_undo(plain::Undo::RootInserted { root });
+            });
+
+            // Initial enumeration in fact-ordinal order.
+            let initial_keys: Vec<Arc<dyn KeyValue>> = runtime
+                .committed
+                .view(view)
+                .map(|snapshot| snapshot.entries().map(|entry| Arc::clone(&entry.key)).collect())
+                .unwrap_or_default();
+            for key in initial_keys {
+                plain::queue_family_child(&mut runtime, family_id, key)?;
+            }
+            if let Err(error) = plain::quiesce(&mut runtime) {
+                return Err(error);
+            }
+
+            Ok(KeyedFamily {
+                engine_id: self.plain_engine_id(),
+                id: family_id,
+                marker: std::marker::PhantomData,
+            })
+        })();
+
+        match result {
+            Ok(family) => {
+                use crate::reactive::plain::with_txn_pub;
+                let deltas = with_txn_pub(|txn| txn.journal.commit_deltas());
+                let changes = with_txn_pub(|txn| txn.journal.commit_changes());
+                drop(_txn_frame);
+                if !deltas.is_empty() {
+                    runtime.committed.apply(&deltas);
+                    runtime.epoch += 1;
+                    runtime.last_changed = changes;
+                    plain::update_sinks(&runtime);
+                }
+                Ok(family)
+            }
+            Err(error) => {
+                let txn = take_txn_pub();
+                drop(_txn_frame);
+                rollback_txn_pub(txn, &runtime.state.clone(), &mut runtime.roots);
+                Err(error)
+            }
+        }
+    }
+
+    /// Removes a keyed family: every child retires in ordinal order and all
+    /// replace/patch-owned publications retract through the journal.
+    pub fn remove_keyed<V: MapView>(&mut self, family: &KeyedFamily<V>) -> Result<()> {
+        use crate::reactive::plain::{
+            push_txn_pub, rollback_txn_pub, take_txn_pub,
+        };
+        if family.engine_id != self.plain_engine_id() {
+            return Err(Error::PlanForDifferentEngine);
+        }
+        let mut runtime = self.plain.lock();
+        if !runtime.families.contains_key(&family.id) {
+            return Ok(()); // idempotent removal
+        }
+        let _txn_frame = push_txn_pub();
+        let outcome = (|| -> Result<()> {
+            let family_runtime = runtime.families.get(&family.id).expect("family present");
+            let graph = Arc::clone(&family_runtime.graph);
+            let ids: Vec<u64> = {
+                let graph_guard = graph.lock();
+                let mut ids = graph_guard.live_child_ids();
+                ids.sort_unstable();
+                ids
+            };
+            for id in ids {
+                plain::retract_child_owned(&graph, &runtime.state, id)?;
+            }
+            runtime.families.remove(&family.id);
+            runtime.family_by_root.remove(&graph.lock().root);
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                use crate::reactive::plain::with_txn_pub;
+                let deltas = with_txn_pub(|txn| txn.journal.commit_deltas());
+                let changes = with_txn_pub(|txn| txn.journal.commit_changes());
+                drop(_txn_frame);
+                if !deltas.is_empty() {
+                    runtime.committed.apply(&deltas);
+                    runtime.epoch += 1;
+                    runtime.last_changed = changes;
+                    plain::update_sinks(&runtime);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let txn = take_txn_pub();
+                drop(_txn_frame);
+                rollback_txn_pub(txn, &runtime.state.clone(), &mut runtime.roots);
+                Err(error)
+            }
+        }
+    }
+
+    /// Subscribes to committed changes of one typed view.
+    pub fn subscribe<V: View>(
+        &mut self,
+        subscriber: impl Fn(Snapshot, usize) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.plain_subscriptions
+            .lock()
+            .push((TypeId::of::<V>(), Arc::new(subscriber)));
+        Ok(())
+    }
+
+    /// Returns a read-only committed snapshot.
+    pub fn snapshot(&self) -> Snapshot {
+        let runtime = self.plain.lock();
+        Snapshot {
+            plain: Arc::new(plain::snapshot(&runtime)),
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot (committed-state observation)
-// ---------------------------------------------------------------------------
-
-/// A read-only view of the committed state.
+/// A read-only view of committed typed facts.
 #[derive(Clone)]
 pub struct Snapshot {
-    pub(crate) shared: Arc<Shared>,
+    pub(crate) plain: Arc<plain::PlainSnapshot>,
 }
 
 impl Snapshot {
-    pub fn box_view<V: BoxView>(&self) -> SnapshotBox<V> {
-        SnapshotBox {
-            store: self.store_of::<V>(),
-            _marker: std::marker::PhantomData,
+    /// Reads one committed fact.
+    pub fn observe<V: View>(&self, input: V::Input) -> Option<Arc<V::Output>> {
+        V::__snapshot(self, input)
+    }
+
+    /// Reads every committed input key of one typed view.
+    pub fn inputs<V: View>(&self) -> Vec<V::Input> {
+        V::__snapshot_inputs(self)
+    }
+
+    #[doc(hidden)]
+    pub fn __plain_observe<V: View>(&self, input: V::Input) -> Option<Arc<V::Output>> {
+        self.plain.observe::<V>(input)
+    }
+
+    #[doc(hidden)]
+    pub fn __plain_inputs<V: View>(&self) -> Vec<V::Input> {
+        self.plain.inputs::<V>()
+    }
+
+    /// Total committed fact entries across every view: the live
+    /// persistent-bytes proxy (plan §20.6). Diffing two snapshots taken
+    /// around one command shows retention growth, not just churn.
+    #[doc(hidden)]
+    pub fn live_fact_count(&self) -> u64 {
+        self.plain.live_fact_count()
+    }
+
+    /// Reads a list-kind view's committed length under one domain key.
+    pub fn list_len<V: ListView>(&self, key: &V::Key) -> usize {
+        match self.__plain_observe::<V>(ListKey::Len(key.clone())).as_deref() {
+            Some(ListFact::Len(len)) => *len as usize,
+            _ => 0,
         }
     }
-    pub fn map_view<V: MapView>(&self) -> SnapshotMap<V> {
-        SnapshotMap {
-            store: self.store_of::<V>(),
-            _marker: std::marker::PhantomData,
+
+    /// Reads a list-kind view's committed items under one domain key.
+    pub fn list<V: ListView>(&self, key: &V::Key) -> Vec<Arc<V::Item>> {
+        let len = self.list_len::<V>(key);
+        let mut items = Vec::with_capacity(len);
+        for index in 0..len {
+            if let Some(ListFact::Item(item)) = self
+                .__plain_observe::<V>(ListKey::Slot(key.clone(), index as u32))
+                .as_deref()
+            {
+                items.push(Arc::new(item.clone()));
+            }
+        }
+        items
+    }
+
+    /// Reads a tree-kind view's committed roots across all domain keys.
+    pub fn tree_roots<V: TreeView>(&self) -> Vec<Node<V>> {
+        let mut roots = Vec::new();
+        for input in self.__plain_inputs::<V>() {
+            if let TreeKey::RootOrder(key) = &input
+                && let Some(observed) = self.__plain_observe::<V>(input.clone())
+            {
+                if let TreeFact::RootOrder(order) = observed.as_ref() {
+                    for link in order.iter() {
+                        if let Some(observed) =
+                            self.__plain_observe::<V>(TreeKey::RootLink(key.clone(), *link))
+                            && let TreeFact::RootLink(root) = observed.as_ref()
+                        {
+                            roots.push(*root);
+                        }
+                    }
+                }
+            }
+        }
+        roots
+    }
+
+    /// Reads a tree-kind view's committed root list under one domain key.
+    pub fn tree_roots_of<V: TreeView>(&self, key: &V::Key) -> Vec<Node<V>> {
+        let Some(observed) = self
+            .__plain_observe::<V>(TreeKey::RootOrder(key.clone()))
+        else {
+            return Vec::new();
+        };
+        let TreeFact::RootOrder(order) = observed.as_ref() else {
+            return Vec::new();
+        };
+        let mut roots = Vec::with_capacity(order.len());
+        for link in order.iter() {
+            if let Some(observed) =
+                self.__plain_observe::<V>(TreeKey::RootLink(key.clone(), *link))
+                && let TreeFact::RootLink(root) = observed.as_ref()
+            {
+                roots.push(*root);
+            }
+        }
+        roots
+    }
+
+    /// Reads one committed tree node's payload.
+    pub fn tree_payload<V: TreeView>(&self, id: Node<V>) -> Option<Arc<V::Payload>> {
+        let observed = self.__plain_observe::<V>(TreeKey::Payload(id))?;
+        match observed.as_ref() {
+            TreeFact::Payload(payload) => Some(Arc::new(payload.clone())),
+            _ => None,
         }
     }
-    pub fn tree_view<V: TreeView>(&self) -> SnapshotTree<V> {
-        SnapshotTree {
-            store: self.store_of::<V>(),
-            _marker: std::marker::PhantomData,
-        }
-    }
-    pub fn graph_view<V: GraphView>(&self) -> SnapshotGraph<V> {
-        SnapshotGraph {
-            store: self.store_of::<V>(),
-            _marker: std::marker::PhantomData,
+
+    /// Reads one committed tree node's parent.
+    pub fn tree_parent<V: TreeView>(&self, id: Node<V>) -> Option<Node<V>> {
+        let observed = self.__plain_observe::<V>(TreeKey::Parent(id))?;
+        match observed.as_ref() {
+            TreeFact::Parent(parent) => *parent,
+            _ => None,
         }
     }
 
-    fn store_of<V: ViewSpec>(&self) -> Arc<dyn DynStore> {
-        let ty = TypeId::of::<V>();
-        let view = *self
-            .shared
-            .view_by_type
-            .lock()
-            .get(&ty)
-            .expect("snapshot of an unregistered view");
-        Arc::clone(&self.shared.views.lock()[view as usize].store)
+    /// Reads one committed tree node's ordered children.
+    pub fn tree_children<V: TreeView>(&self, id: Node<V>) -> Vec<Node<V>> {
+        let Some(observed) = self.__plain_observe::<V>(TreeKey::ChildOrder(id)) else {
+            return Vec::new();
+        };
+        let TreeFact::Order(order) = observed.as_ref() else {
+            return Vec::new();
+        };
+        let mut children = Vec::with_capacity(order.len());
+        for link in order.iter() {
+            if let Some(observed) = self.__plain_observe::<V>(TreeKey::ChildLink(id, *link))
+                && let TreeFact::Link(child) = observed.as_ref()
+            {
+                children.push(*child);
+            }
+        }
+        children
     }
-}
 
-pub struct SnapshotBox<V: BoxView> {
-    store: Arc<dyn DynStore>,
-    _marker: std::marker::PhantomData<V>,
-}
+    /// Reads one committed graph node's payload.
+    pub fn graph_node<V: GraphView>(&self, id: Node<V>) -> Option<Arc<V::NodePayload>> {
+        match self.__plain_observe::<V>(GraphKey::Node(id)).as_deref() {
+            Some(GraphFact::Node(payload)) => Some(Arc::new(payload.clone())),
+            _ => None,
+        }
+    }
 
-impl<V: BoxView> SnapshotBox<V> {
-    pub fn get(&self) -> Option<Arc<V::Value>> {
-        self.store
-            .read_committed(&crate::reactive::view::BoxFactKey::Value)
-            .and_then(|value| downcast_value(value))
-    }
-}
-
-pub struct SnapshotMap<V: MapView> {
-    store: Arc<dyn DynStore>,
-    _marker: std::marker::PhantomData<V>,
-}
-
-impl<V: MapView> SnapshotMap<V> {
-    pub fn get(&self, key: &V::Key) -> Option<Arc<V::Value>> {
-        let fact: Arc<dyn KeyValue> =
-            Arc::new(crate::reactive::view::MapFactKey::Entry(key.clone()));
-        self.store
-            .read_committed(fact.as_ref())
-            .and_then(|value| downcast_value(value))
-    }
-    pub fn contains(&self, key: &V::Key) -> bool {
-        self.get(key).is_some()
-    }
-    pub fn keys(&self) -> Vec<V::Key> {
-        let fact: Arc<dyn KeyValue> = Arc::new(crate::reactive::view::MapFactKey::<V::Key>::Keys);
-        self.store
-            .read_committed(fact.as_ref())
-            .and_then(|value| downcast_value(value))
-            .map(|keys: Arc<Vec<V::Key>>| (*keys).clone())
-            .unwrap_or_default()
-    }
-}
-
-pub struct SnapshotTree<V: TreeView> {
-    store: Arc<dyn DynStore>,
-    _marker: std::marker::PhantomData<V>,
-}
-
-impl<V: TreeView> SnapshotTree<V> {
-    pub fn node(&self, id: NodeId) -> Option<Arc<V::Value>> {
-        let fact: Arc<dyn KeyValue> = Arc::new(crate::reactive::view::TreeFactKey::Node(id));
-        self.store
-            .read_committed(fact.as_ref())
-            .and_then(|value| downcast_value(value))
-    }
-    pub fn children(&self, id: NodeId) -> Vec<NodeId> {
-        let fact: Arc<dyn KeyValue> = Arc::new(crate::reactive::view::TreeFactKey::Children(id));
-        self.store
-            .read_committed(fact.as_ref())
-            .and_then(|value| downcast_value(value))
-            .map(|kids: Arc<Vec<NodeId>>| (*kids).clone())
-            .unwrap_or_default()
-    }
-    pub fn parent(&self, id: NodeId) -> Option<NodeId> {
-        let fact: Arc<dyn KeyValue> = Arc::new(crate::reactive::view::TreeFactKey::Parent(id));
-        self.store
-            .read_committed(fact.as_ref())
-            .and_then(|value| downcast_value(value))
-            .and_then(|parent: Arc<Option<NodeId>>| *parent)
-    }
-    pub fn roots(&self) -> Vec<NodeId> {
-        let fact: Arc<dyn KeyValue> = Arc::new(crate::reactive::view::TreeFactKey::Roots);
-        self.store
-            .read_committed(fact.as_ref())
-            .and_then(|value| downcast_value(value))
-            .map(|roots: Arc<Vec<NodeId>>| (*roots).clone())
-            .unwrap_or_default()
-    }
-}
-
-pub struct SnapshotGraph<V: GraphView> {
-    store: Arc<dyn DynStore>,
-    _marker: std::marker::PhantomData<V>,
-}
-
-impl<V: GraphView> SnapshotGraph<V> {
-    pub fn node(&self, id: NodeId) -> Option<Arc<V::Value>> {
-        let fact: Arc<dyn KeyValue> = Arc::new(crate::reactive::view::GraphFactKey::<V::Label>::Node(id));
-        self.store
-            .read_committed(fact.as_ref())
-            .and_then(|value| downcast_value(value))
-    }
-    pub fn edge(&self, source: NodeId, label: &V::Label, target: NodeId) -> Option<Arc<V::Edge>> {
-        let fact: Arc<dyn KeyValue> = Arc::new(crate::reactive::view::GraphFactKey::Edge(
-            crate::reactive::view::GraphEdgeKey {
-                source,
-                label: label.clone(),
-                target,
-            },
-        ));
-        self.store
-            .read_committed(fact.as_ref())
-            .and_then(|value| downcast_value(value))
-    }
-    pub fn outgoing(
+    /// Reads one committed labelled edge bucket.
+    pub fn outgoing<V: GraphView>(
         &self,
-        source: NodeId,
+        from: Node<V>,
         label: &V::Label,
-    ) -> Vec<crate::reactive::view::GraphEdgeKey<V::Label>> {
-        let fact: Arc<dyn KeyValue> =
-            Arc::new(crate::reactive::view::GraphFactKey::Bucket(source, label.clone()));
-        self.store
-            .read_committed(fact.as_ref())
-            .and_then(|value| {
-                downcast_value(value).map(
-                    |edges: Arc<Vec<crate::reactive::view::GraphEdgeKey<V::Label>>>| {
-                        (*edges).clone()
-                    },
-                )
-            })
-            .unwrap_or_default()
+    ) -> Vec<Node<V>> {
+        match self.__plain_observe::<V>(GraphKey::Bucket(from, label.clone())).as_deref() {
+            Some(GraphFact::Targets(targets)) => targets.clone(),
+            _ => Vec::new(),
+        }
     }
-    pub fn nodes(&self) -> Vec<NodeId> {
-        let fact: Arc<dyn KeyValue> = Arc::new(crate::reactive::view::GraphFactKey::<V::Label>::Nodes);
-        self.store
-            .read_committed(fact.as_ref())
-            .and_then(|value| downcast_value(value))
-            .map(|nodes: Arc<Vec<NodeId>>| (*nodes).clone())
-            .unwrap_or_default()
-    }
-}
 
-/// Downcasts an erased value (infallible for the view's own type).
-pub(crate) fn downcast_value<V: Value>(value: Arc<dyn Value>) -> Option<Arc<V>> {
-    let any: Arc<dyn Any + Send + Sync> = value;
-    any.downcast::<V>().ok()
+    /// Reads a box-kind view's committed cell.
+    pub fn box_value<V: BoxView>(&self) -> Option<Arc<V::Output>> {
+        self.__plain_observe::<V>(())
+    }
 }

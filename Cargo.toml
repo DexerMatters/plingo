@@ -37,3 +37,10 @@ reactive-macros = { path = "reactive-macros" }
 # For locking (engine, stores, visitor buffers)
 parking_lot = "0.12"
 color-print = "0.3.7"
+
+[[bench]]
+name = "incremental_pipeline"
+harness = false
+
+[dev-dependencies]
+serde_json = "1"

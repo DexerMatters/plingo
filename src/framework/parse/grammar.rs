@@ -9,7 +9,6 @@ use crate::framework::parse::{
         green::{ErrorKind, GreenId, TreeArena},
         product::{Product, ProductArena, ProductData, ProductId},
     },
-    identity::TokenFingerprint,
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -187,6 +186,9 @@ pub struct BuildCx<'a> {
     pub trees: &'a mut TreeArena,
     pub products: &'a mut ProductArena,
     pub ast: &'a mut AstArena,
+    /// Stable syntax-lineage allocator (plan §8.7): every freshly built
+    /// node receives a document-stable identity through the proof order.
+    pub lineage: &'a mut crate::framework::parse::parsing::lineage::LineageState,
     /// Stable token occurrence immediately following this reduction. Empty
     /// productions use it as their zero-width source anchor.
     pub boundary: usize,
@@ -270,12 +272,26 @@ impl<'a> BuildCx<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let green = self.trees.node(self.lhs(production)?, greens);
         let (extent, mut ast_ids) = self.child_metadata(children);
+        let direct_children = children
+            .iter()
+            .filter_map(|child| self.products.get(*child))
+            .filter_map(|product| match product.data {
+                ProductData::Node { ast, .. } | ProductData::Token { ast: Some(ast), .. } => {
+                    Some(ast)
+                }
+                ProductData::Error { .. } | ProductData::Token { ast: None, .. } => None,
+            })
+            .collect::<Vec<_>>();
         let ast = self.ast.insert(value, extent);
-        ast_ids.push(ast.id);
+        self.lineage.assign_new(production, extent, ast.raw_id());
+        for child in direct_children {
+            self.ast.set_parent(child, Some(ast.raw_id()));
+        }
+        ast_ids.push(ast.raw_id());
         let product = self
             .products
             .insert(Product::node(green, ast, children.to_vec()).with_metadata(extent, ast_ids));
-        self.ast.bind_product(ast.id, product);
+        self.ast.bind_product(ast.raw_id(), product);
         Ok(product)
     }
 
@@ -289,11 +305,10 @@ impl<'a> BuildCx<'a> {
         terminal: TerminalId,
         entry: TokenEntryId,
         occurrence: usize,
-        fingerprint: TokenFingerprint,
     ) -> ProductId {
         let green = self.trees.leaf(length, terminal);
         self.products.insert(
-            Product::token(green, entry, fingerprint)
+            Product::token(green, entry)
                 .with_metadata(AnchoredSpan::token(occurrence), Vec::new()),
         )
     }
@@ -303,7 +318,6 @@ impl<'a> BuildCx<'a> {
         length: usize,
         terminal: TerminalId,
         entry: TokenEntryId,
-        fingerprint: TokenFingerprint,
         value: T,
     ) -> ProductId
     where
@@ -312,11 +326,16 @@ impl<'a> BuildCx<'a> {
         let green = self.trees.leaf(length, terminal);
         let extent = AnchoredSpan::point(self.boundary);
         let ast = self.ast.insert(value, extent);
+        // Typed tokens carry no production role; the sentinel keeps their
+        // candidate keys disjoint from real productions (plan §8.7 proof 2
+        // still applies within the typed-token domain).
+        const TYPED_TOKEN_ROLE: u32 = u32::MAX;
+        self.lineage.assign_new(TYPED_TOKEN_ROLE, extent, ast.raw_id());
         let product = self.products.insert(
-            Product::typed_token(green, entry, fingerprint, ast)
-                .with_metadata(extent, vec![ast.id]),
+            Product::typed_token(green, entry, ast)
+                .with_metadata(extent, vec![ast.raw_id()]),
         );
-        self.ast.bind_product(ast.id, product);
+        self.ast.bind_product(ast.raw_id(), product);
         product
     }
 

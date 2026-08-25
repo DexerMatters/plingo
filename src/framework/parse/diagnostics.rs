@@ -5,16 +5,22 @@ use std::collections::HashSet;
 
 use super::{
     data::{
-        green::{ParseErrorInfo, TreeData},
-        product::{ProductData, ProductId},
+        green::{ParseErrorInfo, TreeArena, TreeData},
+        product::{ProductArena, ProductData, ProductId},
     },
     parsing::ParserSessionState,
-    types::SessionArenas,
 };
+
+/// Read-only arena view for diagnostic collection.
+#[derive(Clone, Copy)]
+pub(crate) struct DiagnosticArenas<'a> {
+    pub trees: &'a TreeArena,
+    pub products: &'a ProductArena,
+}
 
 pub(crate) fn collect_parse_diagnostics(
     state: &ParserSessionState,
-    arenas: Option<&SessionArenas>,
+    arenas: Option<DiagnosticArenas<'_>>,
     roots: &[ProductId],
 ) -> Vec<ParseErrorInfo> {
     let mut diagnostics = Vec::new();
@@ -46,7 +52,7 @@ pub(crate) fn collect_parse_diagnostics(
 
 fn collect_ast_parse_diagnostics(
     product_id: ProductId,
-    arenas: &SessionArenas,
+    arenas: DiagnosticArenas<'_>,
     seen_products: &mut HashSet<ProductId>,
     seen_diagnostics: &mut HashSet<ParseErrorInfo>,
     diagnostics: &mut Vec<ParseErrorInfo>,

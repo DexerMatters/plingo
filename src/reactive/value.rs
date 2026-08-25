@@ -8,6 +8,7 @@
 //! (T3).
 
 use std::any::Any;
+use std::sync::Arc;
 use std::fmt::Debug;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -52,6 +53,9 @@ pub trait KeyValue: Any + Send + Sync + Debug {
     /// Deterministic hash of this key.
     fn hash_value(&self) -> u64;
 
+    /// Clones this key behind its erased type.
+    fn clone_key(&self) -> Arc<dyn KeyValue>;
+
     /// Downcast helper.
     fn as_any(&self) -> &dyn Any;
 }
@@ -70,11 +74,11 @@ impl<K: Any + Send + Sync + Debug + Clone + Eq + Hash> KeyValue for K {
         hasher.finish()
     }
 
+    fn clone_key(&self) -> Arc<dyn KeyValue> {
+        Arc::new(self.clone())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
-
-/// The typed key bound: erased [`KeyValue`] plus `Clone + Eq + Hash`.
-pub trait KeySpec: KeyValue + Clone + Eq + Hash + Send + Sync + Debug + 'static {}
-impl<T: KeyValue + Clone + Eq + Hash + Send + Sync + Debug + 'static> KeySpec for T {}

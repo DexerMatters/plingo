@@ -2,7 +2,7 @@ use std::{any::TypeId, sync::Arc};
 
 use crate::framework::parse::{
     data::{
-        ast::{AstBox, AstToken, TokenEntryId},
+        ast::{AstBox, AstToken},
         green::{ParseErrorInfo, TreeData},
         product::{ProductData, ProductId},
     },
@@ -11,6 +11,9 @@ use crate::framework::parse::{
     },
 };
 use crate::utils::Either;
+/// Opaque ABI alias used only by generated token-field builders.
+#[doc(hidden)]
+pub type TokenEntryId = usize;
 
 pub fn begin_non_terminal(grammar: &mut GrammarBuilder, label: &'static str) -> (Symbol, bool) {
     grammar.begin_non_terminal(label)
@@ -133,7 +136,9 @@ impl<T: 'static> BuildField for AstToken<T> {
             .get(product)
             .ok_or(BuildError::MissingProduct(product))?;
         match &p.data {
-            ProductData::Token { entry, .. } => Ok(AstToken::new(*entry)),
+            ProductData::Token { entry, .. } => {
+                Ok(AstToken::new(*entry, p.extent.start, cx.ast.document_id()))
+            }
             _ => Err(BuildError::ExpectedToken { product }),
         }
     }
@@ -141,15 +146,18 @@ impl<T: 'static> BuildField for AstToken<T> {
 
 impl<T: 'static> TokenField for AstToken<T> {
     fn from_token_entry(cx: &BuildCx<'_>, entry: TokenEntryId) -> Result<Self, BuildError> {
-        match &cx
+        let product = cx
             .products
             .get(entry)
-            .ok_or(BuildError::MissingProduct(entry))?
-            .data
-        {
+            .ok_or(BuildError::MissingProduct(entry))?;
+        match &product.data {
             ProductData::Token {
                 entry: tok_entry, ..
-            } => Ok(AstToken::new(*tok_entry)),
+            } => Ok(AstToken::new(
+                *tok_entry,
+                product.extent.start,
+                cx.ast.document_id(),
+            )),
             _ => Err(BuildError::ExpectedToken { product: entry }),
         }
     }

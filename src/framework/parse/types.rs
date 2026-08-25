@@ -1,24 +1,29 @@
-//! Public parser vocabulary and snapshot values shared by all parser subsystems.
-
-use std::{any::TypeId, collections::HashMap, fmt, ops::Deref, sync::Arc};
-
+use std::{
+    any::TypeId,
+    collections::{BTreeSet, HashMap},
+    fmt,
+    ops::Deref,
+    sync::Arc,
+};
 use fluent_uri::Uri;
 use ropey::Rope;
-
 use crate::utils::Span;
 
-use crate::framework::parse::{
-    data::{
-        ast::{AstBox, AstId, AstToken, TokenEntryId},
-        green::TreeArena,
-        gss::GssArena,
-        product::{ProductArena, ProductId},
+use crate::framework::{
+    lex::{LayoutRevisionId, LexicalDocument, LexerRoot, ParseTokenRef, TokenLayoutEntry},
+    parse::{
+        data::{
+            ast::{document_key, AnchoredSpan, AstBox, AstId, AstToken, TokenEntryId},
+            green::TreeArena,
+            gss::GssArena,
+            product::{ProductArena, ProductId},
+        },
+        grammar::TerminalId,
+        identity::TokenFingerprint,
+        parsing::ParserSessionState,
     },
-    grammar::TerminalId,
-    identity::TokenFingerprint,
-    parsing::ParserSessionState,
+    tape::{PersistentOccurrenceIndex, StableTape, TapeCursor},
 };
-
 use super::data::ast::AstArena;
 
 #[derive(Debug, Clone)]
@@ -36,22 +41,14 @@ impl Default for ParserConfig {
     }
 }
 
-/// Stable identity of a reachable AST value across parser publications.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AstKey {
-    pub uri: Uri<&'static str>,
-    pub id: AstId,
-}
+pub(crate) type ParseSnapshotId = u64;
 
-pub type ParseSnapshotId = u64;
-
-/// Metadata and source span for one AST value. The span is mandatory: it was
-/// anchored when the value's shift/reduction created its product.
+/// Metadata and source span for one AST value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AstSnapshotEntry {
-    pub product: ProductId,
-    pub type_id: TypeId,
-    pub span: Span,
+pub(crate) struct AstSnapshotEntry {
+    pub(crate) product: ProductId,
+    pub(crate) type_id: TypeId,
+    pub(crate) span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,16 +60,16 @@ pub struct AstTokenSnapshotEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AstLookupError {
     WrongDocument,
-    Deleted { id: AstId },
-    TypeMismatch { id: AstId },
+    Deleted,
+    TypeMismatch,
 }
 
 impl fmt::Display for AstLookupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongDocument => write!(f, "AST box belongs to a different document"),
-            Self::Deleted { id } => write!(f, "AST node #{id} is not live in this snapshot"),
-            Self::TypeMismatch { id } => write!(f, "AST node #{id} has a different runtime type"),
+            Self::Deleted => write!(f, "AST node is not live in this snapshot"),
+            Self::TypeMismatch => write!(f, "AST node has a different runtime type"),
         }
     }
 }
@@ -82,7 +79,6 @@ impl fmt::Display for AstLookupError {
 /// revision.
 pub struct ResolvedAst<T> {
     value: Arc<T>,
-    product: ProductId,
     span: Span,
 }
 
@@ -99,12 +95,8 @@ impl<T> ResolvedAst<T> {
         Arc::clone(&self.value)
     }
 
-    pub fn product(&self) -> ProductId {
-        self.product
-    }
-
     pub fn span(&self) -> Span {
-        self.span
+        self.span.clone()
     }
 }
 
@@ -114,108 +106,121 @@ impl<T> ResolvedAst<T> {
 #[derive(Clone)]
 pub struct AstSnapshot {
     id: ParseSnapshotId,
-    uri: Uri<&'static str>,
+    uri: Uri<String>,
     source: Arc<Rope>,
-    entries: Arc<HashMap<AstId, AstSnapshotEntry>>,
-    values: Arc<HashMap<AstId, Arc<dyn std::any::Any + Send + Sync>>>,
-    tokens: Arc<HashMap<TokenEntryId, AstTokenSnapshotEntry>>,
+    arena: Arc<AstArena>,
+    live_records: Arc<crate::reactive::store::RadixMap<()>>,
+    token_document: Arc<ParserTokenDocument>,
+}
+
+
+impl std::fmt::Debug for AstSnapshot {
+    /// Debug shows only the stable snapshot identity; the payload maps are
+    /// opaque and never part of reactive equality.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AstSnapshot").field("id", &self.id).finish()
+    }
+}
+
+/// A document-typed handle to one committed AST snapshot (plan §8.4
+/// precursor). Equality is the snapshot identity; `A` participates only in
+/// resolution typing.
+pub struct DocumentSnapshot<A: 'static> {
+    snapshot: Arc<AstSnapshot>,
+    _marker: std::marker::PhantomData<fn() -> A>,
+}
+
+impl<A: 'static> Clone for DocumentSnapshot<A> {
+    fn clone(&self) -> Self {
+        Self {
+            snapshot: Arc::clone(&self.snapshot),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<A: 'static> DocumentSnapshot<A> {
+    pub(crate) fn new(snapshot: Arc<AstSnapshot>) -> Self {
+        Self {
+            snapshot,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// The committed snapshot.
+    pub fn snapshot(&self) -> &AstSnapshot {
+        &self.snapshot
+    }
+
+    /// The committed snapshot handle.
+    pub fn arc(&self) -> &Arc<AstSnapshot> {
+        &self.snapshot
+    }
+}
+
+impl<A: 'static> PartialEq for DocumentSnapshot<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot == other.snapshot
+    }
+}
+impl<A: 'static> Eq for DocumentSnapshot<A> {}
+
+impl<A: 'static> std::fmt::Debug for DocumentSnapshot<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocumentSnapshot").field("snapshot", &self.snapshot).finish()
+    }
 }
 
 impl AstSnapshot {
     pub(crate) fn new(
         id: ParseSnapshotId,
-        uri: Uri<&'static str>,
-        source: Arc<str>,
-        entries: HashMap<AstId, AstSnapshotEntry>,
-        values: HashMap<AstId, Arc<dyn std::any::Any + Send + Sync>>,
-        tokens: HashMap<TokenEntryId, AstTokenSnapshotEntry>,
+        uri: Uri<String>,
+        source: Arc<Rope>,
+        arena: Arc<AstArena>,
+        live_records: Arc<crate::reactive::store::RadixMap<()>>,
+        token_document: Arc<ParserTokenDocument>,
     ) -> Self {
         Self {
             id,
             uri,
-            source: Arc::new(Rope::from_str(&source)),
-            entries: Arc::new(entries),
-            values: Arc::new(values),
-            tokens: Arc::new(tokens),
+            source,
+            arena,
+            live_records,
+            token_document,
         }
     }
 
-    pub fn id(&self) -> ParseSnapshotId {
-        self.id
-    }
-
-    /// The byte span of one live AST record (used by generated tree
-    /// walkers and the parser component to derive stable syntax ids).
-    pub fn ast_span(&self, id: AstId) -> Option<crate::utils::Span> {
-        self.entries.get(&id).map(|entry| entry.span)
-    }
-
-    pub fn uri(&self) -> Uri<&'static str> {
-        self.uri
-    }
-
-    pub fn source(&self) -> &Rope {
-        &self.source
-    }
-
-    pub fn ast_keys(&self) -> impl Iterator<Item = AstKey> + '_ {
-        self.entries
-            .keys()
-            .copied()
-            .map(|id| AstKey { uri: self.uri, id })
-    }
-
-    /// Every live value as immutable erased metadata. Parser publication uses
-    /// this to materialize one graph fact per AST identity without requiring a
-    /// parser node for every concrete AST type.
-    pub(crate) fn erased_entries(
-        &self,
-    ) -> impl Iterator<
-        Item = (
-            AstKey,
-            AstSnapshotEntry,
-            Arc<dyn std::any::Any + Send + Sync>,
-        ),
-    > + '_ {
-        self.entries.iter().filter_map(|(id, entry)| {
-            self.values.get(id).map(|value| {
-                (
-                    AstKey {
-                        uri: self.uri,
-                        id: *id,
-                    },
-                    entry.clone(),
-                    Arc::clone(value),
-                )
-            })
-        })
+    /// Debug oracle surface (plan §20.2): the live record ids this
+    /// snapshot publishes. Never used on production command paths.
+    #[doc(hidden)]
+    pub fn __live_record_ids(&self) -> Vec<u64> {
+        self.live_records.iter().map(|(id, ())| id).collect()
     }
 
     pub fn resolve<T>(&self, node: AstBox<T>) -> Result<ResolvedAst<T>, AstLookupError>
     where
         T: Send + Sync + 'static,
     {
-        if node.uri != self.uri {
+        if node.document_id() != document_key(&self.uri) {
             return Err(AstLookupError::WrongDocument);
         }
-        let entry = self
-            .entries
-            .get(&node.id)
-            .ok_or(AstLookupError::Deleted { id: node.id })?;
-        if entry.type_id != TypeId::of::<T>() {
-            return Err(AstLookupError::TypeMismatch { id: node.id });
+        let id = node.raw_id();
+        if self.live_records.get(id as u64).is_none() {
+            return Err(AstLookupError::Deleted);
         }
-        let value = Arc::clone(
-            self.values
-                .get(&node.id)
-                .ok_or(AstLookupError::Deleted { id: node.id })?,
-        )
-        .downcast::<T>()
-        .map_err(|_| AstLookupError::TypeMismatch { id: node.id })?;
+        if self.arena.type_of(id) != Some(TypeId::of::<T>()) {
+            return Err(AstLookupError::TypeMismatch);
+        }
+        let value = self
+            .arena
+            .cloned_erased(id)
+            .ok_or(AstLookupError::Deleted)?
+            .downcast::<T>()
+            .map_err(|_| AstLookupError::TypeMismatch)?;
+        let extent = self.arena.extent_of_id(id).ok_or(AstLookupError::Deleted)?;
         Ok(ResolvedAst {
             value,
-            product: entry.product,
-            span: entry.span,
+            span: self.span_for_extent(extent),
         })
     }
 
@@ -228,11 +233,49 @@ impl AstSnapshot {
         self.resolve(node).ok().map(|resolved| resolved.arc())
     }
 
-    pub fn token<T>(&self, token: AstToken<T>) -> Option<&AstTokenSnapshotEntry> {
-        self.tokens.get(&token.id)
+    #[inline]
+    pub fn token<T>(&self, token: AstToken<T>) -> Option<AstTokenSnapshotEntry> {
+        let occurrence = token.occurrence();
+        let data = self
+            .token_document
+            .rank_of_occurrence(occurrence)
+            .and_then(|rank| self.token_document.token_at(rank))?;
+        let end = data.start.saturating_add(data.length).min(self.source.len_bytes());
+        Some(AstTokenSnapshotEntry {
+            terminal: data.terminal,
+            span: Span::new_uri(
+                self.uri.clone(),
+                data.start.min(end),
+                data.start.max(end),
+            )
+            .expect("parser token coordinates are UTF-8 source boundaries"),
+        })
     }
 
-    pub fn source_text(&self, span: Span) -> String {
+    fn coordinate_at(&self, occurrence: usize) -> usize {
+        self.token_document
+            .rank_of_occurrence(occurrence)
+            .and_then(|rank| self.token_document.token_at(rank))
+            .map_or(self.source.len_bytes(), |token| token.start)
+    }
+
+    fn span_for_extent(&self, extent: AnchoredSpan) -> Span {
+        let start = self.coordinate_at(extent.start);
+        let end = self
+            .token_document
+            .rank_of_occurrence(extent.end)
+            .and_then(|rank| self.token_document.token_at(rank))
+            .map_or(self.source.len_bytes(), |token| {
+                if extent.end_at_token_end {
+                    token.start.saturating_add(token.length)
+                } else {
+                    token.start
+                }
+            });
+        Span::new_uri(self.uri.clone(), start.min(end), start.max(end))
+            .expect("parser token coordinates are UTF-8 source boundaries")
+    }
+    pub(crate) fn source_text(&self, span: Span) -> String {
         let span = span.trim(&self.source);
         self.source
             .byte_slice(span.range.start()..span.range.end())
@@ -269,7 +312,7 @@ pub enum ParseStatus {
     Unrecoverable { diagnostics: usize },
 }
 
-pub type TokenOccurrenceId = usize;
+pub(crate) type TokenOccurrenceId = usize;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IncrementalParseStats {
@@ -281,32 +324,337 @@ pub struct IncrementalParseStats {
     pub frontier_matches: usize,
     pub reparsed: usize,
     pub reused: usize,
+    /// Suffix columns physically rewritten during reuse (cache-stable
+    /// columns are attached verbatim — plan §8.6 fast path).
+    pub suffix_rewritten: usize,
     pub recovery_columns: usize,
 }
 
+/// Deterministic parser work counters for one document command (plan §10.1).
+/// Counters roll back with their command and never enter reactive facts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParserWork {
+    /// Parser component invocations for this document.
+    pub component_runs: u64,
+    /// Restart occurrence anchors chosen for replay.
+    pub restart_occurrences: u64,
+    /// Restart boundary anchors chosen for replay.
+    pub restart_columns: u64,
+    /// Parse tokens decoded by the lazy cursor.
+    pub tokens_decoded: u64,
+    /// Legacy alias counter retained for report compatibility.
+    pub tokens_replayed: u64,
+    /// Prefix tokens reused without decoding.
+    pub tokens_reused: u64,
+    /// Columns rebuilt inside the replay window.
+    pub columns_replayed: u64,
+    /// Suffix columns transferred unchanged.
+    pub columns_reused: u64,
+    /// Retained suffix columns physically visited after convergence.
+    pub suffix_columns_physically_visited: u64,
+    /// Immutable parse segments attached by pointer.
+    pub segments_attached: u64,
+    /// Checkpoint equality comparisons.
+    pub checkpoint_comparisons: u64,
+    /// Frontier equality comparisons.
+    pub frontier_comparisons: u64,
+    /// GSS nodes created.
+    pub gss_records_created: u64,
+    /// GSS nodes reused by identity.
+    pub gss_records_reused: u64,
+    /// Products created.
+    pub product_records_created: u64,
+    /// Products reused through reduction caches.
+    pub product_records_reused: u64,
+    /// AST records created.
+    pub ast_records_created: u64,
+    /// AST records reused by identity.
+    pub ast_records_reused: u64,
+    /// Exact parser record mutations journaled.
+    pub record_journal_touches: u64,
+    /// Parser records entering reachability.
+    pub parser_records_inserted: u64,
+    /// Retained parser records with changed payloads.
+    pub parser_records_updated: u64,
+    /// Parser records leaving reachability.
+    pub parser_records_removed: u64,
+    /// Snapshot entries changed by publication.
+    pub snapshot_entries_changed: u64,
+    /// Snapshot entries eagerly materialized by a command.
+    pub snapshot_entries_materialized: u64,
+    /// Synthesized token facts published.
+    pub synthesized_token_facts: u64,
+    /// Syntax node/root facts patched.
+    pub syntax_facts_patched: u64,
+    /// Tree-publisher node scans.
+    pub tree_publisher_node_scans: u64,
+    /// Full parser-token vector clones.
+    pub full_token_vector_clones: u64,
+    /// Full parser-store or tree scans.
+    pub full_store_scans: u64,
+    /// Defensive full rebuilds; valid local edits must leave this zero.
+    pub full_rebuild_fallbacks: u64,
+    /// Replays that ran to EOF instead of converging.
+    pub eof_replays: u64,
+    /// Recovery searches started.
+    pub recovery_searches: u64,
+    /// Recovery segments reused without search.
+    pub recovery_segments_reused: u64,
+    /// Recovery segments invalidated by intersecting edits.
+    pub recovery_segments_invalidated: u64,
+    /// Recovery-derived columns in the final session.
+    pub recovery_columns: u64,
+    /// Configurations expanded by canonical recovery search.
+    pub recovery_configurations_expanded: u64,
+    /// Witness tokens/gaps recorded for recovery reuse proofs.
+    pub recovery_witness_tokens: u64,
+    /// Recovery interval-index probes.
+    pub recovery_interval_probes: u64,
+}
+
+impl ParserWork {
+    /// Merges another counter set into this one (checked addition).
+    pub fn merge(&mut self, other: &Self) {
+        self.component_runs += other.component_runs;
+        self.restart_occurrences += other.restart_occurrences;
+        self.restart_columns += other.restart_columns;
+        self.tokens_decoded += other.tokens_decoded;
+        self.tokens_replayed += other.tokens_replayed;
+        self.tokens_reused += other.tokens_reused;
+        self.columns_replayed += other.columns_replayed;
+        self.columns_reused += other.columns_reused;
+        self.suffix_columns_physically_visited += other.suffix_columns_physically_visited;
+        self.segments_attached += other.segments_attached;
+        self.checkpoint_comparisons += other.checkpoint_comparisons;
+        self.frontier_comparisons += other.frontier_comparisons;
+        self.gss_records_created += other.gss_records_created;
+        self.gss_records_reused += other.gss_records_reused;
+        self.product_records_created += other.product_records_created;
+        self.product_records_reused += other.product_records_reused;
+        self.ast_records_created += other.ast_records_created;
+        self.ast_records_reused += other.ast_records_reused;
+        self.record_journal_touches += other.record_journal_touches;
+        self.parser_records_inserted += other.parser_records_inserted;
+        self.parser_records_updated += other.parser_records_updated;
+        self.parser_records_removed += other.parser_records_removed;
+        self.snapshot_entries_changed += other.snapshot_entries_changed;
+        self.snapshot_entries_materialized += other.snapshot_entries_materialized;
+        self.synthesized_token_facts += other.synthesized_token_facts;
+        self.syntax_facts_patched += other.syntax_facts_patched;
+        self.tree_publisher_node_scans += other.tree_publisher_node_scans;
+        self.full_token_vector_clones += other.full_token_vector_clones;
+        self.full_store_scans += other.full_store_scans;
+        self.full_rebuild_fallbacks += other.full_rebuild_fallbacks;
+        self.eof_replays += other.eof_replays;
+        self.recovery_searches += other.recovery_searches;
+        self.recovery_segments_reused += other.recovery_segments_reused;
+        self.recovery_segments_invalidated += other.recovery_segments_invalidated;
+        self.recovery_columns += other.recovery_columns;
+        self.recovery_configurations_expanded += other.recovery_configurations_expanded;
+        self.recovery_witness_tokens += other.recovery_witness_tokens;
+        self.recovery_interval_probes += other.recovery_interval_probes;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TokenData {
-    pub id: TokenEntryId,
-    pub terminal: Option<TerminalId>,
-    pub start: usize,
-    pub length: usize,
+pub(crate) struct TokenData {
+    pub(crate) id: TokenEntryId,
+    pub(crate) terminal: Option<TerminalId>,
+    pub(crate) start: usize,
+    pub(crate) length: usize,
+
     /// Stable occurrence identity; it is independent of byte and token positions.
-    pub column: TokenOccurrenceId,
-    pub fingerprint: TokenFingerprint,
+    pub(crate) column: TokenOccurrenceId,
+    pub(crate) fingerprint: TokenFingerprint,
+}
+/// parser-relevant persistent projections; typed lexical payloads remain in
+/// the lexer arena. Token decoding is rank-addressed and never requires a
+/// document-wide `Vec<TokenData>`.
+#[derive(Clone)]
+pub(crate) struct ParserTokenDocument {
+    source_len: usize,
+    /// Layout revision of the lexical root this projection was built from.
+    /// The semantic parser keying is structural; this field lets the layout
+    /// refresh child detect whether a parser token root is stale for
+    /// coordinate-only edits.
+    layout_revision: LayoutRevisionId,
+    semantic: StableTape<ParseTokenRef>,
+    semantic_index: PersistentOccurrenceIndex,
+    layout: StableTape<TokenLayoutEntry>,
+    layout_index: PersistentOccurrenceIndex,
 }
 
+impl ParserTokenDocument {
+    pub(crate) fn from_lexical<R: LexerRoot>(document: &LexicalDocument<R>) -> Self {
+        Self {
+            source_len: document.source.len_bytes(),
+            layout_revision: document.layout_revision,
+            semantic: document.semantic.clone(),
+            semantic_index: document.semantic_index.clone(),
+            layout: document.layout.clone(),
+            layout_index: document.layout_index.clone(),
+        }
+    }
+
+    pub(crate) fn layout_revision(&self) -> LayoutRevisionId {
+        self.layout_revision
+    }
+
+    pub(crate) fn semantic_len(&self) -> usize {
+        self.semantic.len()
+    }
+
+    pub(crate) fn occurrence_at(&self, rank: usize) -> Option<TokenOccurrenceId> {
+        self.semantic
+            .get(rank)
+            .and_then(|token| usize::try_from(token.occurrence.0).ok())
+    }
+
+    pub(crate) fn rank_of_occurrence(&self, occurrence: TokenOccurrenceId) -> Option<usize> {
+        self.semantic.rank_of_id(occurrence as u64, &self.semantic_index)
+    }
+
+    pub(crate) fn token_at(&self, rank: usize) -> Option<TokenData> {
+        if rank == self.semantic.len() {
+            return Some(TokenData {
+                id: usize::MAX,
+                terminal: None,
+                start: self.source_len,
+                length: 0,
+                column: usize::MAX,
+                fingerprint: crate::framework::parse::identity::eof_fingerprint(),
+            });
+        }
+        let token = self.semantic.get(rank)?;
+        let layout_rank = self
+            .layout
+            .rank_of_id(token.occurrence.0, &self.layout_index)?;
+        let layout = self.layout.get(layout_rank)?;
+        Some(TokenData {
+            id: usize::try_from(token.occurrence.0).ok()?,
+            terminal: token.terminal,
+            start: usize::try_from(self.layout.metric_before(layout_rank).source_bytes).ok()?,
+            length: layout.byte_len as usize,
+            column: usize::try_from(token.occurrence.0).ok()?,
+            fingerprint: layout.fingerprint.0,
+        })
+    }
+
+    pub(crate) fn structure_ptr_eq(&self, other: &Self) -> bool {
+        self.semantic.root_ptr_eq(&other.semantic)
+    }
+}
+
+
+/// A rank-addressed cursor over a parser token root. The semantic cursor moves
+/// inside tape leaves in amortized O(1); only coordinate lookup for the token
+/// currently being decoded uses the lexical occurrence index.
+pub(crate) struct ParserTokenCursor {
+    document: Arc<ParserTokenDocument>,
+    semantic: Option<TapeCursor<ParseTokenRef>>,
+    at_eof: bool,
+}
+
+impl ParserTokenDocument {
+    pub(crate) fn cursor_at(self: &Arc<Self>, rank: usize) -> ParserTokenCursor {
+        let semantic_len = self.semantic.len();
+        ParserTokenCursor {
+            document: Arc::clone(self),
+            semantic: self.semantic.cursor_at(rank),
+            at_eof: rank >= semantic_len,
+        }
+    }
+}
+
+impl ParserTokenCursor {
+    pub(crate) fn rank(&self) -> usize {
+        self.semantic
+            .as_ref()
+            .map_or(self.document.semantic_len(), TapeCursor::rank)
+    }
+
+    pub(crate) fn current(&self) -> Option<TokenData> {
+        if self.at_eof {
+            return self.document.token_at(self.document.semantic_len());
+        }
+        let semantic = self.semantic.as_ref()?.current();
+        let layout_rank = self
+            .document
+            .layout
+            .rank_of_id(semantic.occurrence.0, &self.document.layout_index)?;
+        let layout = self.document.layout.get(layout_rank)?;
+        Some(TokenData {
+            id: usize::try_from(semantic.occurrence.0).ok()?,
+            terminal: semantic.terminal,
+            start: usize::try_from(
+                self.document.layout.metric_before(layout_rank).source_bytes,
+            )
+            .ok()?,
+            length: layout.byte_len as usize,
+            column: usize::try_from(semantic.occurrence.0).ok()?,
+            fingerprint: layout.fingerprint.0,
+        })
+    }
+
+    /// Moves to the next semantic token, then to the synthetic EOF token.
+    /// Returns false only once EOF has already been consumed.
+    pub(crate) fn advance(&mut self) -> bool {
+        if self.at_eof {
+            return false;
+        }
+        if self.semantic.as_mut().is_some_and(TapeCursor::advance) {
+            return true;
+        }
+        self.semantic = None;
+        self.at_eof = true;
+        true
+    }
+}
+
+/// Persistent tree-facing membership facts for one parser document: the
+/// live arena-record set plus the accepted root record (plan §9.2). The
+/// record set is a persistent radix set — applying one command's journal
+/// path-copies only changed branches, never clones the live set.
 #[derive(Clone, Default)]
-pub struct ParserSnapshotState {
-    pub sessions: HashMap<Uri<&'static str>, Arc<ParserSessionState>>,
-    pub roots: HashMap<Uri<&'static str>, Arc<Vec<ProductId>>>,
-    pub(crate) tokens: HashMap<Uri<&'static str>, Arc<Vec<TokenData>>>,
-    pub(crate) incremental_stats: HashMap<Uri<&'static str>, IncrementalParseStats>,
+pub(crate) struct ParserTreeFacts {
+    pub(crate) records: Arc<crate::reactive::store::RadixMap<()>>,
+    pub(crate) root: Option<u64>,
 }
 
+impl ParserTreeFacts {
+    pub(crate) fn contains(&self, record: u64) -> bool {
+        self.records.get(record).is_some()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.records.len()
+    }
+}
+
+/// Per-document mutable parser arenas and working session state.
 #[derive(Clone)]
 pub(crate) struct SessionArenas {
     pub trees: TreeArena,
     pub products: ProductArena,
-    pub ast: AstArena,
+    pub ast: Arc<AstArena>,
     pub gss: GssArena,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ParserSnapshotState {
+    pub(crate) sessions: HashMap<Uri<String>, Arc<ParserSessionState>>,
+    pub(crate) roots: HashMap<Uri<String>, Arc<Vec<ProductId>>>,
+    pub(crate) tokens: HashMap<Uri<String>, Arc<ParserTokenDocument>>,
+    pub(crate) incremental_stats: HashMap<Uri<String>, IncrementalParseStats>,
+    pub(crate) tree_facts: HashMap<Uri<String>, Arc<ParserTreeFacts>>,
+    /// The canonical adjacent-revision output consumed by the tree
+    /// publisher (plan §9, §12).
+    pub(crate) tree_deltas: HashMap<Uri<String>, Arc<crate::framework::parse::delta::ParseDelta>>,
+    /// Per-document semantic-revision ordinals: bumped once per non-empty
+    /// ParseDelta so tree consumers get an O(1) equality handle (§12.7).
+    pub(crate) semantic_revisions: HashMap<Uri<String>, u64>,
+    /// The last published status fact, for exact status deltas.
+    pub(crate) published_status: HashMap<Uri<String>, crate::framework::parse::delta::ParsedStatus>,
+    /// The last published diagnostics, for exact diagnostic key deltas.
+    pub(crate) published_diagnostics: HashMap<Uri<String>, Arc<Vec<crate::framework::parse::data::green::ParseErrorInfo>>>,
 }

@@ -3,9 +3,9 @@
 
 pub mod lex;
 pub mod parse;
-pub(crate) mod tape;
 pub mod scope;
 pub mod source;
+pub(crate) mod tape;
 pub mod workspace;
 
 pub mod change;

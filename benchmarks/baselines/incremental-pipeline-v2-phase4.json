@@ -1,0 +1,805 @@
+{
+ "schema_version": 2,
+ "recovery_policy_version": "RECOVERY_POLICY_VERSION@phase4",
+ "percentile_policy": "nearest_rank_v1",
+ "phase": "follow-up-phase4-parser-locality",
+ "date": "2026-08-27",
+ "status": "recorded",
+ "source_state": {
+  "git_head": "working-tree (follow-up Phase 4 parser locality + Phase 5 example components + Phase 6 schema)",
+  "profile": "release",
+  "toolchain": "stable-x86_64-unknown-linux-gnu",
+  "notes": "Same-terminal numeric edits keep the semantic parser cold; retained parser suffix segments are attached by pointer; benchmark work objects carry per-structure path_work. STLC scope pass migrated to automatic identities (Cut I)."
+ },
+ "target": {
+  "os": "linux",
+  "arch": "x86_64",
+  "fixture_checksums": {
+   "json_512": 12204654688906566588,
+   "json_10k": 7430654030717443365,
+   "json_100k": 6479917537037151557,
+   "stlc_1k": 9244844128292208043
+  }
+ },
+ "cases": [
+  {
+   "name": "json_512_replace_s1",
+   "tokens": 512,
+   "samples": 3,
+   "median_us": 158573,
+   "p95_us": 170573,
+   "avg_alloc_count": 1754910,
+   "avg_alloc_bytes": 296729987,
+   "source_bytes": 2700,
+   "lexical_occurrences": 1227,
+   "semantic_tokens": 1330,
+   "declarations": 0,
+   "live_facts": 1856,
+   "work": {
+    "live_facts_before": 1851,
+    "live_facts_after": 1856,
+    "rounds": 4,
+    "fact_reads": 8,
+    "fact_scan_steps": 0,
+    "fact_writes": 629,
+    "fact_retractions": 0,
+    "facts_changed": 629,
+    "candidate_writes": 629,
+    "committed_changes": 629,
+    "patch_key_lookups": 4331,
+    "patch_key_comparisons": 623,
+    "patch_ops_coalesced": 0,
+    "ordered_splices_applied": 0,
+    "forbidden_full_vector_scans": 0,
+    "invocation_scans": 0,
+    "state_diffs": 0,
+    "diff_scan_steps": 0,
+    "path_work": {
+     "rope_tree": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "source_index": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "lexer_document_index": {
+      "operations": 6,
+      "key_comparisons": 6,
+      "nodes_visited": 6,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 1
+     },
+     "token_tape": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "token_index": {
+      "operations": 3201,
+      "key_comparisons": 2775,
+      "nodes_visited": 28383,
+      "nodes_copied": 3384,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 9
+     },
+     "fact_hamt": {
+      "operations": 23485,
+      "key_comparisons": 11752,
+      "nodes_visited": 88265,
+      "nodes_copied": 30492,
+      "nodes_created": 868,
+      "rebalances": 0,
+      "max_depth": 9
+     },
+     "ownership_hamt": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "dependency_hamt": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "collision_tree": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "parser_radix": {
+      "operations": 6152,
+      "key_comparisons": 2469,
+      "nodes_visited": 50457,
+      "nodes_copied": 19690,
+      "nodes_created": 5,
+      "rebalances": 0,
+      "max_depth": 9
+     },
+     "parser_index": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "column_seq": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "measured_seq": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "scc_adjacency": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "scc_members": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "scc_condensation": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "dirty_queue": {
+      "operations": 10,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     }
+    },
+    "source_validated_operations": 2,
+    "source_effective_splices": 1,
+    "source_bytes_removed": 9,
+    "source_bytes_inserted": 7,
+    "source_coordinate_islands_built": 2,
+    "source_coordinate_islands_queried": 0,
+    "source_rope_chunks_traversed": 0,
+    "source_rope_edit_operations": 1,
+    "source_full_materializations": 0,
+    "lexer_restart_bytes": 3,
+    "lexer_relexed": 4,
+    "lexer_reused": 1223,
+    "lexer_dfa_transitions": 14,
+    "lexer_bytes_examined": 14,
+    "lexer_eof_replays": 0,
+    "lexer_lexical_entries_visited": 7,
+    "lexer_semantic_entries_visited": 7,
+    "lexer_retained_suffix_entries_visited": 0,
+    "lexer_full_tape_iterations": 0,
+    "lexer_full_projection_fallbacks": 0,
+    "lexer_document_vector_rebuilds": 0,
+    "parser_restart_columns": 3,
+    "parser_reparsed": 1330,
+    "parser_reused": 0,
+    "parser_convergence_checks": 0,
+    "parser_frontier_matches": 0,
+    "parser_gss_created": 0,
+    "parser_products_created": 0,
+    "parser_ast_created": 0,
+    "parser_snapshot_entries": 0,
+    "parser_recovery_searches": 103,
+    "parser_eof_replays": 0
+   },
+   "outcome": {
+    "status": "recorded"
+   }
+  },
+  {
+   "name": "json_4096_replace_true",
+   "tokens": 4096,
+   "samples": 3,
+   "median_us": 20019965,
+   "p95_us": 20911963,
+   "avg_alloc_count": 87136586,
+   "avg_alloc_bytes": 15865169686,
+   "source_bytes": 23910,
+   "lexical_occurrences": 9828,
+   "semantic_tokens": 10646,
+   "declarations": 0,
+   "live_facts": 14755,
+   "work": {
+    "live_facts_before": 14755,
+    "live_facts_after": 14755,
+    "rounds": 4,
+    "fact_reads": 8,
+    "fact_scan_steps": 0,
+    "fact_writes": 4926,
+    "fact_retractions": 0,
+    "facts_changed": 9,
+    "candidate_writes": 4926,
+    "committed_changes": 9,
+    "patch_key_lookups": 34431,
+    "patch_key_comparisons": 4925,
+    "patch_ops_coalesced": 0,
+    "ordered_splices_applied": 0,
+    "forbidden_full_vector_scans": 0,
+    "invocation_scans": 0,
+    "state_diffs": 0,
+    "diff_scan_steps": 0,
+    "path_work": {
+     "rope_tree": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "source_index": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "lexer_document_index": {
+      "operations": 6,
+      "key_comparisons": 6,
+      "nodes_visited": 6,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 1
+     },
+     "token_tape": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "token_index": {
+      "operations": 21108,
+      "key_comparisons": 20688,
+      "nodes_visited": 189552,
+      "nodes_copied": 3360,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 9
+     },
+     "fact_hamt": {
+      "operations": 152437,
+      "key_comparisons": 63953,
+      "nodes_visited": 544043,
+      "nodes_copied": 206451,
+      "nodes_created": 7535,
+      "rebalances": 0,
+      "max_depth": 9
+     },
+     "ownership_hamt": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "dependency_hamt": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "collision_tree": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "parser_radix": {
+      "operations": 49152,
+      "key_comparisons": 19703,
+      "nodes_visited": 402983,
+      "nodes_copied": 157154,
+      "nodes_created": 39,
+      "rebalances": 0,
+      "max_depth": 9
+     },
+     "parser_index": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "column_seq": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "measured_seq": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "scc_adjacency": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "scc_members": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "scc_condensation": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "dirty_queue": {
+      "operations": 10,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     }
+    },
+    "source_validated_operations": 2,
+    "source_effective_splices": 1,
+    "source_bytes_removed": 9,
+    "source_bytes_inserted": 10,
+    "source_coordinate_islands_built": 2,
+    "source_coordinate_islands_queried": 0,
+    "source_rope_chunks_traversed": 0,
+    "source_rope_edit_operations": 1,
+    "source_full_materializations": 0,
+    "lexer_restart_bytes": 3,
+    "lexer_relexed": 3,
+    "lexer_reused": 9825,
+    "lexer_dfa_transitions": 16,
+    "lexer_bytes_examined": 16,
+    "lexer_eof_replays": 0,
+    "lexer_lexical_entries_visited": 6,
+    "lexer_semantic_entries_visited": 6,
+    "lexer_retained_suffix_entries_visited": 0,
+    "lexer_full_tape_iterations": 0,
+    "lexer_full_projection_fallbacks": 0,
+    "lexer_document_vector_rebuilds": 0,
+    "parser_restart_columns": 5,
+    "parser_reparsed": 10646,
+    "parser_reused": 0,
+    "parser_convergence_checks": 0,
+    "parser_frontier_matches": 0,
+    "parser_gss_created": 0,
+    "parser_products_created": 0,
+    "parser_ast_created": 0,
+    "parser_snapshot_entries": 0,
+    "parser_recovery_searches": 819,
+    "parser_eof_replays": 0
+   },
+   "outcome": {
+    "status": "recorded"
+   }
+  },
+  {
+   "name": "stlc_64_literal",
+   "tokens": 64,
+   "samples": 3,
+   "median_us": 4775,
+   "p95_us": 7791,
+   "avg_alloc_count": 13275,
+   "avg_alloc_bytes": 3768458,
+   "source_bytes": 3780,
+   "lexical_occurrences": 2032,
+   "semantic_tokens": 1089,
+   "declarations": 64,
+   "live_facts": 20453,
+   "work": {
+    "live_facts_before": 20453,
+    "live_facts_after": 20453,
+    "rounds": 3,
+    "fact_reads": 5,
+    "fact_scan_steps": 0,
+    "fact_writes": 7,
+    "fact_retractions": 0,
+    "facts_changed": 6,
+    "candidate_writes": 7,
+    "committed_changes": 6,
+    "patch_key_lookups": 2189,
+    "patch_key_comparisons": 7,
+    "patch_ops_coalesced": 0,
+    "ordered_splices_applied": 0,
+    "forbidden_full_vector_scans": 0,
+    "invocation_scans": 0,
+    "state_diffs": 0,
+    "diff_scan_steps": 0,
+    "path_work": {
+     "rope_tree": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "source_index": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "lexer_document_index": {
+      "operations": 6,
+      "key_comparisons": 6,
+      "nodes_visited": 6,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 1
+     },
+     "token_tape": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "token_index": {
+      "operations": 751,
+      "key_comparisons": 251,
+      "nodes_visited": 6259,
+      "nodes_copied": 4000,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 9
+     },
+     "fact_hamt": {
+      "operations": 49,
+      "key_comparisons": 43,
+      "nodes_visited": 81,
+      "nodes_copied": 10,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 9
+     },
+     "ownership_hamt": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "dependency_hamt": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "collision_tree": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "parser_radix": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "parser_index": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "column_seq": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "measured_seq": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "scc_adjacency": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "scc_members": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "scc_condensation": {
+      "operations": 0,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     },
+     "dirty_queue": {
+      "operations": 8,
+      "key_comparisons": 0,
+      "nodes_visited": 0,
+      "nodes_copied": 0,
+      "nodes_created": 0,
+      "rebalances": 0,
+      "max_depth": 0
+     }
+    },
+    "source_validated_operations": 2,
+    "source_effective_splices": 1,
+    "source_bytes_removed": 11,
+    "source_bytes_inserted": 11,
+    "source_coordinate_islands_built": 2,
+    "source_coordinate_islands_queried": 0,
+    "source_rope_chunks_traversed": 1,
+    "source_rope_edit_operations": 1,
+    "source_full_materializations": 0,
+    "lexer_restart_bytes": 29,
+    "lexer_relexed": 7,
+    "lexer_reused": 2025,
+    "lexer_dfa_transitions": 25,
+    "lexer_bytes_examined": 25,
+    "lexer_eof_replays": 0,
+    "lexer_lexical_entries_visited": 14,
+    "lexer_semantic_entries_visited": 8,
+    "lexer_retained_suffix_entries_visited": 0,
+    "lexer_full_tape_iterations": 0,
+    "lexer_full_projection_fallbacks": 0,
+    "lexer_document_vector_rebuilds": 0,
+    "parser_restart_columns": 0,
+    "parser_reparsed": 0,
+    "parser_reused": 1089,
+    "parser_convergence_checks": 0,
+    "parser_frontier_matches": 0,
+    "parser_gss_created": 0,
+    "parser_products_created": 0,
+    "parser_ast_created": 0,
+    "parser_snapshot_entries": 0,
+    "parser_recovery_searches": 0,
+    "parser_eof_replays": 0
+   },
+   "outcome": {
+    "status": "recorded"
+   }
+  }
+ ],
+ "percentile_selftest": {
+  "vectors": [
+   {
+    "input": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7,
+     8
+    ],
+    "median": 4,
+    "p95": 8
+   },
+   {
+    "input_n": 10,
+    "median": 5,
+    "p95": 10
+   },
+   {
+    "input_n": 50,
+    "median": 25,
+    "p95": 48
+   },
+   {
+    "input": [
+     1,
+     1,
+     1,
+     2,
+     2,
+     9,
+     9,
+     9
+    ],
+    "median": 2,
+    "p95": 9
+   },
+   {
+    "input_n": 10,
+    "p0": 1,
+    "p100": 10
+   },
+   {
+    "input": [],
+    "median": "no_samples",
+    "p95": "no_samples"
+   }
+  ],
+  "policy": "nearest_rank_v1 (index = clamp(ceil(p*n)-1, 0, n-1))"
+ },
+ "verification": {
+  "cargo_test_release_json_heavy": "pass: 17 tests",
+  "cargo_test_release_phase0_instrumentation": "pass: 10 tests",
+  "cargo_test_release_phase0_recovery_baselines": "pass: 3 tests",
+  "cargo_test_release_view_pipeline": "pass: 18 tests",
+  "cargo_test_release_tree_transform": "pass: 20 tests",
+  "cargo_test_release_stlc": "pass: 31 tests",
+  "cargo_test_release_phase0_baseline_schema": "pass: 4 tests",
+  "cargo_test_release_authoring_gates": "pass: 3 tests",
+  "cargo_bench_incremental_pipeline_no_run": "pass"
+ },
+ "gates": {
+  "status": "pass",
+  "phase4": [
+   "recovered_value_edit_stays_parser_cold_with_exact_diagnostics",
+   "head_value_edit_is_parser_cold",
+   "tail_edit_window_is_size_independent",
+   "whitespace_edit_is_parser_cold",
+   "suffix_rewrite_is_measured_and_bounded"
+  ],
+  "phase5": [
+   "scalar_value_edit_wakes_exactly_the_value_chain",
+   "program_removal_retires_exactly_its_component_domain",
+   "payload_edit_evaluates_exactly_the_payload_projection",
+   "number_edit_evaluates_exactly_the_number_payload_producer",
+   "audit_numeric_value_edit_evaluates_exact_elements_only"
+  ],
+  "phase6": [
+   "v2_baselines_carry_the_closed_schema",
+   "v1_artifacts_migrate_with_defaulted_v2_fields",
+   "component_authored_examples_avoid_forbidden_authoring_surface",
+   "scope_lowering_installs_element_components",
+   "tree_transform_keeps_projection_components"
+  ]
+ },
+ "scale_gate": {
+  "status": "pass",
+  "test": "phase0_instrumentation::local_value_edit_has_no_document_sized_source_or_lexer_work + json_heavy::work_gates::suffix_rewrite_is_measured_and_bounded",
+  "sizes": [
+   32,
+   128,
+   300,
+   900
+  ],
+  "assertions": [
+   "full_source_materializations == 0",
+   "full_tape_iterations == 0",
+   "full_projection_fallbacks == 0",
+   "document_vector_rebuilds == 0",
+   "retained_suffix_entries_visited == 0",
+   "parser component_runs == 0 for value edits",
+   "suffix_columns_physically_visited <= 16"
+  ]
+ }
+}

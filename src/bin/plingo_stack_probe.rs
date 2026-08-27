@@ -11,9 +11,9 @@ mod fixtures;
 mod json;
 
 use json::{JsonDocument, JsonToken};
+use plingo::framework::Workspace;
 use plingo::framework::lex::install_lexer;
 use plingo::framework::parse::install_parser;
-use plingo::framework::Workspace;
 
 fn main() {
     let depth: usize = std::env::args()

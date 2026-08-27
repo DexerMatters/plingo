@@ -14,7 +14,9 @@ pub(crate) struct RopeCursor {
 
 impl Clone for RopeCursor {
     fn clone(&self) -> Self {
-        Self { rope: Arc::clone(&self.rope) }
+        Self {
+            rope: Arc::clone(&self.rope),
+        }
     }
 }
 
@@ -53,8 +55,7 @@ impl RopeCursor {
     /// text and the absolute byte offset of its first byte.
     pub(crate) fn chunk_containing(&self, offset: usize) -> (&str, usize) {
         let char_idx = self.rope.byte_to_char(offset);
-        let (chunk_text, chunk_start_char, _byte_idx, _len) =
-            self.rope.chunk_at_char(char_idx);
+        let (chunk_text, chunk_start_char, _byte_idx, _len) = self.rope.chunk_at_char(char_idx);
         let chunk_start_byte = self.rope.char_to_byte(chunk_start_char);
         (chunk_text, chunk_start_byte)
     }

@@ -10,18 +10,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use plingo::framework::lex::{LexErrorInfo, LexToken, Tokens, TokenVec};
+use plingo::framework::Workspace;
+use plingo::framework::lex::{LexErrorInfo, LexToken, TokenVec, Tokens};
 use plingo::framework::parse::data::AstBox;
 use plingo::framework::parse::{
     AstSnapshot, AstSnapshots, DocumentSnapshot, ParseDiagnostics, ParseErrorInfo, ParseStatus,
     ParseUnits,
 };
 use plingo::framework::source::source_snapshot;
-use plingo::framework::Workspace;
 use plingo::reactive::Snapshot;
 
 use super::json::{
-    JsonArray, JsonDocument, JsonElements, JsonMember, JsonObject, JsonMembers, JsonToken,
+    JsonArray, JsonDocument, JsonElements, JsonMember, JsonMembers, JsonObject, JsonToken,
     JsonValue,
 };
 
@@ -107,16 +107,18 @@ impl ValueJoin {
     ) -> Option<String> {
         let entry = snapshot.token(*token)?;
         let range = &entry.span.range;
-        self.by_span
-            .get(&(range.start(), range.end()))
-            .cloned()
+        self.by_span.get(&(range.start(), range.end())).cloned()
     }
 }
 
 /// Converts a resolved JSON document into its canonical value. Resolution
 /// goes through one committed `AstSnapshot`, so structure comes from a
 /// single parser revision.
-pub fn canonical_json(snapshot: &AstSnapshot, document: &JsonDocument, join: &ValueJoin) -> Canonical {
+pub fn canonical_json(
+    snapshot: &AstSnapshot,
+    document: &JsonDocument,
+    join: &ValueJoin,
+) -> Canonical {
     match document {
         JsonDocument::Root(value) => canonical_value(snapshot, *value, join, 0),
         JsonDocument::Error(info) => Canonical::Error(error_projection(info)),
@@ -316,9 +318,11 @@ pub fn project(ws_snapshot: &Snapshot, uri: &str) -> PipelineProjection {
 
     let snapshots = ws_snapshot.observe::<AstSnapshots<JsonDocument>>(uri.to_string());
     let roots = match (&unit, &snapshots) {
-        (Some(unit), Some(document)) if unit.root.is_some() => {
-            project_roots(document.arc(), &unit.root.expect("root checked"), &tokens_view)
-        }
+        (Some(unit), Some(document)) if unit.root.is_some() => project_roots(
+            document.arc(),
+            &unit.root.expect("root checked"),
+            &tokens_view,
+        ),
         _ => Vec::new(),
     };
 
@@ -355,7 +359,9 @@ fn project_roots(
     };
     let join = match tokens {
         Some(tokens_arc) => ValueJoin::new(&tokens_arc.tokens),
-        None => ValueJoin { by_span: HashMap::new() },
+        None => ValueJoin {
+            by_span: HashMap::new(),
+        },
     };
     vec![canonical_json(snapshot, &document_arc, &join).render()]
 }
@@ -422,7 +428,9 @@ impl TraceRunner {
 
         let mut fresh = (self.fresh_builder)();
         let fresh_uri = super::uri(&(format!("{}-fresh", self.name)));
-        fresh.open(fresh_uri.clone(), &self.text).expect("fresh open commits");
+        fresh
+            .open(fresh_uri.clone(), &self.text)
+            .expect("fresh open commits");
         let fresh_projection = project(&fresh.snapshot(), &fresh_uri.to_string());
 
         assert_eq!(
@@ -442,7 +450,9 @@ impl TraceRunner {
             .observe::<Tokens<JsonToken>>(uri_string);
         if let Some(previous) = &self.last_publication {
             assert!(
-                current.as_ref().is_some_and(|current| Arc::ptr_eq(current, previous)),
+                current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, previous)),
                 "unchanged revision must retain its publication Arc"
             );
         }

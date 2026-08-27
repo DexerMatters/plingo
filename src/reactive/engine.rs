@@ -14,9 +14,12 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::reactive::api::{Planned, Running};
 use crate::reactive::error::{Error, Result};
-use crate::reactive::kind::{BoxView, GraphFact, GraphKey, GraphView, ListFact, ListKey, ListView, MapView, TreeFact, TreeKey, TreeView};
-use crate::reactive::value::{KeyValue, Value};
+use crate::reactive::kind::{
+    BoxView, GraphFact, GraphKey, GraphView, ListFact, ListKey, ListView, MapView, TreeFact,
+    TreeKey, TreeView,
+};
 use crate::reactive::plain::{self, OutputSink, PlainRuntime};
+use crate::reactive::value::{KeyValue, Value};
 use crate::reactive::view::{Node, View};
 
 /// Stable identity of one evaluated computation relationship.
@@ -98,8 +101,7 @@ impl CommandReport {
     /// One typed command-local metric extension recorded by framework
     /// components. Unknown types return `None`.
     pub fn metric<T: Send + Sync + 'static>(&self) -> Option<&T> {
-        self.metrics
-            .get::<T>()
+        self.metrics.get::<T>()
     }
 }
 /// Deterministic engine work counters for one command. Counters are
@@ -162,6 +164,10 @@ pub struct EngineWork {
     pub ordered_splices_applied: u64,
     /// Explicit forbidden vector scans in patch processing.
     pub full_patch_vector_scans: u64,
+    /// Per-structure physical work (follow-up plan §4 item 7): operations,
+    /// comparisons, visited/copied/created nodes, rebalances, and max depth
+    /// grouped by primitive persistent-index structure.
+    pub path_work: crate::reactive::pathwork::PathWorkReport,
 }
 
 type Subscription = Arc<dyn Fn(Snapshot, usize) + Send + Sync>;
@@ -221,19 +227,15 @@ impl Engine {
 
     /// Captures one ordinary function in an isolated, scheduler-invisible
     /// computation graph.
-    pub fn plan<F, A, B>(&mut self, function: F, input: A) -> Result<Planned<B>>
+    pub(crate) fn plan<F, A, B>(&mut self, function: F, input: A) -> Result<Planned<B>>
     where
         F: Fn(A) -> Result<B> + Clone + Send + Sync + 'static,
         A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
         B: Clone + PartialEq + std::fmt::Debug + Send + Sync + 'static,
     {
         let runtime = self.plain.lock();
-        let (plan, output) = plain::capture_plan(
-            runtime.state.lock().clone(),
-            runtime.epoch,
-            function,
-            input,
-        )?;
+        let (plan, output) =
+            plain::capture_plan(runtime.state.lock().clone(), runtime.epoch, function, input)?;
         Ok(Planned {
             engine_id: self.plain_engine_id(),
             token: plan.root,
@@ -248,7 +250,7 @@ impl Engine {
     where
         B: Clone + PartialEq + std::fmt::Debug + Send + Sync + 'static,
     {
-        use crate::reactive::plain::{push_txn, take_txn_pub, rollback_txn_pub, with_txn_pub};
+        use crate::reactive::plain::{push_txn, rollback_txn_pub, take_txn_pub, with_txn_pub};
 
         if planned.engine_id != self.plain_engine_id() {
             return Err(Error::PlanForDifferentEngine);
@@ -266,13 +268,10 @@ impl Engine {
         if plan.captured_epoch != runtime.epoch {
             match plain::recapture_plan(plan, runtime.state.lock().clone(), runtime.epoch) {
                 Ok(output) => {
-                    *planned.output.write() = Arc::new(
-                        output
-                            .as_any()
-                            .downcast_ref::<B>()
-                            .cloned()
-                            .ok_or_else(|| Error::Internal("recaptured root result type mismatch".into()))?,
-                    );
+                    *planned.output.write() =
+                        Arc::new(output.as_any().downcast_ref::<B>().cloned().ok_or_else(
+                            || Error::Internal("recaptured root result type mismatch".into()),
+                        )?);
                 }
                 Err(error) => {
                     plan.output = plan_output_backup;
@@ -344,9 +343,10 @@ impl Engine {
         }
         for (view, subscriber) in subscriptions {
             if let Some(count) = counts.get(&view).copied()
-                && count != 0 {
-                    subscriber(snapshot.clone(), count);
-                }
+                && count != 0
+            {
+                subscriber(snapshot.clone(), count);
+            }
         }
 
         Ok(Running {
@@ -359,7 +359,7 @@ impl Engine {
 
     /// Removes one committed root. Removal is borrowed and idempotent.
     pub fn remove<B>(&mut self, running: &Running<B>) -> Result<()> {
-        use crate::reactive::plain::{push_txn, take_txn_pub, rollback_txn_pub, with_txn_pub};
+        use crate::reactive::plain::{push_txn, rollback_txn_pub, take_txn_pub, with_txn_pub};
 
         if running.engine_id != self.plain_engine_id() {
             return Err(Error::PlanForDifferentEngine);
@@ -403,9 +403,10 @@ impl Engine {
             }
             for (view, subscriber) in subscriptions {
                 if let Some(count) = counts.get(&view).copied()
-                    && count != 0 {
-                        subscriber(snapshot.clone(), count);
-                    }
+                    && count != 0
+                {
+                    subscriber(snapshot.clone(), count);
+                }
             }
         } else {
             drop(_txn_frame);
@@ -439,9 +440,10 @@ impl Engine {
         let subscriptions = self.plain_subscriptions.lock().clone();
         for (view, subscriber) in subscriptions {
             if let Some(count) = report.plain_changed.get(&view).copied()
-                && count != 0 {
-                    subscriber(snapshot.clone(), count);
-                }
+                && count != 0
+            {
+                subscriber(snapshot.clone(), count);
+            }
         }
         Ok(report)
     }
@@ -451,15 +453,21 @@ impl Engine {
     /// The function runs once per key, directly scheduled by that key's
     /// changes; no discovery root enumerates the view afterwards. Existing
     /// keys evaluate once during installation.
-    pub fn install_keyed<V, F>(&mut self, mut function: F) -> Result<KeyedFamily<V>>
+    ///
+    /// Crate-private since Cut C: authored components install through the
+    /// generated marker-registered installer
+    /// ([`Self::install_component_each_key`]); this ordinal path remains
+    /// only for framework-internal and transaction-test use.
+    pub(crate) fn install_keyed<V, F>(&mut self, mut function: F) -> Result<KeyedFamily<V>>
     where
         V: MapView,
         F: Fn(V::Input) -> Result<()> + Clone + Send + Sync + 'static,
     {
+        use crate::reactive::plain::ErasedCall;
         use crate::reactive::plain::{
-            erased_call, push_txn_pub, rollback_txn_pub, take_txn_pub, with_txn_pub, PlainStatePub as PlainState,
+            PlainStatePub as PlainState, erased_call, push_txn_pub, rollback_txn_pub, take_txn_pub,
+            with_txn_pub,
         };
-        use crate::reactive::plain::ErasedCall;;
 
         let mut runtime = self.plain.lock();
         let _txn_frame = push_txn_pub();
@@ -497,6 +505,7 @@ impl Engine {
                     view_name: V::name(),
                     install_ordinal,
                     build_call,
+                    definition: None,
                 },
             );
             runtime.family_by_root.insert(root, family_id);
@@ -508,7 +517,12 @@ impl Engine {
             let initial_keys: Vec<Arc<dyn KeyValue>> = runtime
                 .committed
                 .view(view)
-                .map(|snapshot| snapshot.entries().map(|entry| Arc::clone(&entry.key)).collect())
+                .map(|snapshot| {
+                    snapshot
+                        .entries()
+                        .map(|entry| Arc::clone(&entry.key))
+                        .collect()
+                })
                 .unwrap_or_default();
             for key in initial_keys {
                 plain::queue_family_child(&mut runtime, family_id, key)?;
@@ -547,12 +561,126 @@ impl Engine {
         }
     }
 
+    /// Installs one first-class `#[component]` with an `EachKey<V>` driver
+    /// (follow-up plan §6.1 / Cut C).
+    ///
+    /// The definition marker rejects a second installer for the same
+    /// component before anything mutates; children take the marker as their
+    /// identity type so scheduling, retirement, and reaction attribution
+    /// derive from the authored definition and the exact driving element.
+    pub fn install_component_each_key<D, V, F>(&mut self, body: F) -> Result<KeyedFamily<V>>
+    where
+        D: crate::reactive::component::ComponentDefinition + 'static,
+        V: MapView,
+        F: Fn(V::Input) -> Result<()> + Clone + Send + Sync + 'static,
+    {
+        use crate::reactive::plain::ErasedCall;
+        use crate::reactive::plain::{
+            PlainStatePub as PlainState, erased_call_with_definition, push_txn_pub,
+            rollback_txn_pub, take_txn_pub, with_txn_pub,
+        };
+
+        let definition = TypeId::of::<D>();
+        let descriptor = D::__descriptor();
+        {
+            let mut runtime = self.plain.lock();
+            runtime
+                .components
+                .register(definition, descriptor, "each_key")?;
+        }
+
+        let mut runtime = self.plain.lock();
+        let _txn_frame = push_txn_pub();
+        let result = (|| -> Result<KeyedFamily<V>> {
+            let root = plain::fresh_token();
+            let graph = Arc::new(Mutex::new(plain::PlainGraph::new(
+                PlainState::default(),
+                plain::erased_noop_pub(),
+                root,
+            )));
+            graph.lock().state = Arc::clone(&runtime.state);
+            let view = TypeId::of::<V>();
+            let build_call: Arc<dyn Fn(Arc<dyn KeyValue>) -> Arc<dyn ErasedCall> + Send + Sync> = {
+                let body = body.clone();
+                Arc::new(move |key| {
+                    let input = key
+                        .as_any()
+                        .downcast_ref::<V::Input>()
+                        .cloned()
+                        .expect("keyed component received an untyped key");
+                    erased_call_with_definition(definition, body.clone(), input)
+                })
+            };
+            let install_ordinal = runtime.next_install_ordinal;
+            runtime.next_install_ordinal += 1;
+            let family_id = root;
+            runtime.families.insert(
+                family_id,
+                plain::FamilyRuntime {
+                    graph: Arc::clone(&graph),
+                    view,
+                    view_name: descriptor,
+                    install_ordinal,
+                    build_call,
+                    definition: Some((descriptor, definition)),
+                },
+            );
+            runtime.family_by_root.insert(root, family_id);
+            with_txn_pub(|txn| {
+                txn.push_undo(plain::Undo::RootInserted { root });
+            });
+
+            // Initial enumeration in fact-ordinal order.
+            let initial_keys: Vec<Arc<dyn KeyValue>> = runtime
+                .committed
+                .view(view)
+                .map(|snapshot| {
+                    snapshot
+                        .entries()
+                        .map(|entry| Arc::clone(&entry.key))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for key in initial_keys {
+                plain::queue_family_child(&mut runtime, family_id, key)?;
+            }
+            if let Err(error) = plain::quiesce(&mut runtime) {
+                return Err(error);
+            }
+
+            Ok(KeyedFamily {
+                engine_id: self.plain_engine_id(),
+                id: family_id,
+                marker: std::marker::PhantomData,
+            })
+        })();
+
+        match result {
+            Ok(family) => {
+                let deltas = with_txn_pub(|txn| txn.journal.commit_deltas());
+                let changes = with_txn_pub(|txn| txn.journal.commit_changes());
+                drop(_txn_frame);
+                if !deltas.is_empty() {
+                    runtime.committed.apply(&deltas);
+                    runtime.epoch += 1;
+                    runtime.last_changed = changes;
+                    plain::update_sinks(&runtime);
+                }
+                Ok(family)
+            }
+            Err(error) => {
+                let txn = take_txn_pub();
+                drop(_txn_frame);
+                rollback_txn_pub(txn, &runtime.state.clone(), &mut runtime.roots);
+                Err(error)
+            }
+        }
+    }
+
     /// Removes a keyed family: every child retires in ordinal order and all
     /// replace/patch-owned publications retract through the journal.
     pub fn remove_keyed<V: MapView>(&mut self, family: &KeyedFamily<V>) -> Result<()> {
-        use crate::reactive::plain::{
-            push_txn_pub, rollback_txn_pub, take_txn_pub,
-        };
+        use crate::reactive::plain::{push_txn_pub, rollback_txn_pub, take_txn_pub};
         if family.engine_id != self.plain_engine_id() {
             return Err(Error::PlanForDifferentEngine);
         }
@@ -618,6 +746,15 @@ impl Engine {
             plain: Arc::new(plain::snapshot(&runtime)),
         }
     }
+
+    /// Debug/test liveness audit over the production indexes (follow-up
+    /// plan §4 item 12): tree/ownership/dependency/bijection consistency.
+    /// Read-only; returns one row per violated invariant.
+    #[doc(hidden)]
+    pub fn __liveness_audit(&self) -> Vec<String> {
+        plain::liveness_audit(&self.plain.lock())
+    }
+
 }
 
 /// A read-only view of committed typed facts.
@@ -655,9 +792,17 @@ impl Snapshot {
         self.plain.live_fact_count()
     }
 
+    #[doc(hidden)]
+    pub fn __debug_view_counts(&self) -> Vec<(String, u64)> {
+        self.plain.view_counts()
+    }
+
     /// Reads a list-kind view's committed length under one domain key.
     pub fn list_len<V: ListView>(&self, key: &V::Key) -> usize {
-        match self.__plain_observe::<V>(ListKey::Len(key.clone())).as_deref() {
+        match self
+            .__plain_observe::<V>(ListKey::Len(key.clone()))
+            .as_deref()
+        {
             Some(ListFact::Len(len)) => *len as usize,
             _ => 0,
         }
@@ -687,11 +832,11 @@ impl Snapshot {
             {
                 if let TreeFact::RootOrder(order) = observed.as_ref() {
                     for link in order.iter() {
-                        if let Some(observed) =
-                            self.__plain_observe::<V>(TreeKey::RootLink(key.clone(), *link))
+                        if let Some(observed) = self
+                            .__plain_observe::<V>(TreeKey::RootLink(key.clone(), link.clone()))
                             && let TreeFact::RootLink(root) = observed.as_ref()
                         {
-                            roots.push(*root);
+                            roots.push(root.clone());
                         }
                     }
                 }
@@ -702,9 +847,7 @@ impl Snapshot {
 
     /// Reads a tree-kind view's committed root list under one domain key.
     pub fn tree_roots_of<V: TreeView>(&self, key: &V::Key) -> Vec<Node<V>> {
-        let Some(observed) = self
-            .__plain_observe::<V>(TreeKey::RootOrder(key.clone()))
-        else {
+        let Some(observed) = self.__plain_observe::<V>(TreeKey::RootOrder(key.clone())) else {
             return Vec::new();
         };
         let TreeFact::RootOrder(order) = observed.as_ref() else {
@@ -713,10 +856,10 @@ impl Snapshot {
         let mut roots = Vec::with_capacity(order.len());
         for link in order.iter() {
             if let Some(observed) =
-                self.__plain_observe::<V>(TreeKey::RootLink(key.clone(), *link))
+                self.__plain_observe::<V>(TreeKey::RootLink(key.clone(), link.clone()))
                 && let TreeFact::RootLink(root) = observed.as_ref()
             {
-                roots.push(*root);
+                roots.push(root.clone());
             }
         }
         roots
@@ -735,14 +878,14 @@ impl Snapshot {
     pub fn tree_parent<V: TreeView>(&self, id: Node<V>) -> Option<Node<V>> {
         let observed = self.__plain_observe::<V>(TreeKey::Parent(id))?;
         match observed.as_ref() {
-            TreeFact::Parent(parent) => *parent,
+            TreeFact::Parent(parent) => parent.clone(),
             _ => None,
         }
     }
 
     /// Reads one committed tree node's ordered children.
     pub fn tree_children<V: TreeView>(&self, id: Node<V>) -> Vec<Node<V>> {
-        let Some(observed) = self.__plain_observe::<V>(TreeKey::ChildOrder(id)) else {
+        let Some(observed) = self.__plain_observe::<V>(TreeKey::ChildOrder(id.clone())) else {
             return Vec::new();
         };
         let TreeFact::Order(order) = observed.as_ref() else {
@@ -750,10 +893,11 @@ impl Snapshot {
         };
         let mut children = Vec::with_capacity(order.len());
         for link in order.iter() {
-            if let Some(observed) = self.__plain_observe::<V>(TreeKey::ChildLink(id, *link))
+            if let Some(observed) =
+                self.__plain_observe::<V>(TreeKey::ChildLink(id.clone(), link.clone()))
                 && let TreeFact::Link(child) = observed.as_ref()
             {
-                children.push(*child);
+                children.push(child.clone());
             }
         }
         children
@@ -768,12 +912,11 @@ impl Snapshot {
     }
 
     /// Reads one committed labelled edge bucket.
-    pub fn outgoing<V: GraphView>(
-        &self,
-        from: Node<V>,
-        label: &V::Label,
-    ) -> Vec<Node<V>> {
-        match self.__plain_observe::<V>(GraphKey::Bucket(from, label.clone())).as_deref() {
+    pub fn outgoing<V: GraphView>(&self, from: Node<V>, label: &V::Label) -> Vec<Node<V>> {
+        match self
+            .__plain_observe::<V>(GraphKey::Bucket(from, label.clone()))
+            .as_deref()
+        {
             Some(GraphFact::Targets(targets)) => targets.clone(),
             _ => Vec::new(),
         }

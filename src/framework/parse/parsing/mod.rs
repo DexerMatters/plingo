@@ -1,11 +1,11 @@
-use std::{collections::{BTreeMap, HashMap}, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    sync::Arc,
+};
 
 use indexmap::IndexSet;
 
-use crate::framework::{
-    lex::TokenPatch,
-    parse::types::{ParserTokenDocument, TokenData, TokenOccurrenceId},
-};
 use crate::framework::parse::{
     build::ActionSet,
     data::{
@@ -16,6 +16,11 @@ use crate::framework::parse::{
     },
     grammar::{BuildError, Grammar, TerminalId},
 };
+use crate::framework::{
+    lex::TokenPatch,
+    parse::types::{ParserTokenDocument, TokenData, TokenOccurrenceId},
+};
+use crate::utils::{persistent_seq::SeqMeasureWeight, PersistentSeq, SeqMeasure};
 
 mod checkpoint;
 mod incremental;
@@ -47,7 +52,11 @@ pub(crate) struct TokenTail<'a> {
 }
 
 impl<'a> TokenTail<'a> {
-    pub(crate) fn new(document: &'a ParserTokenDocument, start: usize, grammar: &'a Grammar) -> Self {
+    pub(crate) fn new(
+        document: &'a ParserTokenDocument,
+        start: usize,
+        grammar: &'a Grammar,
+    ) -> Self {
         Self {
             document,
             start,
@@ -70,8 +79,7 @@ impl<'a> TokenTail<'a> {
 
     pub(crate) fn terminal(&mut self, index: usize) -> TerminalId {
         let eof = self.grammar.eof;
-        self.get(index)
-            .map_or(eof, |token| token.terminal)
+        self.get(index).map_or(eof, |token| token.terminal)
     }
 
     /// Number of tokens actually decoded so far (bounded by the search's
@@ -102,6 +110,12 @@ pub enum ParseError {
     MissingGssNode { node: GssNodeId },
     Build(BuildError),
     Recovered { product: ProductId },
+    InvalidReachability {
+        kind: &'static str,
+        key: u64,
+        before: u32,
+        delta: i64,
+    },
 }
 
 impl From<BuildError> for ParseError {
@@ -129,16 +143,22 @@ impl fmt::Display for ParseError {
             Self::MissingGssNode { node } => write!(f, "missing GSS node {node}"),
             Self::Build(error) => write!(f, "build error: {error:?}"),
             Self::Recovered { .. } => write!(f, "parse recovered with errors"),
+            Self::InvalidReachability {
+                kind,
+                key,
+                before,
+                delta,
+            } => write!(
+                f,
+                "invalid {kind} reachability for key {key}: {before} + {delta}"
+            ),
         }
     }
 }
 
 /// One parse column: the GSS frontier at one token boundary plus the
-/// products reduced into it. `records` is the column's record segment
-/// (plan §8.2): the AST ids first made live by products created at this
-/// column. Segments make reachability incremental — truncation retires
-/// exactly the dropped segments' records, and suffix reattachment
-/// restores them — without ever walking the whole live set.
+/// products reduced into it. Published liveness is derived exclusively
+/// from accepted-root reach counts; columns remain parser-cache state.
 #[derive(Clone)]
 pub(crate) struct ParseColumn {
     token: Option<TokenOccurrenceId>,
@@ -149,7 +169,6 @@ pub(crate) struct ParseColumn {
     pub(crate) diagnostics: Vec<ParseErrorInfo>,
     pub(crate) error_derived: bool,
     checkpoint_cache: ColumnCheckpointCache,
-    pub(crate) records: Vec<u64>,
 }
 
 impl ParseColumn {
@@ -163,14 +182,391 @@ impl ParseColumn {
             diagnostics: Vec::new(),
             error_derived: false,
             checkpoint_cache: Default::default(),
-            records: Vec::new(),
         }
+    }
+}
+/// Immutable metadata for one materialized parser segment. Later range views
+/// share this storage without copying retained columns.
+#[derive(Clone)]
+struct SegmentData {
+    columns: PersistentSeq<ParseColumn>,
+    frontiers: PersistentSeq<checkpoint::FrontierCheckpoint>,
+    token_columns: Arc<HashMap<TokenOccurrenceId, usize>>,
+    token_products: Arc<HashMap<TokenOccurrenceId, ProductId>>,
+    error_suffix_counts: PersistentSeq<usize>,
+    first_dirty: Option<usize>,
+    products_cache_stable: bool,
+}
+
+#[derive(Clone)]
+struct SegmentPart {
+    data: Arc<SegmentData>,
+    start: usize,
+    end: usize,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SegmentMeasure {
+    columns: usize,
+    error_columns: usize,
+    first_dirty: Option<usize>,
+    products_cache_stable: bool,
+}
+
+impl SeqMeasure<SegmentPart> for SegmentMeasure {
+    fn measure_leaf(values: &[SegmentPart]) -> Self {
+        values.iter().fold(
+            Self {
+                columns: 0,
+                error_columns: 0,
+                first_dirty: None,
+                products_cache_stable: true,
+            },
+            |left, part| Self::combine(&left, &part.measure()),
+        )
+    }
+
+    fn combine(left: &Self, right: &Self) -> Self {
+        Self {
+            columns: left.columns + right.columns,
+            error_columns: left.error_columns + right.error_columns,
+            first_dirty: left
+                .first_dirty
+                .or_else(|| right.first_dirty.map(|dirty| left.columns + dirty)),
+            products_cache_stable: left.products_cache_stable && right.products_cache_stable,
+        }
+    }
+}
+
+impl SeqMeasureWeight for SegmentMeasure {
+    fn weight(&self) -> usize {
+        self.columns
+    }
+}
+
+impl SegmentPart {
+    fn measure(&self) -> SegmentMeasure {
+        let error_columns = self
+            .data
+            .error_suffix_counts
+            .get(self.start)
+            .copied()
+            .unwrap_or_default()
+            .saturating_sub(
+                self.data
+                    .error_suffix_counts
+                    .get(self.end)
+                    .copied()
+                    .unwrap_or_default(),
+            );
+        SegmentMeasure {
+            columns: self.end - self.start,
+            error_columns,
+            first_dirty: self
+                .data
+                .first_dirty
+                .filter(|&dirty| (self.start..self.end).contains(&dirty))
+                .map(|dirty| dirty - self.start),
+            products_cache_stable: self.data.products_cache_stable,
+        }
+    }
+
+    fn split_at(&self, offset: usize) -> (Self, Self) {
+        debug_assert!(offset > 0 && offset < self.end - self.start);
+        (
+            Self {
+                data: Arc::clone(&self.data),
+                start: self.start,
+                end: self.start + offset,
+            },
+            Self {
+                data: Arc::clone(&self.data),
+                start: self.start + offset,
+                end: self.end,
+            },
+        )
+    }
+}
+
+/// Persistent parser suffix storage. Slices and concatenations share the
+/// underlying column arrays and only allocate bounded piece metadata.
+///
+/// A rebased segment keeps its original immutable columns. Only the accepted
+/// products and token-product lookup are overlaid; the parser never needs to
+/// walk or rewrite the retained columns after a bounded seam proof.
+#[derive(Clone, Default)]
+pub(crate) struct ParseSegment {
+    // Segment metadata is itself persistent. Concatenating a replay prefix
+    // with a retained suffix path-copies only the metadata spine instead of
+    // cloning every prior piece descriptor.
+    parts: PersistentSeq<SegmentPart, SegmentMeasure>,
+    length: usize,
+    raw_accepted: Arc<[ProductId]>,
+    accepted: Arc<[ProductId]>,
+    product_map: Arc<HashMap<ProductId, ProductId>>,
+}
+
+impl ParseSegment {
+    pub(crate) fn from_columns(mut columns: Vec<ParseColumn>, gss: &GssArena) -> Arc<Self> {
+        let mut frontiers = Vec::with_capacity(columns.len());
+        let mut token_columns = HashMap::new();
+        let mut token_products = HashMap::new();
+        let mut first_dirty = None;
+        for (index, column) in columns.iter_mut().enumerate() {
+            frontiers.push(checkpoint::frontier_checkpoint_for_column(column, gss).clone());
+            if let Some(token) = column.token {
+                token_columns.insert(token, index);
+                if !column.error_derived
+                    && let Some(&product) = column.products.first()
+                {
+                    token_products.insert(token, product);
+                }
+            }
+            if column.error_derived && first_dirty.is_none() {
+                first_dirty = Some(index);
+            }
+        }
+        let mut error_suffix_counts = vec![0usize; columns.len() + 1];
+        for index in (0..columns.len()).rev() {
+            error_suffix_counts[index] =
+                error_suffix_counts[index + 1] + usize::from(columns[index].error_derived);
+        }
+        let raw_accepted: Arc<[ProductId]> = columns
+            .last()
+            .map(|column| column.accepted.clone())
+            .unwrap_or_default()
+            .into();
+        let length = columns.len();
+        let data = Arc::new(SegmentData {
+            columns: PersistentSeq::from_iter(columns),
+            frontiers: PersistentSeq::from_iter(frontiers),
+            token_columns: Arc::new(token_columns),
+            token_products: Arc::new(token_products),
+            error_suffix_counts: PersistentSeq::from_iter(error_suffix_counts),
+            first_dirty,
+            // Reduction products are keyed by stable token anchors. A
+            // materialized committed segment therefore starts cache-stable.
+            products_cache_stable: true,
+        });
+        Arc::new(Self {
+            parts: PersistentSeq::from_iter([SegmentPart {
+                start: 0,
+                end: data.columns.len(),
+                data,
+            }]),
+            length,
+            raw_accepted: raw_accepted.clone(),
+            accepted: raw_accepted,
+            product_map: Arc::new(HashMap::new()),
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.length
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    pub(crate) fn accepted(&self) -> &[ProductId] {
+        &self.accepted
+    }
+
+    /// The accepted products stored in the immutable source columns. This is
+    /// the old side of a later frontier rebase; [`Self::accepted`] is the
+    /// logical current view.
+    pub(crate) fn raw_accepted(&self) -> &[ProductId] {
+        &self.raw_accepted
+    }
+
+    pub(crate) fn column(&self, index: usize) -> Option<&ParseColumn> {
+        let (_, local, part) = self.parts.weighted_get(index)?;
+        part.data.columns.get(part.start + local)
+    }
+
+    pub(crate) fn frontier(&self, index: usize) -> Option<&checkpoint::FrontierCheckpoint> {
+        let (_, local, part) = self.parts.weighted_get(index)?;
+        part.data.frontiers.get(part.start + local)
+    }
+
+    pub(crate) fn token_column(&self, token: TokenOccurrenceId) -> Option<usize> {
+        let mut base = 0;
+        for part in self.parts.iter() {
+            let len = part.end - part.start;
+            if let Some(&index) = part.data.token_columns.get(&token)
+                && (part.start..part.end).contains(&index)
+            {
+                return Some(base + index - part.start);
+            }
+            base += len;
+        }
+        None
+    }
+
+    pub(crate) fn token_product(&self, token: TokenOccurrenceId) -> Option<ProductId> {
+        self.parts.iter().find_map(|part| {
+            part.data
+                .token_products
+                .get(&token)
+                .copied()
+                .filter(|_| {
+                    part.data
+                        .token_columns
+                        .get(&token)
+                        .is_some_and(|index| (part.start..part.end).contains(index))
+                })
+                .map(|product| self.product_map.get(&product).copied().unwrap_or(product))
+        })
+    }
+
+    /// Rebase the logical view of a retained segment without copying or
+    /// rewriting its columns. The raw columns remain the old convergence
+    /// oracle for the next command.
+    pub(crate) fn rebase(
+        &self,
+        product_map: HashMap<ProductId, ProductId>,
+        accepted: Arc<[ProductId]>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            parts: self.parts.clone(),
+            length: self.length,
+            raw_accepted: Arc::clone(&self.raw_accepted),
+            accepted,
+            product_map: Arc::new(product_map),
+        })
+    }
+
+    fn split_parts_at(
+        parts: &PersistentSeq<SegmentPart, SegmentMeasure>,
+        total: usize,
+        offset: usize,
+    ) -> (
+        PersistentSeq<SegmentPart, SegmentMeasure>,
+        PersistentSeq<SegmentPart, SegmentMeasure>,
+    ) {
+        debug_assert!(offset <= total);
+        if offset == 0 {
+            return (PersistentSeq::new(), parts.clone());
+        }
+        if offset == total {
+            return (parts.clone(), PersistentSeq::new());
+        }
+
+        let (part_index, local, part) = parts
+            .weighted_get(offset)
+            .expect("interior weighted split must resolve a segment part");
+        let (prefix, suffix) = parts.split_at(part_index);
+        if local == 0 {
+            return (prefix, suffix);
+        }
+
+        let (left_part, right_part) = part.split_at(local);
+        let left_piece = PersistentSeq::from_iter([left_part]);
+        let right_piece = PersistentSeq::from_iter([right_part]);
+        (prefix.concat(&left_piece), right_piece.concat(&suffix))
+    }
+
+    pub(crate) fn slice(&self, range: std::ops::Range<usize>) -> Arc<Self> {
+        assert!(range.start <= range.end && range.end <= self.len());
+        let tail_len = self.length - range.start;
+        let (_, tail) = Self::split_parts_at(&self.parts, self.length, range.start);
+        let (parts, _) = Self::split_parts_at(&tail, tail_len, range.end - range.start);
+        let accepts = range.end == self.len();
+        Arc::new(Self {
+            parts,
+            length: range.end - range.start,
+            raw_accepted: accepts
+                .then(|| Arc::clone(&self.raw_accepted))
+                .unwrap_or_default(),
+            accepted: accepts
+                .then(|| Arc::clone(&self.accepted))
+                .unwrap_or_default(),
+            product_map: Arc::clone(&self.product_map),
+        })
+    }
+    pub(crate) fn concat(left: Arc<Self>, right: Arc<Self>) -> Arc<Self> {
+        if left.is_empty() {
+            return right;
+        }
+        if right.is_empty() {
+            return left;
+        }
+        let mut product_map = (*left.product_map).clone();
+        product_map.extend(right.product_map.iter().map(|(&old, &new)| (old, new)));
+        Arc::new(Self {
+            parts: left.parts.concat(&right.parts),
+            length: left.length + right.length,
+            raw_accepted: Arc::clone(&right.raw_accepted),
+            accepted: Arc::clone(&right.accepted),
+            product_map: Arc::new(product_map),
+        })
+    }
+
+    pub(crate) fn is_clean_from(&self, index: usize) -> bool {
+        if index >= self.len() {
+            return true;
+        }
+        let Some((part_index, local, part)) = self.parts.weighted_get(index) else {
+            return true;
+        };
+        if part
+            .measure()
+            .first_dirty
+            .is_some_and(|dirty| dirty >= local)
+        {
+            return false;
+        }
+        self.parts
+            .measure_after_items(part_index + 1)
+            .is_none_or(|measure| measure.first_dirty.is_none())
+    }
+
+    pub(crate) fn products_cache_stable(&self) -> bool {
+        self.parts
+            .measure()
+            .is_none_or(|measure| measure.products_cache_stable)
+    }
+
+    pub(crate) fn error_count_after(&self, index: usize) -> usize {
+        if index >= self.len() {
+            return 0;
+        }
+        let Some((part_index, local, part)) = self.parts.weighted_get(index) else {
+            return 0;
+        };
+        let current_end = part
+            .data
+            .error_suffix_counts
+            .get(part.end)
+            .copied()
+            .unwrap_or_default();
+        let current_start = part
+            .data
+            .error_suffix_counts
+            .get(part.start + local)
+            .copied()
+            .unwrap_or_default();
+        let current = current_start.saturating_sub(current_end);
+        current
+            + self
+                .parts
+                .measure_after_items(part_index + 1)
+                .map_or(0, |measure| measure.error_columns)
+    }
+
+    pub(crate) fn materialize(&self) -> Vec<ParseColumn> {
+        (0..self.len())
+            .filter_map(|index| self.column(index).cloned())
+            .collect()
     }
 }
 
 #[derive(Clone, Default)]
 pub struct ParserSessionState {
     pub(crate) columns: Vec<ParseColumn>,
+    /// Immutable suffix attached after replay convergence. Replay detaches
+    /// this handle before mutating the working prefix.
+    pub(crate) retained_suffix: Option<Arc<ParseSegment>>,
     pub(crate) generation: u32,
     pub(crate) diagnostics: Vec<ParseErrorInfo>,
     token_columns: HashMap<TokenOccurrenceId, usize>,
@@ -197,14 +593,7 @@ pub struct ParserSessionState {
     /// Inverse reduction cache used by suffix product rebasing. Keeping this
     /// index avoids rediscovering origins by scanning every cached reduction.
     reduction_origins: HashMap<ProductId, ReductionKey>,
-    /// Live-record reference counts (plan §9.2): how many kept column
-    /// segments reference each AST record. Zero means the record left the
-    /// live set and its tree fact is retracted.
-    pub(crate) record_live_counts: HashMap<u64, u64>,
-    /// Journal of record liveness for this command (plan §9.1): every
-    /// record whose live count changed maps to its final live state.
-    pub(crate) record_journal: BTreeMap<u64, bool>,
-    /// Stable syntax-lineage identities for live records (plan §8.7).
+    /// Stable syntax-lineage identities for live records.
     pub(crate) lineage: lineage::LineageState,
 }
 
@@ -234,9 +623,7 @@ impl ParserSessionState {
     fn synthetic_bytes(&self, segment: u64, ordinal: u64) -> u64 {
         // (document_serial << 48) | (segment << 24) | ordinal — deterministic
         // and compact. The document serial is the stable URI FNV hash.
-        (self.document_serial << 48)
-            | ((segment & 0xFFFF_FFFF) << 16)
-            | (ordinal & 0xFFFF)
+        (self.document_serial << 48) | ((segment & 0xFFFF_FFFF) << 16) | (ordinal & 0xFFFF)
     }
 
     /// Records that one real source token was a witness to the given
@@ -260,7 +647,10 @@ impl ParserSessionState {
         end: TokenOccurrenceId,
     ) -> Vec<u64> {
         let mut segments = std::collections::BTreeSet::new();
-        for &occurrence in self.witness_intervals.range(start..=end).flat_map(|(k, _)| std::iter::once(k))
+        for &occurrence in self
+            .witness_intervals
+            .range(start..=end)
+            .flat_map(|(k, _)| std::iter::once(k))
         {
             if let Some(bucket) = self.witness_intervals.get(&occurrence) {
                 segments.extend(bucket.iter().copied());
@@ -270,58 +660,11 @@ impl ParserSessionState {
     }
 }
 
-impl ParserSessionState {
-    /// Marks one record live inside a kept column segment (plan §9.2):
-    /// the per-segment reference count increments, and the journal
-    /// records the 0→1 transition exactly once per command.
-    pub(crate) fn record_became_live(&mut self, record: u64) {
-        let count = self.record_live_counts.entry(record).or_insert(0);
-        *count += 1;
-        if *count == 1 {
-            self.record_journal.insert(record, true);
-        }
-    }
-
-    /// Marks one record's segment reference dropped. When the last
-    /// segment reference goes away the record leaves the live set and
-    /// the journal records the 1→0 transition.
-    pub(crate) fn record_died(&mut self, record: u64) {
-        // Recovery's `*state = snapshot` restore can legitimately revert
-        // counters below the bookkeeping baseline of the running command;
-        // these counts are observational until Phase 7 rewires them, so
-        // they saturate instead of panicking.
-        if let Some(count) = self.record_live_counts.get_mut(&record) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.record_journal.insert(record, false);
-            }
-        }
-    }
-
-    /// Adopts one column's record segment: every record it lists becomes
-    /// live inside it.
-    pub(crate) fn adopt_column_records(&mut self, column: &ParseColumn) {
-        for &record in &column.records {
-            self.record_became_live(record);
-        }
-    }
-
-    /// Releases one column's record segment (plan §9.2): truncation and
-    /// reuse staging call this for every column they drop.
-    pub(crate) fn drop_column_records(&mut self, column: &ParseColumn) {
-        for &record in &column.records {
-            self.record_died(record);
-        }
-    }
-}
 
 /// The direct AST record of one product, if any (plan §9.2). A column's
 /// record segment lists exactly these records for the products it holds,
 /// so liveness follows product membership in both directions.
-pub(crate) fn product_direct_record(
-    products: &ProductArena,
-    product: ProductId,
-) -> Option<u64> {
+pub(crate) fn product_direct_record(products: &ProductArena, product: ProductId) -> Option<u64> {
     match &products.get(product)?.data {
         ProductData::Node { ast, .. } | ProductData::Token { ast: Some(ast), .. } => {
             Some(*ast as u64)
@@ -380,18 +723,14 @@ impl ReplayPlan {
                     .before
                     .and_then(|occurrence| {
                         old.as_ref()
-                            .and_then(|document| {
-                                document.rank_of_occurrence(occurrence.0 as usize)
-                            })
+                            .and_then(|document| document.rank_of_occurrence(occurrence.0 as usize))
                     })
                     .map_or(0, |rank| rank.saturating_add(1));
                 let old_end = splice
                     .after
                     .and_then(|occurrence| {
                         old.as_ref()
-                            .and_then(|document| {
-                                document.rank_of_occurrence(occurrence.0 as usize)
-                            })
+                            .and_then(|document| document.rank_of_occurrence(occurrence.0 as usize))
                     })
                     .unwrap_or(old_extent);
                 let new_start = splice

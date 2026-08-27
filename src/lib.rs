@@ -43,7 +43,7 @@ pub use plingo_macros::{
     NonTerminal, PrettyNonTerminal, PrettyTerminal, ScopeDomain, Terminal, generate, lregex,
     scope_path,
 };
-pub use reactive_macros::{abstract_tree, view};
+pub use reactive_macros::{abstract_tree, component, view};
 
 pub use framework::Workspace;
 pub use reactive::prelude;

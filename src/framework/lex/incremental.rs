@@ -15,10 +15,9 @@ use fluent_uri::Uri;
 
 use crate::framework::{
     lex::{
-        CanonicalLexerState, IncrementalLexStats, LexInterrupt, Lexer, LexerRoot,
-        LexicalDocument, LexicalOccurrence, ParseTokenRef, ScannedToken, TapeSplice,
-        TokenLayoutEntry, TokenOccurrenceId, TokenPatch,
-        cursor::RopeCursor,
+        CanonicalLexerState, IncrementalLexStats, LexInterrupt, Lexer, LexerRoot, LexicalDocument,
+        LexicalOccurrence, ParseTokenRef, ScannedToken, TapeSplice, TokenLayoutEntry,
+        TokenOccurrenceId, TokenPatch, cursor::RopeCursor,
     },
     source::SourceSplice,
     tape::StableTape,
@@ -70,7 +69,8 @@ impl PatchBuilder {
                 let mut removed = Vec::with_capacity(previous.removed.len() + splice.removed.len());
                 removed.extend(previous.removed.iter().copied());
                 removed.extend(splice.removed.iter().copied());
-                let mut inserted = Vec::with_capacity(previous.inserted.len() + splice.inserted.len());
+                let mut inserted =
+                    Vec::with_capacity(previous.inserted.len() + splice.inserted.len());
                 inserted.extend(previous.inserted.iter().copied());
                 inserted.extend(splice.inserted.iter().copied());
                 previous.removed = removed.into();
@@ -132,17 +132,22 @@ where
             .lexical
             .lexical_rank_at_byte_detailed(splice.old_range.start as u64);
         let restart_offset = document.lexical_start(restart_rank);
-        let old_semantic_start = usize::try_from(
-            document.lexical.metric_before(restart_rank).semantic_count,
-        )
-        .expect("semantic rank exceeds usize");
+        let old_semantic_start =
+            usize::try_from(document.lexical.metric_before(restart_rank).semantic_count)
+                .expect("semantic rank exceeds usize");
         let start_state = document.state_before_rank(restart_rank);
         let old_suffix_source_start = splice.old_range.end;
         let new_change_end = splice.new_range.end;
         let net_shift = isize::try_from(next_source.len_bytes())
             .ok()
-            .and_then(|next| isize::try_from(old_source.len_bytes()).ok().and_then(|old| next.checked_sub(old)))
-            .ok_or_else(|| LexInterrupt::InternalError("source length delta overflows isize".to_string()))?;
+            .and_then(|next| {
+                isize::try_from(old_source.len_bytes())
+                    .ok()
+                    .and_then(|old| next.checked_sub(old))
+            })
+            .ok_or_else(|| {
+                LexInterrupt::InternalError("source length delta overflows isize".to_string())
+            })?;
 
         // Take the interner without cloning its buckets: replay interns only
         // the states it actually visits, and the original entries remain
@@ -218,7 +223,10 @@ where
 
         let old_suffix_rank = convergence.unwrap_or(old_lexical_len);
         let old_semantic_end = usize::try_from(
-            document.lexical.metric_before(old_suffix_rank).semantic_count,
+            document
+                .lexical
+                .metric_before(old_suffix_rank)
+                .semantic_count,
         )
         .expect("semantic rank exceeds usize");
         let old_range = restart_rank..old_suffix_rank;
@@ -229,8 +237,7 @@ where
             .cloned()
             .collect();
 
-        if let Err(error) =
-            Self::reconcile_occurrence_ids(document, &old_window, &mut provisional)
+        if let Err(error) = Self::reconcile_occurrence_ids(document, &old_window, &mut provisional)
         {
             document.state_interner = interner;
             return Err(error);
@@ -252,7 +259,8 @@ where
         );
 
         let tape_checkpoint = document.tape_ids.checkpoint();
-        let lexical_replacement = StableTape::from_entries(provisional.clone(), &mut document.tape_ids);
+        let lexical_replacement =
+            StableTape::from_entries(provisional.clone(), &mut document.tape_ids);
         let (lexical, lexical_index) = document.lexical.splice_with_index(
             &document.lexical_index,
             old_range.clone(),
@@ -260,7 +268,10 @@ where
             &mut document.tape_ids,
         );
         let layout_replacement = StableTape::from_entries(
-            provisional.iter().map(TokenLayoutEntry::from).collect::<Vec<_>>(),
+            provisional
+                .iter()
+                .map(TokenLayoutEntry::from)
+                .collect::<Vec<_>>(),
             &mut document.tape_ids,
         );
         let (layout, layout_index) = document.layout.splice_with_index(
@@ -310,12 +321,9 @@ where
             && old_semantic_window
                 .iter()
                 .zip(new_semantic_window.iter())
-                .all(
-                    |(old_entry, new_entry)| {
-                        old_entry.terminal == new_entry.terminal
-                            && old_entry.error == new_entry.error
-                    },
-                );
+                .all(|(old_entry, new_entry)| {
+                    old_entry.terminal == new_entry.terminal && old_entry.error == new_entry.error
+                });
         if !structure_unchanged {
             document.structure_revision = crate::framework::lex::TokenStructureRevisionId(
                 document
@@ -340,8 +348,7 @@ where
             work.dfa_transitions += dfa_transitions;
             work.source_bytes_examined += source_bytes_examined;
             work.lexical_entries_visited += (old_window.len() + replayed) as u64;
-            work.semantic_entries_visited +=
-                (old_semantic_window.len() + new_semantic_len) as u64;
+            work.semantic_entries_visited += (old_semantic_window.len() + new_semantic_len) as u64;
             work.tokens_replayed += replayed as u64;
             work.tokens_reused += reused as u64;
             work.tokens_inserted += local.inserted.len() as u64;
@@ -400,9 +407,12 @@ where
                 continue;
             }
             let id = document.next_occurrence;
-            document.next_occurrence = document.next_occurrence.checked_add(1).ok_or_else(|| {
-                LexInterrupt::InternalError("token occurrence identity space exhausted".to_string())
-            })?;
+            document.next_occurrence =
+                document.next_occurrence.checked_add(1).ok_or_else(|| {
+                    LexInterrupt::InternalError(
+                        "token occurrence identity space exhausted".to_string(),
+                    )
+                })?;
             token.id = TokenOccurrenceId(id);
         }
         Ok(())
@@ -472,14 +482,30 @@ where
             });
         }
 
-        let old_semantic_ids: BTreeSet<_> = old_semantic.iter().map(|token| token.occurrence).collect();
-        let new_semantic_ids: BTreeSet<_> = new_semantic.iter().map(|token| token.occurrence).collect();
-        patch.inserted.extend(new_semantic_ids.difference(&old_semantic_ids).copied());
-        patch.removed.extend(old_semantic_ids.difference(&new_semantic_ids).copied());
+        // Prefix/suffix convergence proves that every occurrence outside the
+        // replay window is unchanged. Classify only the bounded window;
+        // building document-wide ID sets here would defeat persistent tape
+        // locality.
+        let old_window_ids: std::collections::BTreeSet<_> =
+            old_semantic.iter().map(|token| token.occurrence).collect();
+        let new_window_ids: std::collections::BTreeSet<_> =
+            new_semantic.iter().map(|token| token.occurrence).collect();
+        patch.inserted.extend(
+            new_semantic[prefix..new_end]
+                .iter()
+                .map(|token| token.occurrence)
+                .filter(|occurrence| !old_window_ids.contains(occurrence)),
+        );
+        patch.removed.extend(
+            old_semantic[prefix..old_end]
+                .iter()
+                .map(|token| token.occurrence)
+                .filter(|occurrence| !new_window_ids.contains(occurrence)),
+        );
 
         let old_by_id: HashMap<_, _> = old_lexical.iter().map(|token| (token.id, token)).collect();
         for token in new_lexical {
-            if !token.is_semantic() || !old_semantic_ids.contains(&token.id) {
+            if !token.is_semantic() {
                 continue;
             }
             let Some(old) = old_by_id.get(&token.id) else {
@@ -492,5 +518,3 @@ where
         patch
     }
 }
-
-

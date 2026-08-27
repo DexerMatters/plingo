@@ -42,11 +42,10 @@ pub trait ScopeDomain: Clone + Eq + Hash + Debug + Send + Sync + 'static {
 #[derive(PartialEq, Eq, Hash)]
 pub struct Scope<D: ScopeDomain>(Node<ScopeGraph<D>>);
 
-impl<D: ScopeDomain> Copy for Scope<D> {}
 
 impl<D: ScopeDomain> Clone for Scope<D> {
     fn clone(&self) -> Self {
-        *self
+        Self(self.0.clone())
     }
 }
 
@@ -58,7 +57,7 @@ impl<D: ScopeDomain> fmt::Debug for Scope<D> {
 
 impl<D: ScopeDomain> Scope<D> {
     #[doc(hidden)]
-    pub fn from_node(node: Node<ScopeGraph<D>>) -> Self {
+    pub fn from_graph_node(node: Node<ScopeGraph<D>>) -> Self {
         Self(node)
     }
 }
@@ -75,7 +74,14 @@ impl<D: ScopeDomain> Scope<D> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::any::TypeId::of::<ScopeGraph<D>>().hash(&mut hasher);
         seed.hash(&mut hasher);
-        Self(Node::from_raw(hasher.finish()))
+        let identity = hasher.finish();
+        Self(Node::from_syntax(
+            identity,
+            "<scope>",
+            identity,
+            0,
+            false,
+        ))
     }
 }
 
@@ -103,8 +109,8 @@ pub struct ScopeGraph<D: ScopeDomain>(Graph<ScopeNode<D>, D::Label>);
 impl<D: ScopeDomain> Scope<D> {
     /// The underlying graph identity.
     #[doc(hidden)]
-    pub fn node(self) -> Node<ScopeGraph<D>> {
-        self.0
+    pub fn node(&self) -> Node<ScopeGraph<D>> {
+        self.0.clone()
     }
 }
 
@@ -114,7 +120,7 @@ impl<D: ScopeDomain> Scope<D> {
 pub fn scope<D: ScopeDomain>(data: D::ScopeData) -> Result<Scope<D>> {
     let graph = crate::reactive::kind::emit_view::<ScopeGraph<D>>()?;
     let node = graph.mint(ScopeNode::Scope(data))?;
-    Ok(Scope::from_node(node))
+    Ok(Scope::from_graph_node(node))
 }
 
 /// Publishes or replaces the payload of an existing scope.
@@ -130,7 +136,7 @@ pub fn declare<D: ScopeDomain>(
     data: D::ScopeData,
 ) -> Result<Scope<D>> {
     let graph = crate::reactive::kind::emit_view::<ScopeGraph<D>>()?;
-    let declaration = Scope::from_node(graph.mint(ScopeNode::Declaration(data))?);
+    let declaration = Scope::from_graph_node(graph.mint(ScopeNode::Declaration(data))?);
     graph.link(owner.node(), name, declaration.node())?;
     Ok(declaration)
 }
@@ -143,7 +149,7 @@ pub fn reference<D: ScopeDomain>(
     target: Scope<D>,
 ) -> Result<()> {
     let graph = crate::reactive::kind::emit_view::<ScopeGraph<D>>()?;
-    let reference = Scope::from_node(graph.mint(ScopeNode::Reference(data))?);
+    let reference = Scope::from_graph_node(graph.mint(ScopeNode::Reference(data))?);
     graph.link(owner.node(), name.clone(), reference.node())?;
     graph.link(reference.node(), name, target.node())
 }
@@ -153,7 +159,6 @@ pub fn edge<D: ScopeDomain>(source: Scope<D>, label: D::Label, target: Scope<D>)
     let graph = crate::reactive::kind::emit_view::<ScopeGraph<D>>()?;
     graph.link(source.node(), label, target.node())
 }
-
 /// Retracts one scope node. Buckets referencing it keep their owners.
 pub fn remove_scope<D: ScopeDomain>(id: Scope<D>) -> Result<()> {
     let graph = crate::reactive::kind::emit_view::<ScopeGraph<D>>()?;
@@ -182,7 +187,7 @@ pub fn outgoing<D: ScopeDomain>(source: Scope<D>, label: &D::Label) -> Result<Ve
     Ok(observe
         .outgoing(source.node(), label)?
         .into_iter()
-        .map(Scope::from_node)
+        .map(Scope::from_graph_node)
         .collect())
 }
 
@@ -191,7 +196,7 @@ pub fn declarations<D: ScopeDomain>(source: Scope<D>, label: &D::Label) -> Resul
     let mut result: Vec<Scope<D>> = Vec::new();
     for target in outgoing(source, label)? {
         if matches!(
-            observe_node(target)?.as_deref(),
+            observe_node(target.clone())?.as_deref(),
             Some(ScopeNode::Declaration(_))
         ) {
             result.push(target);
@@ -234,9 +239,9 @@ where
 
     let expression: PathExpr<D::Label> = path.into_path();
     let mut states = std::collections::HashSet::new();
-    states.insert((start, expression.clone()));
+    states.insert((start.clone(), expression.clone()));
     let mut pending = vec![Search {
-        scope: start,
+        scope: start.clone(),
         expression,
         scopes: vec![start],
         labels: Vec::new(),
@@ -246,7 +251,7 @@ where
 
     while let Some(search) = pending.pop() {
         if search.expression.nullable()
-            && let Some(node) = observe_node(search.scope)?
+            && let Some(node) = observe_node(search.scope.clone())?
             && accepts(&node)
             && let ScopeNode::Scope(data) = &*node
         {
@@ -261,13 +266,13 @@ where
             if residual == PathExpr::Empty {
                 continue;
             }
-            for target in outgoing(search.scope, &label)? {
-                let state = (target, residual.clone());
+            for target in outgoing(search.scope.clone(), &label)? {
+                let state = (target.clone(), residual.clone());
                 if search.states.contains(&state) {
                     continue;
                 }
                 let mut next = search.clone();
-                next.scope = target;
+                next.scope = target.clone();
                 next.expression = residual.clone();
                 next.scopes.push(target);
                 next.labels.push(label.clone());
@@ -278,14 +283,13 @@ where
     }
     Ok(answers)
 }
-
 /// Returns the committed scope identities in registration order.
 pub fn snapshot_nodes<D: ScopeDomain>(snapshot: &Snapshot) -> Vec<Scope<D>> {
     snapshot
         .inputs::<ScopeGraph<D>>()
         .into_iter()
         .filter_map(|input| match input {
-            crate::reactive::kind::GraphKey::Node(id) => Some(Scope::from_node(id)),
+            crate::reactive::kind::GraphKey::Node(id) => Some(Scope::from_graph_node(id)),
             _ => None,
         })
         .collect()
@@ -319,7 +323,7 @@ pub fn snapshot_outgoing<D: ScopeDomain>(
     snapshot
         .outgoing::<ScopeGraph<D>>(source.node(), label)
         .into_iter()
-        .map(Scope::from_node)
+        .map(Scope::from_graph_node)
         .collect()
 }
 
@@ -333,15 +337,12 @@ pub fn snapshot_declarations<D: ScopeDomain>(
         .into_iter()
         .filter(|node| {
             matches!(
-                snapshot_node::<D>(snapshot, *node).as_deref(),
+                snapshot_node::<D>(snapshot, node.clone()).as_deref(),
                 Some(ScopeNode::Declaration(_))
             )
         })
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// Path data (ported engine-free from the former scope implementation)
 // ---------------------------------------------------------------------------
 
 /// A regular path language used by scope-graph resolution.
@@ -584,7 +585,7 @@ impl<D: ScopeDomain> ResolutionPath<D> {
     }
 
     pub fn target_scope(&self) -> Scope<D> {
-        self.scopes[self.scopes.len() - 1]
+        self.scopes[self.scopes.len() - 1].clone()
     }
 }
 
@@ -598,7 +599,6 @@ impl<D: ScopeDomain> fmt::Debug for ResolutionPath<D> {
             .finish()
     }
 }
-
 /// Partitions resolved paths into visible vs shadowed witnesses under a
 /// [`PathOrder`].
 pub fn partition_visible<D: ScopeDomain>(

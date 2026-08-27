@@ -1,3 +1,6 @@
+use crate::utils::Span;
+use fluent_uri::Uri;
+use ropey::Rope;
 use std::{
     any::TypeId,
     collections::{BTreeSet, HashMap},
@@ -5,15 +8,13 @@ use std::{
     ops::Deref,
     sync::Arc,
 };
-use fluent_uri::Uri;
-use ropey::Rope;
-use crate::utils::Span;
 
+use super::data::ast::AstArena;
 use crate::framework::{
-    lex::{LayoutRevisionId, LexicalDocument, LexerRoot, ParseTokenRef, TokenLayoutEntry},
+    lex::{LayoutRevisionId, LexerRoot, LexicalDocument, ParseTokenRef, TokenLayoutEntry},
     parse::{
         data::{
-            ast::{document_key, AnchoredSpan, AstBox, AstId, AstToken, TokenEntryId},
+            ast::{AnchoredSpan, AstBox, AstId, AstToken, TokenEntryId, document_key},
             green::TreeArena,
             gss::GssArena,
             product::{ProductArena, ProductId},
@@ -24,7 +25,6 @@ use crate::framework::{
     },
     tape::{PersistentOccurrenceIndex, StableTape, TapeCursor},
 };
-use super::data::ast::AstArena;
 
 #[derive(Debug, Clone)]
 pub struct ParserConfig {
@@ -113,7 +113,6 @@ pub struct AstSnapshot {
     token_document: Arc<ParserTokenDocument>,
 }
 
-
 impl std::fmt::Debug for AstSnapshot {
     /// Debug shows only the stable snapshot identity; the payload maps are
     /// opaque and never part of reactive equality.
@@ -167,7 +166,9 @@ impl<A: 'static> Eq for DocumentSnapshot<A> {}
 
 impl<A: 'static> std::fmt::Debug for DocumentSnapshot<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DocumentSnapshot").field("snapshot", &self.snapshot).finish()
+        f.debug_struct("DocumentSnapshot")
+            .field("snapshot", &self.snapshot)
+            .finish()
     }
 }
 
@@ -240,15 +241,14 @@ impl AstSnapshot {
             .token_document
             .rank_of_occurrence(occurrence)
             .and_then(|rank| self.token_document.token_at(rank))?;
-        let end = data.start.saturating_add(data.length).min(self.source.len_bytes());
+        let end = data
+            .start
+            .saturating_add(data.length)
+            .min(self.source.len_bytes());
         Some(AstTokenSnapshotEntry {
             terminal: data.terminal,
-            span: Span::new_uri(
-                self.uri.clone(),
-                data.start.min(end),
-                data.start.max(end),
-            )
-            .expect("parser token coordinates are UTF-8 source boundaries"),
+            span: Span::new_uri(self.uri.clone(), data.start.min(end), data.start.max(end))
+                .expect("parser token coordinates are UTF-8 source boundaries"),
         })
     }
 
@@ -511,7 +511,8 @@ impl ParserTokenDocument {
     }
 
     pub(crate) fn rank_of_occurrence(&self, occurrence: TokenOccurrenceId) -> Option<usize> {
-        self.semantic.rank_of_id(occurrence as u64, &self.semantic_index)
+        self.semantic
+            .rank_of_id(occurrence as u64, &self.semantic_index)
     }
 
     pub(crate) fn token_at(&self, rank: usize) -> Option<TokenData> {
@@ -544,7 +545,6 @@ impl ParserTokenDocument {
         self.semantic.root_ptr_eq(&other.semantic)
     }
 }
-
 
 /// A rank-addressed cursor over a parser token root. The semantic cursor moves
 /// inside tape leaves in amortized O(1); only coordinate lookup for the token
@@ -586,10 +586,8 @@ impl ParserTokenCursor {
         Some(TokenData {
             id: usize::try_from(semantic.occurrence.0).ok()?,
             terminal: semantic.terminal,
-            start: usize::try_from(
-                self.document.layout.metric_before(layout_rank).source_bytes,
-            )
-            .ok()?,
+            start: usize::try_from(self.document.layout.metric_before(layout_rank).source_bytes)
+                .ok()?,
             length: layout.byte_len as usize,
             column: usize::try_from(semantic.occurrence.0).ok()?,
             fingerprint: layout.fingerprint.0,
@@ -611,15 +609,87 @@ impl ParserTokenCursor {
     }
 }
 
-/// Persistent tree-facing membership facts for one parser document: the
-/// live arena-record set plus the accepted root record (plan §9.2). The
-/// record set is a persistent radix set — applying one command's journal
-/// path-copies only changed branches, never clones the live set.
+/// Persistent reach-count keys for the accepted-root DAG domain.
+///
+/// Product and record counts use distinct key types even though both are
+/// encoded as compact `u64` trie keys. Keeping the domains typed prevents a
+/// product ID from being accidentally looked up in the record index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ProductReachKey(pub(crate) ProductId);
+
+impl crate::reactive::store::TrieKey for ProductReachKey {
+    fn trie_hash(&self) -> u64 {
+        self.0 as u64
+    }
+
+    fn trie_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct RecordReachKey(pub(crate) u64);
+
+impl crate::reactive::store::TrieKey for RecordReachKey {
+    fn trie_hash(&self) -> u64 {
+        self.0
+    }
+
+    fn trie_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+/// One accepted-root reach-count transition captured during freeze.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecordTransition {
+    pub(crate) before_count: u32,
+    pub(crate) after_count: u32,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct ParserTreeFacts {
     pub(crate) records: Arc<crate::reactive::store::RadixMap<()>>,
     pub(crate) root: Option<u64>,
+    /// Product reach counts in the accepted-root DAG. Parser-column/cache
+    /// retention never updates this domain.
+    pub(crate) product_reach_counts:
+        Arc<crate::reactive::store::Hamt<ProductReachKey, u32>>,
+    /// Direct AST-record reach counts induced by accepted products.
+    pub(crate) record_reach_counts:
+        Arc<crate::reactive::store::Hamt<RecordReachKey, u32>>,
+    /// Stable lineage for every record in `records` at the last commit.
+    /// This preserves exact removal keys when the mutable parser arena
+    /// reuses a cached product across commands.
+    pub(crate) record_lineages: Arc<std::collections::HashMap<u64, u64>>,
+    /// Last lineage-to-node order committed by the tree publisher.
+    pub(crate) published_child_orders: Arc<std::collections::HashMap<u64, PublishedChildOrder>>,
+    /// Last published child order per parent lineage, expressed as
+    /// lineage identities for the parser splice oracle.
+    pub(crate) child_orders: Arc<std::collections::HashMap<u64, Vec<u64>>>,
 }
+
+/// One successfully published parent/child order. The parser freeze keeps
+/// lineage order for its delta oracle; publication additionally records the
+/// complete generated syntax identities so a later command can retract links
+/// after the originating arena/session has been replaced.
+#[derive(Clone)]
+pub(crate) struct PublishedChildOrder {
+    pub(crate) parent_node: PublishedNodeIdentity,
+    pub(crate) children: Arc<[(u64, PublishedNodeIdentity)]>,
+}
+
+/// A node identity retained across parser arena/session replacement.
+///
+/// `raw` is the stable fact-key hash. `identity` is the complete logical
+/// syntax key needed to reconstruct a typed `Node` without consulting a
+/// dead arena record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PublishedNodeIdentity {
+    pub(crate) raw: u64,
+    pub(crate) identity: crate::reactive::view::SyntaxNodeIdentity,
+}
+
 
 impl ParserTreeFacts {
     pub(crate) fn contains(&self, record: u64) -> bool {
@@ -656,5 +726,6 @@ pub(crate) struct ParserSnapshotState {
     /// The last published status fact, for exact status deltas.
     pub(crate) published_status: HashMap<Uri<String>, crate::framework::parse::delta::ParsedStatus>,
     /// The last published diagnostics, for exact diagnostic key deltas.
-    pub(crate) published_diagnostics: HashMap<Uri<String>, Arc<Vec<crate::framework::parse::data::green::ParseErrorInfo>>>,
+    pub(crate) published_diagnostics:
+        HashMap<Uri<String>, Arc<Vec<crate::framework::parse::data::green::ParseErrorInfo>>>,
 }

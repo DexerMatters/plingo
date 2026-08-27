@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use fluent_uri::Uri;
 
-use crate::reactive::kind::{emit_view, observe_view, Map};
+use crate::reactive::kind::{Map, emit_view, observe_view};
 use crate::reactive::{Engine, Error, Result};
 use crate::utils::Span;
 use reactive_macros::view;
@@ -136,6 +136,14 @@ pub(crate) struct SourceCoordinateMap {
 }
 
 impl SourceCoordinateMap {
+    fn signed_offset(new_start: usize, old_start: usize) -> isize {
+        if new_start >= old_start {
+            isize::try_from(new_start - old_start).unwrap_or(isize::MAX)
+        } else {
+            -isize::try_from(old_start - new_start).unwrap_or(isize::MAX)
+        }
+    }
+
     /// Builds the island complement of normalized splices in `O(m)`.
     pub(crate) fn build(old_len: usize, new_len: usize, splices: &[SourceSplice]) -> Self {
         let mut islands = Vec::with_capacity(splices.len() + 1);
@@ -143,10 +151,11 @@ impl SourceCoordinateMap {
         let mut new_cursor = 0usize;
         for splice in splices {
             if splice.old_range.start > old_cursor {
-                let delta = splice.old_range.start as isize - old_cursor as isize;
+                let unchanged_len = splice.old_range.start - old_cursor;
+                let delta = Self::signed_offset(new_cursor, old_cursor);
                 islands.push(UnchangedIsland {
                     old: old_cursor..splice.old_range.start,
-                    new: new_cursor..new_cursor + (splice.old_range.start - old_cursor),
+                    new: new_cursor..new_cursor + unchanged_len,
                     delta,
                 });
             }
@@ -154,20 +163,16 @@ impl SourceCoordinateMap {
             new_cursor = splice.new_range.end;
         }
         if old_cursor < old_len {
-            let delta = new_len as isize - old_len as isize;
+            let tail_old = old_len - old_cursor;
+            let last_new_start = new_cursor;
+            debug_assert_eq!(last_new_start + tail_old, new_len);
             islands.push(UnchangedIsland {
                 old: old_cursor..old_len,
-                new: new_cursor..new_len,
-                delta: delta.min(0),
+                new: last_new_start..last_new_start + tail_old,
+                delta: Self::signed_offset(last_new_start, old_cursor),
             });
-            // Fix the tail island's affine offset precisely: new length here
-            // equals old length plus any net shift already applied.
-            let last_new_start = new_cursor;
-            let tail_old = old_len - old_cursor;
-            islands.last_mut().unwrap().new = last_new_start..last_new_start + tail_old;
-            islands.last_mut().unwrap().delta =
-                last_new_start as isize - old_cursor as isize;
-            let _ = delta;
+        } else {
+            debug_assert_eq!(new_cursor, new_len);
         }
         let old_starts: Arc<[usize]> = islands.iter().map(|island| island.old.start).collect();
         let new_starts: Arc<[usize]> = islands.iter().map(|island| island.new.start).collect();
@@ -181,7 +186,10 @@ impl SourceCoordinateMap {
     /// Maps an old coordinate into the new space when it lies inside one
     /// island at a whole offset; gaps between changed ranges never map.
     pub(crate) fn map_old_to_new(&self, at: usize) -> Option<(usize, usize)> {
-        let index = self.old_starts.partition_point(|start| *start <= at).saturating_sub(1);
+        let index = self
+            .old_starts
+            .partition_point(|start| *start <= at)
+            .saturating_sub(1);
         let island = self.islands.get(index)?;
         if !island.old.contains(&at) {
             return None;
@@ -247,7 +255,9 @@ impl std::fmt::Debug for SourceRevision {
 
 impl std::fmt::Debug for SourceCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SourceCommand").field("id", &self.id.0).finish()
+        f.debug_struct("SourceCommand")
+            .field("id", &self.id.0)
+            .finish()
     }
 }
 
@@ -290,7 +300,8 @@ impl SourceSnapshot {
     /// Checked byte slice; UTF-8 boundaries required.
     pub fn byte_slice(&self, range: Range<usize>) -> Result<String, Error> {
         let rope = self.0.text.clone();
-        if rope.try_byte_to_char(range.start).is_err() || rope.try_byte_to_char(range.end).is_err() {
+        if rope.try_byte_to_char(range.start).is_err() || rope.try_byte_to_char(range.end).is_err()
+        {
             #[allow(clippy::needless_borrows_for_generic_args)]
             return Err(Error::Internal("byte slice off char boundary".into()));
         }
@@ -316,6 +327,8 @@ pub(crate) struct NormalizedBatch {
     pub(crate) effective_splices: u64,
     pub(crate) bytes_removed: u64,
     pub(crate) bytes_inserted: u64,
+    /// Rope chunks visited while validating exact replacement equality.
+    pub(crate) rope_chunks_traversed: u64,
 }
 
 /// Validates and normalizes editor operations against the current Rope:
@@ -351,20 +364,31 @@ pub(crate) fn normalize_edits(
             SourceEdit::Insert { key, value } => {
                 let at = key.range.start();
                 if at > len || base.try_byte_to_char(at).is_err() {
-                    return Err(Error::Internal(format!("insert at {at} out of bounds").into()));
+                    return Err(Error::Internal(
+                        format!("insert at {at} out of bounds").into(),
+                    ));
                 }
-                ops.push(Op { ordinal, kind: Kind::Insert { at, value } });
+                ops.push(Op {
+                    ordinal,
+                    kind: Kind::Insert { at, value },
+                });
             }
             SourceEdit::Delete { key } => {
                 let start = key.range.start();
                 let end = key.range.end();
-                if start > end || end > len || base.try_byte_to_char(start).is_err() || base.try_byte_to_char(end).is_err()
+                if start > end
+                    || end > len
+                    || base.try_byte_to_char(start).is_err()
+                    || base.try_byte_to_char(end).is_err()
                 {
                     return Err(Error::Internal(
                         format!("delete {start}..{end} invalid").into(),
                     ));
                 }
-                ops.push(Op { ordinal, kind: Kind::Delete { start, end } });
+                ops.push(Op {
+                    ordinal,
+                    kind: Kind::Delete { start, end },
+                });
             }
         }
     }
@@ -415,7 +439,10 @@ pub(crate) fn normalize_edits(
                 let mut delete_taken = false;
                 while index < ops.len() {
                     match &ops[index].kind {
-                        Kind::Insert { at: other_at, value: part } if *other_at == at => {
+                        Kind::Insert {
+                            at: other_at,
+                            value: part,
+                        } if *other_at == at => {
                             value.push_str(part);
                             index += 1;
                         }
@@ -477,23 +504,30 @@ pub(crate) fn normalize_edits(
     // comparing replacement bytes directly against the old rope range.
     let mut shift: isize = 0;
     for repl in &mut replacements {
-        let old_start = repl.old_range.start.checked_add_signed(shift).ok_or_else(|| {
-            Error::Internal("source batch overflow".into())
-        })?;
-        let old_end = repl.old_range.end.checked_add_signed(shift).ok_or_else(|| {
-            Error::Internal("source batch overflow".into())
-        })?;
+        let old_start = repl
+            .old_range
+            .start
+            .checked_add_signed(shift)
+            .ok_or_else(|| Error::Internal("source batch overflow".into()))?;
         // Exact-equality drop: compare without materializing the old range.
         let equal = repl.inserted.len() == repl.old_range.len() && {
+            let mut old_chunks = 0u64;
             let old_bytes = base
                 .slice(repl.old_range.start..repl.old_range.end)
-                .bytes();
-            repl.inserted
+                .chunks()
+                .flat_map(|chunk| {
+                    old_chunks += 1;
+                    chunk.as_bytes().iter().copied()
+                });
+            let equal = repl
+                .inserted
                 .as_bytes()
                 .iter()
                 .copied()
                 .zip(old_bytes)
-                .all(|(inserted_byte, old_byte)| inserted_byte == old_byte)
+                .all(|(inserted_byte, old_byte)| inserted_byte == old_byte);
+            out.rope_chunks_traversed += old_chunks;
+            equal
         };
         if equal {
             continue;
@@ -513,15 +547,10 @@ pub(crate) fn normalize_edits(
     let mut merged_splices: Vec<SourceSplice> = Vec::with_capacity(out.splices.len());
     let mut merged_inserted: Vec<String> = Vec::with_capacity(out.splices.len());
     for (splice, text) in out.splices.drain(..).zip(out.inserted.drain(..)) {
-        match (
-            merged_splices.last_mut(),
-            merged_inserted.last_mut(),
-        ) {
-            (
-                Some(last),
-                Some(last_text),
-            ) if last.old_range.end == splice.old_range.start
-                && last.new_range.end == splice.new_range.start =>
+        match (merged_splices.last_mut(), merged_inserted.last_mut()) {
+            (Some(last), Some(last_text))
+                if last.old_range.end == splice.old_range.start
+                    && last.new_range.end == splice.new_range.start =>
             {
                 last.old_range.end = splice.old_range.end;
                 last.new_range.end = splice.new_range.end;
@@ -541,7 +570,11 @@ pub(crate) fn normalize_edits(
 
 /// Applies normalized splices to an `O(1)`-cloned Rope in descending order,
 /// converting each byte boundary to a Rope character boundary exactly once.
-pub(crate) fn apply_splices(base: &ropey::Rope, splices: &[SourceSplice], inserted: &[String]) -> Result<ropey::Rope, Error> {
+pub(crate) fn apply_splices(
+    base: &ropey::Rope,
+    splices: &[SourceSplice],
+    inserted: &[String],
+) -> Result<ropey::Rope, Error> {
     let mut rope = base.clone();
     // Descending application keeps earlier offsets valid.
     for (splice, text) in splices.iter().rev().zip(inserted.iter().rev()) {
@@ -587,15 +620,15 @@ fn source_document(uri: String) -> Result<()> {
             .map(|revision| revision.document.clone())
             .unwrap_or(DocumentIdentity {
                 id: DocumentId(fnv1a_uri(&uri)),
-                uri: Arc::new(
-                    Uri::parse(uri.to_string())
-                        .expect("workspace uris parse"),
-                ),
+                uri: Arc::new(Uri::parse(uri.to_string()).expect("workspace uris parse")),
             })
     }();
 
     let next_revision_id = SourceRevisionId(
-        previous.as_ref().map(|revision| revision.id.0 + 1).unwrap_or(1),
+        previous
+            .as_ref()
+            .map(|revision| revision.id.0 + 1)
+            .unwrap_or(1),
     );
 
     let (coordinates, new_len) = match &command.delta {
@@ -615,7 +648,6 @@ fn source_document(uri: String) -> Result<()> {
             SourceDelta::Load { .. } => 1,
             SourceDelta::Edit { splices } => splices.len() as u64,
         };
-        work.rope_chunks_traversed += command.next_text.chunks().count() as u64;
     });
 
     let revision = Arc::new(SourceRevision {
@@ -630,7 +662,6 @@ fn source_document(uri: String) -> Result<()> {
     let _ = new_len;
     Ok(())
 }
-
 
 /// FNV-1a over the URI bytes — the same stable derivation the lexer uses
 /// for `StableDocumentId` (plan §3.2: identity from final text/URI, never
@@ -650,32 +681,40 @@ pub(crate) fn next_command_id_pub() -> u64 {
 }
 
 fn next_command_id() -> u64 {
-    std::sync::atomic::AtomicU64::fetch_add(&NEXT_COMMAND_ID, 1, std::sync::atomic::Ordering::Relaxed)
+    std::sync::atomic::AtomicU64::fetch_add(
+        &NEXT_COMMAND_ID,
+        1,
+        std::sync::atomic::Ordering::Relaxed,
+    )
 }
-
 
 /// Reads one committed revision from an engine snapshot (plan §6 façade).
 ///
 /// Free-standing so the reactive module never names framework types.
-pub fn source_snapshot(
-    snapshot: &crate::reactive::Snapshot,
-    uri: &str,
-) -> Option<SourceSnapshot> {
+pub fn source_snapshot(snapshot: &crate::reactive::Snapshot, uri: &str) -> Option<SourceSnapshot> {
     use crate::reactive::View;
     snapshot
         .observe::<SourceRevisions>(uri.to_string())
         .map(|value| SourceSnapshot(Arc::clone(&*value)))
 }
 
-
-/// Installs the built-in source fold as an ordinary reactive root.
+/// Installs the built-in source fold as one first-class component (Cut C):
+/// membership lifecycle over `SourceEdits`, identity = definition + URI.
 pub fn install_source(engine: &mut Engine) -> Result<()> {
-    let planned = engine.plan(
-        |()| crate::reactive::run_each_key::<SourceEdits, _>(source_document),
-        (),
-    )?;
-    let _running = engine.run(&planned)?;
+    engine.install_component_each_key::<SourceFoldDefinition, SourceEdits, _>(|uri| {
+        source_document(uri)
+    })?;
     Ok(())
+}
+
+/// Definition marker for the framework source fold (Cut C).
+#[doc(hidden)]
+pub struct SourceFoldDefinition;
+
+impl crate::reactive::component::ComponentDefinition for SourceFoldDefinition {
+    fn __descriptor() -> &'static str {
+        "plingo::framework::source::source_fold"
+    }
 }
 
 #[cfg(test)]
@@ -714,7 +753,10 @@ mod tests {
 
     #[test]
     fn coordinate_map_round_trips_unchanged_regions() {
-        let splices = vec![SourceSplice { old_range: 3..4, new_range: 3..6 }];
+        let splices = vec![SourceSplice {
+            old_range: 3..4,
+            new_range: 3..6,
+        }];
         let map = SourceCoordinateMap::build(10, 12, &splices);
         // Byte 0..3 unchanged: maps 1:1 inside island 0.
         assert_eq!(map.map_old_to_new(2), Some((2, 0)));
@@ -723,11 +765,38 @@ mod tests {
     }
 
     #[test]
+    fn coordinate_map_tracks_each_prior_splice_shift() {
+        let splices = vec![
+            SourceSplice {
+                old_range: 2..3,
+                new_range: 2..5,
+            },
+            SourceSplice {
+                old_range: 8..10,
+                new_range: 10..11,
+            },
+        ];
+        let map = SourceCoordinateMap::build(20, 21, &splices);
+        assert_eq!(map.map_old_to_new(1), Some((1, 0)));
+        // The second unchanged island includes the +2 shift from the first
+        // splice, not the old-coordinate distance from the previous cursor.
+        assert_eq!(map.map_old_to_new(4), Some((6, 1)));
+        assert_eq!(map.map_old_to_new(10), Some((11, 2)));
+        assert_eq!(map.map_old_to_new(19), Some((20, 2)));
+    }
+
+    #[test]
     fn apply_splices_produce_expected_text() {
         let base = ropey::Rope::from_str("abcdef");
         let splices = vec![
-            SourceSplice { old_range: 1..2, new_range: 1..1 },
-            SourceSplice { old_range: 4..5, new_range: 3..5 },
+            SourceSplice {
+                old_range: 1..2,
+                new_range: 1..1,
+            },
+            SourceSplice {
+                old_range: 4..5,
+                new_range: 3..5,
+            },
         ];
         let inserted = vec![String::new(), "XY".into()];
         let next = apply_splices(&base, &splices, &inserted).unwrap();

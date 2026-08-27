@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::reactive::kind::{self, emit_view, observe_view};
 use crate::reactive::prelude::*;
-use crate::reactive::{KeyedFamily, StateValue};
-use reactive_macros::StateValue as StateValueDerive;
 use crate::reactive::view::Node;
+use crate::reactive::{KeyedFamily, StateValue};
 use crate::view;
+use reactive_macros::StateValue as StateValueDerive;
 
 #[view]
 struct KindsMap(Map<u64, i64>);
@@ -111,12 +111,7 @@ fn list_writer(_: ()) -> Result<()> {
         0 => vec!["a".into(), "b".into(), "c".into()],
         10 => vec!["a".into(), "b".into(), "c".into(), "z".into()],
         // Only slot 1 differs from step 10; the length is unchanged.
-        20 | 40 => vec![
-            "a".into(),
-            "changed".into(),
-            "c".into(),
-            "z".into(),
-        ],
+        20 | 40 => vec!["a".into(), "changed".into(), "c".into(), "z".into()],
         30 => vec!["x".into(), "y".into()],
         _ => Vec::new(),
     };
@@ -165,11 +160,11 @@ fn forest_builder(_: ()) -> Result<()> {
 
 fn tree_verifier(_: ()) -> Result<()> {
     let observe = observe_view::<KindsTree>()?;
-    let grand = GRANDCHILD.lock().expect("grand");
-    let parent = observe.parent(grand)?.expect("parent link");
-    assert_eq!(observe.payload(parent)?.as_deref(), Some(&2));
-    let root = observe.parent(parent)?.expect("root parent link");
-    assert_eq!(observe.payload(root)?.as_deref(), Some(&1));
+    let grand = GRANDCHILD.lock().clone().expect("grand");
+    let parent = observe.parent(grand.clone())?.expect("parent link");
+    assert_eq!(observe.payload(parent.clone())?.as_deref(), Some(&2));
+    let root = observe.parent(parent.clone())?.expect("root parent link");
+    assert_eq!(observe.payload(root.clone())?.as_deref(), Some(&1));
     assert_eq!(observe.roots(&"doc".to_string())?.len(), 1);
     assert_eq!(observe.children(root)?.len(), 1);
     Ok(())
@@ -189,8 +184,11 @@ fn tree_round_trips_nodes_roots_and_parents() {
             .len(),
         1
     );
-    let root = snapshot.tree_roots::<KindsTree>()[0];
-    assert_eq!(snapshot.tree_payload::<KindsTree>(root).as_deref(), Some(&1));
+    let root = snapshot.tree_roots::<KindsTree>()[0].clone();
+    assert_eq!(
+        snapshot.tree_payload::<KindsTree>(root).as_deref(),
+        Some(&1)
+    );
 
     let plan = engine.plan(tree_verifier, ()).expect("plan");
     engine.run(&plan).expect("verify run");
@@ -204,10 +202,10 @@ fn bucket_builder(_: ()) -> Result<()> {
         .unwrap_or(0);
     let hub = graph.mint(0)?;
     let leaf = graph.mint(1)?;
-    graph.link(hub, 1, leaf)?;
+    graph.link(hub.clone(), 1, leaf)?;
     if step >= 1 {
         let other = graph.mint(2)?;
-        graph.link(hub, 2, other)?;
+        graph.link(hub.clone(), 2, other)?;
     }
     *HUB.lock() = Some(hub);
     Ok(())
@@ -217,19 +215,19 @@ fn graph_builder(_: ()) -> Result<()> {
     let graph = emit_view::<KindsGraph>()?;
     let a = graph.mint(1)?;
     let b = graph.mint(2)?;
-    graph.link(a, 9, b)?;
-    graph.link(a, 9, b)?; // deduplicated by the bucket emitter
-    graph.unlink(a, 9, b)?;
-    graph.link(a, 9, b)?;
+    graph.link(a.clone(), 9, b.clone())?;
+    graph.link(a.clone(), 9, b.clone())?; // deduplicated by the bucket emitter
+    graph.unlink(a.clone(), 9, b.clone())?;
+    graph.link(a.clone(), 9, b.clone())?;
     *ENDPOINTS.lock() = Some((a, b));
     Ok(())
 }
 
 fn graph_verifier(_: ()) -> Result<()> {
     let observe = observe_view::<KindsGraph>()?;
-    let (a, b) = ENDPOINTS.lock().expect("endpoints");
-    assert_eq!(observe.outgoing(a, &9)?, vec![b]);
-    assert_eq!(observe.payload(a)?.as_deref(), Some(&1));
+    let (a, b) = ENDPOINTS.lock().clone().expect("endpoints");
+    assert_eq!(observe.outgoing(a.clone(), &9)?, vec![b.clone()]);
+    assert_eq!(observe.payload(a.clone())?.as_deref(), Some(&1));
     assert_eq!(observe.payload(b)?.as_deref(), Some(&2));
     assert_eq!(observe.nodes()?.len(), 2);
     Ok(())
@@ -321,10 +319,10 @@ fn tree_builder(_: ()) -> Result<()> {
         .map(|step| *step)
         .unwrap_or(0);
     let root = tree.root(&"g".to_string(), 1)?;
-    let child_a = tree.child(root, 10)?;
+    let child_a = tree.child(root.clone(), 10)?;
     let child_b = tree.child(root, 20)?;
     if step >= 1 {
-        tree.set_payload(child_a, 11)?;
+        tree.set_payload(child_a.clone(), 11)?;
     }
     *TREE_NODES.lock() = Some((child_a, child_b));
     Ok(())
@@ -332,16 +330,16 @@ fn tree_builder(_: ()) -> Result<()> {
 
 fn tree_node_a_watcher(_: ()) -> Result<()> {
     NODE_A_RUNS.fetch_add(1, Ordering::SeqCst);
-    let (a, _) = TREE_NODES.lock().expect("tree nodes");
-    let id = a;
+    let (a, _) = TREE_NODES.lock().clone().expect("tree nodes");
+    let id = a.clone();
     observe_view::<KindsTree>()?.payload(id)?;
     Ok(())
 }
 
 fn tree_node_b_watcher(_: ()) -> Result<()> {
     NODE_B_RUNS.fetch_add(1, Ordering::SeqCst);
-    let (_, b) = TREE_NODES.lock().expect("tree nodes");
-    let id = b;
+    let (_, b) = TREE_NODES.lock().clone().expect("tree nodes");
+    let id = b.clone();
     observe_view::<KindsTree>()?.payload(id)?;
     Ok(())
 }
@@ -373,14 +371,14 @@ fn tree_payload_writes_wake_exactly_that_node() {
 
 fn bucket_one_watcher(_: ()) -> Result<()> {
     BUCKET_ONE_RUNS.fetch_add(1, Ordering::SeqCst);
-    let hub = HUB.lock().expect("hub");
+    let hub = HUB.lock().clone().expect("hub");
     observe_view::<KindsGraph>()?.outgoing(hub, &1)?;
     Ok(())
 }
 
 fn bucket_two_watcher(_: ()) -> Result<()> {
     BUCKET_TWO_RUNS.fetch_add(1, Ordering::SeqCst);
-    let hub = HUB.lock().expect("hub");
+    let hub = HUB.lock().clone().expect("hub");
     observe_view::<KindsGraph>()?.outgoing(hub, &2)?;
     Ok(())
 }
@@ -445,9 +443,7 @@ fn list_pipeline_never_exposes_glitches() {
 
     for step in [1u64, 2, 3] {
         set_step(&mut engine, step);
-        let expected = engine
-            .snapshot()
-            .list_len::<SumSource>(&5);
+        let expected = engine.snapshot().list_len::<SumSource>(&5);
         assert_eq!(*running.output(), expected as u64);
     }
 }
@@ -463,8 +459,8 @@ fn graph_construction_is_deterministic_across_engines() {
         let a = graph.mint(1)?;
         let b = graph.mint(2)?;
         let c = graph.mint(3)?;
-        graph.link(a, 7, b)?;
-        graph.link(a, 7, c)?;
+        graph.link(a.clone(), 7, b.clone())?;
+        graph.link(a.clone(), 7, c.clone())?;
         graph.link(b, 8, c)?;
         Ok(())
     }
@@ -473,10 +469,13 @@ fn graph_construction_is_deterministic_across_engines() {
         let observe = observe_view::<KindsGraph>()?;
         let mut lines = Vec::new();
         for node in observe.nodes()? {
-            if let Some(payload) = observe.payload(node)? {
+            if let Some(payload) = observe.payload(node.clone())? {
                 lines.push(format!("node {payload:?}"));
                 for label in [7u8, 8] {
-                    lines.push(format!("bucket {label} -> {:?}", observe.outgoing(node, &label)?));
+                    lines.push(format!(
+                        "bucket {label} -> {:?}",
+                        observe.outgoing(node.clone(), &label)?
+                    ));
                 }
             }
         }
@@ -497,6 +496,7 @@ fn graph_construction_is_deterministic_across_engines() {
 
     assert_eq!(run(), run());
 }
+
 
 // ---------------------------------------------------------------------------
 // StateValue derive + StateCell (plan §5.6)
@@ -520,7 +520,10 @@ fn state_cell_persists_across_epochs_and_rolls_back() {
             visits: visits + 1,
             label: format!("visit-{visits}"),
         })?;
-        let tick = observe_view::<Step>()?.get(&())?.map(|value| *value).unwrap_or(0);
+        let tick = observe_view::<Step>()?
+            .get(&())?
+            .map(|value| *value)
+            .unwrap_or(0);
         emit_view::<StateTick>()?.insert(0, visits + tick)?;
         Ok(())
     }
@@ -528,14 +531,20 @@ fn state_cell_persists_across_epochs_and_rolls_back() {
     let mut engine = Engine::new();
     let plan = engine.plan(writer, ()).expect("plan");
     let running = engine.run(&plan).expect("run");
-    assert_eq!(engine.snapshot().observe::<StateTick>(0).as_deref(), Some(&0));
+    assert_eq!(
+        engine.snapshot().observe::<StateTick>(0).as_deref(),
+        Some(&0)
+    );
 
     // Second epoch wakes the SAME root; the slot carries the committed value.
     engine
         .command(|| emit_view::<Step>()?.insert((), 10))
         .expect("tick command");
     // Slot persisted (visits=1) and the tick fact recomputed from it.
-    assert_eq!(engine.snapshot().observe::<StateTick>(0).as_deref(), Some(&11));
+    assert_eq!(
+        engine.snapshot().observe::<StateTick>(0).as_deref(),
+        Some(&11)
+    );
     let _ = &running;
 
     // A failing command rolls the whole epoch (facts + slot) back atomically.
@@ -545,9 +554,11 @@ fn state_cell_persists_across_epochs_and_rolls_back() {
         })
         .unwrap_err();
     assert!(matches!(error, Error::Internal(_)));
-    assert_eq!(engine.snapshot().observe::<StateTick>(0).as_deref(), Some(&11));
+    assert_eq!(
+        engine.snapshot().observe::<StateTick>(0).as_deref(),
+        Some(&11)
+    );
 }
-
 
 // ---------------------------------------------------------------------------
 // Keyed families (plan §5.4)
@@ -558,6 +569,17 @@ struct FamilyInput(Map<u64, i64>);
 
 #[view]
 struct FamilyEcho(Map<u64, i64>);
+
+/// Private fixture component definition (plan §6.1): identity derives from
+/// this marker plus the exact driving key, with duplicate-install
+/// rejection through the descriptor registry.
+struct FamilyEchoDefinition;
+
+impl crate::reactive::component::ComponentDefinition for FamilyEchoDefinition {
+    fn __descriptor() -> &'static str {
+        "reactive::tests::kinds::family_echo"
+    }
+}
 
 #[test]
 fn keyed_family_evaluates_exactly_one_child_per_changed_key() {
@@ -582,18 +604,29 @@ fn keyed_family_evaluates_exactly_one_child_per_changed_key() {
         })
         .expect("seed inputs");
 
-    let family: KeyedFamily<FamilyInput> = engine.install_keyed(echo_child).expect("install");
+    let family: KeyedFamily<FamilyInput> = engine
+        .install_component_each_key::<FamilyEchoDefinition, FamilyInput, _>(echo_child)
+        .expect("install");
     // Initial enumeration evaluated exactly the two existing keys once.
     assert_eq!(RUNS.load(Ordering::SeqCst), 2);
-    assert_eq!(engine.snapshot().observe::<FamilyEcho>(1).as_deref(), Some(&30));
-    assert_eq!(engine.snapshot().observe::<FamilyEcho>(2).as_deref(), Some(&60));
+    assert_eq!(
+        engine.snapshot().observe::<FamilyEcho>(1).as_deref(),
+        Some(&30)
+    );
+    assert_eq!(
+        engine.snapshot().observe::<FamilyEcho>(2).as_deref(),
+        Some(&60)
+    );
 
     // One changed key wakes exactly one child.
     engine
         .command(|| emit_view::<FamilyInput>()?.insert(2, 21))
         .expect("edit key 2");
     assert_eq!(RUNS.load(Ordering::SeqCst), 3);
-    assert_eq!(engine.snapshot().observe::<FamilyEcho>(2).as_deref(), Some(&63));
+    assert_eq!(
+        engine.snapshot().observe::<FamilyEcho>(2).as_deref(),
+        Some(&63)
+    );
     // Untouched key stayed cold: no third re-run for key 1.
 
     // Inserting a NEW key schedules only that child.
@@ -601,7 +634,10 @@ fn keyed_family_evaluates_exactly_one_child_per_changed_key() {
         .command(|| emit_view::<FamilyInput>()?.insert(3, 5))
         .expect("insert key 3");
     assert_eq!(RUNS.load(Ordering::SeqCst), 4);
-    assert_eq!(engine.snapshot().observe::<FamilyEcho>(3).as_deref(), Some(&15));
+    assert_eq!(
+        engine.snapshot().observe::<FamilyEcho>(3).as_deref(),
+        Some(&15)
+    );
 
     // Removal runs the child once observing absence, then retires it and
     // retracts the publication.
@@ -634,8 +670,7 @@ fn map_patch_touches_only_mentioned_keys() {
     // Patch: one upsert plus one remove; the untouched key stays cold.
     let report = engine
         .command(|| {
-            plingo::reactive::emit_patch::<PatchTarget>()?
-                .upsert(2, "TWO".into())?;
+            plingo::reactive::emit_patch::<PatchTarget>()?.upsert(2, "TWO".into())?;
             plingo::reactive::emit_patch::<PatchTarget>()?.remove(1)?;
             Ok(())
         })
@@ -684,6 +719,15 @@ fn randomized_keyed_traces_match_replace_all_oracle() {
     #[view]
     struct RandEcho(Map<u64, i64>);
 
+    /// Private fixture component definition (plan §6.1).
+    struct RandEchoDefinition;
+
+    impl crate::reactive::component::ComponentDefinition for RandEchoDefinition {
+        fn __descriptor() -> &'static str {
+            "reactive::tests::kinds::rand_echo"
+        }
+    }
+
     fn echo_child(input: u64) -> Result<()> {
         let value = observe_view::<RandSource>()?
             .get(&input)?
@@ -698,7 +742,10 @@ fn randomized_keyed_traces_match_replace_all_oracle() {
     fn replace_all(_: ()) -> Result<()> {
         let mut items = Vec::new();
         for input in 0..24u64 {
-            if let Some(value) = observe_view::<RandSource>()?.get(&input)?.map(|value| *value) {
+            if let Some(value) = observe_view::<RandSource>()?
+                .get(&input)?
+                .map(|value| *value)
+            {
                 items.push((input, value * 2));
             }
         }
@@ -725,7 +772,9 @@ fn randomized_keyed_traces_match_replace_all_oracle() {
             Ok(())
         })
         .expect("seed");
-    incremental.install_keyed::<RandSource, _>(echo_child).expect("install family");
+    incremental
+        .install_component_each_key::<RandEchoDefinition, RandSource, _>(echo_child)
+        .expect("install family");
 
     let mut reference = Engine::new();
     reference
@@ -796,13 +845,24 @@ struct B1Upstream(Map<u64, String>);
 #[view]
 struct B1Downstream(Map<u64, bool>);
 
+/// Private fixture component definition (plan §6.1).
+struct B1KeyedChildDefinition;
+
+impl crate::reactive::component::ComponentDefinition for B1KeyedChildDefinition {
+    fn __descriptor() -> &'static str {
+        "reactive::tests::kinds::b1_keyed_child"
+    }
+}
+
 #[test]
 fn keyed_child_retraction_wakes_downstream_root() {
     // A keyed family child publishes to B1Downstream. A separate root
     // observes B1Downstream. When the upstream key is removed, the child
     // retires and retracts its publication. The downstream root MUST fire.
     fn keyed_child(key: u64) -> Result<()> {
-        let value = observe_view::<B1Upstream>()?.get(&key)?.map(|v| (*v).clone());
+        let value = observe_view::<B1Upstream>()?
+            .get(&key)?
+            .map(|v| (*v).clone());
         match value {
             Some(text) => {
                 emit_view::<B1Downstream>()?.insert(key, text == "alive")?;
@@ -837,7 +897,7 @@ fn keyed_child_retraction_wakes_downstream_root() {
         .expect("seed");
 
     engine
-        .install_keyed::<B1Upstream, _>(keyed_child)
+        .install_component_each_key::<B1KeyedChildDefinition, B1Upstream, _>(keyed_child)
         .expect("install family");
 
     let plan = engine.plan(downstream_watcher, ()).expect("plan watcher");
@@ -893,14 +953,14 @@ fn child_lifecycle(_: ()) -> Result<()> {
         CHILD_RUNS.fetch_add(1, Ordering::SeqCst);
         let observe = observe_view::<KindsTree>()?;
         let link = observe.fact(
-            kind::TreeKey::ChildLink(parent, child.raw_id()),
+            kind::TreeKey::ChildLink(parent.clone(), child.clone()),
             crate::reactive::plain::Temporal::Current,
         )?;
         let echo = emit_view::<ChildEcho>()?;
         match link.as_deref() {
             Some(kind::TreeFact::Link(_)) => {
-                let payload = observe.payload(child)?.as_deref().copied().unwrap_or(0);
-                echo.insert((parent, child), payload)?;
+                let payload = observe.payload(child.clone())?.as_deref().copied().unwrap_or(0);
+                echo.insert((parent.clone(), child.clone()), payload)?;
             }
             _ => {
                 echo.remove((parent, child))?;
@@ -920,7 +980,7 @@ fn child_forest_builder(_: ()) -> Result<()> {
     // Child A's payload depends on the step; child B exists only at
     // step 2. Identities are stable across reruns (same call sites),
     // so unchanged links never respawn.
-    let child_a = tree.child(root, if step == 1 { 11 } else { 10 })?;
+    let child_a = tree.child(root.clone(), if step == 1 { 11 } else { 10 })?;
     if step == 2 {
         let _child_b = tree.child(root, 20)?;
     }
@@ -949,7 +1009,7 @@ fn per_child_lifecycle_wakes_exactly_the_affected_child() {
             .map(|(parent, child): (Node<KindsTree>, Node<KindsTree>)| {
                 let payload = engine
                     .snapshot()
-                    .observe::<ChildEcho>((parent, child))
+                    .observe::<ChildEcho>((parent.clone(), child.clone()))
                     .map(|v| *v)
                     .unwrap_or(0);
                 (parent.raw_id(), payload)
@@ -984,7 +1044,10 @@ fn per_child_lifecycle_wakes_exactly_the_affected_child() {
     let pairs = echo(&engine);
     assert_eq!(pairs.len(), 2);
     assert_eq!(
-        pairs.iter().map(|(_, payload)| *payload).collect::<Vec<_>>(),
+        pairs
+            .iter()
+            .map(|(_, payload)| *payload)
+            .collect::<Vec<_>>(),
         vec![10, 20]
     );
 
@@ -1003,8 +1066,8 @@ fn splice_mint(
     root: Node<KindsTree>,
     payload: i64,
 ) -> Result<Node<KindsTree>> {
-    let id = crate::reactive::__macro_private::fresh_node_id::<KindsTree>()?;
-    tree.set_node(id, Some(root), payload, Vec::new())?;
+    let id = crate::reactive::__macro_private::automatic_effect_node_id::<KindsTree>()?;
+    tree.set_node(id.clone(), Some(root), payload, Vec::new())?;
     Ok(id)
 }
 
@@ -1018,52 +1081,52 @@ fn splice_builder(_: ()) -> Result<()> {
         .map(|step| *step)
         .unwrap_or(0);
     let root = tree.root(&"doc".to_string(), 1)?;
-    let a = tree.child(root, 10)?;
-    let b = tree.child(root, 20)?;
-    let c = tree.child(root, 30)?;
-    let d = tree.child(root, 40)?;
+    let a = tree.child(root.clone(), 10)?;
+    let b = tree.child(root.clone(), 20)?;
+    let c = tree.child(root.clone(), 30)?;
+    let d = tree.child(root.clone(), 40)?;
     match step {
         1 => {
             // Insert x between b and c: [a,b,x,c,d].
-            let x = splice_mint(&tree, root, 99)?;
-            tree.splice_children(root, Some(b), &[], &[x], Some(c))?;
+            let x = splice_mint(&tree, root.clone(), 99)?;
+            tree.splice_children(root.clone(), Some(b.clone()), &[], &[x], Some(c.clone()))?;
         }
         2 => {
             // Coalesce two touches of the same node in one command:
             // x between b and c, then y between x and c.
-            let x = splice_mint(&tree, root, 99)?;
-            let y = splice_mint(&tree, root, 88)?;
-            tree.splice_children(root, Some(b), &[], &[x], Some(c))?;
+            let x = splice_mint(&tree, root.clone(), 99)?;
+            let y = splice_mint(&tree, root.clone(), 88)?;
+            tree.splice_children(root.clone(), Some(b.clone()), &[], &[x.clone()], Some(c.clone()))?;
             tree.splice_children(root, Some(x), &[], &[y], Some(c))?;
         }
         3 => {
             // Remove c between y and d: [a,b,x,y,d].
-            let x = splice_mint(&tree, root, 99)?;
-            let y = splice_mint(&tree, root, 88)?;
-            tree.splice_children(root, Some(b), &[], &[x], Some(c))?;
-            tree.splice_children(root, Some(x), &[], &[y], Some(c))?;
+            let x = splice_mint(&tree, root.clone(), 99)?;
+            let y = splice_mint(&tree, root.clone(), 88)?;
+            tree.splice_children(root.clone(), Some(b.clone()), &[], &[x.clone()], Some(c.clone()))?;
+            tree.splice_children(root.clone(), Some(x), &[], &[y.clone()], Some(c.clone()))?;
             tree.splice_children(root, Some(y), &[c], &[], Some(d))?;
         }
         4 => {
             // Replace y with z: [a,b,x,z,d].
-            let x = splice_mint(&tree, root, 99)?;
-            let y = splice_mint(&tree, root, 88)?;
-            let z = splice_mint(&tree, root, 77)?;
-            tree.splice_children(root, Some(b), &[], &[x], Some(c))?;
-            tree.splice_children(root, Some(x), &[], &[y], Some(c))?;
-            tree.splice_children(root, Some(y), &[c], &[], Some(d))?;
+            let x = splice_mint(&tree, root.clone(), 99)?;
+            let y = splice_mint(&tree, root.clone(), 88)?;
+            let z = splice_mint(&tree, root.clone(), 77)?;
+            tree.splice_children(root.clone(), Some(b.clone()), &[], &[x.clone()], Some(c.clone()))?;
+            tree.splice_children(root.clone(), Some(x.clone()), &[], &[y.clone()], Some(c.clone()))?;
+            tree.splice_children(root.clone(), Some(y.clone()), &[c.clone()], &[], Some(d.clone()))?;
             tree.splice_children(root, Some(x), &[y], &[z], Some(d))?;
         }
         5 => {
             // Absent before-anchor rejected.
-            let ghost = splice_mint(&tree, root, 7)?;
+            let ghost = splice_mint(&tree, root.clone(), 7)?;
             let result = tree.splice_children(root, Some(ghost), &[], &[], Some(a));
             *SPLICE_ERROR.lock() = Some(format!("{result:?}"));
         }
         6 => {
             // Removed-run mismatch rejected (the run between b and d is
             // [c], not []).
-            let x = splice_mint(&tree, root, 99)?;
+            let x = splice_mint(&tree, root.clone(), 99)?;
             let result = tree.splice_children(root, Some(b), &[], &[x], Some(d));
             *SPLICE_ERROR.lock() = Some(format!("{result:?}"));
         }
@@ -1075,7 +1138,7 @@ fn splice_builder(_: ()) -> Result<()> {
 fn splice_verifier(_: ()) -> Result<()> {
     let observe = observe_view::<KindsTree>()?;
     let expected = SPLICE_ORDER.lock().clone().expect("expected order");
-    let root = observe.roots(&"doc".to_string())?[0];
+    let root = observe.roots(&"doc".to_string())?[0].clone();
     let children = observe.children(root)?;
     let mut payloads = Vec::with_capacity(children.len());
     for child in children {
@@ -1112,5 +1175,3 @@ fn tree_ordered_splice_validates_and_coalesces() {
         "invalid splices must be rejected"
     );
 }
-
-

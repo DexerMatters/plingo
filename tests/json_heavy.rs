@@ -13,7 +13,7 @@ fn uri(name: &str) -> fluent_uri::Uri<String> {
 }
 
 fn build(workers: usize) -> Workspace {
-    Workspace::build( |engine| {
+    Workspace::build(|engine| {
         install_lexer::<JsonToken>(engine)?;
         install_parser::<JsonToken, JsonDocument>(engine)?;
         Ok(())
@@ -69,7 +69,10 @@ impl JsonRuntime {
     }
 
     fn diagnostic_count(&self) -> usize {
-        self.ws.snapshot().list::<ParseDiagnostics>(&self.uri_str()).len()
+        self.ws
+            .snapshot()
+            .list::<ParseDiagnostics>(&self.uri_str())
+            .len()
     }
 
     fn lex_error_count(&self) -> usize {
@@ -85,12 +88,7 @@ impl JsonRuntime {
     }
 }
 
-fn replace(
-    u: &fluent_uri::Uri<String>,
-    text: &str,
-    needle: &str,
-    value: &str,
-) -> Vec<SourceEdit> {
+fn replace(u: &fluent_uri::Uri<String>, text: &str, needle: &str, value: &str) -> Vec<SourceEdit> {
     let start = text.find(needle).expect("fixture contains target");
     let end = start + needle.len();
     vec![
@@ -353,13 +351,16 @@ mod work_gates {
             ws.open(u.clone(), &doc).unwrap();
             // Same-width replacement of the first digit character.
             let report = ws
-                .edit(vec![SourceEdit::Delete {
-                    key: plingo::utils::Span::new_uri(u.clone(), first_num, first_num + 1)
-                        .unwrap(),
-                }, SourceEdit::Insert {
-                    key: plingo::utils::Span::point_uri(u.clone(), first_num).unwrap(),
-                    value: "9".into(),
-                }])
+                .edit(vec![
+                    SourceEdit::Delete {
+                        key: plingo::utils::Span::new_uri(u.clone(), first_num, first_num + 1)
+                            .unwrap(),
+                    },
+                    SourceEdit::Insert {
+                        key: plingo::utils::Span::point_uri(u.clone(), first_num).unwrap(),
+                        value: "9".into(),
+                    },
+                ])
                 .expect("head edit commits");
             let work = report
                 .work()
@@ -371,7 +372,9 @@ mod work_gates {
                 "size={size} value-only edit woke the parser"
             );
             assert_eq!(
-                work.parser_records_inserted + work.parser_records_updated + work.parser_records_removed,
+                work.parser_records_inserted
+                    + work.parser_records_updated
+                    + work.parser_records_removed,
                 0,
                 "size={size} value-only edit touched parser records"
             );
@@ -408,7 +411,11 @@ mod work_gates {
                     key: plingo::utils::Span::new_uri(u.clone(), at, at + 1).unwrap(),
                 }])
                 .expect("tail restore commits");
-            let work = report.work().parser(u.as_str()).cloned().unwrap_or_default();
+            let work = report
+                .work()
+                .parser(u.as_str())
+                .cloned()
+                .unwrap_or_default();
             windows.push((size, work.tokens_replayed, work.columns_reused));
         }
         // Both sizes replay through EOF for a tail edit inside an object
@@ -444,9 +451,15 @@ mod work_gates {
                 value: " ".into(),
             }])
             .expect("whitespace edit commits");
-        let work = report.work().parser(u.as_str()).cloned().unwrap_or_default();
+        let work = report
+            .work()
+            .parser(u.as_str())
+            .cloned()
+            .unwrap_or_default();
         assert_eq!(
-            work.parser_records_inserted + work.parser_records_removed + work.parser_records_updated,
+            work.parser_records_inserted
+                + work.parser_records_removed
+                + work.parser_records_updated,
             0,
             "trivia edit touched parser records"
         );
@@ -472,16 +485,23 @@ mod work_gates {
             ws.open(u.clone(), &doc).unwrap();
             // Rare, high-popularity head edit (same-width) leaving the whole
             // array as a reusable suffix.
-            let at = doc.find("[[") .unwrap() + 2;
+            let at = doc.find("[[").unwrap() + 2;
             let report = ws
-                .edit(vec![SourceEdit::Delete {
-                    key: plingo::utils::Span::new_uri(u.clone(), at, at + 1).unwrap(),
-                }, SourceEdit::Insert {
-                    key: plingo::utils::Span::point_uri(u.clone(), at).unwrap(),
-                    value: "9".into(),
-                }])
+                .edit(vec![
+                    SourceEdit::Delete {
+                        key: plingo::utils::Span::new_uri(u.clone(), at, at + 1).unwrap(),
+                    },
+                    SourceEdit::Insert {
+                        key: plingo::utils::Span::point_uri(u.clone(), at).unwrap(),
+                        value: "9".into(),
+                    },
+                ])
                 .expect("head edit commits");
-            let work = report.work().parser(u.as_str()).cloned().unwrap_or_default();
+            let work = report
+                .work()
+                .parser(u.as_str())
+                .cloned()
+                .unwrap_or_default();
             // §19 invariant, now with the cache-stable fast path (plan
             // §8.6): the number of retained suffix columns physically
             // rewritten by ONE command is a SMALL CONSTANT (only the
@@ -499,7 +519,6 @@ mod work_gates {
             );
         }
     }
-
 }
 // ---------------------------------------------------------------------------
 // Recovery determinism (plan §14): identical recovery traces produce
@@ -534,9 +553,79 @@ mod recovery_determinism {
             one, four,
             "recovery trace diverged across worker counts (synthetic-token nondeterminism?)"
         );
-        assert_eq!(one.parse_status.as_deref(), Some("clean"), "repair must recover to clean");
-
+        assert_eq!(
+            one.parse_status.as_deref(),
+            Some("clean"),
+            "repair must recover to clean"
+        );
     }
+    /// Plan §8 item 8 / Phase 4 exit gate: a transition that changes only
+    /// status/diagnostics must execute ZERO syntax identity/dimension
+    /// projection work. In a recovered document, a same-terminal VALUE edit
+    /// keeps the parser component completely cold (zero evaluations, zero
+    /// record journaling, zero syntax facts) while the committed diagnostics
+    /// still equal a fresh oracle — the observable form of the gate.
+    #[test]
+    fn recovered_value_edit_stays_parser_cold_with_exact_diagnostics() {
+        let mut ws = build(1);
+        let u = uri("recdet-cold");
+        let malformed = r#"{"a": [1, 2] "b": true}"#.to_string();
+        ws.open(u.clone(), &malformed).unwrap();
+        let before = common::oracle::project(&ws.snapshot(), &u.to_string());
+        assert!(
+            before.parse_status.as_deref().is_some_and(|s| s.starts_with("recovered")),
+            "fixture must start recovered: {:?}",
+            before.parse_status
+        );
+        assert!(!before.diagnostics.is_empty());
+
+        // Same-terminal value edit inside the recovered region: `2` -> `7`.
+        let at = malformed.find('2').unwrap();
+        let report = ws
+            .edit(vec![
+                SourceEdit::Delete {
+                    key: Span::new_uri(u.clone(), at, at + 1).unwrap(),
+                },
+                SourceEdit::Insert {
+                    key: Span::point_uri(u.clone(), at).unwrap(),
+                    value: "7".into(),
+                },
+            ])
+            .unwrap();
+        let work = report
+            .work()
+            .parser(&u.to_string())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            work.component_runs, 0,
+            "value edit woke the parser: {work:?}"
+        );
+        assert_eq!(
+            work.parser_records_inserted + work.parser_records_updated + work.parser_records_removed,
+            0,
+            "value edit journaled parser records: {work:?}"
+        );
+        assert_eq!(work.syntax_facts_patched, 0, "{work:?}");
+        assert_eq!(work.full_rebuild_fallbacks, 0, "{work:?}");
+        assert_eq!(work.full_store_scans, 0, "{work:?}");
+        assert_eq!(work.full_token_vector_clones, 0, "{work:?}");
+
+        // The committed diagnostics stay exact against a fresh workspace.
+        let after = common::oracle::project(&ws.snapshot(), &u.to_string());
+        let mut fresh = build(1);
+        let v = uri("recdet-cold-fresh");
+        let mut edited = malformed.clone();
+        edited.replace_range(at..at + 1, "7");
+        fresh.open(v.clone(), &edited).unwrap();
+        let fresh_projection = common::oracle::project(&fresh.snapshot(), &v.to_string());
+        assert_eq!(
+            after.diagnostics, fresh_projection.diagnostics,
+            "recovered diagnostics diverged from the fresh oracle"
+        );
+        assert_eq!(after.parse_status, fresh_projection.parse_status);
+    }
+
     /// Plan §14: after a recovery-shaped edit, the persistent witness
     /// interval index records the consumed token occurrences and an
     /// interval query returns the intersecting recovery segments (so a

@@ -14,11 +14,11 @@ mod common;
 
 use common::json::{JsonDocument, JsonToken};
 use common::oracle;
-use plingo::framework::parse::{AstSnapshots, ParseUnits};
+use plingo::framework::Workspace;
 use plingo::framework::lex::install_lexer;
 use plingo::framework::parse::install_parser;
+use plingo::framework::parse::{AstSnapshots, ParseUnits};
 use plingo::framework::source::SourceEdit;
-use plingo::framework::Workspace;
 use plingo::utils::Span;
 
 fn build() -> Workspace {
@@ -74,8 +74,16 @@ fn one_real_shift_accepts_a_repair() {
     );
 
     // Repair restores a clean parse with zero stale diagnostics.
-    let repaired = ws.edit(replace_at(&u, text, "1 2", "1, 2")).expect("repair");
-    assert_eq!(repaired.work().parser(&u.to_string()).map(|p| p.recovery_searches), Some(0));
+    let repaired = ws
+        .edit(replace_at(&u, text, "1 2", "1, 2"))
+        .expect("repair");
+    assert_eq!(
+        repaired
+            .work()
+            .parser(&u.to_string())
+            .map(|p| p.recovery_searches),
+        Some(0)
+    );
     let projection = oracle::project(&ws.snapshot(), &u.to_string());
     assert_eq!(projection.parse_status.as_deref(), Some("clean"));
     assert!(projection.diagnostics.is_empty());
@@ -105,7 +113,8 @@ fn equal_cost_alternate_repairs_are_dropped_by_the_current_search() {
     assert!(!first.diagnostics.is_empty());
 
     // A later repair clears every stale diagnostic.
-    ws.edit(replace_at(&u, text, "\"x\" 1", "\"x\": 1")).expect("repair");
+    ws.edit(replace_at(&u, text, "\"x\" 1", "\"x\": 1"))
+        .expect("repair");
     let repaired = oracle::project(&ws.snapshot(), &u.to_string());
     assert_eq!(repaired.parse_status.as_deref(), Some("clean"));
     assert!(repaired.diagnostics.is_empty());

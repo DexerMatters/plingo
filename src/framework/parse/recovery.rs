@@ -189,7 +189,14 @@ pub(crate) fn find_recovery(
         );
         // Reductions do not consume source input; explore recovery actions from
         // every stack that is reachable under the current lookahead first.
-        if is_viable_completion(ctx, tail, item.config.input, &closed, &item.config, &mut cache) {
+        if is_viable_completion(
+            ctx,
+            tail,
+            item.config.input,
+            &closed,
+            &item.config,
+            &mut cache,
+        ) {
             let repairs = item.config.repairs.clone();
             if solution_cost.is_none() {
                 solution_cost = Some(item.cost);
@@ -721,4 +728,3 @@ fn pushed(stack: &[usize], state: usize) -> Vec<usize> {
     next.push(state);
     next
 }
-

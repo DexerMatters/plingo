@@ -13,7 +13,8 @@ struct T1Source(Map<u64, i64>);
 struct T1Derived(Map<u64, i64>);
 
 fn derive(input: u64) -> Result<i64> {
-    let value = observe_view::<T1Source>()?.get(&input)?
+    let value = observe_view::<T1Source>()?
+        .get(&input)?
         .map(|value| *value)
         .unwrap_or_default();
     let result = value + 1;

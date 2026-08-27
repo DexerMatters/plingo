@@ -526,7 +526,7 @@ fn gen_from_parts_arm(
                 case_fields.push(quote! {
                     #name: {
                         if children_cursor < children.len() {
-                            let value: #node_ty = children[children_cursor];
+                            let value: #node_ty = children[children_cursor].clone();
                             children_cursor += 1;
                             value
                         } else {
@@ -554,7 +554,7 @@ fn gen_from_parts_arm(
                     #name: {
                         if *#binding {
                             if children_cursor < children.len() {
-                                let value: #node_ty = children[children_cursor];
+                                let value: #node_ty = children[children_cursor].clone();
                                 children_cursor += 1;
                                 ::std::option::Option::Some(value)
                             } else {
@@ -698,10 +698,10 @@ fn gen_tree_emit_arm(
                 ChildKind::Single => child_walks.push(quote! {
                     {
                         let child_id =
-                            ::plingo::reactive::__macro_private::fresh_node_id::<#view_ident>()?;
+                            ::plingo::reactive::__macro_private::automatic_effect_node_id::<#view_ident>()?;
                         #child_member::__tree_emit(
-                            ::std::option::Option::Some(id),
-                            child_id,
+                            ::std::option::Option::Some(id.clone()),
+                            child_id.clone(),
                             #binding,
                         )?;
                         children.push(child_id);
@@ -711,10 +711,10 @@ fn gen_tree_emit_arm(
                     {
                         for child_value in #binding.iter() {
                             let child_id =
-                                ::plingo::reactive::__macro_private::fresh_node_id::<#view_ident>()?;
+                                ::plingo::reactive::__macro_private::automatic_effect_node_id::<#view_ident>()?;
                             #child_member::__tree_emit(
-                                ::std::option::Option::Some(id),
-                                child_id,
+                                ::std::option::Option::Some(id.clone()),
+                                child_id.clone(),
                                 child_value,
                             )?;
                             children.push(child_id);
@@ -725,10 +725,10 @@ fn gen_tree_emit_arm(
                     {
                         if let ::std::option::Option::Some(child_value) = #binding.as_ref() {
                             let child_id =
-                                ::plingo::reactive::__macro_private::fresh_node_id::<#view_ident>()?;
+                                ::plingo::reactive::__macro_private::automatic_effect_node_id::<#view_ident>()?;
                             #child_member::__tree_emit(
-                                ::std::option::Option::Some(id),
-                                child_id,
+                                ::std::option::Option::Some(id.clone()),
+                                child_id.clone(),
                                 child_value,
                             )?;
                             children.push(child_id);
@@ -747,32 +747,31 @@ fn gen_tree_emit_arm(
             #(#child_walks)*
             let emit = ::plingo::reactive::kind::emit_view::<#view_ident>()?;
             emit.put(
-                ::plingo::reactive::kind::TreeKey::Payload(id),
+                ::plingo::reactive::kind::TreeKey::Payload(id.clone()),
                 ::std::option::Option::Some(::plingo::reactive::kind::TreeFact::Payload(
                     #union_node_ident::#member_short(payload),
                 )),
             )?;
             emit.put(
-                ::plingo::reactive::kind::TreeKey::Parent(id),
+                ::plingo::reactive::kind::TreeKey::Parent(id.clone()),
                 ::std::option::Option::Some(::plingo::reactive::kind::TreeFact::Parent(
-                    parent,
+                    parent.clone(),
                 )),
             )?;
-            let order: ::std::sync::Arc<[u64]> = children
-                .iter()
-                .map(|child| child.raw_id())
-                .collect();
+            let order: ::std::sync::Arc<
+                [::plingo::reactive::view::Node<#view_ident>],
+            > = children.iter().cloned().collect();
             emit.put(
-                ::plingo::reactive::kind::TreeKey::ChildOrder(id),
+                ::plingo::reactive::kind::TreeKey::ChildOrder(id.clone()),
                 ::std::option::Option::Some(::plingo::reactive::kind::TreeFact::Order(
                     order,
                 )),
             )?;
-            for &child in children.iter() {
+            for child in children.iter() {
                 emit.put(
-                    ::plingo::reactive::kind::TreeKey::ChildLink(id, child.raw_id()),
+                    ::plingo::reactive::kind::TreeKey::ChildLink(id.clone(), child.clone()),
                     ::std::option::Option::Some(::plingo::reactive::kind::TreeFact::Link(
-                        child,
+                        child.clone(),
                     )),
                 )?;
             }
@@ -796,10 +795,7 @@ fn gen_tree_kind_arm(
 }
 
 /// Generates the non-recursive child collection arm used by sparse patches.
-fn gen_plain_children_arm(
-    variant: &GenVariant,
-    names: &FamilyNames,
-) -> proc_macro2::TokenStream {
+fn gen_plain_children_arm(variant: &GenVariant, names: &FamilyNames) -> proc_macro2::TokenStream {
     let vident = &variant.ident;
     let (pattern, bindings) = bindings(variant);
     let root_ident = &names.root;
@@ -874,7 +870,70 @@ fn gen_plain_children_arm(
         }
     }
 }
-
+/// Generates the raw AST child records represented by generated tree fields.
+fn gen_plain_child_records_arm(variant: &GenVariant) -> proc_macro2::TokenStream {
+    let vident = &variant.ident;
+    let (pattern, bindings) = bindings(variant);
+    let mut children = Vec::new();
+    let is_ast_box = |ty: &syn::Type| -> bool {
+        let syn::Type::Path(path) = ty else {
+            return false;
+        };
+        path.path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "AstBox")
+    };
+    let inner_is_ast_box = |ty: &syn::Type| -> bool {
+        let Some((_, inner)) = container_inner(ty) else {
+            return false;
+        };
+        is_ast_box(inner)
+    };
+    for (index, field) in variant.fields.iter().enumerate() {
+        let binding = &bindings[index];
+        let FieldClass::Child { kind, .. } = &field.class else {
+            continue;
+        };
+        let push_child = |child_box: proc_macro2::TokenStream| {
+            quote! {
+                if arena.get(#child_box).is_some() {
+                    children.push((#child_box).identity());
+                }
+            }
+        };
+        let collect = match kind {
+            ChildKind::Single if is_ast_box(&field.leaf_ty) => {
+                Some(push_child(quote! { *#binding }))
+            }
+            ChildKind::Optional if inner_is_ast_box(&field.leaf_ty) => {
+                let body = push_child(quote! { *child_box });
+                Some(quote! {
+                    if let ::std::option::Option::Some(child_box) = #binding.as_ref() {
+                        #body
+                    }
+                })
+            }
+            ChildKind::List if inner_is_ast_box(&field.leaf_ty) => {
+                let body = push_child(quote! { *child_box });
+                Some(quote! {
+                    for child_box in #binding.iter() {
+                        #body
+                    }
+                })
+            }
+            _ => None,
+        };
+        if let Some(collect) = collect {
+            children.push(collect);
+        }
+    }
+    quote! {
+        Self::#vident #pattern => {
+            #(#children)*
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Member surface
@@ -895,6 +954,16 @@ fn gen_member_surface(
     let view_input_ident = format_ident!("{}Input", view_ident);
     let view_output_ident = format_ident!("{}Output", view_ident);
     let union_node_ident = &names.node;
+    let plain_child_records_arms: Vec<proc_macro2::TokenStream> = member
+        .variants
+        .iter()
+        .map(gen_plain_child_records_arm)
+        .collect();
+    let plain_children_arms: Vec<proc_macro2::TokenStream> = member
+        .variants
+        .iter()
+        .map(|variant| gen_plain_children_arm(variant, names))
+        .collect();
     let member_short = short_of(names, ident);
 
     let node_variants: Vec<proc_macro2::TokenStream> = member
@@ -954,11 +1023,6 @@ fn gen_member_surface(
         .iter()
         .map(|variant| gen_tree_emit_arm(variant, ident, names))
         .collect();
-    let plain_children_arms: Vec<proc_macro2::TokenStream> = member
-        .variants
-        .iter()
-        .map(|variant| gen_plain_children_arm(variant, names))
-        .collect();
     quote! {
         /// The payload node of one member enum (leaf fields + kind tag).
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1003,6 +1067,19 @@ fn gen_member_surface(
         }
 
         impl #ident {
+            /// Returns the raw AST records represented by generated child
+            /// fields, preserving field/list order for parser deltas.
+            #[doc(hidden)]
+            pub(crate) fn __tree_plain_child_records(
+                arena: &::plingo::framework::parse::data::AstArena,
+                value: &Self,
+            ) -> ::std::vec::Vec<u64> {
+                let mut children = ::std::vec::Vec::new();
+                match value {
+                    #(#plain_child_records_arms),*
+                }
+                children
+            }
             /// The variant ordinal (the `kind` dimension of derived ids).
             pub fn tree_kind(&self) -> u8 {
                 match self {
@@ -1043,13 +1120,13 @@ fn gen_member_surface(
                 let payload: #node_ident = ::std::convert::From::from(value);
                 let patch = ::plingo::reactive::kind::emit_patch::<#view_ident>()?;
                 patch.upsert(
-                    ::plingo::reactive::kind::TreeKey::Payload(id),
+                    ::plingo::reactive::kind::TreeKey::Payload(id.clone()),
                     ::plingo::reactive::kind::TreeFact::Payload(
                         #union_node_ident::#member_short(payload),
                     ),
                 )?;
                 patch.upsert(
-                    ::plingo::reactive::kind::TreeKey::Parent(id),
+                    ::plingo::reactive::kind::TreeKey::Parent(id.clone()),
                     ::plingo::reactive::kind::TreeFact::Parent(parent),
                 )?;
                 Self::__tree_plain_emit_links(&patch, id, &children)
@@ -1062,21 +1139,7 @@ fn gen_member_surface(
                 id: ::plingo::reactive::view::Node<#view_ident>,
                 children: &[::plingo::reactive::view::Node<#view_ident>],
             ) -> ::plingo::reactive::Result<()> {
-                let order: ::std::sync::Arc<[u64]> = children
-                    .iter()
-                    .map(|child| child.raw_id())
-                    .collect();
-                patch.upsert(
-                    ::plingo::reactive::kind::TreeKey::ChildOrder(id),
-                    ::plingo::reactive::kind::TreeFact::Order(order),
-                )?;
-                for &child in children {
-                    patch.upsert(
-                        ::plingo::reactive::kind::TreeKey::ChildLink(id, child.raw_id()),
-                        ::plingo::reactive::kind::TreeFact::Link(child),
-                    )?;
-                }
-                Ok(())
+                patch.set_children(id, children.to_vec())
             }
         }
 
@@ -1151,17 +1214,17 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                     let parent =
                         match ::plingo::reactive::kind::observe_view::<Self>()?
                             .fact(
-                                ::plingo::reactive::kind::TreeKey::Parent(id),
+                                ::plingo::reactive::kind::TreeKey::Parent(id.clone()),
                                 ::plingo::reactive::__macro_private::Temporal::Current,
                             )? {
                             Some(output) => match &*output {
                                 ::plingo::reactive::kind::TreeFact::Parent(parent) =>
-                                    *parent,
+                                    parent.clone(),
                                 _ => ::std::option::Option::None,
                             },
                             ::std::option::Option::None => ::std::option::Option::None,
                         };
-                    #member_ident::__tree_emit(parent, id, value)
+                    #member_ident::__tree_emit(parent.clone(), id, value)
                 }
             }
         })
@@ -1209,6 +1272,10 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                 if let ::std::option::Option::Some(value) =
                     arena.get_id::<#member_ident>(raw)
                 {
+                    let member_payload: #member_node =
+                        ::std::convert::From::from(value);
+                    let payload = #node_ident::#short(member_payload);
+                    let patch = ::plingo::reactive::kind::emit_patch::<#view_ident>()?;
                     let id = Self::__tree_plain_node_for_record(
                         uri,
                         arena,
@@ -1217,16 +1284,30 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                         resolver,
                     )
                     .expect("payload record must resolve to a node");
-                    let member_payload: #member_node =
-                        ::std::convert::From::from(value);
-                    let patch = ::plingo::reactive::kind::emit_patch::<#view_ident>()?;
                     patch.upsert(
                         ::plingo::reactive::kind::TreeKey::Payload(id),
-                        ::plingo::reactive::kind::TreeFact::Payload(
-                            #node_ident::#short(member_payload),
-                        ),
+                        ::plingo::reactive::kind::TreeFact::Payload(payload),
                     )?;
                     return Ok(true);
+                }
+            }
+        })
+        .collect();
+    let payload_value_arms: Vec<proc_macro2::TokenStream> = members
+        .iter()
+        .map(|member| {
+            let member_ident = &member.ident;
+            let member_node = format_ident!("{}Node", member.ident);
+            let short = short_of(names, &member.ident);
+            quote! {
+                if let ::std::option::Option::Some(value) =
+                    arena.get_id::<#member_ident>(raw)
+                {
+                    let member_payload: #member_node =
+                        ::std::convert::From::from(value);
+                    return ::std::option::Option::Some(
+                        #node_ident::#short(member_payload)
+                    );
                 }
             }
         })
@@ -1345,6 +1426,33 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                 )*
                 ::std::option::Option::None
             }
+            fn __tree_plain_child_records(
+                arena: &::plingo::framework::parse::data::AstArena,
+                record: u64,
+            ) -> ::std::vec::Vec<u64> {
+                let Some(raw) = usize::try_from(record).ok() else {
+                    return ::std::vec::Vec::new();
+                };
+                #(
+                    if let ::std::option::Option::Some(value) =
+                        arena.get_id::<#kind_members>(raw)
+                    {
+                        return #kind_members::__tree_plain_child_records(arena, value);
+                    }
+                )*
+                ::std::vec::Vec::new()
+            }
+            /// Returns the stable payload value for one live arena record
+            /// without publishing a public tree fact.
+            fn __tree_payload_for_record(
+                arena: &::plingo::framework::parse::data::AstArena,
+                record: u64,
+            ) -> ::std::option::Option<Self::Node> {
+                let raw = usize::try_from(record).ok()?;
+                #(#payload_value_arms)*
+                ::std::option::Option::None
+            }
+
 
             /// Writes ONLY the payload fact of one record (plan §12 step 1).
             fn __tree_refresh_payload(
@@ -1380,21 +1488,20 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                 roots: ::std::vec::Vec<::plingo::reactive::view::Node<#view_ident>>,
             ) -> ::plingo::reactive::Result<()> {
                 let patch = ::plingo::reactive::kind::emit_patch::<#view_ident>()?;
-                let order: ::std::sync::Arc<[u64]> = roots
-                    .iter()
-                    .map(|root| (*root).raw_id())
-                    .collect();
+                let order: ::std::sync::Arc<
+                    [::plingo::reactive::view::Node<#view_ident>],
+                > = roots.iter().cloned().collect();
                 patch.upsert(
                     ::plingo::reactive::kind::TreeKey::RootOrder(uri.to_string()),
                     ::plingo::reactive::kind::TreeFact::RootOrder(order),
                 )?;
-                for &root in roots.iter() {
+                for root in roots.iter() {
                     patch.upsert(
                         ::plingo::reactive::kind::TreeKey::RootLink(
                             uri.to_string(),
-                            root.raw_id(),
+                            root.clone(),
                         ),
-                        ::plingo::reactive::kind::TreeFact::RootLink(root),
+                        ::plingo::reactive::kind::TreeFact::RootLink(root.clone()),
                     )?;
                 }
                 Ok(())
@@ -1404,37 +1511,52 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
             /// parent, child order, and the surviving parent's link to this
             /// record. Descendant records are retracted by their own calls.
             #[doc(hidden)]
+            #[allow(clippy::too_many_arguments)]
             fn __tree_plain_remove_record(
                 uri: &str,
                 arena: &::plingo::framework::parse::data::AstArena,
                 record: u64,
+                old_parent_record: ::std::option::Option<u64>,
+                old_child_records: &[u64],
                 resolver: &dyn Fn(u64) -> ::std::option::Option<u64>,
+                retractions: &mut ::std::vec::Vec<
+                    ::plingo::reactive::kind::TreeKey<
+                        ::std::string::String,
+                        ::plingo::reactive::view::Node<#view_ident>,
+                    >,
+                >,
             ) -> ::plingo::reactive::Result<bool> {
-                let Some(raw_record) = usize::try_from(record).ok() else {
-                    return Ok(false);
-                };
                 let Some(id) =
                     Self::__tree_plain_node_for_record(uri, arena, record, false, resolver)
                 else {
                     return Ok(false);
                 };
                 let patch = ::plingo::reactive::kind::emit_patch::<#view_ident>()?;
-                patch.remove(::plingo::reactive::kind::TreeKey::Payload(id))?;
-                patch.remove(::plingo::reactive::kind::TreeKey::Parent(id))?;
-                patch.remove(::plingo::reactive::kind::TreeKey::ChildOrder(id))?;
-                if let ::std::option::Option::Some(parent_record) = arena.parent_of(raw_record)
-                    && let ::std::option::Option::Some(parent) = Self::__tree_plain_node_for_record(
-                        uri,
-                        arena,
-                        parent_record as u64,
-                        false,
-                        resolver,
-                    )
+                patch.remove(::plingo::reactive::kind::TreeKey::Payload(id.clone()))?;
+                patch.remove(::plingo::reactive::kind::TreeKey::Parent(id.clone()))?;
+                patch.remove(::plingo::reactive::kind::TreeKey::ChildOrder(id.clone()))?;
+                for child_record in old_child_records {
+                    if let ::std::option::Option::Some(child) =
+                        Self::__tree_plain_node_for_record(
+                            uri, arena, *child_record, false, resolver,
+                        )
+                    {
+                        retractions.push(::plingo::reactive::kind::TreeKey::ChildLink(
+                            id.clone(),
+                            child.clone(),
+                        ));
+                    }
+                }
+                if let ::std::option::Option::Some(parent_record) = old_parent_record
+                    && let ::std::option::Option::Some(parent) =
+                        Self::__tree_plain_node_for_record(
+                            uri, arena, parent_record, false, resolver,
+                        )
                 {
-                    patch.remove(::plingo::reactive::kind::TreeKey::ChildLink(
+                    retractions.push(::plingo::reactive::kind::TreeKey::ChildLink(
                         parent,
-                        id.raw_id(),
-                    ))?;
+                        id.clone(),
+                    ));
                 }
                 Ok(true)
             }
@@ -1455,9 +1577,13 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                 value: &#root_ident,
             ) -> ::plingo::reactive::Result<::plingo::reactive::view::Node<#view_ident>> {
                 let root =
-                    ::plingo::reactive::__macro_private::fresh_node_id::<Self>()?;
-                Self::append_root(Self::anonymous_key(), root)?;
-                #root_ident::__tree_emit(::std::option::Option::None, root, value)?;
+                    ::plingo::reactive::__macro_private::automatic_effect_node_id::<Self>()?;
+                Self::append_root(Self::anonymous_key(), root.clone())?;
+                #root_ident::__tree_emit(
+                    ::std::option::Option::None,
+                    root.clone(),
+                    value,
+                )?;
                 Ok(root)
             }
 
@@ -1488,14 +1614,14 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                 emit.put(
                     ::plingo::reactive::kind::TreeKey::RootOrder(key.clone()),
                     ::std::option::Option::Some(::plingo::reactive::kind::TreeFact::RootOrder(
-                        roots.iter().map(|root| (*root).raw_id()).collect(),
+                        roots.iter().cloned().collect(),
                     )),
                 )?;
-                for &root in roots.iter() {
+                for root in roots.iter() {
                     emit.put(
-                        ::plingo::reactive::kind::TreeKey::RootLink(key.clone(), root.raw_id()),
+                        ::plingo::reactive::kind::TreeKey::RootLink(key.clone(), root.clone()),
                         ::std::option::Option::Some(::plingo::reactive::kind::TreeFact::RootLink(
-                            root,
+                            root.clone(),
                         )),
                     )?;
                 }
@@ -1507,7 +1633,7 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
             ) -> ::plingo::reactive::Result<::std::option::Option<#case_ident>> {
                 let observe = ::plingo::reactive::kind::observe_view::<Self>()?;
                 let Some(output) = observe.fact(
-                        ::plingo::reactive::kind::TreeKey::Payload(id),
+                        ::plingo::reactive::kind::TreeKey::Payload(id.clone()),
                         ::plingo::reactive::__macro_private::Temporal::Current,
                     )? else {
                     return Ok(::std::option::Option::None);
@@ -1530,7 +1656,7 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
             > {
                 let Some(output) = ::plingo::reactive::kind::observe_view::<Self>()?
                     .fact(
-                        ::plingo::reactive::kind::TreeKey::Payload(id),
+                        ::plingo::reactive::kind::TreeKey::Payload(id.clone()),
                         ::plingo::reactive::__macro_private::Temporal::Current,
                     )? else {
                     return Ok(::std::option::Option::None);
@@ -1549,7 +1675,7 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
             > {
                 let observe = ::plingo::reactive::kind::observe_view::<Self>()?;
                 let Some(output) = observe.fact(
-                        ::plingo::reactive::kind::TreeKey::ChildOrder(id),
+                        ::plingo::reactive::kind::TreeKey::ChildOrder(id.clone()),
                         ::plingo::reactive::__macro_private::Temporal::Current,
                     )? else {
                     return Ok(::std::sync::Arc::new(::std::vec::Vec::new()));
@@ -1559,13 +1685,16 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                         let mut children = ::std::vec::Vec::with_capacity(order.len());
                         for link in order.iter() {
                             if let ::std::option::Option::Some(fact) = observe.fact(
-                                ::plingo::reactive::kind::TreeKey::ChildLink(id, *link),
+                                ::plingo::reactive::kind::TreeKey::ChildLink(
+                                    id.clone(),
+                                    link.clone(),
+                                ),
                                 ::plingo::reactive::__macro_private::Temporal::Current,
                             )? {
                                 if let ::plingo::reactive::kind::TreeFact::Link(child) =
                                     &*fact
                                 {
-                                    children.push(*child);
+                                    children.push(child.clone());
                                 }
                             }
                         }
@@ -1583,13 +1712,13 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
             > {
                 let Some(output) = ::plingo::reactive::kind::observe_view::<Self>()?
                     .fact(
-                        ::plingo::reactive::kind::TreeKey::Parent(id),
+                        ::plingo::reactive::kind::TreeKey::Parent(id.clone()),
                         ::plingo::reactive::__macro_private::Temporal::Current,
                     )? else {
                     return Ok(::std::option::Option::None);
                 };
                 Ok(match &*output {
-                    ::plingo::reactive::kind::TreeFact::Parent(parent) => *parent,
+                    ::plingo::reactive::kind::TreeFact::Parent(parent) => parent.clone(),
                     _ => None,
                 })
             }
@@ -1635,14 +1764,17 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                             if let ::plingo::reactive::kind::TreeFact::RootOrder(order) = &*output {
                                 for link in order.iter() {
                                     if let ::std::option::Option::Some(link_fact) = observe.fact(
-                                        ::plingo::reactive::kind::TreeKey::RootLink(key.clone(), *link),
+                                        ::plingo::reactive::kind::TreeKey::RootLink(
+                                            key.clone(),
+                                            link.clone(),
+                                        ),
                                         ::plingo::reactive::__macro_private::Temporal::Current,
                                     )? {
                                         if let ::plingo::reactive::kind::TreeFact::RootLink(
                                             root,
                                         ) = &*link_fact
                                         {
-                                            roots.push(*root);
+                                            roots.push(root.clone());
                                         }
                                     }
                                 }
@@ -1678,13 +1810,16 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                         let mut roots = ::std::vec::Vec::with_capacity(order.len());
                         for link in order.iter() {
                             if let ::std::option::Option::Some(link_fact) = observe.fact(
-                                ::plingo::reactive::kind::TreeKey::RootLink(key.clone(), *link),
+                                ::plingo::reactive::kind::TreeKey::RootLink(
+                                    key.clone(),
+                                    link.clone(),
+                                ),
                                 ::plingo::reactive::__macro_private::Temporal::Current,
                             )? {
                                 if let ::plingo::reactive::kind::TreeFact::RootLink(root) =
                                     &*link_fact
                                 {
-                                    roots.push(*root);
+                                    roots.push(root.clone());
                                 }
                             }
                         }
@@ -1699,7 +1834,7 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
             ) -> ::plingo::reactive::Result<::std::option::Option<#case_ident>> {
                 let observe = ::plingo::reactive::kind::observe_view::<Self>()?;
                 let Some(output) = observe.fact(
-                        ::plingo::reactive::kind::TreeKey::Payload(id),
+                        ::plingo::reactive::kind::TreeKey::Payload(id.clone()),
                         ::plingo::reactive::__macro_private::Temporal::Previous,
                     )? else {
                     return Ok(::std::option::Option::None);
@@ -1722,7 +1857,7 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
             > {
                 let Some(output) = ::plingo::reactive::kind::observe_view::<Self>()?
                     .fact(
-                        ::plingo::reactive::kind::TreeKey::Payload(id),
+                        ::plingo::reactive::kind::TreeKey::Payload(id.clone()),
                         ::plingo::reactive::__macro_private::Temporal::Previous,
                     )? else {
                     return Ok(::std::option::Option::None);
@@ -1741,7 +1876,7 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
             > {
                 let observe = ::plingo::reactive::kind::observe_view::<Self>()?;
                 let Some(output) = observe.fact(
-                        ::plingo::reactive::kind::TreeKey::ChildOrder(id),
+                        ::plingo::reactive::kind::TreeKey::ChildOrder(id.clone()),
                         ::plingo::reactive::__macro_private::Temporal::Previous,
                     )? else {
                     return Ok(::std::sync::Arc::new(::std::vec::Vec::new()));
@@ -1751,13 +1886,16 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                         let mut children = ::std::vec::Vec::with_capacity(order.len());
                         for link in order.iter() {
                             if let ::std::option::Option::Some(fact) = observe.fact(
-                                ::plingo::reactive::kind::TreeKey::ChildLink(id, *link),
+                                ::plingo::reactive::kind::TreeKey::ChildLink(
+                                    id.clone(),
+                                    link.clone(),
+                                ),
                                 ::plingo::reactive::__macro_private::Temporal::Previous,
                             )? {
                                 if let ::plingo::reactive::kind::TreeFact::Link(child) =
                                     &*fact
                                 {
-                                    children.push(*child);
+                                    children.push(child.clone());
                                 }
                             }
                         }
@@ -1774,13 +1912,13 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
             > {
                 let Some(output) = ::plingo::reactive::kind::observe_view::<Self>()?
                     .fact(
-                        ::plingo::reactive::kind::TreeKey::Parent(id),
+                        ::plingo::reactive::kind::TreeKey::Parent(id.clone()),
                         ::plingo::reactive::__macro_private::Temporal::Previous,
                     )? else {
                     return Ok(::std::option::Option::None);
                 };
                 Ok(match &*output {
-                    ::plingo::reactive::kind::TreeFact::Parent(parent) => *parent,
+                    ::plingo::reactive::kind::TreeFact::Parent(parent) => parent.clone(),
                     _ => None,
                 })
             }
@@ -1802,14 +1940,17 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                             if let ::plingo::reactive::kind::TreeFact::RootOrder(order) = &*output {
                                 for link in order.iter() {
                                     if let ::std::option::Option::Some(link_fact) = observe.fact(
-                                        ::plingo::reactive::kind::TreeKey::RootLink(key.clone(), *link),
+                                        ::plingo::reactive::kind::TreeKey::RootLink(
+                                            key.clone(),
+                                            link.clone(),
+                                        ),
                                         ::plingo::reactive::__macro_private::Temporal::Previous,
                                     )? {
                                         if let ::plingo::reactive::kind::TreeFact::RootLink(
                                             root,
                                         ) = &*link_fact
                                         {
-                                            roots.push(*root);
+                                            roots.push(root.clone());
                                         }
                                     }
                                 }
@@ -1827,28 +1968,30 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
             ) -> ::plingo::reactive::Result<()> {
                 let emit = ::plingo::reactive::kind::emit_view::<Self>()?;
                 emit.put(
-                    ::plingo::reactive::kind::TreeKey::Payload(id),
+                    ::plingo::reactive::kind::TreeKey::Payload(id.clone()),
                     ::std::option::Option::Some(::plingo::reactive::kind::TreeFact::Payload(payload)),
                 )?;
                 emit.put(
-                    ::plingo::reactive::kind::TreeKey::Parent(id),
+                    ::plingo::reactive::kind::TreeKey::Parent(id.clone()),
                     ::std::option::Option::Some(::plingo::reactive::kind::TreeFact::Parent(
                         ::std::option::Option::None,
                     )),
                 )?;
-                let order: ::std::sync::Arc<[u64]> = children
-                    .iter()
-                    .map(|child| (*child).raw_id())
-                    .collect();
+                let order: ::std::sync::Arc<
+                    [::plingo::reactive::view::Node<#view_ident>],
+                > = children.iter().cloned().collect();
                 emit.put(
-                    ::plingo::reactive::kind::TreeKey::ChildOrder(id),
+                    ::plingo::reactive::kind::TreeKey::ChildOrder(id.clone()),
                     ::std::option::Option::Some(::plingo::reactive::kind::TreeFact::Order(order)),
                 )?;
-                for &child in children.iter() {
+                for child in children.iter() {
                     emit.put(
-                        ::plingo::reactive::kind::TreeKey::ChildLink(id, child.raw_id()),
+                        ::plingo::reactive::kind::TreeKey::ChildLink(
+                            id.clone(),
+                            child.clone(),
+                        ),
                         ::std::option::Option::Some(::plingo::reactive::kind::TreeFact::Link(
-                            child,
+                            child.clone(),
                         )),
                     )?;
                 }
@@ -1860,11 +2003,11 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
             ) -> ::plingo::reactive::Result<()> {
                 let emit = ::plingo::reactive::kind::emit_view::<Self>()?;
                 emit.put(
-                    ::plingo::reactive::kind::TreeKey::Payload(id),
+                    ::plingo::reactive::kind::TreeKey::Payload(id.clone()),
                     ::std::option::Option::None,
                 )?;
                 emit.put(
-                    ::plingo::reactive::kind::TreeKey::Parent(id),
+                    ::plingo::reactive::kind::TreeKey::Parent(id.clone()),
                     ::std::option::Option::None,
                 )?;
                 emit.put(
@@ -1883,7 +2026,7 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                     ::plingo::reactive::kind::TreeKey::Parent(id),
                 );
                 match fact.as_deref() {
-                    Some(::plingo::reactive::kind::TreeFact::Parent(parent)) => *parent,
+                    Some(::plingo::reactive::kind::TreeFact::Parent(parent)) => parent.clone(),
                     _ => ::std::option::Option::None,
                 }
             }
@@ -1893,9 +2036,9 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                 id: ::plingo::reactive::view::Node<#view_ident>,
             ) -> ::std::option::Option<#case_ident> {
                 let output = snapshot.observe::<Self>(
-                    ::plingo::reactive::kind::TreeKey::Payload(id),
+                    ::plingo::reactive::kind::TreeKey::Payload(id.clone()),
                 );
-                let children = Self::snapshot_children(snapshot, id);
+                let children = Self::snapshot_children(snapshot, id.clone());
                 match output.as_deref() {
                     Some(::plingo::reactive::kind::TreeFact::Payload(payload)) => {
                         match payload {
@@ -1925,17 +2068,20 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                 id: ::plingo::reactive::view::Node<#view_ident>,
             ) -> ::std::sync::Arc<::std::vec::Vec<::plingo::reactive::view::Node<#view_ident>>> {
                 let output = snapshot.observe::<Self>(
-                    ::plingo::reactive::kind::TreeKey::ChildOrder(id),
+                    ::plingo::reactive::kind::TreeKey::ChildOrder(id.clone()),
                 );
                 match output.as_deref() {
                     Some(::plingo::reactive::kind::TreeFact::Order(order)) => {
                         let mut children = ::std::vec::Vec::with_capacity(order.len());
                         for link in order.iter() {
                             if let ::std::option::Option::Some(fact) = snapshot.observe::<Self>(
-                                ::plingo::reactive::kind::TreeKey::ChildLink(id, *link),
+                                ::plingo::reactive::kind::TreeKey::ChildLink(
+                                    id.clone(),
+                                    link.clone(),
+                                ),
                             ) {
                                 if let ::plingo::reactive::kind::TreeFact::Link(child) = &*fact {
-                                    children.push(*child);
+                                    children.push(child.clone());
                                 }
                             }
                         }
@@ -1959,7 +2105,7 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                                         snapshot.observe::<Self>(
                                             ::plingo::reactive::kind::TreeKey::RootLink(
                                                 key.clone(),
-                                                *link,
+                                                link.clone(),
                                             ),
                                         )
                                     {
@@ -1967,7 +2113,7 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                                             root,
                                         ) = &*link_fact
                                         {
-                                            roots.push(*root);
+                                            roots.push(root.clone());
                                         }
                                     }
                                 }
@@ -1993,10 +2139,10 @@ fn gen_family_surface(members: &[GenMember], names: &FamilyNames) -> proc_macro2
                 let mut roots = ::std::vec::Vec::with_capacity(order.len());
                 for link in order.iter() {
                     if let ::std::option::Option::Some(link_fact) = snapshot.observe::<Self>(
-                        ::plingo::reactive::kind::TreeKey::RootLink(key.clone(), *link),
+                        ::plingo::reactive::kind::TreeKey::RootLink(key.clone(), link.clone()),
                     ) {
                         if let ::plingo::reactive::kind::TreeFact::RootLink(root) = &*link_fact {
-                            roots.push(*root);
+                            roots.push(root.clone());
                         }
                     }
                 }

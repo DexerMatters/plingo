@@ -121,6 +121,8 @@ impl Grammar {
             states,
             session_arenas: HashMap::new(),
             config,
+            tree_member_kind: None,
+            tree_child_records: None,
             latest: ParserSnapshotState::default().into(),
             next_snapshot: 0,
             _root: PhantomData,

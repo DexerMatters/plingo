@@ -1,41 +1,60 @@
+use indexmap::IndexSet;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
-use indexmap::IndexSet;
 
 use super::{
-    ParseColumn, ParseError, ParseToken, ParserSessionState, ReplayPlan, SessionContext,
-    TokenTail, checkpoint, product_direct_record,
+    ParseColumn, ParseError, ParseToken, ParserSessionState, ReplayPlan, SessionContext, TokenTail,
+    checkpoint,
 };
-use crate::{
-    framework::{
-        lex::LexerRoot,
-        parse::{
-            IncrementalParseStats, Parser, ParserSnapshotState,
-            data::{
-                ast::{AnchoredSpan, AstArena},
-                green::{ParseErrorInfo, TreeArena},
-                gss::{GssArena, GssNodeId},
-                product::{ProductArena, ProductData, ProductId},
-            },
-            diagnostics::collect_parse_diagnostics,
-            delta::{ChildSplice, KeyDelta, OrderedDelta, ParseDelta, ParsedStatus,
-                ParseDiagnosticKey, SyntheticTokenId, SyntaxNodeId},
-            types::{ParserTreeFacts, SessionArenas},
+use crate::framework::{
+    lex::LexerRoot,
+    parse::{
+        IncrementalParseStats, Parser, ParserSnapshotState,
+        data::{
+            ast::{AnchoredSpan, AstArena},
+            green::{ParseErrorInfo, TreeArena},
+            gss::GssArena,
+            product::{ProductArena, ProductData, ProductId},
+        },
+        delta::{
+            ChildSplice, KeyDelta, OrderedDelta, ParseDelta, ParseDiagnosticKey, ParsedStatus,
+            SyntaxNodeId, SyntheticTokenId,
+        },
+        diagnostics::collect_parse_diagnostics,
+        types::{
+            ParserTreeFacts, ProductReachKey, RecordReachKey, RecordTransition, SessionArenas,
         },
     },
 };
 
 struct ReusableSuffix {
-    columns: Vec<ParseColumn>,
-    boundary_columns: Vec<Option<usize>>,
-    /// A convergence candidate may only enter a suffix containing ordinary
-    /// token columns. Recovery columns are replayed, not structurally reused.
-    clean: Vec<bool>,
+    segment: Arc<super::ParseSegment>,
     column_base: usize,
-    token_columns: HashMap<usize, usize>,
+}
+
+impl ReusableSuffix {
+    fn len(&self) -> usize {
+        self.segment.len()
+    }
+
+    fn column(&self, index: usize) -> Option<&ParseColumn> {
+        self.segment.column(index)
+    }
+
+    fn frontier(&self, index: usize) -> Option<&checkpoint::FrontierCheckpoint> {
+        self.segment.frontier(index)
+    }
+
+    fn is_clean_from(&self, index: usize) -> bool {
+        self.segment.is_clean_from(index)
+    }
+
+    fn products_cache_stable(&self) -> bool {
+        self.segment.products_cache_stable()
+    }
 }
 
 /// Phase accounting for exact parser convergence. These durations are emitted
@@ -50,70 +69,13 @@ struct ReuseTiming {
     rebase: Duration,
 }
 
-/// Dense parser-arena IDs make vector-backed remapping substantially cheaper
-/// than hashing every retained node/product during suffix rebasing.
-struct ProductRemap {
-    values: Vec<Option<ProductId>>,
-}
-
-impl ProductRemap {
-    fn from_mapping(mapping: HashMap<ProductId, ProductId>, capacity: usize) -> Self {
-        let mut values = vec![None; capacity];
-        for (old, new) in mapping {
-            if old >= values.len() {
-                values.resize(old + 1, None);
-            }
-            values[old] = Some(new);
-        }
-        Self { values }
-    }
-
-    fn get(&self, old: ProductId) -> Option<ProductId> {
-        self.values.get(old).copied().flatten()
-    }
-
-    fn insert(&mut self, old: ProductId, new: ProductId) {
-        if old >= self.values.len() {
-            self.values.resize(old + 1, None);
-        }
-        self.values[old] = Some(new);
-    }
-}
-
-struct NodeRemap {
-    values: Vec<Option<GssNodeId>>,
-}
-
-impl NodeRemap {
-    fn from_mapping(mapping: HashMap<GssNodeId, GssNodeId>, capacity: usize) -> Self {
-        let mut values = vec![None; capacity];
-        for (old, new) in mapping {
-            if old >= values.len() {
-                values.resize(old + 1, None);
-            }
-            values[old] = Some(new);
-        }
-        Self { values }
-    }
-
-    fn get(&self, old: GssNodeId) -> Option<GssNodeId> {
-        self.values.get(old).copied().flatten()
-    }
-
-    fn insert(&mut self, old: GssNodeId, new: GssNodeId) {
-        if old >= self.values.len() {
-            self.values.resize(old + 1, None);
-        }
-        self.values[old] = Some(new);
-    }
-}
 
 fn remap_product(
     old: ProductId,
-    mapping: &mut ProductRemap,
+    mapping: &mut HashMap<ProductId, ProductId>,
     session_ctx: &mut SessionContext<'_>,
 ) -> Result<Option<ProductId>, ParseError> {
-    if let Some(product) = mapping.get(old) {
+    if let Some(product) = mapping.get(&old).copied() {
         return Ok(Some(product));
     }
     let Some(data) = session_ctx
@@ -164,8 +126,6 @@ pub(super) fn decode_data(
     }
 }
 
-
-
 fn maybe_reuse_suffix(
     plan: &ReplayPlan,
     old: &mut ReusableSuffix,
@@ -182,17 +142,13 @@ fn maybe_reuse_suffix(
     }
     stats.convergence_checks += 1;
     let old_token_boundary = plan.old_reuse_start + (current_token_boundary - plan.new_reuse_start);
-    let Some(old_boundary) = old
-        .boundary_columns
-        .get(old_token_boundary)
-        .copied()
-        .flatten()
+    let old_index = plan
+        .old_unit(old_token_boundary)
+        .and_then(|token| old.segment.token_column(token.column))
+        .or_else(|| (old_token_boundary == plan.old_reuse_start).then_some(0));
+    let Some(old_index) =
+        old_index.filter(|&index| index < old.len() && old.is_clean_from(index + 1))
     else {
-        return Ok(false);
-    };
-    let Some(old_index) = old_boundary.checked_sub(old.column_base).filter(|&index| {
-        old.columns.get(index).is_some() && old.clean.get(index).copied().unwrap_or(false)
-    }) else {
         return Ok(false);
     };
 
@@ -201,9 +157,8 @@ fn maybe_reuse_suffix(
         let current_column = &mut session_ctx.state.columns[current_boundary];
         checkpoint::frontier_checkpoint_for_column(current_column, session_ctx.gss).clone()
     };
-    let old_frontier = {
-        let old_column = &mut old.columns[old_index];
-        checkpoint::frontier_checkpoint_for_column(old_column, session_ctx.gss).clone()
+    let Some(old_frontier) = old.frontier(old_index).cloned() else {
+        return Ok(false);
     };
     if current_frontier != old_frontier {
         timing.checkpoint += checkpoint_start.elapsed();
@@ -213,7 +168,9 @@ fn maybe_reuse_suffix(
     stats.checkpoint_matches += 1;
 
     let frontier_start = Instant::now();
-    let old_column = &old.columns[old_index];
+    let Some(old_column) = old.column(old_index) else {
+        return Ok(false);
+    };
     let current_column = &session_ctx.state.columns[current_boundary];
     let old_base = old_column.base_active_nodes().collect::<Vec<_>>();
     let old_active = old_column.active_nodes().collect::<Vec<_>>();
@@ -229,164 +186,315 @@ fn maybe_reuse_suffix(
     timing.frontier_match += frontier_start.elapsed();
     stats.frontier_matches += 1;
 
-    let mut nodes = NodeRemap::from_mapping(frontier_nodes, session_ctx.gss.node_count());
-    let mut products =
-        ProductRemap::from_mapping(frontier_products, session_ctx.products.products.len());
-
-    let tail = &old.columns[old_index + 1..];
-    let tail_validation_start = Instant::now();
-    if tail.iter().any(|column| {
-        column
-            .token
-            .is_none_or(|token| !old.token_columns.contains_key(&token))
-    }) {
-        timing.tail_validation += tail_validation_start.elapsed();
-        return Ok(false);
+    // A fully identity frontier is the proof that the immutable tail's
+    // existing GSS edges remain valid. No retained column needs to be read.
+    let identity_frontier = shared_prefix
+        && frontier_nodes.iter().all(|(old, new)| old == new)
+        && frontier_products.iter().all(|(old, new)| old == new);
+    if identity_frontier && old.products_cache_stable() {
+        let tail = old.segment.slice(old_index + 1..old.len());
+        timing.rebase += Duration::default();
+        stats.reconverged_new_boundary = Some(current_boundary);
+        stats.reconverged_old_boundary = Some(old.column_base + old_index);
+        session_ctx.state.append_reused_segment(tail);
+        return Ok(true);
     }
-    timing.tail_validation += tail_validation_start.elapsed();
 
+    // Rebase only the bounded accepted-root/product closure. The retained
+    // columns remain immutable source data; their raw GSS frontier is the
+    // convergence oracle for the next command.
     let rebase_start = Instant::now();
-    let mut scheduled_nodes = vec![false; session_ctx.gss.node_count()];
-    let mut planned_nodes = Vec::<(GssNodeId, usize, usize)>::new();
-    for (offset, column) in tail.iter().enumerate() {
-        for node in column.base_active_nodes().chain(column.active_nodes()) {
-            if nodes.get(node).is_some() || scheduled_nodes[node] {
-                continue;
-            }
-            let Some(state) = session_ctx.gss.get_node(node).map(|node| node.state) else {
-                return Ok(false);
-            };
-            scheduled_nodes[node] = true;
-            planned_nodes.push((node, state, current_boundary + offset + 1));
-        }
-    }
-
-    let mut planned_edges = Vec::new();
-    for &(node, _, _) in &planned_nodes {
-        for edge in session_ctx.gss.outgoing_edges(node) {
-            if nodes.get(edge.to).is_none() && !scheduled_nodes[edge.to] {
-                if !shared_prefix {
-                    return Ok(false);
-                }
-                // A reused reduction may pop beneath the matched frontier.
-                // Such nodes are descendants of the persistent identity anchor.
-                nodes.insert(edge.to, edge.to);
-            }
-            planned_edges.push((node, edge.to, edge.product));
-        }
-    }
-
-    timing.rebase += rebase_start.elapsed();
-
-    let product_remap_start = Instant::now();
-    for &(_, _, product) in &planned_edges {
-        if remap_product(product, &mut products, session_ctx)?.is_none() {
+    let tail = old.segment.slice(old_index + 1..old.len());
+    let mut products = frontier_products;
+    let mut accepted = Vec::with_capacity(tail.raw_accepted().len());
+    for &product in tail.raw_accepted() {
+        let Some(mapped) = remap_product(product, &mut products, session_ctx)? else {
             return Ok(false);
-        }
+        };
+        accepted.push(mapped);
     }
-    for column in tail {
-        for &product in column.products.iter().chain(column.accepted()) {
-            if remap_product(product, &mut products, session_ctx)?.is_none() {
-                return Ok(false);
+    let rebased = tail.rebase(products, accepted.into());
+    timing.product_remap += rebase_start.elapsed();
+    timing.rebase += Duration::default();
+
+    stats.reconverged_new_boundary = Some(current_boundary);
+    stats.reconverged_old_boundary = Some(old.column_base + old_index);
+    session_ctx.state.append_reused_segment(rebased);
+    Ok(true)
+}
+/// The accepted-root reachability update for one parser command.
+///
+/// Parser columns and retained suffixes are a cache domain. Only the
+/// symmetric difference of the old/new accepted-root multisets changes this
+/// domain, so a value-only edit that leaves the accepted roots unchanged does
+/// not walk parser records or the AST.
+struct ReachabilityUpdate {
+    live_records: crate::reactive::store::RadixMap<()>,
+    product_reach_counts: crate::reactive::store::Hamt<ProductReachKey, u32>,
+    record_reach_counts: crate::reactive::store::Hamt<RecordReachKey, u32>,
+    record_journal: BTreeMap<u64, RecordTransition>,
+}
+
+fn checked_reach_count(
+    kind: &'static str,
+    key: u64,
+    before: u32,
+    delta: i64,
+) -> Result<u32, ParseError> {
+    let after = i64::from(before)
+        .checked_add(delta)
+        .ok_or(ParseError::InvalidReachability {
+            kind,
+            key,
+            before,
+            delta,
+        })?;
+    if !(0..=i64::from(u32::MAX)).contains(&after) {
+        return Err(ParseError::InvalidReachability {
+            kind,
+            key,
+            before,
+            delta,
+        });
+    }
+    Ok(after as u32)
+}
+
+fn add_pending_product(
+    pending: &mut BTreeMap<ProductId, i64>,
+    product: ProductId,
+    delta: i64,
+) -> Result<(), ParseError> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let entry = pending.entry(product).or_default();
+    *entry = entry
+        .checked_add(delta)
+        .ok_or(ParseError::InvalidReachability {
+            kind: "product-pending",
+            key: product as u64,
+            before: 0,
+            delta,
+        })?;
+    if *entry == 0 {
+        pending.remove(&product);
+    }
+    Ok(())
+}
+
+/// Applies an accepted-root multiset delta to the persistent product/record
+/// reach domains. A product's children are adopted/released only when that
+/// product crosses zero; this preserves multiplicity for shared parents
+/// without recursively re-walking an already reachable subtree.
+fn apply_accepted_root_delta(
+    previous: &ParserTreeFacts,
+    previous_roots: &[ProductId],
+    current_roots: &[ProductId],
+    products: &ProductArena,
+) -> Result<ReachabilityUpdate, ParseError> {
+    let mut product_reach_counts = (*previous.product_reach_counts).clone();
+    let mut record_reach_counts = (*previous.record_reach_counts).clone();
+    let mut pending = BTreeMap::<ProductId, i64>::new();
+    for &product in previous_roots {
+        add_pending_product(&mut pending, product, -1)?;
+    }
+    for &product in current_roots {
+        add_pending_product(&mut pending, product, 1)?;
+    }
+
+    let mut record_journal = BTreeMap::<u64, RecordTransition>::new();
+    while let Some(product) = pending.keys().next_back().copied() {
+        let delta = pending
+            .remove(&product)
+            .expect("pending product key disappeared");
+        if delta == 0 {
+            continue;
+        }
+        let key = ProductReachKey(product);
+        let before = product_reach_counts.get(&key).copied().unwrap_or(0);
+        let after = checked_reach_count("product", product as u64, before, delta)?;
+        if after == before {
+            continue;
+        }
+
+        let crossed_into_live = before == 0 && after > 0;
+        let crossed_dead = before > 0 && after == 0;
+        if after == 0 {
+            product_reach_counts.remove(&key);
+        } else {
+            product_reach_counts.insert(key, after);
+        }
+
+        if crossed_into_live || crossed_dead {
+            if let Some(record) = super::product_direct_record(products, product) {
+                let record_key = RecordReachKey(record);
+                let record_before = record_reach_counts
+                    .get(&record_key)
+                    .copied()
+                    .unwrap_or(0);
+                let record_delta = if crossed_into_live { 1 } else { -1 };
+                let record_after =
+                    checked_reach_count("record", record, record_before, record_delta)?;
+                if record_after == 0 {
+                    record_reach_counts.remove(&record_key);
+                } else {
+                    record_reach_counts.insert(record_key, record_after);
+                }
+                record_journal
+                    .entry(record)
+                    .and_modify(|transition| transition.after_count = record_after)
+                    .or_insert(RecordTransition {
+                        before_count: record_before,
+                        after_count: record_after,
+                    });
+            }
+
+            let Some(product_data) = products.get(product).map(|product| &product.data) else {
+                return Err(ParseError::InvalidReachability {
+                    kind: "missing-product",
+                    key: product as u64,
+                    before,
+                    delta,
+                });
+            };
+            let children: &[ProductId] = match product_data {
+                ProductData::Error { children } | ProductData::Node { children, .. } => children,
+                ProductData::Token { .. } => &[],
+            };
+            for &child in children {
+                if child >= product {
+                    return Err(ParseError::InvalidReachability {
+                        kind: "non-topological-edge",
+                        key: product as u64,
+                        before,
+                        delta: child as i64,
+                    });
+                }
+                add_pending_product(
+                    &mut pending,
+                    child,
+                    if crossed_into_live { 1 } else { -1 },
+                )?;
             }
         }
     }
 
-    timing.product_remap += product_remap_start.elapsed();
-
-    let rebase_start = Instant::now();
-    for &(old_node, state, column) in &planned_nodes {
-        let new_node = session_ctx
-            .gss
-            .node(state, column, session_ctx.state.generation);
-        nodes.insert(old_node, new_node);
+    let mut live_records = (*previous.records).clone();
+    for (&record, transition) in &record_journal {
+        match (transition.before_count, transition.after_count) {
+            (0, after) if after > 0 => {
+                live_records.insert(record, ());
+            }
+            (before, 0) if before > 0 => {
+                if !live_records.remove(record) {
+                    return Err(ParseError::InvalidReachability {
+                        kind: "record-live-map",
+                        key: record,
+                        before,
+                        delta: -i64::from(before),
+                    });
+                }
+            }
+            _ => {}
+        }
     }
-    for (from, to, product) in planned_edges {
-        session_ctx.gss.add_edge(
-            nodes.get(from).expect("proven node correspondence"),
-            nodes.get(to).expect("proven node correspondence"),
-            products
-                .get(product)
-                .expect("proven product correspondence"),
-            session_ctx.state.generation,
+    #[cfg(debug_assertions)]
+    {
+        let (expected_products, expected_records) =
+            slow_accepted_root_reach(current_roots, products)?;
+        let actual_products: BTreeMap<ProductId, u32> = product_reach_counts
+            .iter()
+            .map(|(key, count)| (key.0, *count))
+            .collect();
+        let actual_records: BTreeMap<u64, u32> = record_reach_counts
+            .iter()
+            .map(|(key, count)| (key.0, *count))
+            .collect();
+        debug_assert_eq!(
+            actual_products, expected_products,
+            "accepted-root product reach counts diverged from slow oracle"
+        );
+        debug_assert_eq!(
+            actual_records, expected_records,
+            "accepted-root record reach counts diverged from slow oracle"
+        );
+        debug_assert_eq!(
+            live_records.iter().map(|(record, ())| record).collect::<Vec<_>>(),
+            expected_records.keys().copied().collect::<Vec<_>>(),
+            "persistent live-record map diverged from accepted-root oracle"
         );
     }
 
-    // The suffix was moved out of the working session during replay setup;
-    // transfer its reusable tail directly rather than cloning every column.
-    let mut reused_columns = old.columns.split_off(old_index + 1);
-    for column in &mut reused_columns {
-        column.token = column.token.map(|token| old.token_columns[&token]);
-        // Cache-stable fast path (plan §8.6): when every product of this
-        // retained-suffix column remapped to itself, its gss nodes, product
-        // ids, and record segment are already correct in the immutable old
-        // column — attaching it verbatim skips the O(suffix) rewrite. Only
-        // the token anchor and the (now invalid) checkpoint cache change.
-        let cache_stable = column
-            .products
-            .iter()
-            .chain(column.accepted.iter())
-            .all(|&product| {
-                products
-                    .get(product)
-                    .is_some_and(|mapped| mapped == product)
-            });
-        if cache_stable {
-            column.checkpoint_cache = Default::default();
-            continue;
+
+    Ok(ReachabilityUpdate {
+        live_records,
+        product_reach_counts,
+        record_reach_counts,
+        record_journal,
+    })
+}
+#[cfg(any(test, debug_assertions))]
+/// Recomputes accepted-root reachability from scratch for debug and unit-test
+/// validation. A product is expanded once when it first becomes reachable;
+/// incoming root/edge multiplicity is still retained in its count.
+fn slow_accepted_root_reach(
+    roots: &[ProductId],
+    products: &ProductArena,
+) -> Result<(BTreeMap<ProductId, u32>, BTreeMap<u64, u32>), ParseError> {
+    let mut product_counts = BTreeMap::<ProductId, u32>::new();
+    let mut pending = Vec::new();
+    for &root in roots {
+        let before = product_counts.get(&root).copied().unwrap_or(0);
+        let after = checked_reach_count("product", root as u64, before, 1)?;
+        product_counts.insert(root, after);
+        if before == 0 {
+            pending.push(root);
         }
-        stats.suffix_rewritten += 1;
-        column.base_active = column
-            .base_active
-            .iter()
-            .map(|node| nodes.get(*node).expect("proven node correspondence"))
-            .collect();
-        column.active = column
-            .active
-            .iter()
-            .map(|node| nodes.get(*node).expect("proven node correspondence"))
-            .collect();
-        column.products = column
-            .products
-            .iter()
-            .map(|product| {
-                products
-                    .get(*product)
-                    .expect("proven product correspondence")
-            })
-            .collect();
-        column.accepted = column
-            .accepted
-            .iter()
-            .map(|product| {
-                products
-                    .get(*product)
-                    .expect("proven product correspondence")
-            })
-            .collect();
-        column.checkpoint_cache = Default::default();
-        // Remapped products may own new direct AST records (the replay
-        // rebuilt them); the segment must list exactly the records its
-        // products hold (plan §9.2), so reattachment restores precise
-        // liveness and the journal sees genuinely live records.
-        let mut records = Vec::new();
-        for &product in column.products.iter().chain(column.accepted.iter()) {
-            if let Some(record) = product_direct_record(session_ctx.products, product)
-                && !records.contains(&record)
-            {
-                records.push(record);
-            }
-        }
-        column.records = records;
     }
 
-    timing.rebase += rebase_start.elapsed();
+    while let Some(product) = pending.pop() {
+        let Some(product_data) = products.get(product).map(|product| &product.data) else {
+            return Err(ParseError::InvalidReachability {
+                kind: "missing-product",
+                key: product as u64,
+                before: 0,
+                delta: 1,
+            });
+        };
+        let children: &[ProductId] = match product_data {
+            ProductData::Error { children } | ProductData::Node { children, .. } => children,
+            ProductData::Token { .. } => &[],
+        };
+        for &child in children {
+            if child >= product {
+                return Err(ParseError::InvalidReachability {
+                    kind: "non-topological-edge",
+                    key: product as u64,
+                    before: product_counts[&product],
+                    delta: child as i64,
+                });
+            }
+            let before = product_counts.get(&child).copied().unwrap_or(0);
+            let after = checked_reach_count("product", child as u64, before, 1)?;
+            product_counts.insert(child, after);
+            if before == 0 {
+                pending.push(child);
+            }
+        }
+    }
 
-    stats.reconverged_new_boundary = Some(current_boundary);
-    stats.reconverged_old_boundary = Some(old_boundary);
-    session_ctx.state.append_reused_columns(reused_columns);
-    Ok(true)
+    let mut record_counts = BTreeMap::<u64, u32>::new();
+    for &product in product_counts.keys() {
+        if let Some(record) = super::product_direct_record(products, product) {
+            let before = record_counts.get(&record).copied().unwrap_or(0);
+            let after = checked_reach_count("record", record, before, 1)?;
+            record_counts.insert(record, after);
+        }
+    }
+    Ok((product_counts, record_counts))
 }
+
 
 
 /// Freezes one command into the canonical [`ParseDelta`] (plan §9).
@@ -398,48 +506,91 @@ fn maybe_reuse_suffix(
 /// (currently: none — record-granular republication relies on fact
 /// equality downstream); lineage-keyed updates arrive with Phase 9.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn freeze_parse_delta(
-    roots_after: &[ProductId],
     state: &mut ParserSessionState,
     products: &ProductArena,
     ast: &AstArena,
     previous: &ParserTreeFacts,
+    previous_roots: &[ProductId],
+    current_roots: &[ProductId],
     tree_root: Option<u64>,
-    mut live: crate::reactive::store::RadixMap<()>,
     previous_infos: &[ParseErrorInfo],
     current_infos: Vec<ParseErrorInfo>,
     previous_status: Option<ParsedStatus>,
     current_status: ParsedStatus,
-) -> Arc<ParseDelta> {
-    // Authoritative membership: every record transitively owned by an
-    // accepted root product.
-    let mut current: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    for &root in roots_after {
-        if let Some(product) = products.get(root) {
-            for &id in product.ast_ids.iter() {
-                current.insert(id as u64);
-            }
+    tree_member_kind: Option<fn(&AstArena, u64) -> Option<u8>>,
+    tree_child_records_fn: Option<fn(&AstArena, u64) -> Vec<u64>>,
+)-> Result<(Arc<ParseDelta>, ReachabilityUpdate), ParseError> {
+    let reachability =
+        apply_accepted_root_delta(previous, previous_roots, current_roots, products)?;
+    if std::env::var_os("PLINGO_TRACE_PARSER").is_some() {
+        eprintln!(
+            "freeze roots prev={previous_roots:?} curr={current_roots:?} journal={journal:?} live_before={live_before} live_after={live_after}",
+            previous_roots = previous_roots,
+            current_roots = current_roots,
+            journal = reachability.record_journal,
+            live_before = previous.records.len(),
+            live_after = reachability.live_records.len()
+        );
+    }
+    let live = reachability.live_records.clone();
+    let current = &live;
+
+    let mut inserted = Vec::new();
+    let mut removed = Vec::new();
+    for (&record, transition) in &reachability.record_journal {
+        match (transition.before_count, transition.after_count) {
+            (0, after) if after > 0 => inserted.push(record),
+            (before, 0) if before > 0 => removed.push(record),
+            _ => {}
         }
     }
-    let mut fresh_live = crate::reactive::store::RadixMap::default();
-    for record in &current {
-        fresh_live.insert(*record, ());
-    }
-    live = fresh_live;
 
-    let mut inserted: Vec<u64> = current
-        .iter()
-        .copied()
-        .filter(|record| !previous.contains(*record))
-        .collect();
-    let mut removed: Vec<u64> = previous
-        .records
-        .iter()
-        .map(|(record, ())| record)
-        .filter(|record| !current.contains(record))
-        .collect();
+    // Settle only the records whose accepted-root reachability changed.
+    // Walking `previous.records` and `current` here made every local edit
+    // proportional to the whole document.
+    state.lineage.settle(
+        &previous.records,
+        current,
+        &inserted,
+        &removed,
+        products,
+        ast,
+    );
 
+    let mut computed_child_splices: Vec<ChildSplice> = Vec::new();
+    // Retained-record splice oracle (Cut E): last published order per
+    // parent lineage. Interim O(parents) clone on first mutation; the
+    // persistent-root migration (Cut G) replaces this with structural
+    // sharing.
+    let tree_child_records = |record: usize| {
+        let raw = tree_child_records_fn
+            .map(|children| children(ast, record as u64))
+            .unwrap_or_else(|| {
+                crate::framework::parse::parsing::lineage::direct_tree_child_records(
+                    products, ast, record,
+                )
+                .into_iter()
+                .map(|child| child as u64)
+                .collect()
+            });
+        raw.into_iter()
+            .filter(|child| {
+                tree_member_kind
+                    .map(|kind| kind(ast, *child as u64).is_some())
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut next_child_orders: std::collections::HashMap<u64, Vec<u64>> =
+        (*previous.child_orders).clone();
+    // Dropped-lineage record resolution: prefer a LIVE record bearing the
+    // lineage (a child that moved), else the command's death journal.
+    let reverse_died: std::collections::HashMap<u64, u64> = state
+        .lineage
+        .iter_died()
+        .map(|(record, lin)| (lin, record as u64))
+        .collect();
     // ---- payload-update classification via stable lineage -------------
     // A record whose identity a dead predecessor provably carries is an
     // UPDATE under a retained key unless its shape (green + extent) is
@@ -448,9 +599,8 @@ fn freeze_parse_delta(
     let mut updated_records: Vec<(SyntaxNodeId, u64)> = Vec::new();
     let mut silent: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     {
-        let dead_lookup = |record: u64| -> Option<u64> {
-            state.lineage.lineage_of(record as usize)
-        };
+        let dead_lookup =
+            |record: u64| -> Option<u64> { state.lineage.lineage_of(record as usize) };
         let _ = dead_lookup;
         for &record in &inserted {
             let rec = record as usize;
@@ -459,7 +609,7 @@ fn freeze_parse_delta(
             };
             // The counterpart must have left the live tree; a surviving
             // twin resolves to local replacement (freshened in lineage).
-            if current.contains(&(old_record as u64)) && old_record as u64 != record {
+            if current.get(old_record as u64).is_some() && old_record as u64 != record {
                 continue;
             }
             let shape_equal = record_signature(ast, products, old_record as u64)
@@ -478,16 +628,6 @@ fn freeze_parse_delta(
     }
 
 
-    // Release dead registrations first so removal mapping can consult the
-    // death journal (plan §9.1: final values after coalescing).
-    state
-        .lineage
-        .finalize_deaths(removed.iter().map(|record| *record as usize).collect());
-
-    let root_carried =
-        previous.root.is_some() && tree_root.is_some() && previous.root != tree_root;
-
-
     let mut syntax_inserted: Vec<SyntaxNodeId> = Vec::new();
     let mut inserted_pairs: Vec<(SyntaxNodeId, u64)> = Vec::new();
     for record in &inserted {
@@ -503,6 +643,10 @@ fn freeze_parse_delta(
         syntax_inserted.push(SyntaxNodeId(lineage));
         inserted_pairs.push((SyntaxNodeId(lineage), *record));
     }
+    syntax_inserted.sort_unstable();
+    syntax_inserted.dedup();
+    inserted_pairs.sort_unstable();
+    inserted_pairs.dedup();
     // Any inherited identity remains represented by its new bearer,
     // including shape-identical ("silent") replacements. Its dead arena
     // record must not retract a stable tree fact before the bearer is
@@ -521,23 +665,47 @@ fn freeze_parse_delta(
         .iter()
         .chain(syntax_inserted.iter())
         .map(|SyntaxNodeId(lineage)| *lineage)
-        .chain(inherited_carriers)
+        .chain(inherited_carriers.iter().copied())
         .collect();
     let mut syntax_removed: Vec<SyntaxNodeId> = Vec::new();
-    let mut removed_pairs: Vec<(SyntaxNodeId, u64)> = Vec::new();
+    let mut removed_pairs: Vec<crate::framework::parse::delta::RemovedRecord> = Vec::new();
     for record in &removed {
-        // A replaced document root keeps its stable published node.
-        if root_carried && Some(*record) == previous.root {
-            continue;
-        }
-        let Some(lineage) = state.lineage.died_lineage_of(*record) else {
+        // Prefer the committed record→lineage map. The mutable lineage
+        // journal can have already revived the cached arena record during
+        // this replay, while the previous tree facts remain authoritative
+        // for the exact removed key.
+        let Some(lineage) = previous
+            .record_lineages
+            .get(record)
+            .copied()
+            .or_else(|| state.lineage.died_lineage_of(*record))
+        else {
             continue;
         };
         if carriers.contains(&lineage) {
             continue;
         }
         syntax_removed.push(SyntaxNodeId(lineage));
-        removed_pairs.push((SyntaxNodeId(lineage), *record));
+        let child_records: Vec<u64> = tree_child_records(*record as usize)
+            .into_iter()
+            .map(|child| child as u64)
+            .collect();
+        let parent_record = ast.parent_of(*record as usize).map(|parent| parent as u64);
+        let parent_lineage = parent_record.and_then(|parent| {
+            previous
+                .record_lineages
+                .get(&parent)
+                .copied()
+                .or_else(|| state.lineage.died_lineage_of(parent))
+                .or_else(|| state.lineage.lineage_of(parent as usize))
+        });
+        removed_pairs.push(crate::framework::parse::delta::RemovedRecord {
+            lineage: SyntaxNodeId(lineage),
+            record: *record,
+            parent_record,
+            parent_lineage,
+            child_records: child_records.into(),
+        });
     }
     {
         let mut sorted = syntax_removed.clone();
@@ -546,101 +714,243 @@ fn freeze_parse_delta(
         syntax_removed = sorted;
         removed_pairs.sort_unstable();
         removed_pairs.dedup();
-    // ---- parents + child splices (plan §9 canonical domains) ---------
-    // For each record whose identity a dead predecessor provably carries
-    // (an update under a retained key), compare the predecessor's children
-    // against the new record's children by stable lineage; a differing
-    // ordered sequence yields one OrderedDelta, and a differing parent
-    // lineages yields a parent update.
-    use super::lineage::direct_child_records;
-    let mut parent_updated: Vec<SyntaxNodeId> = Vec::new();
-    let mut parent_removed: Vec<SyntaxNodeId> = Vec::new();
-    let mut parent_inserted: Vec<SyntaxNodeId> = Vec::new();
-    let mut child_splices: Vec<ChildSplice> = Vec::new();
-    let resolve_lineage = |record: usize| -> Option<u64> {
-        state
-            .lineage
-            .lineage_of(record)
-            .or_else(|| state.lineage.died_lineage_of(record as u64))
-    };
-    for &(SyntaxNodeId(_lin), record) in &updated_records {
-        let rec = record as usize;
-        let Some(old_record) = state.lineage.inherited_from(rec) else {
-            continue;
+        // ---- parents + child splices (plan §9 canonical domains) ---------
+        // (child_splices declared at function scope so the delta carries them)
+        // For each record whose identity a dead predecessor provably carries
+        // (an update under a retained key), compare the predecessor's children
+
+        let resolve_lineage = |record: usize| -> Option<u64> {
+            state
+                .lineage
+                .lineage_of(record)
+                .or_else(|| state.lineage.died_lineage_of(record as u64))
         };
-        let Some(node_lineage) = resolve_lineage(rec) else {
-            continue;
-        };
-        // Parent fact.
-        let old_parent_lin = ast
-            .parent_of(old_record as usize)
-            .and_then(|parent| resolve_lineage(parent as usize));
-        let new_parent_lin = ast.parent_of(rec).and_then(|parent| resolve_lineage(parent));
-        if old_parent_lin != new_parent_lin {
-            parent_updated.push(SyntaxNodeId(node_lineage));
-        }
-        // Child list splice.
-        let old_child_records = direct_child_records(products, ast, old_record as usize);
-        let old_children = old_child_records
-            .iter()
-            .filter_map(|&child| resolve_lineage(child as usize).map(SyntaxNodeId))
-            .collect::<Vec<_>>();
-        let new_children = direct_child_records(products, ast, rec)
-            .into_iter()
-            .filter_map(|child| resolve_lineage(child as usize).map(SyntaxNodeId))
-            .collect::<Vec<_>>();
-        if old_children != new_children {
-            // Alignment for retraction: the removed middle children, paired
-            // with their (possibly dead) arena record so the publisher can
-            // derive their old node identity.
-            let mut prefix = 0;
-            while prefix < old_children.len() && prefix < new_children.len()
-                && old_children[prefix] == new_children[prefix]
-            {
-                prefix += 1;
-            }
-            let mut suffix = 0;
-            while suffix < old_children.len().saturating_sub(prefix)
-                && suffix < new_children.len().saturating_sub(prefix)
-                && old_children[old_children.len() - 1 - suffix]
-                    == new_children[new_children.len() - 1 - suffix]
-            {
-                suffix += 1;
-            }
-            let removed_children: Vec<(SyntaxNodeId, u64)> = old_child_records
-                [prefix..old_child_records.len() - suffix]
+        for &(SyntaxNodeId(_lin), record) in &updated_records {
+            let rec = record as usize;
+            let Some(old_record) = state.lineage.inherited_from(rec) else {
+                continue;
+            };
+            let Some(node_lineage) = resolve_lineage(rec) else {
+                continue;
+            };
+            let old_child_records = tree_child_records(old_record as usize);
+            // Child list splice (Cut E): retain only the bounded changed
+            // middle. Publication reconstructs the order from its previous
+            // opaque node ids and these lineage/record pairs.
+            let new_child_records_all = tree_child_records(rec);
+            let old_pairs: Vec<(SyntaxNodeId, u64)> = old_child_records
                 .iter()
                 .filter_map(|&child| {
-                    resolve_lineage(child as usize).map(|lin| (SyntaxNodeId(lin), child as u64))
+                    resolve_lineage(child as usize)
+                        .map(|lin| (SyntaxNodeId(lin), child as u64))
                 })
                 .collect();
-            child_splices.push(ChildSplice {
-                parent: SyntaxNodeId(node_lineage),
-                delta: ordered_splice(&old_children, &new_children),
-                removed_children: removed_children.into(),
-            });
+            let new_pairs: Vec<(SyntaxNodeId, u64)> = new_child_records_all
+                .iter()
+                .filter_map(|&child| {
+                    resolve_lineage(child as usize)
+                        .map(|lin| (SyntaxNodeId(lin), child as u64))
+                })
+                .collect();
+            let old_children: Vec<SyntaxNodeId> =
+                old_pairs.iter().map(|(lineage, _)| *lineage).collect();
+            let new_children: Vec<SyntaxNodeId> =
+                new_pairs.iter().map(|(lineage, _)| *lineage).collect();
+            if old_children != new_children {
+                let (prefix, suffix) = common_edges(&old_children, &new_children);
+                let removed_children: Vec<(SyntaxNodeId, u64)> = old_pairs
+                    [prefix..old_pairs.len() - suffix]
+                    .iter()
+                    .copied()
+                    .collect();
+                let inserted_children: Vec<(SyntaxNodeId, u64)> = new_pairs
+                    [prefix..new_pairs.len() - suffix]
+                    .iter()
+                    .copied()
+                    .collect();
+                let current_lineages: std::collections::HashSet<u64> =
+                    new_children.iter().map(|id| id.0).collect();
+                let removed_children: Vec<(SyntaxNodeId, u64)> = removed_children
+                    .into_iter()
+                    .filter(|(lin, _record)| !current_lineages.contains(&lin.0))
+                    .collect();
+                computed_child_splices.push(ChildSplice {
+                    parent: SyntaxNodeId(node_lineage),
+                    delta: ordered_splice(&old_children, &new_children),
+                    removed_children: removed_children.into(),
+                    inserted_children: inserted_children.into(),
+                });
+            }
         }
-    }
-    for &(node, _) in &inserted_pairs {
-        parent_inserted.push(node);
-    }
-    for &(node, _) in &removed_pairs {
-        parent_removed.push(node);
-    }
-    let dedup_sorted = |v: &mut Vec<SyntaxNodeId>| {
-        v.sort_unstable();
-        v.dedup();
-    };
-    dedup_sorted(&mut parent_updated);
-    dedup_sorted(&mut parent_removed);
-    dedup_sorted(&mut parent_inserted);
-    child_splices.sort_unstable_by_key(|splice| splice.parent);
+        // ---- Cut E candidate parents (retained topology changes) --------
+        // A RETAINED record never enters updated_records, so its child-list
+        // change is detected through the touched records' parents compared
+        // against the published-order oracle.
+        let mut candidate_parents: Vec<(u64, u64)> = Vec::new();
+        {
+            let mut note = |parent_record: Option<usize>,
+                            resolve: &dyn Fn(usize) -> Option<u64>| {
+                let Some(parent_record) = parent_record else {
+                    return;
+                };
+                let Some(parent_lineage) = resolve(parent_record) else {
+                    return;
+                };
+                // The parent record may itself be an inherited replacement.
+                // Compare against the published-order bearer so a reverse
+                // reconstructs the retained parent's child order even when
+                // every record in the local tree was recreated.
+                let Some(parent_bearer) = state.lineage.holder_of(parent_lineage) else {
+                    return;
+                };
+                candidate_parents.push((parent_lineage, parent_bearer));
+            };
+            for &record in inserted.iter() {
+                note(ast.parent_of(record as usize), &|parent| resolve_lineage(parent));
+            }
+            for &record in removed.iter() {
+                note(ast.parent_of(record as usize), &|parent| resolve_lineage(parent));
+            }
+            for &(_lineage, record) in updated_records.iter() {
+                note(ast.parent_of(record as usize), &|parent| resolve_lineage(parent));
+            }
+            // A newly reached record can itself own a generated child field.
+            // Seed its current order directly; relying only on a touched
+            // child's arena parent misses a reappearing retained record whose
+            // arena parent still describes the previous parse.
+            for &record in inserted.iter() {
+                let Some(lineage) = resolve_lineage(record as usize) else {
+                    continue;
+                };
+                if state.lineage.holder_of(lineage) == Some(record) {
+                    candidate_parents.push((lineage, record));
+                }
+            }
+        }
+        if std::env::var_os("PLINGO_TRACE_PARSER").is_some() {
+            eprintln!(
+                "candidate parents inserted={inserted:?} removed={removed:?} pairs={candidate_parents:?}"
+            );
+        }
+        candidate_parents.sort_unstable();
+        candidate_parents.dedup();
+        let spliced_already: std::collections::HashSet<u64> =
+            computed_child_splices.iter().map(|s| s.parent.0).collect();
+        if std::env::var_os("PLINGO_TRACE_PARSER").is_some() {
+            eprintln!(
+                "candidate-sorted={candidate_parents:?} previous-orders={:?}",
+                previous.child_orders
+            );
+            for &(lineage, record) in &candidate_parents {
+                let children = tree_child_records(record as usize);
+                eprintln!(
+                    "candidate-detail lineage={lineage} record={record} children={children:?} child-lineages={:?}",
+                    children
+                        .iter()
+                        .filter_map(|child| resolve_lineage(*child as usize))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        for (parent_lin, parent_record) in candidate_parents {
+            let new_list = tree_child_records(parent_record as usize);
+            let new_pairs: Vec<(SyntaxNodeId, u64)> = new_list
+                .iter()
+                .filter_map(|&child| {
+                    resolve_lineage(child as usize)
+                        .map(|lin| (SyntaxNodeId(lin), child as u64))
+                })
+                .collect();
+            let new_children: Vec<SyntaxNodeId> =
+                new_pairs.iter().map(|(lineage, _)| *lineage).collect();
+            next_child_orders.insert(
+                parent_lin,
+                new_children.iter().map(|lineage| lineage.0).collect(),
+            );
+            if spliced_already.contains(&parent_lin) {
+                continue;
+            }
+            if let Some(old_order) = previous.child_orders.get(&parent_lin) {
+                let old_children: Vec<SyntaxNodeId> =
+                    old_order.iter().map(|&lin| SyntaxNodeId(lin)).collect();
+                if old_children != new_children {
+                    let (prefix, suffix) = common_edges(&old_children, &new_children);
+                    let current_lineages: std::collections::HashSet<u64> =
+                        new_children.iter().map(|id| id.0).collect();
+                    let removed_children: Vec<(SyntaxNodeId, u64)> = old_order
+                        [prefix..old_order.len() - suffix]
+                        .iter()
+                        .filter(|&lin| !current_lineages.contains(lin))
+                        .filter_map(|&lin| {
+                            dropped_record(lin, &state.lineage, &reverse_died)
+                                .map(|rec| (SyntaxNodeId(lin), rec))
+                        })
+                        .collect();
+                    let inserted_children: Vec<(SyntaxNodeId, u64)> = new_pairs
+                        [prefix..new_pairs.len() - suffix]
+                        .iter()
+                        .copied()
+                        .collect();
+                    computed_child_splices.push(ChildSplice {
+                        parent: SyntaxNodeId(parent_lin),
+                        delta: ordered_splice(&old_children, &new_children),
+                        removed_children: removed_children.into(),
+                        inserted_children: inserted_children.into(),
+                    });
+                }
+            }
+        }
+
+        // The first command has no prior splice oracle. Building its complete
+        // order map is an initialization pass; every later command updates
+        // only touched parents and bounded splice middles.
+        if previous.child_orders.is_empty() {
+            for (record, ()) in current.iter() {
+                let Some(lineage) = resolve_lineage(record as usize) else {
+                    continue;
+                };
+                let order = tree_child_records(record as usize)
+                    .iter()
+                    .filter_map(|&child| resolve_lineage(child as usize))
+                    .collect();
+                next_child_orders.insert(lineage, order);
+            }
+        }
+
+        for removed in &removed_pairs {
+            next_child_orders.remove(&removed.lineage.0);
+        }
+
     }
 
     sort_dedup(&mut inserted);
     sort_dedup(&mut removed);
 
-
+    // Root transitions are a small ordered domain of syntax lineages. A
+    // retained root lineage keeps the document-stable public node and does
+    // not produce a root splice.
+    let previous_root_lineage = previous
+        .root
+        .and_then(|record| previous.record_lineages.get(&record).copied())
+        .map(SyntaxNodeId);
+    let current_root_lineage = tree_root
+        .and_then(|record| {
+            state
+                .lineage
+                .lineage_of(record as usize)
+                .or_else(|| state.lineage.died_lineage_of(record))
+        })
+        .map(SyntaxNodeId);
+    let roots = if previous_root_lineage == current_root_lineage {
+        OrderedDelta::default()
+    } else {
+        OrderedDelta {
+            before: None,
+            removed: previous_root_lineage.into_iter().collect(),
+            inserted: current_root_lineage.into_iter().collect(),
+            after: None,
+        }
+    };
 
     // ---- diagnostics + status domains --------------------------------
     let diagnostics = diagnostic_delta(previous_infos, &current_infos);
@@ -663,8 +973,9 @@ fn freeze_parse_delta(
             removed: syntax_removed.into(),
         },
         parents: KeyDelta::default(),
-        child_splices: Arc::from([]),
-        roots: OrderedDelta::default(),
+        child_splices: Arc::from(computed_child_splices),
+        child_orders_next: Arc::new(next_child_orders),
+        roots,
         // Deterministic synthesized-token identities recorded during
         // recovery this command (plan §14), keyed by stable occurrence.
         synthesized_tokens: {
@@ -696,12 +1007,10 @@ fn freeze_parse_delta(
     };
     #[cfg(debug_assertions)]
     delta.assert_valid();
-    Arc::new(delta)
+    Ok((Arc::new(delta), reachability))
 }
-
-/// Computes the deterministic ordered child splice transforming `old` into
 /// `new` (plan §9): trims the common prefix/suffix and reports the bounded
-/// middle plus the full resulting order.
+/// middle plus its retained anchors.
 fn ordered_splice(old: &[SyntaxNodeId], new: &[SyntaxNodeId]) -> OrderedDelta<SyntaxNodeId> {
     let mut prefix = 0;
     while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
@@ -721,16 +1030,50 @@ fn ordered_splice(old: &[SyntaxNodeId], new: &[SyntaxNodeId]) -> OrderedDelta<Sy
         removed: removed.into(),
         inserted: inserted.into(),
         after: new.get(new.len() - suffix).copied(),
-        order_after: new.to_vec().into(),
     }
 }
+/// Returns the shared prefix and suffix lengths of two child orders.
+fn common_edges(old: &[SyntaxNodeId], new: &[SyntaxNodeId]) -> (usize, usize) {
+    let mut prefix = 0;
+    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old.len().saturating_sub(prefix)
+        && suffix < new.len().saturating_sub(prefix)
+        && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    (prefix, suffix)
+}
+
+/// Resolves a dropped child lineage to a usable arena record: a live record
+/// bearing the lineage (the child moved), else the death journal.
+fn dropped_record(
+    lineage: u64,
+    lineage_state: &crate::framework::parse::parsing::lineage::LineageState,
+    reverse_died: &std::collections::HashMap<u64, u64>,
+) -> Option<u64> {
+    // Preferred: the lineage's CURRENT live bearer (a dropped child that
+    // merely moved elsewhere is still alive).
+    if let Some(bearer) = lineage_state.holder_of(lineage) {
+        return Some(bearer);
+    }
+    reverse_died.get(&lineage).copied()
+}
+
 fn status_of(infos: &[ParseErrorInfo], no_acceptance: bool) -> ParsedStatus {
     if infos.is_empty() {
         ParsedStatus::Clean
     } else if no_acceptance {
-        ParsedStatus::Unrecovered { regions: infos.len() }
+        ParsedStatus::Unrecovered {
+            regions: infos.len(),
+        }
     } else {
-        ParsedStatus::Recovered { segments: infos.len() }
+        ParsedStatus::Recovered {
+            segments: infos.len(),
+        }
     }
 }
 
@@ -809,6 +1152,17 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
         plan: ReplayPlan,
     ) -> Result<(), ParseError> {
         let total_start = Instant::now();
+        if std::env::var_os("PLINGO_TRACE_PARSER").is_some() {
+            eprintln!(
+                "parse batch uri={} old_len={:?} new_len={} terminals={:?}",
+                uri,
+                plan.old.as_ref().map(|old| old.semantic_len()),
+                plan.new.semantic_len(),
+                (0..plan.new.semantic_len())
+                    .filter_map(|rank| plan.new.token_at(rank).map(|token| token.terminal))
+                    .collect::<Vec<_>>()
+            );
+        }
         let plan_elapsed = Duration::default();
 
         let session_setup_start = Instant::now();
@@ -817,6 +1171,11 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             .get(&uri)
             .cloned()
             .unwrap_or_else(|| Arc::new(ParserTreeFacts::default()));
+        let previous_roots = working
+            .roots
+            .get(&uri)
+            .map(|roots| roots.as_slice())
+            .unwrap_or(&[]);
         let arenas = self
             .session_arenas
             .entry(uri.clone())
@@ -827,7 +1186,7 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
                 gss: GssArena::new(),
             });
         let state = Arc::make_mut(working.sessions.entry(uri.clone()).or_default());
-        if state.columns.is_empty() {
+        if state.columns.is_empty() && state.retained_suffix.is_none() {
             let start = arenas.gss.node(0, 0, 0);
             state.columns = vec![ParseColumn::new(None, IndexSet::from([start]))];
         }
@@ -843,16 +1202,11 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             gotos: &self.gotos,
             error_recovery: self.config.error_recovery,
         };
-        // The record journal and lineage windows are command-scoped
-        // (plan §9.1): stale entries from a prior command would corrupt
-        // this command's delta.
-        session_ctx.state.record_journal.clear();
         session_ctx.state.lineage.begin_command();
         // Deterministic synthetic-token identity (plan §14): the document
         // serial is the stable URI hash; this command's synthetic tokens
         // restart empty.
-        session_ctx.state.document_serial =
-            crate::framework::parse::data::ast::document_key(&uri);
+        session_ctx.state.document_serial = crate::framework::parse::data::ast::document_key(&uri);
         session_ctx.state.synthetic_tokens.clear();
         session_ctx.state.active_recovery_segment = None;
         let gss_before = session_ctx.gss.node_count();
@@ -860,74 +1214,61 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
         let ast_before = session_ctx.ast.len();
         let session_setup_elapsed = session_setup_start.elapsed();
 
-        // Recovery may add physical columns without consuming a token. Keep the
-        // token-to-column map explicit instead of treating both axes as equal.
-        let old_boundary_columns = std::iter::once(Some(0))
-            .chain((0..plan.old_extent).map(|rank| {
-                plan.old_unit(rank)
-                    .and_then(|token| session_ctx.state.token_columns.get(&token.column).copied())
-            }))
-            .collect::<Vec<_>>();
-        // Replay begins at the nearest checkpoint at or before the first
-        // changed token. Recovery columns are valid deterministic checkpoints;
-        // their exact frontier state participates in later convergence proof.
-        let restart_token_boundary = (0..=plan
-            .restart_boundary
-            .min(old_boundary_columns.len().saturating_sub(1)))
+        // Recovery may add physical columns without consuming a token. Find
+        // the nearest existing checkpoint by probing only the bounded replay
+        // prefix; the unchanged suffix is indexed by its segment metadata.
+        let restart_token_boundary = (0..=plan.restart_boundary.min(plan.old_extent))
             .rev()
-            .find(|&boundary| old_boundary_columns[boundary].is_some())
-            .unwrap_or(0);
-        let restart_boundary = old_boundary_columns[restart_token_boundary].unwrap_or(0);
-        let old_column_base = old_boundary_columns
-            .get(plan.old_reuse_start..)
-            .and_then(|boundaries| boundaries.iter().flatten().next())
-            .copied()
-            .unwrap_or(session_ctx.state.columns.len());
-        let checkpoint_start = Instant::now();
-        // Move only a suffix strictly beyond the retained restart checkpoint.
-        // When the old reusable boundary includes that checkpoint (notably an
-        // initial EOF replacement), preserve it in the working session and
-        // snapshot the suffix instead; `truncate_to_column` requires it.
-        let old_suffix_columns = if old_column_base <= restart_boundary {
-            // The staged copy shares its columns with the kept prefix;
-            // truncate_to_column (below) releases the overlapping range's
-            // record segments when it drops the tail.
-            session_ctx.state.columns[old_column_base..].to_vec()
-        } else {
-            // The split removes these columns from the working session:
-            // their record segments leave the live set until suffix
-            // reattachment restores them (plan §9.2).
-            let split = session_ctx.state.columns.split_off(old_column_base);
-            for column in &split {
-                session_ctx.state.drop_column_records(column);
-            }
-            split
-        };
-        let mut old_suffix_is_clean = vec![true; old_suffix_columns.len() + 1];
-        for index in (0..old_suffix_columns.len()).rev() {
-            old_suffix_is_clean[index] =
-                old_suffix_is_clean[index + 1] && old_suffix_columns[index].token.is_some();
-        }
-        let reusable_len = plan
-            .old_extent
-            .saturating_sub(plan.old_reuse_start)
-            .min(plan.new_extent.saturating_sub(plan.new_reuse_start));
-        let token_columns = (0..reusable_len)
-            .filter_map(|offset| {
-                let old = plan.old_unit(plan.old_reuse_start + offset)?;
-                let new = plan.new_unit(plan.new_reuse_start + offset)?;
-                Some((old.column, new.column))
+            .find(|&rank| {
+                plan.old_unit(rank)
+                    .and_then(|token| session_ctx.state.column_for_token(token.column))
+                    .is_some()
             })
-            .collect();
+            .unwrap_or(0);
+        let restart_column = plan
+            .old_unit(restart_token_boundary)
+            .and_then(|token| session_ctx.state.column_for_token(token.column))
+            .unwrap_or(0);
+        let restart_boundary = (0..=restart_column.saturating_sub(1))
+            .rev()
+            .find(|&column| {
+                session_ctx
+                    .state
+                    .column_at(column)
+                    .is_some_and(|column| !column.error_derived)
+            })
+            .unwrap_or(0);
+        // A committed parse may be represented entirely by an immutable
+        // segment. Materialize only the checkpoint prefix needed by this
+        // replay before detaching the old suffix.
+        session_ctx.state.ensure_prefix(restart_boundary);
+        let old_column_base = plan
+            .old_unit(plan.old_reuse_start)
+            .and_then(|token| session_ctx.state.column_for_token(token.column))
+            .unwrap_or_else(|| session_ctx.state.column_count());
+        let checkpoint_start = Instant::now();
+        let detached = session_ctx
+            .state
+            .detach_suffix(old_column_base, session_ctx.gss);
+        let empty_segment = || super::ParseSegment::from_columns(Vec::new(), session_ctx.gss);
+        let detached = detached.unwrap_or_else(empty_segment);
+        // If the restart checkpoint lies inside the detached range, keep only
+        // that bounded overlap mutable for replay. The retained segment stays
+        // shared and remains the old-side convergence oracle.
+        if old_column_base <= restart_boundary {
+            let keep = restart_boundary
+                .saturating_sub(old_column_base)
+                .saturating_add(1)
+                .min(detached.len());
+            let overlap = detached.slice(0..keep).materialize();
+            session_ctx.state.append_reused_columns(overlap);
+        }
         let mut old_suffix = ReusableSuffix {
-            columns: old_suffix_columns,
-            boundary_columns: old_boundary_columns,
-            clean: old_suffix_is_clean,
+            segment: detached,
             column_base: old_column_base,
-            token_columns,
         };
         let checkpoint_elapsed = checkpoint_start.elapsed();
-        let old_suffix_len = old_suffix.columns.len();
+        let old_suffix_len = old_suffix.len();
 
         let truncate_start = Instant::now();
         session_ctx.state.truncate_to_column(restart_boundary);
@@ -1081,13 +1422,7 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
                     .current_column()
                     .saturating_sub(restart_boundary)
             });
-        let recovery_columns = session_ctx
-            .state
-            .columns
-            .iter()
-            .skip(restart_boundary.saturating_add(1))
-            .filter(|c| c.error_derived)
-            .count();
+        let recovery_columns = session_ctx.state.recovery_columns_after(restart_boundary);
         let stats_start = Instant::now();
         stats.restart_boundary = restart_boundary;
         stats.reparsed = reparsed;
@@ -1108,27 +1443,8 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             work.columns_replayed += reparsed as u64;
             work.columns_reused += reused as u64;
             work.segments_attached += u64::from(stats.reconverged_old_boundary.is_some());
-            // Honest §19 gate: the number of retained suffix columns the
-            // reuse path physically rewrites (currently the whole reused
-            // tail; the ParseSegment Arc-share design in handoff §12 is what
-            // drives this to zero).
             work.suffix_columns_physically_visited += stats.suffix_rewritten as u64;
-            work.checkpoint_comparisons += stats.checkpoint_matches as u64;
-            work.frontier_comparisons += stats.frontier_matches as u64;
-            work.gss_records_created +=
-                (session_ctx.gss.node_count().saturating_sub(gss_before)) as u64;
-            work.product_records_created +=
-                (session_ctx.products.products.len().saturating_sub(products_before)) as u64;
-            work.ast_records_created += (session_ctx.ast.len().saturating_sub(ast_before)) as u64;
-            work.eof_replays += u64::from(stats.reconverged_old_boundary.is_none());
-            work.recovery_columns += recovery_columns as u64;
         });
-
-        // Journal-first record delta (plan §9.1–§9.2). The replay journal
-        // holds every record whose segment reference count changed, mapped
-        // to its final live state. Applying the journal to the previous
-        // live set costs O(delta × log n) — never a whole-tree walk. The
-        // root record still comes from the accepted root product.
         let mut tree_root = None;
         for (index, root) in roots_after.iter().copied().enumerate() {
             let Some(product) = session_ctx.products.get(root) else {
@@ -1136,83 +1452,80 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             };
             if index == 0 {
                 tree_root = match &product.data {
-                    ProductData::Node { ast, .. }
-                    | ProductData::Token { ast: Some(ast), .. } => Some(*ast as u64),
+                    ProductData::Node { ast, .. } | ProductData::Token { ast: Some(ast), .. } => {
+                        Some(*ast as u64)
+                    }
                     ProductData::Error { .. } | ProductData::Token { ast: None, .. } => {
                         product.ast_ids.first().map(|id| *id as u64)
                     }
                 };
             }
         }
-        // Freeze (plan §9): coalesce the journal into the canonical exact
-        // ParseDelta. The persistent live set applies only journaled keys.
-        session_ctx
-            .state
-            .lineage
-            .resolve_contexts(session_ctx.products, session_ctx.ast);
-        let current_records = (*previous_tree_facts.records).clone();
         let previous_infos = working
             .published_diagnostics
             .get(&uri)
             .map(|infos| infos.as_ref().clone())
             .unwrap_or_default();
+        let previous_status = working.published_status.get(&uri).cloned();
         let current_infos = collect_parse_diagnostics(
             session_ctx.state,
             Some(crate::framework::parse::diagnostics::DiagnosticArenas {
-                trees: &*session_ctx.trees,
-                products: &*session_ctx.products,
+                trees: session_ctx.trees,
+                products: session_ctx.products,
             }),
             &roots_after,
         );
-        let previous_status = working.published_status.get(&uri).copied();
-        let current_status = status_of(
-            &current_infos,
-            roots_after.is_empty(),
-        );
-        session_ctx
-            .state
-            .lineage
-            .resolve_contexts(session_ctx.products, session_ctx.ast);
-        let tree_delta = freeze_parse_delta(
-            &roots_after,
+        let current_status = status_of(&current_infos, roots_after.is_empty());
+        let (tree_delta, reachability) = freeze_parse_delta(
             &mut *session_ctx.state,
             session_ctx.products,
             session_ctx.ast,
             &previous_tree_facts,
+            previous_roots,
+            &roots_after,
             tree_root,
-            current_records,
             &previous_infos,
             current_infos.clone(),
             previous_status,
             current_status.clone(),
-        );
+            self.tree_member_kind,
+            self.tree_child_records,
+        )?;
         if !tree_delta.is_empty() {
-            let next = working
-                .semantic_revisions
-                .entry(uri.clone())
-                .or_insert(0);
+            let next = working.semantic_revisions.entry(uri.clone()).or_insert(0);
             *next = next.saturating_add(1);
         }
         crate::framework::workspace::record_parser_work(&uri.to_string(), |work| {
             work.parser_records_inserted = tree_delta.ast_records.inserted.len() as u64;
             work.parser_records_removed = tree_delta.ast_records.removed.len() as u64;
         });
-        working
-            .published_status
-            .insert(uri.clone(), current_status);
+        working.published_status.insert(uri.clone(), current_status);
         working
             .published_diagnostics
             .insert(uri.clone(), Arc::new(current_infos));
+        let mut current_record_lineages = (*previous_tree_facts.record_lineages).clone();
+        for &record in &*tree_delta.ast_records.removed {
+            current_record_lineages.remove(&record);
+        }
+        for &record in &*tree_delta.ast_records.inserted {
+            if let Some(lineage) = session_ctx.state.lineage.lineage_of(record as usize) {
+                current_record_lineages.insert(record, lineage);
+            }
+        }
         let current_tree_facts = Arc::new(ParserTreeFacts {
             records: Arc::clone(tree_delta.live_records()),
             root: tree_root,
+            product_reach_counts: Arc::new(reachability.product_reach_counts),
+            record_reach_counts: Arc::new(reachability.record_reach_counts),
+            record_lineages: Arc::new(current_record_lineages),
+            published_child_orders: Arc::clone(&previous_tree_facts.published_child_orders),
+            child_orders: Arc::clone(&tree_delta.child_orders_next),
         });
-        // The journal is command-scoped: clear it so the next command's
-        // delta starts from a clean slate.
-        session_ctx.state.record_journal.clear();
-        working
-            .tree_facts
-            .insert(uri.clone(), current_tree_facts);
+        // Commit the parser session as a persistent root. Future edits
+        // materialize only their restart prefix; successful suffix
+        // attachments keep the retained Arc untouched.
+        session_ctx.state.seal(session_ctx.gss);
+        working.tree_facts.insert(uri.clone(), current_tree_facts);
         working.tree_deltas.insert(uri.clone(), tree_delta);
         let stats_elapsed = stats_start.elapsed();
 
@@ -1259,5 +1572,187 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
         );
 
         Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::parse::data::{
+        ast::{AnchoredSpan, AstArena},
+        product::{Product, ProductArena},
+    };
+
+    fn arenas() -> (AstArena, ProductArena) {
+        let uri: fluent_uri::Uri<String> = "test://accepted-root".parse().unwrap();
+        (AstArena::new(uri), ProductArena::new())
+    }
+
+    fn node(
+        ast: &mut AstArena,
+        products: &mut ProductArena,
+        value: usize,
+        children: Vec<ProductId>,
+    ) -> ProductId {
+        let record = ast.insert(value, AnchoredSpan::point(0));
+        products.insert(Product::node(0, record, children))
+    }
+
+    fn product_counts(update: &ReachabilityUpdate) -> BTreeMap<ProductId, u32> {
+        update
+            .product_reach_counts
+            .iter()
+            .map(|(key, count)| (key.0, *count))
+            .collect()
+    }
+
+    fn record_counts(update: &ReachabilityUpdate) -> BTreeMap<u64, u32> {
+        update
+            .record_reach_counts
+            .iter()
+            .map(|(key, count)| (key.0, *count))
+            .collect()
+    }
+
+    fn facts(update: &ReachabilityUpdate) -> ParserTreeFacts {
+        ParserTreeFacts {
+            records: Arc::new(update.live_records.clone()),
+            product_reach_counts: Arc::new(update.product_reach_counts.clone()),
+            record_reach_counts: Arc::new(update.record_reach_counts.clone()),
+            ..ParserTreeFacts::default()
+        }
+    }
+
+    #[test]
+    fn accepted_root_reachability_preserves_shared_and_duplicate_edges() {
+        let (mut ast, mut products) = arenas();
+        let child = node(&mut ast, &mut products, 0, Vec::new());
+        let parent = node(&mut ast, &mut products, 1, vec![child, child]);
+
+        let update =
+            apply_accepted_root_delta(&ParserTreeFacts::default(), &[], &[parent], &products)
+                .unwrap();
+        assert_eq!(
+            product_counts(&update),
+            BTreeMap::from([(child, 2), (parent, 1)])
+        );
+        assert_eq!(
+            record_counts(&update),
+            BTreeMap::from([(0, 1), (1, 1)])
+        );
+        assert_eq!(
+            slow_accepted_root_reach(&[parent], &products).unwrap(),
+            (product_counts(&update), record_counts(&update))
+        );
+
+        let duplicate_roots =
+            apply_accepted_root_delta(&ParserTreeFacts::default(), &[], &[parent, parent], &products)
+                .unwrap();
+        assert_eq!(
+            product_counts(&duplicate_roots),
+            BTreeMap::from([(child, 2), (parent, 2)])
+        );
+        assert_eq!(
+            record_counts(&duplicate_roots),
+            BTreeMap::from([(0, 1), (1, 1)])
+        );
+    }
+
+    #[test]
+    fn accepted_root_reachability_counts_shared_parent_edges_once_per_parent() {
+        let (mut ast, mut products) = arenas();
+        let child = node(&mut ast, &mut products, 0, Vec::new());
+        let left = node(&mut ast, &mut products, 1, vec![child]);
+        let right = node(&mut ast, &mut products, 2, vec![child]);
+
+        let update =
+            apply_accepted_root_delta(&ParserTreeFacts::default(), &[], &[left, right], &products)
+                .unwrap();
+        assert_eq!(
+            product_counts(&update),
+            BTreeMap::from([(child, 2), (left, 1), (right, 1)])
+        );
+        assert_eq!(
+            record_counts(&update),
+            BTreeMap::from([(0, 1), (1, 1), (2, 1)])
+        );
+
+        let reverted = apply_accepted_root_delta(
+            &facts(&update),
+            &[left, right],
+            &[],
+            &products,
+        )
+        .unwrap();
+        assert!(product_counts(&reverted).is_empty());
+        assert!(record_counts(&reverted).is_empty());
+        assert!(reverted.live_records.is_empty());
+        assert_eq!(
+            reverted.record_journal.get(&0),
+            Some(&RecordTransition {
+                before_count: 1,
+                after_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn accepted_root_reachability_excludes_unreachable_cache_products() {
+        let (mut ast, mut products) = arenas();
+        let orphan = node(&mut ast, &mut products, 0, Vec::new());
+        let root = node(&mut ast, &mut products, 1, Vec::new());
+
+        let update =
+            apply_accepted_root_delta(&ParserTreeFacts::default(), &[], &[root], &products)
+                .unwrap();
+        assert_eq!(product_counts(&update), BTreeMap::from([(root, 1)]));
+        assert_eq!(record_counts(&update), BTreeMap::from([(1, 1)]));
+        assert!(!product_counts(&update).contains_key(&orphan));
+        assert_eq!(update.live_records.iter().map(|(key, _)| key).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn accepted_root_reachability_rejects_underflow_and_non_topological_edges() {
+        let (_ast, mut products) = arenas();
+        products.insert(Product::error(0));
+        let underflow = match apply_accepted_root_delta(
+            &ParserTreeFacts::default(),
+            &[0],
+            &[],
+            &products,
+        ) {
+            Ok(_) => panic!("root removal at zero must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            underflow,
+            ParseError::InvalidReachability {
+                kind: "product",
+                key: 0,
+                before: 0,
+                delta: -1
+            }
+        ));
+
+        let (_ast, mut products) = arenas();
+        products.insert(Product::error_with_children(0, vec![0]));
+        let non_topological = match apply_accepted_root_delta(
+            &ParserTreeFacts::default(),
+            &[],
+            &[0],
+            &products,
+        ) {
+            Ok(_) => panic!("self-referential product edge must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            non_topological,
+            ParseError::InvalidReachability {
+                kind: "non-topological-edge",
+                key: 0,
+                ..
+            }
+        ));
     }
 }

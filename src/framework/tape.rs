@@ -8,11 +8,7 @@
 //! created on a changed path receives a fresh checked ID from the owning
 //! document allocator.
 
-use std::{
-    cmp::Ordering,
-    ops::Range,
-    sync::Arc,
-};
+use std::{cmp::Ordering, ops::Range, sync::Arc};
 
 use crate::reactive::store::RadixMap;
 
@@ -129,7 +125,10 @@ pub(crate) struct TapeIdAllocator {
 
 impl Default for TapeIdAllocator {
     fn default() -> Self {
-        Self { next: 1, created: 0 }
+        Self {
+            next: 1,
+            created: 0,
+        }
     }
 }
 
@@ -152,7 +151,10 @@ impl TapeIdAllocator {
 
     fn allocate(&mut self) -> TapeNodeId {
         let id = TapeNodeId(self.next);
-        self.next = self.next.checked_add(1).expect("tape node identity overflow");
+        self.next = self
+            .next
+            .checked_add(1)
+            .expect("tape node identity overflow");
         self.created = self
             .created
             .checked_add(1)
@@ -350,9 +352,17 @@ pub(crate) struct OccurrenceLocation {
 /// Persistent `occurrence ID -> (leaf, slot)` index.  `RadixMap` path-copies
 /// only modified keys, while all untouched suffix locations share their old
 /// trie nodes by `Arc`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct PersistentOccurrenceIndex {
     entries: RadixMap<OccurrenceLocation>,
+}
+
+impl Default for PersistentOccurrenceIndex {
+    fn default() -> Self {
+        Self {
+            entries: RadixMap::with_kind(crate::reactive::pathwork::StructureKind::TokenIndex),
+        }
+    }
 }
 
 impl PersistentOccurrenceIndex {
@@ -446,10 +456,10 @@ impl<T: TapeEntry> StableTape<T> {
                     if rank <= left_len {
                         prefix(branch.left.as_ref(), rank)
                     } else {
-                        branch.left.metric().add(&prefix(
-                            branch.right.as_ref(),
-                            rank - left_len,
-                        ))
+                        branch
+                            .left
+                            .metric()
+                            .add(&prefix(branch.right.as_ref(), rank - left_len))
                     }
                 }
             }
@@ -584,11 +594,7 @@ impl<T: TapeEntry> StableTape<T> {
 
     /// Splits at an entry rank, path-copying only the two boundary spines.
     /// Unchanged full subtrees are returned by pointer.
-    pub(crate) fn split_at(
-        &self,
-        rank: usize,
-        allocator: &mut TapeIdAllocator,
-    ) -> (Self, Self) {
+    pub(crate) fn split_at(&self, rank: usize, allocator: &mut TapeIdAllocator) -> (Self, Self) {
         let rank = rank.min(self.len());
         let Some(root) = &self.root else {
             return (Self::new(), Self::new());
@@ -617,11 +623,8 @@ impl<T: TapeEntry> StableTape<T> {
         let end = range.end.min(self.len()).max(start);
         let (prefix, remainder) = self.split_at(start, allocator);
         let (_, suffix) = remainder.split_at(end - start, allocator);
-        let fitted = replacement.rekey_between(
-            prefix.last_order_key(),
-            suffix.first_order_key(),
-            allocator,
-        );
+        let fitted =
+            replacement.rekey_between(prefix.last_order_key(), suffix.first_order_key(), allocator);
         prefix.concat(&fitted, allocator).concat(&suffix, allocator)
     }
 
@@ -638,11 +641,7 @@ impl<T: TapeEntry> StableTape<T> {
         self.root.as_ref().map(|root| root.last_order())
     }
 
-    fn fits_between(
-        &self,
-        lower: Option<&LeafOrderKey>,
-        upper: Option<&LeafOrderKey>,
-    ) -> bool {
+    fn fits_between(&self, lower: Option<&LeafOrderKey>, upper: Option<&LeafOrderKey>) -> bool {
         self.root.as_ref().is_none_or(|root| {
             lower.is_none_or(|lower| lower < root.first_order())
                 && upper.is_none_or(|upper| root.last_order() < upper)
@@ -705,8 +704,8 @@ impl<T: TapeEntry> StableTape<T> {
         let replacement_end = start
             .checked_add(replacement.len())
             .expect("tape splice length overflow");
-        let new_window = start.saturating_sub(LEAF_MAX)
-            ..(replacement_end + LEAF_MAX).min(next.len());
+        let new_window =
+            start.saturating_sub(LEAF_MAX)..(replacement_end + LEAF_MAX).min(next.len());
         let new_locations = next.locations_in_range(new_window);
         let mut next_index = index.clone();
         for (id, _) in old_locations {
@@ -720,11 +719,7 @@ impl<T: TapeEntry> StableTape<T> {
 
     /// Rank lookup by stable occurrence ID through the persistent occurrence
     /// index plus immutable leaf order labels.
-    pub(crate) fn rank_of_id(
-        &self,
-        id: u64,
-        index: &PersistentOccurrenceIndex,
-    ) -> Option<usize> {
+    pub(crate) fn rank_of_id(&self, id: u64, index: &PersistentOccurrenceIndex) -> Option<usize> {
         let location = index.get(id)?;
         let root = self.root.as_ref()?;
         let rank = Self::rank_of_order(root, &location.order, 0)?;
@@ -741,22 +736,14 @@ impl<T: TapeEntry> StableTape<T> {
         self.cursor_at(self.rank_of_id(id, index)?)
     }
 
-    pub(crate) fn predecessor_id(
-        &self,
-        id: u64,
-        index: &PersistentOccurrenceIndex,
-    ) -> Option<u64> {
+    pub(crate) fn predecessor_id(&self, id: u64, index: &PersistentOccurrenceIndex) -> Option<u64> {
         self.rank_of_id(id, index)
             .and_then(|rank| rank.checked_sub(1))
             .and_then(|rank| self.get(rank))
             .map(TapeEntry::stable_id)
     }
 
-    pub(crate) fn successor_id(
-        &self,
-        id: u64,
-        index: &PersistentOccurrenceIndex,
-    ) -> Option<u64> {
+    pub(crate) fn successor_id(&self, id: u64, index: &PersistentOccurrenceIndex) -> Option<u64> {
         self.rank_of_id(id, index)
             .and_then(|rank| rank.checked_add(1))
             .filter(|rank| *rank < self.len())
@@ -818,7 +805,9 @@ impl<T: TapeEntry> StableTape<T> {
         debug_assert!(entries.len() <= LEAF_MAX);
         let metric = entries
             .iter()
-            .fold(SequenceMetric::default(), |metric, entry| metric.add(&entry.metric()));
+            .fold(SequenceMetric::default(), |metric, entry| {
+                metric.add(&entry.metric())
+            });
         Arc::new(TapeNode::Leaf(TapeLeaf {
             id: allocator.allocate(),
             order,
@@ -893,25 +882,23 @@ impl<T: TapeEntry> StableTape<T> {
                     let TapeNode::Branch(branch) = left.as_ref() else {
                         unreachable!("leaf cannot have height greater than one")
                     };
-                    let joined = Self::concat_nodes(
-                        Some(Arc::clone(&branch.right)),
-                        Some(right),
-                        allocator,
-                    )
-                    .expect("joining two roots yields a root");
+                    let joined =
+                        Self::concat_nodes(Some(Arc::clone(&branch.right)), Some(right), allocator)
+                            .expect("joining two roots yields a root");
                     return Some(Self::rebalance(Arc::clone(&branch.left), joined, allocator));
                 }
                 if right_height > left_height.saturating_add(1) {
                     let TapeNode::Branch(branch) = right.as_ref() else {
                         unreachable!("leaf cannot have height greater than one")
                     };
-                    let joined = Self::concat_nodes(
-                        Some(left),
-                        Some(Arc::clone(&branch.left)),
+                    let joined =
+                        Self::concat_nodes(Some(left), Some(Arc::clone(&branch.left)), allocator)
+                            .expect("joining two roots yields a root");
+                    return Some(Self::rebalance(
+                        joined,
+                        Arc::clone(&branch.right),
                         allocator,
-                    )
-                    .expect("joining two roots yields a root");
-                    return Some(Self::rebalance(joined, Arc::clone(&branch.right), allocator));
+                    ));
                 }
                 Some(Self::make_branch(left, right, allocator))
             }
@@ -980,17 +967,10 @@ impl<T: TapeEntry> StableTape<T> {
         }
         match node.as_ref() {
             TapeNode::Leaf(leaf) => {
-                let left = Self::make_leaf(
-                    leaf.entries[..rank].to_vec(),
-                    leaf.order.clone(),
-                    allocator,
-                );
+                let left =
+                    Self::make_leaf(leaf.entries[..rank].to_vec(), leaf.order.clone(), allocator);
                 let right_order = LeafOrderKey::between(Some(&leaf.order), upper);
-                let right = Self::make_leaf(
-                    leaf.entries[rank..].to_vec(),
-                    right_order,
-                    allocator,
-                );
+                let right = Self::make_leaf(leaf.entries[rank..].to_vec(), right_order, allocator);
                 (Some(left), Some(right))
             }
             TapeNode::Branch(branch) => {
@@ -1002,27 +982,21 @@ impl<T: TapeEntry> StableTape<T> {
                         Some(branch.right.first_order()),
                         allocator,
                     );
-                    let suffix = Self::concat_nodes(middle, Some(Arc::clone(&branch.right)), allocator);
+                    let suffix =
+                        Self::concat_nodes(middle, Some(Arc::clone(&branch.right)), allocator);
                     (prefix, suffix)
                 } else {
-                    let (middle, suffix) = Self::split_node(
-                        &branch.right,
-                        rank - left_len,
-                        upper,
-                        allocator,
-                    );
-                    let prefix = Self::concat_nodes(Some(Arc::clone(&branch.left)), middle, allocator);
+                    let (middle, suffix) =
+                        Self::split_node(&branch.right, rank - left_len, upper, allocator);
+                    let prefix =
+                        Self::concat_nodes(Some(Arc::clone(&branch.left)), middle, allocator);
                     (prefix, suffix)
                 }
             }
         }
     }
 
-    fn rank_of_order(
-        node: &Arc<TapeNode<T>>,
-        order: &LeafOrderKey,
-        base: usize,
-    ) -> Option<usize> {
+    fn rank_of_order(node: &Arc<TapeNode<T>>, order: &LeafOrderKey, base: usize) -> Option<usize> {
         match node.as_ref() {
             TapeNode::Leaf(leaf) => (leaf.order == *order).then_some(base),
             TapeNode::Branch(branch) => {
@@ -1425,7 +1399,8 @@ mod tests {
         assert!(joined.exact_eq(&tape));
 
         let replacement = StableTape::from_entries(entries(1_000, 3), &mut allocator);
-        let (next, next_index) = tape.splice_with_index(&index, 70..73, &replacement, &mut allocator);
+        let (next, next_index) =
+            tape.splice_with_index(&index, 70..73, &replacement, &mut allocator);
         let ids: Vec<u64> = next.iter().map(TapeEntry::stable_id).collect();
         assert_eq!(&ids[..70], &(0..70).collect::<Vec<_>>());
         assert_eq!(&ids[70..73], &[1_000, 1_001, 1_002]);
@@ -1446,10 +1421,7 @@ mod tests {
         assert_eq!(cursor.current_id(), 64);
         assert!(cursor.retreat());
         assert_eq!(cursor.current_id(), 63);
-        let range: Vec<u64> = tape
-            .iter_range(61..68)
-            .map(TapeEntry::stable_id)
-            .collect();
+        let range: Vec<u64> = tape.iter_range(61..68).map(TapeEntry::stable_id).collect();
         assert_eq!(range, (61..68).collect::<Vec<_>>());
     }
 

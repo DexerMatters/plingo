@@ -508,10 +508,7 @@ fn collect_raw_match_ends<A: Automaton, R: LexerRoot>(
     );
 
     let (transitions, bytes) = scan_counters.get();
-    scan_counters.set((
-        transitions + dfa_transitions + 1,
-        bytes + bytes_fed,
-    ));
+    scan_counters.set((transitions + dfa_transitions + 1, bytes + bytes_fed));
 
     best_ends
 }

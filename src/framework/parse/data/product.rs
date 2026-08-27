@@ -1,10 +1,8 @@
 use std::{any::TypeId, sync::Arc};
 
-use crate::framework::parse::{
-    data::{
-        ast::{AnchoredSpan, AstBox, AstId, TokenEntryId},
-        green::GreenId,
-    },
+use crate::framework::parse::data::{
+    ast::{AnchoredSpan, AstBox, AstId, TokenEntryId},
+    green::GreenId,
 };
 
 pub type ProductId = usize;
@@ -60,11 +58,7 @@ impl Product {
         )
     }
 
-    pub fn typed_token<T: 'static>(
-        green: GreenId,
-        entry: TokenEntryId,
-        ast: AstBox<T>,
-    ) -> Self {
+    pub fn typed_token<T: 'static>(green: GreenId, entry: TokenEntryId, ast: AstBox<T>) -> Self {
         Self::new(
             green,
             ProductData::Token {

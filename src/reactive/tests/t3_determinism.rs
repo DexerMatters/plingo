@@ -13,7 +13,8 @@ struct T3Total(Map<(), i64>);
 fn total(_: ()) -> Result<i64> {
     let mut sum = 0;
     for input in observe_view::<T3Source>()?.keys()? {
-        sum += observe_view::<T3Source>()?.get(&input)?
+        sum += observe_view::<T3Source>()?
+            .get(&input)?
             .map(|value| *value)
             .unwrap_or_default();
     }

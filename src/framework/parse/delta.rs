@@ -36,11 +36,20 @@ impl<K: Ord + Clone> KeyDelta<K> {
         debug_assert!(is_sorted(&self.updated), "updated not sorted");
         debug_assert!(is_sorted(&self.removed), "removed not sorted");
         for a in &*self.inserted {
-            debug_assert!(self.updated.binary_search(a).is_err(), "inserted overlaps updated");
-            debug_assert!(self.removed.binary_search(a).is_err(), "inserted overlaps removed");
+            debug_assert!(
+                self.updated.binary_search(a).is_err(),
+                "inserted overlaps updated"
+            );
+            debug_assert!(
+                self.removed.binary_search(a).is_err(),
+                "inserted overlaps removed"
+            );
         }
         for a in &*self.updated {
-            debug_assert!(self.removed.binary_search(a).is_err(), "updated overlaps removed");
+            debug_assert!(
+                self.removed.binary_search(a).is_err(),
+                "updated overlaps removed"
+            );
         }
     }
 }
@@ -51,55 +60,66 @@ fn is_sorted<K: Ord>(values: &[K]) -> bool {
 
 /// An ordered sequence splice for one parent's child list (plan §8.5).
 /// `before`/`after` are the retained neighbor anchors the splice sits
-/// between; `order_after` is the complete resulting order so publication
-/// stays `O(splice)` without reading previous facts.
+/// between. The delta carries only the bounded middle; the committed
+/// order is reconstructed from the previous publication plus this splice.
 #[derive(Debug, Clone, Default)]
 pub struct OrderedDelta<K: Clone + Ord> {
     pub before: Option<K>,
     pub removed: Arc<[K]>,
     pub inserted: Arc<[K]>,
     pub after: Option<K>,
-    pub order_after: Arc<[K]>,
 }
 
-/// One parent's child-order change: the splice plus the resulting order.
-/// `removed_children` pairs each retracted link's stable identity with the
-/// dead arena record that resolves its kind for publication.
+/// One parent's child-order change. The bounded splice carries the old
+/// records needed to retract dead links and the live records needed to
+/// publish inserted links.
 #[derive(Debug, Clone)]
 pub struct ChildSplice {
     pub parent: SyntaxNodeId,
     pub delta: OrderedDelta<SyntaxNodeId>,
+    /// Dropped children: stable identity paired with the (possibly dead)
+    /// arena record that resolves their former link identity.
     pub removed_children: Arc<[(SyntaxNodeId, u64)]>,
+    /// Inserted children, same pairing, all alive at publication time.
+    pub inserted_children: Arc<[(SyntaxNodeId, u64)]>,
 }
 
 impl ChildSplice {
-    /// Validates anchor membership against the old/new orders (debug).
+    /// Validates anchor membership against the old order (debug).
     pub(crate) fn assert_anchored(&self, order_before: &[SyntaxNodeId]) {
-        if let Some(before) = &self.delta.before {
-            debug_assert!(
-                order_before.contains(before) || self.delta.order_after.contains(before),
-                "splice before-anchor missing from both orders"
-            );
-        }
-        let mut spliced: Vec<SyntaxNodeId> = Vec::new();
-        for id in order_before {
-            if !self.delta.removed.contains(id) {
-                spliced.push(*id);
-            }
-        }
-        // Insertions land between `before`/`after`; verify only that every
-        // inserted link exists in the resulting order and no removed one does.
+        let start = self
+            .delta
+            .before
+            .as_ref()
+            .map(|before| {
+                order_before
+                    .iter()
+                    .position(|id| id == before)
+                    .expect("splice before-anchor missing from old order")
+                    + 1
+            })
+            .unwrap_or(0);
+        let end = self
+            .delta
+            .after
+            .as_ref()
+            .map(|after| {
+                order_before
+                    .iter()
+                    .position(|id| id == after)
+                    .expect("splice after-anchor missing from old order")
+            })
+            .unwrap_or(order_before.len());
+        debug_assert!(start <= end, "splice anchors cross in old order");
+        debug_assert_eq!(
+            order_before.get(start..end).unwrap_or_default(),
+            self.delta.removed.as_ref(),
+            "splice removed run differs from old order"
+        );
         for id in &*self.delta.inserted {
             debug_assert!(
-                self.delta.order_after.contains(id),
-                "inserted link absent from resulting order"
-            );
-            debug_assert!(!spliced.contains(id) || order_before.is_empty());
-        }
-        for id in &*self.delta.removed {
-            debug_assert!(
-                !self.delta.order_after.contains(id),
-                "removed link still present in resulting order"
+                !order_before[..start].contains(id) && !order_before[end..].contains(id),
+                "splice inserts a link that survives outside the replaced run"
             );
         }
     }
@@ -112,6 +132,24 @@ impl ChildSplice {
 /// canonically without history (plan §3.3).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SyntaxNodeId(pub u64);
+
+/// One removed raw AST record plus the old topology needed for exact
+/// retraction without touching the dying arena. Ordered by lineage so
+/// canonical delta domains stay sorted.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RemovedRecord {
+    /// The stable syntax identity that leaves publication.
+    pub lineage: SyntaxNodeId,
+    /// The dead arena record (debug/oracle reference only).
+    pub record: u64,
+    /// The record's former parent, when it had one.
+    pub parent_record: Option<u64>,
+    /// The former parent's stable lineage, when it had one.
+    pub parent_lineage: Option<u64>,
+    /// The record's former direct child records, in order.
+    pub child_records: Arc<[u64]>,
+}
+
 
 /// A synthesized (recovery) token identity (plan §14): deterministic
 /// `(document, recovery segment, action ordinal)`.
@@ -132,6 +170,10 @@ pub struct ParseDelta {
     pub parents: KeyDelta<SyntaxNodeId>,
     /// One ordered splice per changed parent.
     pub child_splices: Arc<[ChildSplice]>,
+    /// Cut E: the post-publication stable child orders for every parent
+    /// touched this command, consumed by the caller to seed the next
+    /// command's splice oracle. Not a public wire field.
+    pub(crate) child_orders_next: Arc<std::collections::HashMap<u64, Vec<u64>>>,
     /// Root-list splice.
     pub roots: OrderedDelta<SyntaxNodeId>,
     /// Synthesized recovery tokens.
@@ -145,7 +187,11 @@ pub struct ParseDelta {
     pub inserted_records: Arc<[(SyntaxNodeId, u64)]>,
     /// Framework-private alignment pairs: removed syntax key → the dead
     /// arena record that still resolves its kind (arenas are append-only).
-    pub removed_records: Arc<[(SyntaxNodeId, u64)]>,
+    /// Removed syntax records with the OLD topology metadata publication
+    /// needs to retract exactly (follow-up plan §5 items 6–7): the dead
+    /// arena record must never be consulted after lineage death, so its
+    /// former parent and former direct child records ride in the delta.
+    pub removed_records: Arc<[RemovedRecord]>,
     /// Framework-private alignment pairs: updated syntax key → the live
     /// arena record carrying its new payload.
     pub(crate) updated_records: Arc<[(SyntaxNodeId, u64)]>,
@@ -211,7 +257,10 @@ pub struct ParseDiagnosticKey {
 
 impl Default for ParseDiagnosticKey {
     fn default() -> Self {
-        Self { document_id: 0, ordinal: 0 }
+        Self {
+            document_id: 0,
+            ordinal: 0,
+        }
     }
 }
 

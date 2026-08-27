@@ -19,7 +19,8 @@ static MIDDLE_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 fn middle(input: u64) -> Result<i64> {
     MIDDLE_RUNS.fetch_add(1, Ordering::SeqCst);
-    let value = observe_view::<T2Source>()?.get(&input)?
+    let value = observe_view::<T2Source>()?
+        .get(&input)?
         .map(|value| *value)
         .unwrap_or_default();
     let result = value * 2;

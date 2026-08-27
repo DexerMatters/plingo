@@ -9,9 +9,9 @@ mod common;
 use common::fixtures;
 use common::json::{JsonDocument, JsonToken};
 use common::oracle::{self, TraceRunner};
+use plingo::framework::Workspace;
 use plingo::framework::lex::install_lexer;
 use plingo::framework::parse::install_parser;
-use plingo::framework::Workspace;
 
 fn build() -> Workspace {
     Workspace::build(|engine| {
@@ -46,12 +46,7 @@ fn no_op_edit_retains_publication_identity() {
     runner.checkpoint_and_verify_retained_on_noop();
 
     // A real change republishes.
-    runner.step(replace_text(
-        &runner,
-        &u,
-        "\"k\"",
-        "\"kk\"",
-    ));
+    runner.step(replace_text(&runner, &u, "\"k\"", "\"kk\""));
     assert!(true, "republish path exercised");
 }
 
@@ -192,10 +187,7 @@ fn insert_at(
     }
 }
 
-fn same_width_equal_value(
-    u: &fluent_uri::Uri<String>,
-    runner: &TraceRunner,
-) -> Edits {
+fn same_width_equal_value(u: &fluent_uri::Uri<String>, runner: &TraceRunner) -> Edits {
     use plingo::framework::source::SourceEdit;
     use plingo::utils::Span;
     let needle = "\"k\"";

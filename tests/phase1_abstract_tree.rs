@@ -1,7 +1,9 @@
 //! Typed abstract-tree coverage for the plain reactive authoring surface.
 
+use plingo::reactive::component::EachKey;
 use plingo::reactive::prelude::*;
 use plingo::{abstract_tree, view};
+use reactive_macros::component;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LeafVal(pub u64);
@@ -93,23 +95,41 @@ fn upsert_emitter(_: ()) -> Result<()> {
     StlcTree::emit_roots(vec![root])
 }
 
-fn run_emitter<F>(function: F) -> (Engine, Running<()>)
+/// Cut C fixture trigger: one external element drives the emitter
+/// component; the unkeyed planner surface is gone.
+#[view]
+struct FixtureTrigger(Map<(), ()>);
+
+fn run_emitter<F>(function: F) -> Engine
 where
     F: Fn(()) -> Result<()> + Clone + Send + Sync + 'static,
 {
+    let _ = function; // emitters are concrete; kept for signature parity.
     let mut engine = Engine::new();
-    let plan = engine.plan(function, ()).expect("plan");
-    let running = engine.run(&plan).expect("run");
-    (engine, running)
+    upsert_emitter_component_install(&mut engine).expect("install emitter component");
+    engine
+        .command(|| emit_view::<FixtureTrigger>()?.insert((), ()))
+        .expect("trigger emitter");
+    engine
+}
+
+#[component]
+fn upsert_emitter_component(_key: EachKey<FixtureTrigger>) -> Result<()> {
+    upsert_emitter(())
+}
+
+#[component]
+fn granular_writer_component(_key: EachKey<FixtureTrigger>) -> Result<()> {
+    granular_writer(())
 }
 
 #[test]
 fn upsert_then_snapshot_case_reads_nested_typed_tree() {
-    let (engine, _running) = run_emitter(upsert_emitter);
+    let engine = run_emitter(upsert_emitter);
     let snapshot = engine.snapshot();
     let roots = StlcTree::snapshot_roots(&snapshot);
     assert_eq!(roots.len(), 1);
-    let root = roots[0];
+    let root = roots[0].clone();
     let (param, body, span) = match StlcTree::snapshot_case(&snapshot, root) {
         Some(StlcCase::Expr(StlcExprCase::Lam { param, body, span })) => (param, body, span),
         other => panic!("expected Expr::Lam, got {other:?}"),
@@ -128,12 +148,12 @@ fn upsert_then_snapshot_case_reads_nested_typed_tree() {
 
 #[test]
 fn snapshot_case_is_consistent_across_engines() {
-    let (first, _) = run_emitter(upsert_emitter);
-    let (second, _) = run_emitter(upsert_emitter);
+    let first = run_emitter(upsert_emitter);
+    let second = run_emitter(upsert_emitter);
     let first_snapshot = first.snapshot();
     let second_snapshot = second.snapshot();
-    let first_root = StlcTree::snapshot_roots(&first_snapshot)[0];
-    let second_root = StlcTree::snapshot_roots(&second_snapshot)[0];
+    let first_root = StlcTree::snapshot_roots(&first_snapshot)[0].clone();
+    let second_root = StlcTree::snapshot_roots(&second_snapshot)[0].clone();
     assert_eq!(first_root, second_root);
     assert_eq!(
         StlcTree::snapshot_case(&first_snapshot, first_root),
@@ -149,17 +169,17 @@ fn absent_tree_has_no_roots() {
 
 #[test]
 fn generated_snapshot_children_are_typed_and_filtered() {
-    let (engine, _) = run_emitter(upsert_emitter);
+    let engine = run_emitter(upsert_emitter);
     let snapshot = engine.snapshot();
-    let root = StlcTree::snapshot_roots(&snapshot)[0];
+    let root = StlcTree::snapshot_roots(&snapshot)[0].clone();
     let children = StlcTree::snapshot_children(&snapshot, root);
     assert_eq!(children.len(), 2);
     assert!(matches!(
-        StlcTree::snapshot_case(&snapshot, children[0]),
+        StlcTree::snapshot_case(&snapshot, children[0].clone()),
         Some(StlcCase::Param(_))
     ));
     assert!(matches!(
-        StlcTree::snapshot_case(&snapshot, children[1]),
+        StlcTree::snapshot_case(&snapshot, children[1].clone()),
         Some(StlcCase::Expr(_))
     ));
 }
@@ -210,8 +230,10 @@ fn editing_one_leaf_rewrites_exactly_one_node_fact() {
     engine
         .command(|| emit_view::<GranularStep>()?.insert((), 0))
         .expect("step seed");
-    let plan = engine.plan(granular_writer, ()).expect("plan");
-    engine.run(&plan).expect("run");
+    granular_writer_component_install(&mut engine).expect("install writer");
+    engine
+        .command(|| emit_view::<FixtureTrigger>()?.insert((), ()))
+        .expect("trigger writer");
 
     let report = engine
         .command(|| emit_view::<GranularStep>()?.insert((), 1))

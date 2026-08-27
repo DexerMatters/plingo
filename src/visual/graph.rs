@@ -34,7 +34,7 @@ where
 {
     let mut out = String::new();
     for node in snapshot_nodes::<D>(snapshot) {
-        match snapshot_node(snapshot, node) {
+        match snapshot_node(snapshot, node.clone()) {
             Some(data) => writeln!(out, "• {data:?}").expect("write"),
             None => writeln!(out, "• {node:?}").expect("write"),
         }

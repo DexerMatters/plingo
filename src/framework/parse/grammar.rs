@@ -308,8 +308,7 @@ impl<'a> BuildCx<'a> {
     ) -> ProductId {
         let green = self.trees.leaf(length, terminal);
         self.products.insert(
-            Product::token(green, entry)
-                .with_metadata(AnchoredSpan::token(occurrence), Vec::new()),
+            Product::token(green, entry).with_metadata(AnchoredSpan::token(occurrence), Vec::new()),
         )
     }
 
@@ -330,10 +329,10 @@ impl<'a> BuildCx<'a> {
         // candidate keys disjoint from real productions (plan §8.7 proof 2
         // still applies within the typed-token domain).
         const TYPED_TOKEN_ROLE: u32 = u32::MAX;
-        self.lineage.assign_new(TYPED_TOKEN_ROLE, extent, ast.raw_id());
+        self.lineage
+            .assign_new(TYPED_TOKEN_ROLE, extent, ast.raw_id());
         let product = self.products.insert(
-            Product::typed_token(green, entry, ast)
-                .with_metadata(extent, vec![ast.raw_id()]),
+            Product::typed_token(green, entry, ast).with_metadata(extent, vec![ast.raw_id()]),
         );
         self.ast.bind_product(ast.raw_id(), product);
         product

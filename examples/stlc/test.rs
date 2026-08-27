@@ -13,37 +13,36 @@ use plingo::utils::Span;
 use plingo::framework::scope::ScopeNode;
 
 use super::{
-    check::{StlcTypeDiagnostics, check_pass},
-
-    syntax::StlcDeclarationCase,
+    check::{
+        StlcDefinitionTypes, StlcExpectedTypes, StlcSynthesizedTypes, StlcTypeDiagnostics,
+        StlcTypeResult, StlcTypeValue, check_pass_install,
+    },
     name_resolve::{
-        ScopeGraph, StlcScope, StlcScopeData, StlcScopeLabel, StlcTypeValue, name_pass,
-        resolve_pass,
+        ScopeGraph, StlcScope, StlcScopeData, StlcScopeLabel, name_pass_install,
+        resolve_pass_install,
     },
     structural::{
-        StlcLowered, StlcLoweredOrigin, StlcLoweredSummary, StlcLoweringDiagnostics,
-        StlcNodeIndex, structural_pass,
+        StlcLowered, StlcLoweredOrigin, StlcLoweredSummary, StlcLoweringDiagnostics, StlcNodeIndex,
+        structural_pass_install,
     },
+    syntax::StlcDeclarationCase,
     syntax::{StlcDocument, StlcToken, StlcTree},
 };
 
-fn uri(name: &str) -> Uri<String> {
+pub(crate) fn uri(name: &str) -> Uri<String> {
     Span::new(format!("test://{name}"), 0, 0).unwrap().uri
 }
 
-fn build(workers: usize) -> Workspace {
+pub(crate) fn build(workers: usize) -> Workspace {
     let _ = workers;
     Workspace::build(|engine| {
         install_lexer::<StlcToken>(engine)?;
         install_parser_tree::<StlcToken, StlcDocument>(engine)?;
-        let planned = engine.plan(name_pass, ())?;
-        let _running = engine.run(&planned)?;
-        let planned = engine.plan(resolve_pass, ())?;
-        let _running = engine.run(&planned)?;
-        let planned = engine.plan(check_pass, ())?;
-        let _running = engine.run(&planned)?;
-        let planned = engine.plan(structural_pass, ())?;
-        let _running = engine.run(&planned)?;
+        // Cut C: passes install as first-class components.
+        check_pass_install(engine)?;
+        name_pass_install(engine)?;
+        resolve_pass_install(engine)?;
+        structural_pass_install(engine)?;
         Ok(())
     })
     .expect("workspace builds")
@@ -69,8 +68,14 @@ fn pretty_type(ty: &StlcTypeValue) -> String {
         StlcTypeValue::Nat => "Nat".to_owned(),
         StlcTypeValue::Bool => "Bool".to_owned(),
         StlcTypeValue::Unit => "Unit".to_owned(),
-        StlcTypeValue::Arrow(parameter, result) => {
-            format!("{} -> {}", pretty_type(parameter), pretty_type(result))
+        StlcTypeValue::Function(function) => {
+            let parameters = function
+                .parameters()
+                .iter()
+                .map(pretty_type)
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            format!("{parameters} -> {}", pretty_type(function.result()))
         }
     }
 }
@@ -86,7 +91,6 @@ fn pretty_payload(payload: &ScopeNode<StlcScope>) -> String {
         StlcScopeData::CaseSuccessor => "case-successor".to_owned(),
         StlcScopeData::External { path } => format!("external \"{path}\""),
         StlcScopeData::Declaration { name, .. } => format!("declaration \"{name}\""),
-        StlcScopeData::Type(ty) => format!("type {}", pretty_type(ty)),
     }
 }
 
@@ -95,7 +99,6 @@ fn pretty_label(label: &StlcScopeLabel) -> String {
     match label {
         StlcScopeLabel::Lexical => "Lexical".to_owned(),
         StlcScopeLabel::Declaration(name) => format!("Declaration({name})"),
-        StlcScopeLabel::Type => "Type".to_owned(),
         StlcScopeLabel::Import(path) => format!("Import({path})"),
     }
 }
@@ -111,9 +114,9 @@ fn render_scope_graph(snapshot: &plingo::reactive::Snapshot) -> String {
     let mut scopes: Vec<super::name_resolve::Scope<StlcScope>> = Vec::new();
     for input in snapshot.inputs::<ScopeGraph<StlcScope>>() {
         if let GraphKey::Node(node) = input {
-            if let Some(payload) = snapshot.graph_node::<ScopeGraph<StlcScope>>(node) {
+            if let Some(payload) = snapshot.graph_node::<ScopeGraph<StlcScope>>(node.clone()) {
                 payloads.push(pretty_payload(&payload));
-                scopes.push(super::name_resolve::Scope::from_node(node));
+                scopes.push(super::name_resolve::Scope::from_graph_node(node));
             }
         }
     }
@@ -157,7 +160,10 @@ fn render_ast(
         out.push_str("  ");
     }
     writeln!(out, "<node {id:?}>").expect("write");
-    for child in StlcTree::snapshot_children(snapshot, id).iter().copied() {
+    for child in StlcTree::snapshot_children(snapshot, id.clone())
+        .iter()
+        .cloned()
+    {
         render_ast(out, snapshot, child, depth + 1);
     }
 }
@@ -184,27 +190,87 @@ fn pipelines_publish_scope_and_type_results() {
     assert!(diagnostics.iter().any(|diagnostic| {
         matches!(
             diagnostic.error,
-            super::name_resolve::StlcTypeError::Mismatch {
-                expected: StlcTypeValue::Arrow(..),
+            super::check::StlcTypeError::Mismatch {
+                expected: StlcTypeValue::Function(..),
                 found: StlcTypeValue::Unit,
             }
         )
     }));
     // Inferred types are graph facts now: at least one Type payload exists.
-    let typed = snapshot
-        .inputs::<ScopeGraph<StlcScope>>()
+    // Definition types are published through StlcDefinitionTypes.
+    let typed = !snapshot
+        .inputs::<StlcDefinitionTypes>()
+        .is_empty();
+    assert!(typed, "inferred definition types exist");
+}
+
+#[test]
+fn checker_publishes_directional_facts_and_function_spines() {
+    let function = StlcTypeValue::function(
+        [StlcTypeValue::Nat, StlcTypeValue::Bool],
+        StlcTypeValue::Unit,
+    );
+    let StlcTypeValue::Function(function_arc) = &function else {
+        panic!("non-empty parameter list must use the persistent function spine");
+    };
+    assert_eq!(
+        function_arc.parameters(),
+        &[StlcTypeValue::Nat, StlcTypeValue::Bool]
+    );
+    assert_eq!(function_arc.result(), &StlcTypeValue::Unit);
+    let tail = function.apply_one().expect("function has an argument");
+    let StlcTypeValue::Function(tail_arc) = tail else {
+        panic!("applying one argument must preserve the non-empty tail");
+    };
+    assert_eq!(tail_arc.parameters(), &[StlcTypeValue::Bool]);
+
+    let u = uri("directional-type-facts");
+    let mut ws = build(1);
+    open(&mut ws, &u, "id : Bool -> Bool := fun (x : Bool) -> x");
+    let snapshot = ws.snapshot();
+    let root = unit(&ws, &u).root.clone().expect("typed document root");
+
+    let synthesized = snapshot
+        .observe::<StlcSynthesizedTypes>(root.clone())
+        .expect("every syntax node owns a synthesized result");
+    assert!(matches!(synthesized.as_ref(), StlcTypeResult::Unknown));
+    assert!(
+        !snapshot.inputs::<StlcSynthesizedTypes>().is_empty(),
+        "synthesis is published as an explicit map domain"
+    );
+    assert!(
+        !snapshot.inputs::<StlcExpectedTypes>().is_empty(),
+        "checking writes expected types separately from synthesis"
+    );
+    assert!(
+        !snapshot.inputs::<StlcDefinitionTypes>().is_empty(),
+        "binders and declarations publish definition types separately"
+    );
+
+    let lambda = snapshot
+        .inputs::<StlcSynthesizedTypes>()
         .into_iter()
-        .filter_map(|input| match input {
-            plingo::reactive::kind::GraphKey::Node(node) => snapshot
-                .graph_node::<ScopeGraph<StlcScope>>(node)
-                .map(|payload| matches!(
-                    payload.as_ref(),
-                    plingo::framework::scope::ScopeNode::Scope(StlcScopeData::Type(_))
-                )),
-            _ => None,
+        .find(|node| {
+            matches!(
+                StlcTree::snapshot_case(&snapshot, node.clone()),
+                Some(super::syntax::StlcCase::Expr(
+                    super::syntax::StlcExprCase::Lambda { .. }
+                ))
+            )
         })
-        .any(|typed| typed);
-    assert!(typed, "inferred types live in the scope graph");
+        .expect("lambda syntax node");
+    let syn = snapshot
+        .observe::<StlcSynthesizedTypes>(lambda)
+        .expect("lambda synthesis");
+    assert!(
+        matches!(
+            syn.as_ref(),
+            StlcTypeResult::Known(StlcTypeValue::Function(function_arc))
+                if function_arc.parameters() == &[StlcTypeValue::Bool]
+                    && *function_arc.result() == StlcTypeValue::Bool
+        ),
+        "expected Bool -> Bool, got {syn:?}"
+    );
 }
 
 #[test]
@@ -213,9 +279,9 @@ fn structural_pipeline_retracts_removed_roots() {
     let mut ws = build(1);
     open(&mut ws, &u, "f : Nat := ()");
     let snapshot = ws.snapshot();
-    let root = unit(&ws, &u).root.expect("root");
+    let root = unit(&ws, &u).root.clone().expect("root");
     assert!(
-        snapshot.observe::<StlcNodeIndex>(root).is_some(),
+        snapshot.observe::<StlcNodeIndex>(root.clone()).is_some(),
         "the root node is indexed"
     );
 
@@ -228,7 +294,7 @@ fn structural_pipeline_retracts_removed_roots() {
         "closing the document retracts its parse unit"
     );
     assert!(
-        snapshot.observe::<StlcNodeIndex>(root).is_none(),
+        snapshot.observe::<StlcNodeIndex>(root.clone()).is_none(),
         "structural facts retract with their owning visitors"
     );
     assert!(
@@ -243,7 +309,7 @@ fn parser_facts_retain_unchanged_ast_keys() {
     let u = uri("scenario3");
     let mut ws = build(1);
     open(&mut ws, &u, "x := 0\ny := 1");
-    let before = unit(&ws, &u).root.expect("root");
+    let before = unit(&ws, &u).root.clone().expect("root");
     ws.edit(vec![
         SourceEdit::Delete {
             key: Span::new_uri(u.clone(), 5, 6).unwrap(),
@@ -254,7 +320,7 @@ fn parser_facts_retain_unchanged_ast_keys() {
         },
     ])
     .unwrap();
-    let after = unit(&ws, &u).root.expect("root after edit");
+    let after = unit(&ws, &u).root.clone().expect("root after edit");
     assert_eq!(after, before, "the document root remains stable");
 }
 
@@ -279,24 +345,20 @@ fn structural_views_publish_all_downstream_products() {
     let mut ws = build(1);
     open(&mut ws, &u, "id : Nat -> Nat := fun x -> x");
     let snapshot = ws.snapshot();
-    let root = unit(&ws, &u).root.expect("root");
+    let root = unit(&ws, &u).root.clone().expect("root");
     assert_eq!(
         snapshot
-            .observe::<StlcLowered>(root)
+            .observe::<StlcLowered>(root.clone())
             .map(|value| value.as_str().to_owned()),
         Some("untyped::Document".to_owned())
     );
     assert_eq!(
         snapshot
-            .observe::<StlcLoweredOrigin>(root)
-            .map(|origin| *origin),
-        Some(root)
+            .observe::<StlcLoweredOrigin>(root.clone())
+            .map(|origin| origin.as_ref().clone()),
+        Some(root.clone())
     );
-    assert!(
-        snapshot
-            .list::<StlcLoweringDiagnostics>(&root)
-            .is_empty()
-    );
+    assert!(snapshot.list::<StlcLoweringDiagnostics>(&root).is_empty());
     assert_eq!(
         snapshot
             .observe::<StlcLoweredSummary>(root)
@@ -317,23 +379,7 @@ fn one_worker_and_many_worker_runs_produce_equal_facts() {
     let dump = |ws: &Workspace| -> String {
         let snapshot = ws.snapshot();
         let unit = unit(ws, &u);
-        let mut types: Vec<String> = snapshot
-            .inputs::<ScopeGraph<StlcScope>>()
-            .into_iter()
-            .filter_map(|input| match input {
-                plingo::reactive::kind::GraphKey::Node(node) => snapshot
-                    .graph_node::<ScopeGraph<StlcScope>>(node)
-                    .and_then(|payload| match payload.as_ref() {
-                        plingo::framework::scope::ScopeNode::Scope(StlcScopeData::Type(ty)) => {
-                            Some(format!("{ty:?}"))
-                        }
-                        _ => None,
-                    }),
-                _ => None,
-            })
-            .collect();
-        types.sort();
-        format!("{unit:?}|{types:?}")
+        format!("{unit:?}")
     };
     assert_eq!(dump(&single), dump(&many));
 
@@ -355,21 +401,15 @@ fn edit_invalidates_only_affected_pipelines() {
     let u = uri("scenario7");
     let mut ws = build(1);
     open(&mut ws, &u, "x := 0\ny := 1");
-    let before = unit(&ws, &u).root.expect("root");
-    let before_facts = ws
-        .snapshot()
-        .inputs::<StlcNodeIndex>()
-        .len();
+    let before = unit(&ws, &u).root.clone().expect("root");
+    let before_facts = ws.snapshot().inputs::<StlcNodeIndex>().len();
     ws.edit(vec![SourceEdit::Insert {
         key: Span::point_uri(u.clone(), 2).unwrap(),
         value: "9".into(),
     }])
     .unwrap();
-    let after = unit(&ws, &u).root.expect("root after edit");
-    let after_facts = ws
-        .snapshot()
-        .inputs::<StlcNodeIndex>()
-        .len();
+    let after = unit(&ws, &u).root.clone().expect("root after edit");
+    let after_facts = ws.snapshot().inputs::<StlcNodeIndex>().len();
     assert_eq!(before, after);
     assert_eq!(before_facts, after_facts);
 }
@@ -382,7 +422,7 @@ fn prints_ast_and_final_scope_graph_for_let_and_function_code() {
     open(&mut ws, &u, code);
 
     let snapshot = ws.snapshot();
-    let root = unit(&ws, &u).root.expect("root");
+    let root = unit(&ws, &u).root.clone().expect("root");
     let mut buffer = String::new();
     render_ast(&mut buffer, &snapshot, root, 0);
 
@@ -400,9 +440,19 @@ fn prints_ast_and_final_scope_graph_for_let_and_function_code() {
         scope_graph.contains("declaration \"mul\""),
         "the `mul` binder appears as a readable declaration\n{scope_graph}"
     );
+    // Inferred types live in StlcDefinitionTypes, not the scope graph.
+    let defs = snapshot.inputs::<StlcDefinitionTypes>();
     assert!(
-        scope_graph.contains("type Nat -> Nat"),
-        "inferred types render in surface syntax\n{scope_graph}"
+        !defs.is_empty(),
+        "declaration types exist\n{scope_graph}"
+    );
+    assert!(
+        defs.iter().any(|input| {
+            snapshot
+                .observe::<StlcDefinitionTypes>(input.clone())
+                .is_some()
+        }),
+        "at least one definition type has a known value\n{scope_graph}"
     );
     assert!(
         scope_graph.contains("-- Lexical -> scope"),
@@ -412,17 +462,12 @@ fn prints_ast_and_final_scope_graph_for_let_and_function_code() {
         scope_graph.contains("-- Declaration("),
         "declaration edges render with their labels\n{scope_graph}"
     );
-    assert!(
-        scope_graph.contains("-- Type -> scope"),
-        "type edges render with their labels\n{scope_graph}"
-    );
 }
 
 // ---------------------------------------------------------------------------
 // Plan §6.3 audit table: the "After" column, machine-checked. Each row
 // asserts the exact fact-change footprint of one edit class.
 // ---------------------------------------------------------------------------
-
 
 /// Dumps every scope-graph node payload (sorted) so two epochs compare by
 /// content, not insertion order.
@@ -445,8 +490,7 @@ fn graph_dump(ws: &Workspace) -> Vec<String> {
         .into_iter()
         .filter_map(|input| match input {
             plingo::reactive::kind::GraphKey::Bucket(from, label) => {
-                let targets =
-                    snapshot.outgoing::<ScopeGraph<StlcScope>>(from, &label);
+                let targets = snapshot.outgoing::<ScopeGraph<StlcScope>>(from, &label);
                 Some(format!("bucket {label:?} -> {}", targets.len()))
             }
             _ => None,
@@ -494,31 +538,30 @@ fn audit_literal_edit_changes_one_tree_fact_and_no_graph_fact() {
         key: Span::new_uri(u.clone(), 14, 15).unwrap(),
     }])
     .unwrap();
-    let delete_token_keys =
-        ws.snapshot()
-            .inputs::<plingo::framework::lex::TokenFacts<StlcToken>>();
+    let delete_token_keys = ws
+        .snapshot()
+        .inputs::<plingo::framework::lex::TokenFacts<StlcToken>>();
     let after_delete = graph_dump(&ws);
     ws.edit(vec![SourceEdit::Insert {
         key: Span::point_uri(u.clone(), 14).unwrap(),
         value: "7".to_owned(),
     }])
     .unwrap();
-    let after_token_keys =
-        ws.snapshot()
-            .inputs::<plingo::framework::lex::TokenFacts<StlcToken>>();
+    let after_token_keys = ws
+        .snapshot()
+        .inputs::<plingo::framework::lex::TokenFacts<StlcToken>>();
 
     let after_graph = graph_dump(&ws);
     let after_diagnostics = diagnostics_dump(&ws);
     let snapshot = ws.snapshot();
-    let root = unit(&ws, &u).root.expect("root");
-    let root_case = StlcTree::snapshot_case(&snapshot, root);
-    let root_children = StlcTree::snapshot_children(&snapshot, root);
+    let root = unit(&ws, &u).root.clone().expect("root");
+    let root_case = StlcTree::snapshot_case(&snapshot, root.clone());
+    let root_children = StlcTree::snapshot_children(&snapshot, root.clone());
     let child_case = root_children
         .first()
-        .and_then(|child| StlcTree::snapshot_case(&snapshot, *child));
+        .and_then(|child| StlcTree::snapshot_case(&snapshot, child.clone()));
     assert_eq!(
-        before_graph,
-        after_graph,
+        before_graph, after_graph,
         "graph facts unchanged: before={before_graph:?} delete={after_delete:?} after={after_graph:?} root_case={root_case:?} root_children={root_children:?} child_case={child_case:?} delete_tokens={delete_token_keys:?} after_tokens={after_token_keys:?}"
     );
     assert_eq!(
@@ -527,18 +570,83 @@ fn audit_literal_edit_changes_one_tree_fact_and_no_graph_fact() {
     );
 
     // Exactly one syntax-tree node fact differs: the edited literal.
-    let changed_nodes = snapshot
-        .inputs::<StlcLowered>()
-        .len();
+    let changed_nodes = snapshot.inputs::<StlcLowered>().len();
     assert!(changed_nodes > 0, "tree nodes remain indexed");
+}
+
+/// Exact reaction proof (plan §24.7): a same-terminal Number lexeme edit
+/// re-parses the STLC tree (the tree payload carries the literal value), so
+/// the name/check/structural passes legitimately re-run — but every
+/// evaluation reads exact elements, zero broad enumerations run, and the
+/// graph facts and diagnostics stay byte-identical (the typed value is a
+/// Nat either way).
+#[test]
+fn audit_numeric_value_edit_evaluates_exact_elements_only() {
+    let u = uri("audit-reaction");
+    let mut ws = build(1);
+    open(&mut ws, &u, "n : Nat := 1 + 2");
+    let before_graph = graph_dump(&ws);
+    let before_diagnostics = diagnostics_dump(&ws);
+
+    let at = "n : Nat := 1 + 2".find('2').expect("literal two");
+    let report = ws
+        .edit(vec![SourceEdit::Delete {
+            key: Span::new_uri(u.clone(), at, at + 1).unwrap(),
+        }])
+        .unwrap();
+    let delete_digest = report
+        .command()
+        .metric::<plingo::reactive::ReactionDigest>()
+        .expect("delete digest");
+    let report = ws
+        .edit(vec![SourceEdit::Insert {
+            key: Span::point_uri(u.clone(), at).unwrap(),
+            value: "7".to_owned(),
+        }])
+        .unwrap();
+    let digest = report
+        .command()
+        .metric::<plingo::reactive::ReactionDigest>()
+        .expect("reaction digest");
+
+    for digest in [&delete_digest, &digest] {
+        assert!(
+            digest.broad_enumerations.is_empty(),
+            "{:#?}",
+            digest.broad_enumerations
+        );
+        // Every example-owned evaluation belongs to this document: the
+        // driving element is the URI (document-keyed passes), a tuple
+        // carrying it (nested node computations), or an automatic node
+        // identity from the same parse (per-node components).
+        for evaluation in &digest.evaluations {
+            if evaluation.definition.starts_with("stlc::")
+                || evaluation.definition.contains("examples")
+            {
+                assert!(
+                    evaluation.driving_element.contains(u.as_str())
+                        || evaluation.driving_element.starts_with("Node("),
+                    "evaluation escaped the edited document: {evaluation:?}"
+                );
+            }
+        }
+    }
+
+    // Graph facts and diagnostics are byte-identical across the edit.
+    let after_graph = graph_dump(&ws);
+    let after_diagnostics = diagnostics_dump(&ws);
+    assert_eq!(before_graph, after_graph, "graph facts changed on a value edit");
+    assert_eq!(
+        before_diagnostics, after_diagnostics,
+        "diagnostics changed on a value edit"
+    );
 }
 
 #[test]
 fn audit_rename_binder_rewrites_only_the_declaration_payload() {
     let u = uri("audit-rename");
     let mut ws = build(1);
-    open(&mut ws, &u, "x : Nat := 0\ny : Nat := x");
-    let before_graph = graph_dump(&ws);
+    open(&mut ws, &u, "x : Nat := 0\ny : Nat := x");    let before_graph = graph_dump(&ws);
     let before_diagnostics = diagnostics_dump(&ws);
 
     // Rename the binder y -> w on line 2 (the reference stays y).
@@ -563,12 +671,24 @@ fn audit_rename_binder_rewrites_only_the_declaration_payload() {
     // Exactly one graph fact differs — the renamed binder's declaration
     // The binder rename updates its declaration payload and exact old/new
     // name buckets; unrelated scopes, types, and diagnostics remain stable.
-    let removed: Vec<&String> =
-        before_graph.iter().filter(|line| !after_graph.contains(line)).collect();
-    let added: Vec<&String> =
-        after_graph.iter().filter(|line| !before_graph.contains(line)).collect();
-    assert_eq!(removed.len(), 2, "declaration and old name bucket removed; got {removed:?}");
-    assert_eq!(added.len(), 2, "declaration and new name bucket added; got {added:?}");
+    let removed: Vec<&String> = before_graph
+        .iter()
+        .filter(|line| !after_graph.contains(line))
+        .collect();
+    let added: Vec<&String> = after_graph
+        .iter()
+        .filter(|line| !before_graph.contains(line))
+        .collect();
+    assert_eq!(
+        removed.len(),
+        2,
+        "declaration and old name bucket removed; got {removed:?}"
+    );
+    assert_eq!(
+        added.len(),
+        2,
+        "declaration and new name bucket added; got {added:?}"
+    );
     assert!(
         removed[0].contains("Declaration") && added[0].contains("Declaration"),
         "the changed fact is the declaration payload"
@@ -593,7 +713,7 @@ fn audit_terminal_kind_change_retains_lineage_and_rewrites_type_facts() {
     let mut ws = build(1);
     open(&mut ws, &u, "b : Bool := true");
     let before_diagnostics = diagnostics_dump(&ws);
-    let before_root = unit(&ws, &u).root.expect("root");
+    let before_root = unit(&ws, &u).root.clone().expect("root");
 
     // Replace `true` (bytes 12..16) with `0`: a terminal-KIND change.
     ws.edit(vec![
@@ -607,7 +727,7 @@ fn audit_terminal_kind_change_retains_lineage_and_rewrites_type_facts() {
     ])
     .unwrap();
 
-    let after_root = unit(&ws, &u).root.expect("root after terminal change");
+    let after_root = unit(&ws, &u).root.clone().expect("root after terminal change");
     let after_diagnostics = diagnostics_dump(&ws);
     assert_eq!(
         before_root, after_root,
@@ -631,7 +751,9 @@ fn audit_expression_child_insert_writes_only_new_subtree_and_parent_splice() {
     let u = uri("audit-insert-child");
     let mut ws = build(1);
     open(&mut ws, &u, "x : Nat := 1\ny : Nat := 2");
-    let before_root = unit(&ws, &u).root.expect("root");
+    let before_root = unit(&ws, &u).root.clone().expect("root");
+    let before_snapshot = ws.snapshot();
+    let before_children = StlcTree::snapshot_children(&before_snapshot, before_root.clone());
     let before_diagnostics = diagnostics_dump(&ws);
     let before_graph = graph_dump(&ws);
 
@@ -648,8 +770,25 @@ fn audit_expression_child_insert_writes_only_new_subtree_and_parent_splice() {
     .unwrap();
 
     let snapshot = ws.snapshot();
-    let root = unit(&ws, &u).root.expect("root after insert");
-    let children = StlcTree::snapshot_children(&snapshot, root);
+    let root = unit(&ws, &u).root.clone().expect("root after insert");
+    let children = StlcTree::snapshot_children(&snapshot, root.clone());
+    let mut hashes = Vec::new();
+    for lineage in 1..=30_u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&u.to_string(), &mut hasher);
+        std::hash::Hash::hash(&lineage, &mut hasher);
+        std::hash::Hash::hash(&1_u8, &mut hasher);
+        std::hash::Hash::hash(&std::any::TypeId::of::<StlcTree>(), &mut hasher);
+        hashes.push((lineage, std::hash::Hasher::finish(&hasher)));
+    }
+    let trace_children = format!(
+        "before_root={before_root:?} before_children={before_children:?}; \
+         after_root={root:?} after_children={children:?} cases={:?} hashes={hashes:?}",
+        children
+            .iter()
+            .map(|child| StlcTree::snapshot_case(&snapshot, child.clone()))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         children.len(),
         2,
@@ -666,8 +805,9 @@ fn audit_expression_child_insert_writes_only_new_subtree_and_parent_splice() {
     );
     let after_graph = graph_dump(&ws);
     assert_eq!(
-        before_graph, after_graph,
-        "Nat := Nat + Nat types identically: no graph fact changes"
+        before_graph,
+        after_graph,
+        "Nat := Nat + Nat types identically: no graph fact changes; {trace_children}"
     );
 }
 
@@ -677,9 +817,9 @@ fn structural_top_level_insert_refreshes_root_order() {
     let mut ws = build(1);
     open(&mut ws, &u, "x : Nat := 0");
     let before_snapshot = ws.snapshot();
-    let before_root = unit(&ws, &u).root.expect("initial root");
+    let before_root = unit(&ws, &u).root.clone().expect("initial root");
     assert_eq!(
-        StlcTree::snapshot_children(&before_snapshot, before_root).len(),
+        StlcTree::snapshot_children(&before_snapshot, before_root.clone()).len(),
         1
     );
 
@@ -691,7 +831,7 @@ fn structural_top_level_insert_refreshes_root_order() {
     .unwrap();
 
     let snapshot = ws.snapshot();
-    let root = unit(&ws, &u).root.expect("root after insert");
+    let root = unit(&ws, &u).root.clone().expect("root after insert");
     let children = StlcTree::snapshot_children(&snapshot, root);
     assert_eq!(children.len(), 2, "root children: {children:?}");
 }
@@ -709,7 +849,11 @@ fn parser_delta_oracle_matches_slow_membership_diff() {
         let snapshots = snapshot
             .observe::<plingo::framework::parse::AstSnapshots<StlcDocument>>(u.to_string())
             .expect("ast snapshots present");
-        snapshots.snapshot().__live_record_ids().into_iter().collect()
+        snapshots
+            .snapshot()
+            .__live_record_ids()
+            .into_iter()
+            .collect()
     };
     let mut previous = live_ids(&ws);
 
@@ -739,14 +883,28 @@ fn parser_delta_oracle_matches_slow_membership_diff() {
     // Structural: rename a binder token (value-only, same shape).
     apply(
         &mut ws,
-        vec![SourceEdit::Delete { key: Span::new_uri(u.clone(), 1, 2).unwrap() },
-             SourceEdit::Insert { key: Span::point_uri(u.clone(), 1).unwrap(), value: "w".into() }],
+        vec![
+            SourceEdit::Delete {
+                key: Span::new_uri(u.clone(), 1, 2).unwrap(),
+            },
+            SourceEdit::Insert {
+                key: Span::point_uri(u.clone(), 1).unwrap(),
+                value: "w".into(),
+            },
+        ],
     );
     // Terminal-kind change inside first declaration body.
     apply(
         &mut ws,
-        vec![SourceEdit::Delete { key: Span::new_uri(u.clone(), 15, 16).unwrap() },
-             SourceEdit::Insert { key: Span::point_uri(u.clone(), 15).unwrap(), value: "true".into() }],
+        vec![
+            SourceEdit::Delete {
+                key: Span::new_uri(u.clone(), 15, 16).unwrap(),
+            },
+            SourceEdit::Insert {
+                key: Span::point_uri(u.clone(), 15).unwrap(),
+                value: "true".into(),
+            },
+        ],
     );
     // Insert a fresh declaration line.
     let end = {
@@ -765,11 +923,65 @@ fn parser_delta_oracle_matches_slow_membership_diff() {
     // Recovery-shaped garbage insertion.
     apply(
         &mut ws,
-        vec![SourceEdit::Insert { key: Span::point_uri(u.clone(), 2).unwrap(), value: "9".into() }],
+        vec![SourceEdit::Insert {
+            key: Span::point_uri(u.clone(), 2).unwrap(),
+            value: "9".into(),
+        }],
     );
     // Repair by deleting the garbage.
     apply(
         &mut ws,
-        vec![SourceEdit::Delete { key: Span::new_uri(u.clone(), 2, 3).unwrap() }],
+        vec![SourceEdit::Delete {
+            key: Span::new_uri(u.clone(), 2, 3).unwrap(),
+        }],
     );
+}
+
+
+
+#[test]
+fn audit_parser_orphan_fix_never_stales_tree_parents() {
+    let u = uri("audit-orphan-fix");
+    let mut ws = build(1);
+    open(&mut ws, &u, "x : Nat := 1\ny : Nat := x\nz : Nat := y\n");
+
+    let check = |ws: &Workspace| {
+        let snapshot = ws.snapshot();
+        let Some(unit) = snapshot
+            .observe::<TreeParseUnits<StlcDocument>>(u.to_string())
+        else {
+            return;
+        };
+        let Some(ref root) = unit.root else { return; };
+        let mut stack = vec![root.clone()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(node) = stack.pop() {
+            if !seen.insert(node.clone()) { continue; }
+            if node != *root {
+                let parent = StlcTree::observe_parent(node.clone())
+                    .expect("tree_parent fetch")
+                    .expect("non-root node has None tree_parent — orphan records leaked");
+                let _ = parent;
+            }
+            if let Ok(children) = StlcTree::observe_children(node.clone()) {
+                for child in children.iter().cloned() {
+                    stack.push(child);
+                }
+            }
+        }
+    };
+
+    check(&ws);
+    // Rename y -> w in the second declaration.
+    ws.edit(vec![
+        SourceEdit::Delete { key: Span::new_uri(u.clone(), 14, 15).unwrap() },
+        SourceEdit::Insert { key: Span::point_uri(u.clone(), 14).unwrap(), value: "w".to_owned() },
+    ]).unwrap();
+    check(&ws);
+    // Reverse.
+    ws.edit(vec![
+        SourceEdit::Delete { key: Span::new_uri(u.clone(), 14, 15).unwrap() },
+        SourceEdit::Insert { key: Span::point_uri(u.clone(), 14).unwrap(), value: "y".to_owned() },
+    ]).unwrap();
+    check(&ws);
 }

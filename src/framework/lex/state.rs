@@ -1,29 +1,21 @@
 //! Compiled lexer grammar and persistent per-document lexical roots.
 
-use std::{
-    collections::HashMap,
-    fmt,
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use fluent_uri::Uri;
 
 use crate::{
     framework::{
         lex::{
-            IncrementalLexStats, LexInterrupt, LexToken, LexerCreationError, LexerRoot,
-            LexerState, LexicalDocument, TokenOccurrenceId, TokenPatch,
             __macro_private::{BuildErrorToken, TokenMatcher},
-            build,
+            IncrementalLexStats, LexInterrupt, LexToken, LexerCreationError, LexerRoot, LexerState,
+            LexicalDocument, PersistentUriMap, TokenOccurrenceId, TokenPatch, build,
             lexed::document_id,
             mode::{State, StateInfo},
             token::{CompiledState, StateMatcher},
         },
-        parse::{
-            TokenData,
-            grammar::TerminalId,
-        },
-        source::{SourceDelta, SourceSplice},
+        parse::{TokenData, grammar::TerminalId},
+        source::{SourceDelta, SourceRevision, SourceRevisionId, SourceSplice},
     },
     utils::{PrettyDisplay, Span},
 };
@@ -50,6 +42,7 @@ fn validate_source_delta(
 ) -> Result<(), LexInterrupt> {
     let mut old_cursor = 0;
     let mut new_cursor = 0;
+    let mut expected_len = previous.len_bytes();
     for splice in splices {
         if splice.old_range.start < old_cursor
             || splice.new_range.start < new_cursor
@@ -66,8 +59,21 @@ fn validate_source_delta(
                 "source delta does not match adjacent source revisions".to_string(),
             ));
         }
+        expected_len = expected_len
+            .checked_sub(splice.old_range.len())
+            .and_then(|length| length.checked_add(splice.new_range.len()))
+            .ok_or_else(|| {
+                LexInterrupt::InternalError(
+                    "source delta length arithmetic overflowed".to_string(),
+                )
+            })?;
         old_cursor = splice.old_range.end;
         new_cursor = splice.new_range.end;
+    }
+    if expected_len != next.len_bytes() {
+        return Err(LexInterrupt::InternalError(
+            "source delta length does not match adjacent source revisions".to_string(),
+        ));
     }
     Ok(())
 }
@@ -150,8 +156,8 @@ impl<Root: LexerRoot + fmt::Display + Clone> PrettyDisplay<Lexer<Root>> for usiz
 
 #[derive(Debug)]
 pub struct LexerSnapshotState<Root: LexerRoot> {
-    pub(super) documents: HashMap<Uri<String>, Arc<LexicalDocument<Root>>>,
-    pub(super) incremental_stats: HashMap<Uri<String>, IncrementalLexStats>,
+    pub(super) documents: PersistentUriMap<Arc<LexicalDocument<Root>>>,
+    pub(super) incremental_stats: PersistentUriMap<IncrementalLexStats>,
 }
 
 impl<Root: LexerRoot> Clone for LexerSnapshotState<Root> {
@@ -166,8 +172,8 @@ impl<Root: LexerRoot> Clone for LexerSnapshotState<Root> {
 impl<Root: LexerRoot> Default for LexerSnapshotState<Root> {
     fn default() -> Self {
         Self {
-            documents: HashMap::new(),
-            incremental_stats: HashMap::new(),
+            documents: PersistentUriMap::default(),
+            incremental_stats: PersistentUriMap::default(),
         }
     }
 }
@@ -235,26 +241,56 @@ impl<Root: LexerRoot> Lexer<Root> {
     /// unchanged islands by pointer.
     pub(crate) fn derive_document(
         &mut self,
-        uri: Uri<String>,
-        source: Arc<ropey::Rope>,
-        delta: &SourceDelta,
+        revision: Arc<SourceRevision>,
     ) -> Result<LexDocument<Root>, LexInterrupt>
     where
         Root: Clone,
     {
+        let uri = revision.document.uri.as_ref().clone();
+        let source = Arc::clone(&revision.text);
+        let delta = &revision.delta;
         let mut next = (*self.latest).clone();
-        let root_state = self.state_id_of::<Root>().ok_or(LexInterrupt::MissingState)?;
-        let previous = next.documents.get(&uri).cloned().unwrap_or_else(|| {
-            Arc::new(LexicalDocument::empty(document_id(&uri.to_string()), root_state.clone()))
-        });
-        if previous.source.as_ref() == source.as_ref() {
-            return Ok(LexDocument {
-                document: previous.clone(),
-                patch: TokenPatch::unchanged(previous.structure_revision),
+        let root_state = self
+            .state_id_of::<Root>()
+            .ok_or(LexInterrupt::MissingState)?;
+        let mut previous = next.documents.get(&uri).cloned();
+        if let Some(current) = &previous {
+            if current.document.0 != revision.document.id.0 {
+                return Err(LexInterrupt::StaleSourceRevision {
+                    uri: uri.to_string(),
+                });
+            }
+            if revision.previous == Some(current.source_revision) {
+                if revision.id == current.source_revision {
+                    let structure = current.structure_revision;
+                    return Ok(LexDocument {
+                        document: Arc::clone(current),
+                        patch: TokenPatch::unchanged(structure),
+                    });
+                }
+            } else if revision.previous.is_none() {
+                // A document can be closed and reopened while the lexer
+                // machine still owns the old private snapshot until the
+                // same command's retraction phase.  A fresh load starts a
+                // new source lineage and must not be rejected as stale.
+                previous = None;
+            } else {
+                return Err(LexInterrupt::StaleSourceRevision {
+                    uri: uri.to_string(),
+                });
+            }
+        } else if revision.previous.is_some() {
+            return Err(LexInterrupt::StaleSourceRevision {
+                uri: uri.to_string(),
             });
         }
-
-        let initializing = !next.documents.contains_key(&uri);
+        let initializing = previous.is_none();
+        let previous = previous.unwrap_or_else(|| {
+            Arc::new(LexicalDocument::empty(
+                crate::framework::lex::StableDocumentId(revision.document.id.0),
+                root_state.clone(),
+            ))
+        });
         let replacement = SourceSplice {
             old_range: 0..previous.source.len_bytes(),
             new_range: 0..source.len_bytes(),
@@ -269,15 +305,13 @@ impl<Root: LexerRoot> Lexer<Root> {
         let mut document = (*previous).clone();
         let mut snapshot = previous.source.as_ref().clone();
         let mut cumulative_shift = 0isize;
-        let mut patches = crate::framework::lex::incremental::PatchBuilder::new(
-            document.structure_revision,
-        );
+        let mut patches =
+            crate::framework::lex::incremental::PatchBuilder::new(document.structure_revision);
         let mut total_relexed = 0usize;
         let mut total_reused = 0usize;
         let mut first_restart = None;
         let mut first_rank = None;
         let old_semantic_len = document.semantic.len();
-
         for splice in &splices {
             let start = translate_offset(splice.old_range.start, cumulative_shift)?;
             let end = translate_offset(splice.old_range.end, cumulative_shift)?;
@@ -293,12 +327,18 @@ impl<Root: LexerRoot> Lexer<Root> {
                 .lexical_rank_at_byte(evolving.old_range.start as u64);
             let restart = document.lexical_start(restart_rank);
             apply_evolving_splice(&mut snapshot, evolving.old_range.clone(), &inserted)?;
-            let local = self.relex_splice(
-                &uri,
-                &mut document,
-                Arc::new(snapshot.clone()),
-                &evolving,
-            )?;
+            // Each replay must see the source root represented by the
+            // document tape at that point. A single splice can reuse the
+            // authoritative revision root; multiple splices replay against
+            // the O(1)-cloned evolving root so later old coordinates are
+            // translated only by the preceding edits.
+            let replay_source = if splices.len() == 1 {
+                Arc::clone(&source)
+            } else {
+                Arc::new(snapshot.clone())
+            };
+            let local =
+                self.relex_splice(&uri, &mut document, replay_source, &evolving)?;
             total_relexed = total_relexed.saturating_add(local.replayed);
             total_reused = total_reused.saturating_add(local.reused);
             first_restart.get_or_insert(restart);
@@ -318,11 +358,22 @@ impl<Root: LexerRoot> Lexer<Root> {
                     )
                 })?;
         }
-        if snapshot != *source {
+        let expected_shift = isize::try_from(source.len_bytes())
+            .ok()
+            .and_then(|new_len| {
+                isize::try_from(previous.source.len_bytes())
+                    .ok()
+                    .and_then(|old_len| new_len.checked_sub(old_len))
+            })
+            .ok_or_else(|| {
+                LexInterrupt::InternalError("source length delta overflows isize".to_string())
+            })?;
+        if snapshot.len_bytes() != source.len_bytes() || cumulative_shift != expected_shift {
             return Err(LexInterrupt::InternalError(
-                "source delta did not produce the observed document text".to_string(),
+                "source delta length does not match the observed revision".to_string(),
             ));
         }
+        document.source = Arc::clone(&source);
         let patch = patches.freeze(document.structure_revision);
         if !patch.structure_unchanged() {
             // Same-terminal value and layout-only edits preserve parser
@@ -336,6 +387,7 @@ impl<Root: LexerRoot> Lexer<Root> {
                     .expect("semantic revision overflow"),
             );
         }
+        document.source_revision = revision.id;
         let document = Arc::new(document);
         next.incremental_stats.insert(
             uri.clone(),
@@ -367,16 +419,27 @@ impl<Root: LexerRoot> Lexer<Root> {
         self.compiled_states.iter().map(|state| &state.info)
     }
 
-    pub fn resolved_tokens(&self) -> impl ExactSizeIterator<Item = &[crate::framework::lex::ResolvedToken<Root>]> {
-        self.compiled_states.iter().map(|state| state.tokens.as_slice())
+    pub fn resolved_tokens(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &[crate::framework::lex::ResolvedToken<Root>]> {
+        self.compiled_states
+            .iter()
+            .map(|state| state.tokens.as_slice())
     }
 
-    pub fn tokens_in_state(&self, state: State<Root>) -> Option<&[crate::framework::lex::ResolvedToken<Root>]> {
-        self.compiled_states.get(state.id).map(|state| state.tokens.as_slice())
+    pub fn tokens_in_state(
+        &self,
+        state: State<Root>,
+    ) -> Option<&[crate::framework::lex::ResolvedToken<Root>]> {
+        self.compiled_states
+            .get(state.id)
+            .map(|state| state.tokens.as_slice())
     }
 
     pub(crate) fn state_matcher(&self, state: State<Root>) -> Option<&StateMatcher> {
-        self.compiled_states.get(state.id).map(|state| &state.matcher)
+        self.compiled_states
+            .get(state.id)
+            .map(|state| &state.matcher)
     }
 
     /// Explicit lookup façade. IDs are document-local, so the first matching
@@ -405,7 +468,12 @@ impl<Root: LexerRoot> Lexer<Root> {
             let rank = document.lexical_rank_of(occurrence)?;
             let start = document.lexical_start(rank);
             let token = document.lexical_at(rank)?;
-            Span::new_uri(uri.clone(), start, start.saturating_add(token.byte_len as usize)).ok()
+            Span::new_uri(
+                uri.clone(),
+                start,
+                start.saturating_add(token.byte_len as usize),
+            )
+            .ok()
         })
     }
 
@@ -424,7 +492,9 @@ impl<Root: LexerRoot> Lexer<Root> {
         let Some(document) = self.latest.documents.get(&span.uri) else {
             return Vec::new();
         };
-        let start_rank = document.lexical.lexical_rank_at_byte(span.range.start() as u64);
+        let start_rank = document
+            .lexical
+            .lexical_rank_at_byte(span.range.start() as u64);
         let mut data = Vec::new();
         for rank in start_rank..document.lexical.len() {
             let start = document.lexical_start(rank);
@@ -434,7 +504,9 @@ impl<Root: LexerRoot> Lexer<Root> {
             if start >= span.range.end() {
                 break;
             }
-            if token.is_semantic() && start.saturating_add(token.byte_len as usize) > span.range.start() {
+            if token.is_semantic()
+                && start.saturating_add(token.byte_len as usize) > span.range.start()
+            {
                 if let Some(semantic_rank) = document.semantic_rank_of(token.id)
                     && let Some(token_data) = document.token_data_at_semantic_rank(semantic_rank)
                 {

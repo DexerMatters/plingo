@@ -5,6 +5,7 @@
 //! remains a lazy snapshot façade for callers that explicitly request an
 //! ordered token stream; it is not an internal semantic dependency.
 
+use std::marker::PhantomData;
 use std::{
     collections::BTreeSet,
     ops::Deref,
@@ -20,13 +21,14 @@ use crate::{
         lex::{
             LexErrorInfo, LexToken, Lexer, LexerCreationError, LexerRoot, LexicalDocument,
             SemanticTokenDocument, SemanticTokenDocuments, TokenFact, TokenFactId, TokenFactKey,
-            TokenFacts, TokenLayoutDocument, TokenLayoutDocuments, TokenOccurrenceId,
+            TokenFacts, TokenLayoutDocument, TokenLayoutDocuments, TokenOccurrenceId, LexInterrupt,
         },
         source::SourceRevisions,
     },
     reactive::{
         Engine, Error, Result,
         kind::{Map, emit_patch, emit_view, observe_view},
+        peek_committed,
     },
 };
 
@@ -83,8 +85,11 @@ impl<T: LexerRoot + Clone + std::fmt::Debug> std::fmt::Debug for TokenList<T> {
 
 impl<T: LexerRoot + Clone + std::fmt::Debug> PartialEq for TokenList<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.document.layout_revision == other.document.layout_revision
-            && self.document.lexical.exact_eq(&other.document.lexical)
+        // Layout revision is the complete façade identity. The stable
+        // document namespace prevents two fresh documents at the same
+        // revision from comparing equal without scanning their tapes.
+        self.document.document == other.document.document
+            && self.document.layout_revision == other.document.layout_revision
     }
 }
 impl<T: LexerRoot + Clone + std::fmt::Debug> Eq for TokenList<T> {}
@@ -143,8 +148,8 @@ impl<T: LexerRoot + Clone + std::fmt::Debug> std::fmt::Debug for TokenErrors<T> 
 
 impl<T: LexerRoot + Clone + std::fmt::Debug> PartialEq for TokenErrors<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.document.layout_revision == other.document.layout_revision
-            && self.document.lexical.exact_eq(&other.document.lexical)
+        self.document.document == other.document.document
+            && self.document.layout_revision == other.document.layout_revision
     }
 }
 impl<T: LexerRoot + Clone + std::fmt::Debug> Eq for TokenErrors<T> {}
@@ -192,7 +197,10 @@ impl<R: LexerRoot + Clone + std::fmt::Debug> LexerMachine<R> {
     }
 }
 
-fn patch_token_facts<R>(document: &LexicalDocument<R>, patch: &crate::framework::lex::TokenPatch) -> Result<()>
+fn patch_token_facts<R>(
+    document: &LexicalDocument<R>,
+    patch: &crate::framework::lex::TokenPatch,
+) -> Result<()>
 where
     R: LexerRoot + Clone + std::fmt::Debug,
 {
@@ -265,15 +273,58 @@ where
         return emit_view::<TokenLayoutDocuments<R>>()?.remove(uri);
     };
 
+    let was_published = peek_committed::<TokenLayoutDocuments<R>>(uri.clone())?.is_some();
     let mut machine = machine.lock();
     let static_uri: Uri<String> = uri.parse().expect("workspace URI is valid");
+    let had_private_document = machine.lexer.latest.documents.contains_key(&static_uri);
     let derived = machine
         .lexer
-        .derive_document(static_uri, Arc::clone(revision.text()), &revision.delta)
-        .map_err(|error| Error::Internal(error.to_string().into()))?;
+        .derive_document(Arc::clone(&revision))
+        .map_err(|error| match error {
+            LexInterrupt::StaleSourceRevision { uri } => Error::Internal(
+                format!("stale source revision: {uri}").into(),
+            ),
+            error => Error::Internal(error.to_string().into()),
+        })?;
     let document = derived.document;
-    patch_token_facts(document.as_ref(), &derived.patch)?;
-
+    if std::env::var_os("PLINGO_TRACE_PARSER").is_some() {
+        eprintln!(
+            "lex publish uri={uri} source={:?} revision={} previous={:?} semantic_len={}",
+            revision.text,
+            revision.id.0,
+            revision.previous.map(|id| id.0),
+            document.semantic.len()
+        );
+    }
+    // A keyed child can retire without executing its body. If the lexer
+    // machine retained the private document across that membership gap,
+    // TokenFacts were retracted with the old invocation and the incremental
+    // patch alone may mention only changed occurrences. Republish the final
+    // semantic token domain before the new invocation commits.
+    if had_private_document && !was_published {
+        let facts = emit_patch::<TokenFacts<R>>()?;
+        for rank in 0..document.lexical.len() {
+            let Some(token) = document.lexical_at(rank) else {
+                continue;
+            };
+            if !token.is_semantic() {
+                continue;
+            }
+            facts.upsert(
+                TokenFactKey {
+                    document_id: document.document.0,
+                    token: TokenFactId::Source(token.id),
+                },
+                TokenFact {
+                    terminal_id: token.terminal_key(),
+                    fingerprint: token.fingerprint(),
+                    value: Arc::clone(&token.value),
+                },
+            )?;
+        }
+    } else {
+        patch_token_facts(document.as_ref(), &derived.patch)?;
+    }
     emit_view::<Tokens<R>>()?.insert(uri.clone(), TokenVec::new(Arc::clone(&document)))?;
     emit_view::<TokenLayoutDocuments<R>>()?.insert(
         uri.clone(),
@@ -303,21 +354,24 @@ pub fn install_lexer<R>(engine: &mut Engine) -> Result<()>
 where
     R: LexerRoot + Clone + std::fmt::Debug,
 {
-    let machine = Arc::new(Mutex::new(LexerMachine::new(
-        Lexer::new().map_err(|error: LexerCreationError| Error::Internal(error.to_string().into()))?,
-    )));
-    let planned = engine.plan(
-        {
-            let machine = Arc::clone(&machine);
-            move |()| {
-                let child_machine = Arc::clone(&machine);
-                crate::reactive::run_each_key::<SourceRevisions, _>(move |uri| {
-                    lex_document::<R>(Arc::clone(&child_machine), uri)
-                })
-            }
-        },
-        (),
-    )?;
-    let _running = engine.run(&planned)?;
+    let machine = Arc::new(Mutex::new(LexerMachine::new(Lexer::new().map_err(
+        |error: LexerCreationError| Error::Internal(error.to_string().into()),
+    )?)));
+    // Cut C: one first-class component keyed by source-revision membership.
+    engine.install_component_each_key::<LexerDefinition<R>, SourceRevisions, _>(move |uri| {
+        lex_document::<R>(Arc::clone(&machine), uri)
+    })?;
     Ok(())
+}
+
+/// Definition marker for the framework lexer stage (Cut C).
+#[doc(hidden)]
+pub struct LexerDefinition<R>(PhantomData<fn() -> R>);
+
+impl<R: LexerRoot + Clone + std::fmt::Debug> crate::reactive::component::ComponentDefinition
+    for LexerDefinition<R>
+{
+    fn __descriptor() -> &'static str {
+        "plingo::framework::lex::lexer"
+    }
 }

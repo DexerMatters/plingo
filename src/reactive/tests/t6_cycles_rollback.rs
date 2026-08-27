@@ -17,7 +17,8 @@ struct T6Source(Map<u64, i64>);
 struct T6Derived(Map<u64, i64>);
 
 fn cycle_a(_: ()) -> Result<i64> {
-    let value = observe_view::<T6B>()?.get(&())?
+    let value = observe_view::<T6B>()?
+        .get(&())?
         .map(|value| *value)
         .unwrap_or_default();
     emit_view::<T6A>()?.insert((), value + 1)?;
@@ -25,7 +26,8 @@ fn cycle_a(_: ()) -> Result<i64> {
 }
 
 fn cycle_b(_: ()) -> Result<i64> {
-    let value = observe_view::<T6A>()?.get(&())?
+    let value = observe_view::<T6A>()?
+        .get(&())?
         .map(|value| *value)
         .unwrap_or_default();
     emit_view::<T6B>()?.insert((), value + 1)?;
@@ -33,7 +35,8 @@ fn cycle_b(_: ()) -> Result<i64> {
 }
 
 fn failing(input: u64) -> Result<i64> {
-    let value = observe_view::<T6Source>()?.get(&input)?
+    let value = observe_view::<T6Source>()?
+        .get(&input)?
         .map(|value| *value)
         .unwrap_or_default();
     emit_view::<T6Derived>()?.insert(input, value)?;

@@ -1,3 +1,5 @@
+pub mod persistent_seq;
+pub use persistent_seq::{CountMeasure, PersistentSeq, SeqMeasure};
 use core::fmt;
 use std::{error::Error, fmt::Debug, sync::Arc};
 
@@ -270,10 +272,7 @@ impl Span {
         }
         // Interning bounds leaked allocations to one per distinct URI string
         // rather than one per Span construction (plan §6 interim improvement).
-        let uri: Uri<String> = uri
-            .to_string()
-            .parse()
-            .map_err(SpanError::InvalidUri)?;
+        let uri: Uri<String> = uri.to_string().parse().map_err(SpanError::InvalidUri)?;
         Ok(Span {
             uri,
             range: RangeOrPoint::from_range(start, end),

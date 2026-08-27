@@ -8,9 +8,9 @@
 //! (T3).
 
 use std::any::Any;
-use std::sync::Arc;
 use std::fmt::Debug;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 
 /// A materialized fact value: any `Send + Sync + Debug + PartialEq` type.
 ///

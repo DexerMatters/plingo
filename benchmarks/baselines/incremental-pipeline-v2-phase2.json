@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "recovery_policy_version": "RECOVERY_POLICY_VERSION@phase2",
+  "percentile_policy": "nearest_rank_v1",
+  "phase": "follow-up-phase2-components",
+  "date": "2026-08-27",
+  "status": "recorded",
+  "source_state": {
+    "git_head": "working-tree (follow-up Phase 2 component, ownership, and Cut E work)",
+    "profile": "release",
+    "toolchain": "stable-x86_64-unknown-linux-gnu",
+    "notes": "All production roots are component-backed; touched-key ownership, accepted-root reachability, exact child splices, and staged publisher drops are active. Generated Node and Scope ownership callsites compile across every target."
+  },
+  "verification": {
+    "cargo_check_release_all_targets": "pass",
+    "cargo_test_release_workspace_tests": "pass: 223 tests",
+    "cargo_test_release_workspace_bins_lib": "pass: 75 tests",
+    "full_suite_failures": 0,
+    "known_ignored_oracles": [
+      "declaration append/delete strict reverse remains owned by nested-run identity cut",
+      "tree-transform topology strict reverse remains owned by generated field/root drivers"
+    ]
+  },
+  "work": {
+    "component_definitions": { "status": "recorded", "value": "all production roots" },
+    "component_identity": { "status": "recorded", "value": "definition marker plus exact driving element" },
+    "ownership_domain": { "status": "recorded", "value": "touched-key patch journaling with retained ownership" },
+    "accepted_root_reachability": { "status": "recorded", "value": "persistent product and record reach counts" },
+    "child_splices": { "status": "recorded", "value": "rebuilt and retained-parent splice publication" },
+    "publisher_drop_staging": { "status": "recorded", "value": "canonical staged retractions" },
+    "candidate_writes": { "status": "recorded", "value": "touched keys only" }
+  },
+  "gate": {
+    "status": "pass",
+    "assertions": [
+      "all affected targets compile",
+      "workspace tests pass with zero failures",
+      "workspace binary and library tests pass with zero failures",
+      "component ownership callsites use typed generated identities",
+      "Cut E link publication probe passes"
+    ]
+  }
+}

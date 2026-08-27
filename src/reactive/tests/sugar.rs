@@ -26,7 +26,8 @@ struct Singleton(Map<(), i64>);
 struct DomainCount(Map<(), i64>);
 
 fn double(input: u64) -> Result<i64> {
-    let value = observe_view::<Source>()?.get(&input)?
+    let value = observe_view::<Source>()?
+        .get(&input)?
         .map(|value| *value)
         .unwrap_or_default();
     emit_view::<Doubled>()?.insert(input, value * 2)?;
@@ -42,7 +43,8 @@ fn conditional(input: u64) -> Result<i64> {
 }
 
 fn previous(input: u64) -> Result<i64> {
-    let prior = observe_view::<Source>()?.get_previous(&input)?
+    let prior = observe_view::<Source>()?
+        .get_previous(&input)?
         .map(|value| *value)
         .unwrap_or_default();
     emit_view::<Delta>()?.insert(input, prior)?;

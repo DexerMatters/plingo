@@ -38,6 +38,9 @@ pub enum Error {
     StaleSourceRevision {
         uri: String,
     },
+    DuplicateComponent {
+        descriptor: String,
+    },
     DuplicatePatchKey {
         view: String,
     },
@@ -81,6 +84,9 @@ impl fmt::Display for Error {
             Error::StaleSourceRevision { uri } => {
                 write!(f, "stale source revision for `{uri}`")
             }
+            Error::DuplicateComponent { descriptor } => {
+                write!(f, "component `{descriptor}` is already installed")
+            }
             Error::DuplicatePatchKey { view } => {
                 write!(f, "duplicate patch key on `{view}`")
             }
@@ -108,7 +114,7 @@ impl Error {
     ) -> Self {
         Error::ConflictingWrites {
             view: view.to_string(),
-            input: format!("{key:?}"),
+            input: format!("{key:?}#{}", key.hash_value()),
             functions: std::iter::once(writer.to_string())
                 .chain(existing_owners.iter().map(|(_, name)| name.clone()))
                 .collect(),

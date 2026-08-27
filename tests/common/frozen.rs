@@ -77,9 +77,7 @@ impl FixtureChecksums {
             json_512: super::fixtures::fnv1a(super::fixtures::json_array(512).as_bytes()),
             json_10k: super::fixtures::fnv1a(super::fixtures::json_array(10_000).as_bytes()),
             json_100k: super::fixtures::fnv1a(super::fixtures::json_array(100_000).as_bytes()),
-            stlc_1k: super::fixtures::fnv1a(
-                super::fixtures::stlc_program(180).as_bytes(),
-            ),
+            stlc_1k: super::fixtures::fnv1a(super::fixtures::stlc_program(180).as_bytes()),
         }
     }
 }

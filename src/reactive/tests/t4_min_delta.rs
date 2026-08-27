@@ -17,7 +17,8 @@ static RUNS_TWO: AtomicUsize = AtomicUsize::new(0);
 
 fn derive_one(input: u64) -> Result<i64> {
     RUNS_ONE.fetch_add(1, Ordering::SeqCst);
-    let value = observe_view::<T4Source>()?.get(&input)?
+    let value = observe_view::<T4Source>()?
+        .get(&input)?
         .map(|value| *value)
         .unwrap_or_default();
     emit_view::<T4Derived>()?.insert(input, value + 10)?;
@@ -26,7 +27,8 @@ fn derive_one(input: u64) -> Result<i64> {
 
 fn derive_two(input: u64) -> Result<i64> {
     RUNS_TWO.fetch_add(1, Ordering::SeqCst);
-    let value = observe_view::<T4Source>()?.get(&input)?
+    let value = observe_view::<T4Source>()?
+        .get(&input)?
         .map(|value| *value)
         .unwrap_or_default();
     emit_view::<T4Derived>()?.insert(input, value + 20)?;

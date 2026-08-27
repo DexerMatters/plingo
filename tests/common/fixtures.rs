@@ -5,11 +5,11 @@
 //! fixture is the reference scale for work gates; the STLC fixture covers a
 //! grammar with lexer modes, nested parser state, and newline-delimited
 //! declarations.
-use rand::rngs::StdRng;
-use rand::seq::IndexedRandom as _;
 use rand::Rng;
 use rand::RngExt;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand::seq::IndexedRandom as _;
 
 // ---------------------------------------------------------------------------
 // JSON fixtures
@@ -55,9 +55,7 @@ pub fn json_document(elements: usize) -> String {
         .map(|value| format!("\"k{value}\":{value}"))
         .collect::<Vec<_>>()
         .join(",");
-    format!(
-        r#"{{"head":12345,"items":{{{items}}},"middle":23456,"tail":34567}}"#
-    )
+    format!(r#"{{"head":12345,"items":{{{items}}},"middle":23456,"tail":34567}}"#)
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +86,11 @@ pub enum Mutation {
     /// Deletes the byte range.
     Delete { start: usize, len: usize },
     /// Replaces the byte range with `text` of equal byte length.
-    Substitute { start: usize, len: usize, text: String },
+    Substitute {
+        start: usize,
+        len: usize,
+        text: String,
+    },
     /// Truncates the document to `at` bytes.
     Truncate { at: usize },
 }
@@ -126,7 +128,10 @@ pub fn seeded_mutations(text: &str, seed: u64, count: usize) -> Vec<Mutation> {
                     len -= 1;
                 }
                 if len == 0 {
-                    Mutation::Insert { at, text: "1".into() }
+                    Mutation::Insert {
+                        at,
+                        text: "1".into(),
+                    }
                 } else {
                     current_len -= len;
                     Mutation::Delete { start: at, len }
@@ -138,7 +143,10 @@ pub fn seeded_mutations(text: &str, seed: u64, count: usize) -> Vec<Mutation> {
                     len -= 1;
                 }
                 if len == 0 {
-                    Mutation::Insert { at, text: "1".into() }
+                    Mutation::Insert {
+                        at,
+                        text: "1".into(),
+                    }
                 } else {
                     let replacement = substitute_pool[rng.random_range(0..substitute_pool.len())];
                     current_len = current_len - len + replacement.len();
@@ -197,7 +205,11 @@ pub fn apply_mutation(text: &mut String, mutation: &Mutation) {
         Mutation::Delete { start, len } => {
             text.replace_range(*start..start + len, "");
         }
-        Mutation::Substitute { start, len, text: replacement } => {
+        Mutation::Substitute {
+            start,
+            len,
+            text: replacement,
+        } => {
             let replacement = replacement.clone();
             text.replace_range(*start..start + len, &replacement);
         }
@@ -217,9 +229,7 @@ pub fn json_two_errors() -> String {
         .map(|value| format!("{value}"))
         .collect::<Vec<_>>()
         .join(",");
-    format!(
-        r#"{{"a":[{filler}],"b":{{"x":1 "y":2}},"c":[{filler}],"d":{{"p":true "q":false}}}}"#
-    )
+    format!(r#"{{"a":[{filler}],"b":{{"x":1 "y":2}},"c":[{filler}],"d":{{"p":true "q":false}}}}"#)
 }
 
 /// A JSON document whose tail container is unterminated: every edit before

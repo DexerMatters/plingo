@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::reactive::engine::EngineWork;
 use crate::reactive::error::{Error, Result};
+use crate::reactive::pathwork::{self, StructureKind};
 use crate::reactive::plain::record_command_metric;
 use crate::reactive::value::{KeyValue, Value};
 
@@ -42,10 +43,15 @@ pub(crate) trait TrieKey: Clone {
 // ---------------------------------------------------------------------------
 
 /// A persistent map from `u64` to `V`; writes path-copy, readers share.
+///
+/// Each instance carries its [`StructureKind`] so primitive operations
+/// attribute their physical work to the right per-structure counter page
+/// (follow-up plan §4 item 7). Counters live inside these operations.
 #[derive(Debug, Clone)]
 pub(crate) struct RadixMap<V> {
     root: Option<Arc<RadixNode<V>>>,
     len: usize,
+    kind: StructureKind,
 }
 
 #[derive(Debug)]
@@ -55,7 +61,10 @@ enum RadixNode<V> {
         bitmap: [u64; 4],
         children: Arc<[Arc<RadixNode<V>>]>,
     },
-    Leaf { key: u64, value: V },
+    Leaf {
+        key: u64,
+        value: V,
+    },
 }
 
 const RADIX_DEPTH: u32 = 8;
@@ -65,15 +74,24 @@ impl<V> Default for RadixMap<V> {
         Self {
             root: None,
             len: 0,
+            kind: StructureKind::ParserRadix,
         }
     }
 }
 
 impl<V> RadixMap<V> {
+    /// Constructs an empty map whose work attributes to `kind`.
+    pub(crate) fn with_kind(kind: StructureKind) -> Self {
+        Self {
+            root: None,
+            len: 0,
+            kind,
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.len
     }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -95,18 +113,25 @@ impl<V> RadixMap<V> {
     }
 
     pub(crate) fn get(&self, key: u64) -> Option<&V> {
+        pathwork::note_operation(self.kind);
         let mut node = self.root.as_deref()?;
-        let mut depth = 0;
+        let mut depth = 0u64;
         loop {
+            pathwork::note_visit(self.kind);
             match node {
-                RadixNode::Leaf { key: leaf_key, value } => {
+                RadixNode::Leaf {
+                    key: leaf_key,
+                    value,
+                } => {
+                    pathwork::note_comparison(self.kind);
+                    pathwork::note_depth(self.kind, depth + 1);
                     return (*leaf_key == key).then_some(value);
                 }
                 RadixNode::Branch { bitmap, children } => {
-                    if depth == RADIX_DEPTH {
+                    if depth as u32 == RADIX_DEPTH {
                         return None;
                     }
-                    let nibble = Self::nibble(key, depth);
+                    let nibble = Self::nibble(key, depth as u32);
                     let (word, bit) = Self::bitmap_index(nibble);
                     if bitmap[word] & bit == 0 {
                         return None;
@@ -121,18 +146,30 @@ impl<V> RadixMap<V> {
     /// Inserts or replaces one entry. Replacement keeps the stored key and
     /// swaps the payload.
     pub(crate) fn insert(&mut self, key: u64, value: V) {
+        pathwork::note_operation(self.kind);
         let replacing = self.get(key).is_some();
         let leaf = Arc::new(RadixNode::Leaf { key, value });
         match self.root.take() {
-            None => self.root = Some(leaf),
-            Some(root) => self.root = Some(Self::insert_at(root, leaf, key, 0)),
+            None => {
+                pathwork::note_create(self.kind);
+                self.root = Some(leaf);
+            }
+            Some(root) => self.root = Some(Self::insert_at(root, leaf, key, 0, self.kind)),
         }
         if !replacing {
             self.len += 1;
         }
     }
 
-    fn insert_at(node: Arc<RadixNode<V>>, leaf: Arc<RadixNode<V>>, key: u64, depth: u32) -> Arc<RadixNode<V>> {
+    fn insert_at(
+        node: Arc<RadixNode<V>>,
+        leaf: Arc<RadixNode<V>>,
+        key: u64,
+        depth: u32,
+        kind: StructureKind,
+    ) -> Arc<RadixNode<V>> {
+        pathwork::note_visit(kind);
+        pathwork::note_depth(kind, u64::from(depth) + 1);
         match node.as_ref() {
             RadixNode::Leaf { .. } => {
                 if depth == RADIX_DEPTH {
@@ -146,7 +183,7 @@ impl<V> RadixMap<V> {
                 if same_key {
                     return leaf;
                 }
-                Self::split_leaf(node, leaf, key, depth)
+                Self::split_leaf(node, leaf, key, depth, kind)
             }
             RadixNode::Branch { bitmap, children } => {
                 let nibble = Self::nibble(key, depth);
@@ -156,12 +193,13 @@ impl<V> RadixMap<V> {
                 let mut next_children: Vec<Arc<RadixNode<V>>> = children.to_vec();
                 if present {
                     let child = Arc::clone(&next_children[rank]);
-                    next_children[rank] = Self::insert_at(child, leaf, key, depth + 1);
+                    next_children[rank] = Self::insert_at(child, leaf, key, depth + 1, kind);
                 } else {
                     next_children.insert(rank, leaf);
                 }
                 let mut next_bitmap = *bitmap;
                 next_bitmap[word] |= bit;
+                pathwork::note_copy(kind);
                 Arc::new(RadixNode::Branch {
                     bitmap: next_bitmap,
                     children: next_children.into(),
@@ -170,7 +208,15 @@ impl<V> RadixMap<V> {
         }
     }
 
-    fn split_leaf(existing: Arc<RadixNode<V>>, new_leaf: Arc<RadixNode<V>>, new_key: u64, depth: u32) -> Arc<RadixNode<V>> {
+    fn split_leaf(
+        existing: Arc<RadixNode<V>>,
+        new_leaf: Arc<RadixNode<V>>,
+        new_key: u64,
+        depth: u32,
+        kind: StructureKind,
+    ) -> Arc<RadixNode<V>> {
+        pathwork::note_visit(kind);
+        pathwork::note_depth(kind, u64::from(depth) + 1);
         let existing_key = match existing.as_ref() {
             RadixNode::Leaf { key, .. } => *key,
             RadixNode::Branch { .. } => unreachable!("split on branch"),
@@ -183,11 +229,12 @@ impl<V> RadixMap<V> {
                 // Impossible for distinct 64-bit keys to agree on all bytes.
                 unreachable!("distinct keys collide across all nibbles")
             } else {
-                Self::split_leaf(existing, new_leaf, new_key, depth + 1)
+                Self::split_leaf(existing, new_leaf, new_key, depth + 1, kind)
             };
             let (word, bit) = Self::bitmap_index(new_nibble);
             let mut bitmap = [0u64; 4];
             bitmap[word] |= bit;
+            pathwork::note_create(kind);
             return Arc::new(RadixNode::Branch {
                 bitmap,
                 children: vec![deeper].into(),
@@ -204,17 +251,18 @@ impl<V> RadixMap<V> {
                 children.insert(rank, node);
             }
         }
+        pathwork::note_create(kind);
         Arc::new(RadixNode::Branch {
             bitmap,
             children: children.into(),
         })
     }
-
     pub(crate) fn remove(&mut self, key: u64) -> bool {
+        pathwork::note_operation(self.kind);
         let Some(root) = self.root.take() else {
             return false;
         };
-        match Self::remove_at(Arc::clone(&root), key, 0) {
+        match Self::remove_at(Arc::clone(&root), key, 0, self.kind) {
             RemoveResult::Missing => {
                 self.root = Some(root);
                 false
@@ -227,9 +275,17 @@ impl<V> RadixMap<V> {
         }
     }
 
-    fn remove_at(node: Arc<RadixNode<V>>, key: u64, depth: u32) -> RemoveResult<V> {
+    fn remove_at(
+        node: Arc<RadixNode<V>>,
+        key: u64,
+        depth: u32,
+        kind: StructureKind,
+    ) -> RemoveResult<V> {
+        pathwork::note_visit(kind);
+        pathwork::note_depth(kind, u64::from(depth) + 1);
         match node.as_ref() {
             RadixNode::Leaf { key: leaf_key, .. } => {
+                pathwork::note_comparison(kind);
                 if *leaf_key == key {
                     RemoveResult::Removed(None)
                 } else {
@@ -246,7 +302,7 @@ impl<V> RadixMap<V> {
                     return RemoveResult::Missing;
                 }
                 let rank = Self::rank(bitmap, word, bit);
-                match Self::remove_at(Arc::clone(&children[rank]), key, depth + 1) {
+                match Self::remove_at(Arc::clone(&children[rank]), key, depth + 1, kind) {
                     RemoveResult::Missing => RemoveResult::Missing,
                     RemoveResult::Removed(replacement) => {
                         let mut next_children: Vec<Arc<RadixNode<V>>> = children.to_vec();
@@ -260,11 +316,15 @@ impl<V> RadixMap<V> {
                         }
                         if next_children.is_empty() {
                             RemoveResult::Removed(None)
-                        } else if next_children.len() == 1 && matches!(next_children[0].as_ref(), RadixNode::Leaf { .. }) && depth > 0 {
+                        } else if next_children.len() == 1
+                            && matches!(next_children[0].as_ref(), RadixNode::Leaf { .. })
+                            && depth > 0
+                        {
                             // Collapse single-leaf branches back into their parent's slot.
                             let only = Arc::clone(&next_children[0]);
                             RemoveResult::Removed(Some(only))
                         } else {
+                            pathwork::note_copy(kind);
                             RemoveResult::Removed(Some(Arc::new(RadixNode::Branch {
                                 bitmap: next_bitmap,
                                 children: next_children.into(),
@@ -282,13 +342,15 @@ impl<V> RadixMap<V> {
         if let Some(root) = &self.root {
             stack.push(root.as_ref());
         }
-        std::iter::from_fn(move || loop {
-            let node = stack.pop()?;
-            match node {
-                RadixNode::Leaf { key, value } => return Some((*key, value)),
-                RadixNode::Branch { children, .. } => {
-                    for child in children.iter().rev() {
-                        stack.push(child.as_ref());
+        std::iter::from_fn(move || {
+            loop {
+                let node = stack.pop()?;
+                match node {
+                    RadixNode::Leaf { key, value } => return Some((*key, value)),
+                    RadixNode::Branch { children, .. } => {
+                        for child in children.iter().rev() {
+                            stack.push(child.as_ref());
+                        }
                     }
                 }
             }
@@ -309,11 +371,13 @@ enum RemoveResult<V> {
 ///
 /// Thirty-two-way branching on five-bit fragments; at most thirteen levels
 /// cover a `u64`. Keys sharing every fragment land in one terminal bucket
-/// that resolves by exact [`TrieKey::trie_eq`].
+/// that resolves by exact [`TrieKey::trie_eq`]. Each instance carries its
+/// [`StructureKind`] for per-structure work attribution.
 #[derive(Debug, Clone)]
 pub(crate) struct Hamt<K: TrieKey, V: Clone> {
     root: Option<Arc<HamtNode<K, V>>>,
     len: usize,
+    kind: StructureKind,
 }
 
 const HAMT_FRAGMENT_BITS: u32 = 5;
@@ -344,11 +408,21 @@ impl<K: TrieKey, V: Clone> Default for Hamt<K, V> {
         Self {
             root: None,
             len: 0,
+            kind: StructureKind::FactHamt,
         }
     }
 }
 
 impl<K: TrieKey, V: Clone> Hamt<K, V> {
+    /// Constructs an empty trie whose work attributes to `kind`.
+    pub(crate) fn with_kind(kind: StructureKind) -> Self {
+        Self {
+            root: None,
+            len: 0,
+            kind,
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -366,66 +440,94 @@ impl<K: TrieKey, V: Clone> Hamt<K, V> {
     }
 
     pub(crate) fn get(&self, key: &K) -> Option<&V> {
+        pathwork::note_operation(self.kind);
         let mut node = self.root.as_deref()?;
         let hash = key.trie_hash();
-        for depth in 0..HAMT_MAX_DEPTH {
+        let mut depth = 0u64;
+        loop {
+            pathwork::note_visit(self.kind);
             match node {
                 HamtNode::Bucket(entries) => {
-                    return entries
-                        .iter()
-                        .find(|entry| entry.hash == hash && entry.key.trie_eq(key))
-                        .map(|entry| &entry.value);
+                    let mut found = None;
+                    for entry in entries.iter() {
+                        if entry.hash == hash {
+                            pathwork::note_comparison(self.kind);
+                            if entry.key.trie_eq(key) {
+                                found = Some(&entry.value);
+                                break;
+                            }
+                        }
+                    }
+                    pathwork::note_depth(self.kind, depth + 1);
+                    return found;
                 }
                 HamtNode::Branch { bitmap, children } => {
-                    let fragment = Self::fragment(hash, depth);
+                    let fragment = Self::fragment(hash, depth as u32);
                     if bitmap & (1 << fragment) == 0 {
                         return None;
                     }
                     node = children[Self::rank(*bitmap, fragment)].as_ref();
+                    depth += 1;
                 }
             }
         }
-        None
     }
 
     /// Inserts or replaces one entry keyed by exact [`TrieKey::trie_eq`].
     pub(crate) fn insert(&mut self, key: K, value: V) {
+        pathwork::note_operation(self.kind);
         let replacing = self.get(&key).is_some();
         let hash = key.trie_hash();
         let entry = HamtEntry { hash, key, value };
         match self.root.take() {
             None => {
+                pathwork::note_create(self.kind);
                 self.root = Some(Arc::new(HamtNode::Bucket(vec![entry].into())));
             }
-            Some(root) => self.root = Some(Self::insert_at(root, entry, 0)),
+            Some(root) => self.root = Some(Self::insert_at(root, entry, 0, self.kind)),
         }
         if !replacing {
             self.len += 1;
         }
     }
 
-    fn replace_in_bucket(entries: &Arc<[HamtEntry<K, V>]>, entry: HamtEntry<K, V>) -> Option<Arc<HamtNode<K, V>>> {
+    fn replace_in_bucket(
+        entries: &Arc<[HamtEntry<K, V>]>,
+        entry: HamtEntry<K, V>,
+        kind: StructureKind,
+    ) -> Option<Arc<HamtNode<K, V>>> {
         let mut next: Vec<HamtEntry<K, V>> = entries.to_vec();
         for slot in next.iter_mut() {
-            if slot.hash == entry.hash && slot.key.trie_eq(&entry.key) {
-                *slot = entry;
-                return Some(Arc::new(HamtNode::Bucket(next.into())));
+            if slot.hash == entry.hash {
+                pathwork::note_comparison(kind);
+                if slot.key.trie_eq(&entry.key) {
+                    *slot = entry;
+                    return Some(Arc::new(HamtNode::Bucket(next.into())));
+                }
             }
         }
         None
     }
 
-    fn insert_at(node: Arc<HamtNode<K, V>>, entry: HamtEntry<K, V>, depth: u32) -> Arc<HamtNode<K, V>> {
+    fn insert_at(
+        node: Arc<HamtNode<K, V>>,
+        entry: HamtEntry<K, V>,
+        depth: u32,
+        kind: StructureKind,
+    ) -> Arc<HamtNode<K, V>> {
+        pathwork::note_visit(kind);
+        pathwork::note_depth(kind, u64::from(depth) + 1);
         match node.as_ref() {
             HamtNode::Bucket(entries) => {
                 // Exact-key replacement takes precedence over growth.
-                if let Some(replaced) = Self::replace_in_bucket(entries, entry.clone()) {
+                if let Some(replaced) = Self::replace_in_bucket(entries, entry.clone(), kind) {
                     return replaced;
                 }
                 let same_hash = entries.iter().all(|existing| existing.hash == entry.hash);
                 let mut next: Vec<HamtEntry<K, V>> = entries.to_vec();
                 if same_hash || depth + 1 >= HAMT_MAX_DEPTH {
                     next.push(entry);
+                    pathwork::note_copy(kind);
                     return Arc::new(HamtNode::Bucket(next.into()));
                 }
                 // Split the bucket across the differing fragment.
@@ -452,6 +554,7 @@ impl<K: TrieKey, V: Clone> Hamt<K, V> {
                 for (_, group) in groups {
                     children.push(Arc::new(HamtNode::Bucket(group.into())));
                 }
+                pathwork::note_create(kind);
                 Arc::new(HamtNode::Branch {
                     bitmap,
                     children: children.into(),
@@ -464,11 +567,12 @@ impl<K: TrieKey, V: Clone> Hamt<K, V> {
                 let mut next_children: Vec<Arc<HamtNode<K, V>>> = children.to_vec();
                 if present {
                     let child = Arc::clone(&next_children[rank]);
-                    next_children[rank] = Self::insert_at(child, entry, depth + 1);
+                    next_children[rank] = Self::insert_at(child, entry, depth + 1, kind);
                 } else {
                     next_children.insert(rank, Arc::new(HamtNode::Bucket(vec![entry].into())));
                 }
                 let next_bitmap = *bitmap | (1 << fragment);
+                pathwork::note_copy(kind);
                 Arc::new(HamtNode::Branch {
                     bitmap: next_bitmap,
                     children: next_children.into(),
@@ -478,10 +582,11 @@ impl<K: TrieKey, V: Clone> Hamt<K, V> {
     }
 
     pub(crate) fn remove(&mut self, key: &K) -> bool {
+        pathwork::note_operation(self.kind);
         let Some(root) = self.root.take() else {
             return false;
         };
-        match Self::remove_at(Arc::clone(&root), key, 0) {
+        match Self::remove_at(Arc::clone(&root), key, 0, self.kind) {
             RemoveOutcome::Missing => {
                 self.root = Some(root);
                 false
@@ -494,18 +599,33 @@ impl<K: TrieKey, V: Clone> Hamt<K, V> {
         }
     }
 
-    fn remove_at(node: Arc<HamtNode<K, V>>, key: &K, depth: u32) -> RemoveOutcome<K, V> {
+    fn remove_at(
+        node: Arc<HamtNode<K, V>>,
+        key: &K,
+        depth: u32,
+        kind: StructureKind,
+    ) -> RemoveOutcome<K, V> {
+        pathwork::note_visit(kind);
+        pathwork::note_depth(kind, u64::from(depth) + 1);
         let hash = key.trie_hash();
         match node.as_ref() {
             HamtNode::Bucket(entries) => {
-                let position = entries
-                    .iter()
-                    .position(|entry| entry.hash == hash && entry.key.trie_eq(key));
+                let mut position = None;
+                for (index, entry) in entries.iter().enumerate() {
+                    if entry.hash == hash {
+                        pathwork::note_comparison(kind);
+                        if entry.key.trie_eq(key) {
+                            position = Some(index);
+                            break;
+                        }
+                    }
+                }
                 match position {
                     None => RemoveOutcome::Missing,
                     Some(index) => {
                         let mut next: Vec<HamtEntry<K, V>> = entries.to_vec();
                         next.remove(index);
+                        pathwork::note_copy(kind);
                         RemoveOutcome::Removed(
                             (!next.is_empty()).then(|| Arc::new(HamtNode::Bucket(next.into()))),
                         )
@@ -518,7 +638,7 @@ impl<K: TrieKey, V: Clone> Hamt<K, V> {
                     return RemoveOutcome::Missing;
                 }
                 let rank = Self::rank(*bitmap, fragment);
-                match Self::remove_at(Arc::clone(&children[rank]), key, depth + 1) {
+                match Self::remove_at(Arc::clone(&children[rank]), key, depth + 1, kind) {
                     RemoveOutcome::Missing => RemoveOutcome::Missing,
                     RemoveOutcome::Removed(replacement) => {
                         let mut next_bitmap = *bitmap;
@@ -542,6 +662,7 @@ impl<K: TrieKey, V: Clone> Hamt<K, V> {
                                 let only = Arc::clone(&next_children[0]);
                                 return RemoveOutcome::Removed(Some(only));
                             }
+                            pathwork::note_copy(kind);
                             RemoveOutcome::Removed(Some(Arc::new(HamtNode::Branch {
                                 bitmap: next_bitmap,
                                 children: next_children.into(),
@@ -556,32 +677,40 @@ impl<K: TrieKey, V: Clone> Hamt<K, V> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         enum Frame<'a, K: TrieKey, V: Clone> {
             Node(&'a HamtNode<K, V>),
-            Bucket { entries: &'a [HamtEntry<K, V>], next: usize },
+            Bucket {
+                entries: &'a [HamtEntry<K, V>],
+                next: usize,
+            },
         }
         let mut stack: Vec<Frame<K, V>> = Vec::new();
         // Frames borrow shared nodes; no cloning occurs during iteration.
         if let Some(root) = &self.root {
             stack.push(Frame::Node(root.as_ref()));
         }
-        std::iter::from_fn(move || loop {
-            let mut frame = stack.pop()?;
+        std::iter::from_fn(move || {
             loop {
-                match frame {
-                    Frame::Node(HamtNode::Branch { children, .. }) => {
-                        for child in children.iter().rev() {
-                            stack.push(Frame::Node(child.as_ref()));
-                        }
-                        break;
-                    }
-                    Frame::Node(HamtNode::Bucket(entries)) => {
-                        frame = Frame::Bucket { entries, next: 0 };
-                    }
-                    Frame::Bucket { entries, next } => {
-                        if next >= entries.len() {
+                let mut frame = stack.pop()?;
+                loop {
+                    match frame {
+                        Frame::Node(HamtNode::Branch { children, .. }) => {
+                            for child in children.iter().rev() {
+                                stack.push(Frame::Node(child.as_ref()));
+                            }
                             break;
                         }
-                        stack.push(Frame::Bucket { entries, next: next + 1 });
-                        return Some((&entries[next].key, &entries[next].value));
+                        Frame::Node(HamtNode::Bucket(entries)) => {
+                            frame = Frame::Bucket { entries, next: 0 };
+                        }
+                        Frame::Bucket { entries, next } => {
+                            if next >= entries.len() {
+                                break;
+                            }
+                            stack.push(Frame::Bucket {
+                                entries,
+                                next: next + 1,
+                            });
+                            return Some((&entries[next].key, &entries[next].value));
+                        }
                     }
                 }
             }
@@ -621,9 +750,7 @@ impl ErasedFactKey {
 
 impl PartialEq for ErasedFactKey {
     fn eq(&self, other: &Self) -> bool {
-        self.view == other.view
-            && self.hash == other.hash
-            && self.key.eq_value(other.key.as_ref())
+        self.view == other.view && self.hash == other.hash && self.key.eq_value(other.key.as_ref())
     }
 }
 impl Eq for ErasedFactKey {}
@@ -823,7 +950,10 @@ mod tests {
         }
         assert_eq!(map.len(), 4_000);
         for index in 0..4_000u64 {
-            assert_eq!(map.get(&probe_key(index, splitmix(index))), Some(&-(index as i64)));
+            assert_eq!(
+                map.get(&probe_key(index, splitmix(index))),
+                Some(&-(index as i64))
+            );
         }
         // A different hash makes a different key even when trie_eq would
         // compare equal: canonical cached hashes are part of the address.
@@ -977,7 +1107,8 @@ impl PlainState {
     }
 
     pub(crate) fn slot(&self, view: TypeId, key: &dyn KeyValue) -> Option<&FactSlot> {
-        self.slot_index(view, key).and_then(|index| self.slots[index].as_ref())
+        self.slot_index(view, key)
+            .and_then(|index| self.slots[index].as_ref())
     }
 
     pub(crate) fn read(&self, view: TypeId, key: &dyn KeyValue) -> Option<Arc<dyn Value>> {
@@ -1145,7 +1276,11 @@ impl FactJournal {
 
     /// The staged final slot if the command already touched this key,
     /// otherwise `None` (which also covers "touched and now absent").
-    fn staged_slot<'a>(&'a self, state: &'a PlainState, key: &ErasedFactKey) -> Option<&'a Option<FactSlot>> {
+    fn staged_slot<'a>(
+        &'a self,
+        state: &'a PlainState,
+        key: &ErasedFactKey,
+    ) -> Option<&'a Option<FactSlot>> {
         match self.position(key) {
             Some(position) => Some(&self.entries[position].staged),
             None => state
@@ -1217,13 +1352,26 @@ impl FactJournal {
                 })
                 .map(|mut slot| {
                     slot.fact.writers.insert(writer);
-                    slot.fact.owner_names.push((writer, writer_name.to_string()));
+                    slot.fact
+                        .owner_names
+                        .push((writer, writer_name.to_string()));
                     slot
                 })
             }
             Some(mut slot) => {
                 let owner_present = slot.fact.writers.contains(writer);
-                                if !owner_present && !(slot.fact.shared && shareable) {
+                if !owner_present && !(slot.fact.shared && shareable) {
+                    if std::env::var_os("PLINGO_TRACE_CONFLICT").is_some() {
+                        eprintln!(
+                            "conflict-owners view={} key_hash={} writer={} existing={:?} shared={} shareable={}",
+                            name,
+                            key.hash_value(),
+                            writer_name,
+                            slot.fact.owner_names,
+                            slot.fact.shared,
+                            shareable
+                        );
+                    }
                     return Err(Error::conflicting_write(
                         name,
                         key.as_ref(),
@@ -1236,7 +1384,18 @@ impl FactJournal {
                         return Ok(None);
                     };
                     if !slot.fact.value.value_eq(next.as_ref()) {
-                                                return Err(Error::conflicting_write(
+                        if std::env::var_os("PLINGO_TRACE_CONFLICT").is_some() {
+                            eprintln!(
+                                "conflict-value view={} key_hash={} writer={} existing={:?} shared={} shareable={}",
+                                name,
+                                key.hash_value(),
+                                writer_name,
+                                slot.fact.owner_names,
+                                slot.fact.shared,
+                                shareable
+                            );
+                        }
+                        return Err(Error::conflicting_write(
                             name,
                             key.as_ref(),
                             writer_name,
@@ -1244,7 +1403,9 @@ impl FactJournal {
                         ));
                     }
                     slot.fact.writers.insert(writer);
-                    slot.fact.owner_names.push((writer, writer_name.to_string()));
+                    slot.fact
+                        .owner_names
+                        .push((writer, writer_name.to_string()));
                     Some(slot)
                 } else {
                     let changed = match &value {
@@ -1254,7 +1415,8 @@ impl FactJournal {
                     if !changed {
                         return Ok(None);
                     }
-                    if slot.fact.shared && slot.fact.writers.len() > 1
+                    if slot.fact.shared
+                        && slot.fact.writers.len() > 1
                         && let Some(next) = value.as_ref()
                         && !slot.fact.value.value_eq(next.as_ref())
                     {
@@ -1288,7 +1450,11 @@ impl FactJournal {
 
     /// Installs one pre-built slot (root promotion): value conflicts fail
     /// with both owner lists; equal values union writers.
-    pub(crate) fn install(&mut self, state: &mut PlainState, slot: FactSlot) -> Result<Option<FactChange>> {
+    pub(crate) fn install(
+        &mut self,
+        state: &mut PlainState,
+        slot: FactSlot,
+    ) -> Result<Option<FactChange>> {
         let erased = ErasedFactKey::new(slot.fact.view, Arc::clone(&slot.fact.key));
         record_command_metric::<EngineWork>(|work| {
             work.fact_writes += 1;
@@ -1303,7 +1469,16 @@ impl FactJournal {
                 if !existing.fact.value.value_eq(slot.fact.value.as_ref())
                     || existing.fact.shared != slot.fact.shared
                 {
-                                        return Err(Error::ConflictingWrites {
+                    if std::env::var_os("PLINGO_TRACE_CONFLICT").is_some() {
+                        eprintln!(
+                            "conflict-install view={} key_hash={} new={:?} existing={:?}",
+                            slot.fact.name,
+                            slot.fact.key.hash_value(),
+                            slot.fact.owner_names,
+                            existing.fact.owner_names
+                        );
+                    }
+                    return Err(Error::ConflictingWrites {
                         view: slot.fact.name.to_string(),
                         input: format!("{:?}", slot.fact.key),
                         functions: slot
@@ -1311,7 +1486,13 @@ impl FactJournal {
                             .owner_names
                             .iter()
                             .map(|(_, name)| name.clone())
-                            .chain(existing.fact.owner_names.iter().map(|(_, name)| name.clone()))
+                            .chain(
+                                existing
+                                    .fact
+                                    .owner_names
+                                    .iter()
+                                    .map(|(_, name)| name.clone()),
+                            )
                             .collect(),
                     });
                 }
@@ -1319,11 +1500,8 @@ impl FactJournal {
                 for owner in slot.fact.writers.iter() {
                     if !merged.fact.writers.contains(owner) {
                         merged.fact.writers.insert(owner);
-                        if let Some((_, name)) = slot
-                            .fact
-                            .owner_names
-                            .iter()
-                            .find(|(id, _)| *id == owner)
+                        if let Some((_, name)) =
+                            slot.fact.owner_names.iter().find(|(id, _)| *id == owner)
                         {
                             merged.fact.owner_names.push((owner, name.clone()));
                         }
@@ -1356,15 +1534,24 @@ impl FactJournal {
             return Ok(None);
         };
         if !slot.fact.writers.contains(writer) {
-                        if slot.fact.shared {
+            if slot.fact.shared {
                 return Ok(None);
             }
-            return Err(Error::conflicting_write(
-                name,
-                erased.key.as_ref(),
-                writer_name,
-                &slot.fact.owner_names,
-            ));
+            // The key was re-owned by another writer in this command (plan
+            // §23.5 "edge removal/move retires the old expectation before
+            // the new edge settles"). The new owner's write supersedes the
+            // retired writer's; the retraction is moot, not an error.
+            if std::env::var_os("PLINGO_TRACE_CONFLICT").is_some() {
+                eprintln!(
+                    "conflict-retract-superseded view={} key_hash={} writer={} existing={:?} shared={}",
+                    name,
+                    erased.key.hash_value(),
+                    writer_name,
+                    slot.fact.owner_names,
+                    slot.fact.shared
+                );
+            }
+            return Ok(None);
         }
         if slot.fact.shared && slot.fact.writers.len() > 1 {
             slot.fact.writers.remove(writer);
@@ -1374,7 +1561,11 @@ impl FactJournal {
         self.stage_absent(state, erased)
     }
 
-    fn stage_absent(&mut self, state: &mut PlainState, erased: ErasedFactKey) -> Result<Option<FactChange>> {
+    fn stage_absent(
+        &mut self,
+        state: &mut PlainState,
+        erased: ErasedFactKey,
+    ) -> Result<Option<FactChange>> {
         self.stage(state, erased, None)
     }
 
@@ -1399,10 +1590,8 @@ impl FactJournal {
             }
         };
 
-        let presence_changed = matches!(
-            (&previous_staged, &next),
-            (None, Some(_)) | (Some(_), None)
-        );
+        let presence_changed =
+            matches!((&previous_staged, &next), (None, Some(_)) | (Some(_), None));
         let next = match (previous_staged.is_none(), next) {
             (true, Some(mut slot)) if slot.ordinal == 0 => {
                 slot.ordinal = state.next_ordinal;
@@ -1484,7 +1673,8 @@ impl FactJournal {
                     // Restore the exact pre-command slot content. The slot
                     // may have been freed meanwhile; put_slot reindexes and
                     // never allocates a new ordinal.
-                    if let Some(index) = state.slot_index(first.fact.view, first.fact.key.as_ref()) {
+                    if let Some(index) = state.slot_index(first.fact.view, first.fact.key.as_ref())
+                    {
                         state.put_slot(index, Some(first));
                     } else {
                         // Slot index gone (freed and possibly reused by a
@@ -1493,13 +1683,10 @@ impl FactJournal {
                         // rollback rewinds first). Reinsert preserving the
                         // original ordinal.
                         let mut restored = first;
-                        let index = state
-                            .free
-                            .pop()
-                            .unwrap_or_else(|| {
-                                state.slots.push(None);
-                                state.slots.len() - 1
-                            });
+                        let index = state.free.pop().unwrap_or_else(|| {
+                            state.slots.push(None);
+                            state.slots.len() - 1
+                        });
                         let ordinal = restored.ordinal;
                         restored.ordinal = ordinal;
                         state.slots[index] = Some(restored);
@@ -1534,7 +1721,10 @@ impl FactJournal {
     }
 
     /// Previous-epoch inputs of one view: live keys adjusted by the journal.
-    pub(crate) fn previous_inputs<V: crate::reactive::view::View>(&self, state: &PlainState) -> Vec<V::Input> {
+    pub(crate) fn previous_inputs<V: crate::reactive::view::View>(
+        &self,
+        state: &PlainState,
+    ) -> Vec<V::Input> {
         let mut keys = state.inputs::<V>();
         for entry in &self.entries {
             if entry.key.view != TypeId::of::<V>() {
@@ -1575,10 +1765,21 @@ impl std::fmt::Debug for SnapshotEntry {
 /// One view's committed fact index: exact-key lookups through the HAMT,
 /// ordinal-ordered enumeration through the radix map. Values are frozen
 /// `Arc` clones; later commits path-copy new roots.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct SnapshotView {
+    name: &'static str,
     by_key: Hamt<SnapshotKey, u64>,
     by_ordinal: RadixMap<SnapshotEntry>,
+}
+
+impl Default for SnapshotView {
+    fn default() -> Self {
+        Self {
+            name: "",
+            by_key: Hamt::with_kind(StructureKind::FactHamt),
+            by_ordinal: RadixMap::with_kind(StructureKind::FactHamt),
+        }
+    }
 }
 
 /// A key inside one committed view (the view is the containing map).
@@ -1609,11 +1810,17 @@ impl TrieKey for SnapshotKey {
 
 impl std::fmt::Debug for SnapshotView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SnapshotView").field("len", &self.by_ordinal.len()).finish()
+        f.debug_struct("SnapshotView")
+            .field("len", &self.by_ordinal.len())
+            .finish()
     }
 }
 
 impl SnapshotView {
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+
     pub(crate) fn lookup(&self, key: &dyn KeyValue) -> Option<&SnapshotEntry> {
         let ordinal = *self.by_key.get(&SnapshotKey::new(key))?;
         self.by_ordinal.get(ordinal)
@@ -1683,17 +1890,20 @@ impl SnapshotRoot {
         }
         let mut views = (*self.views).clone();
         for delta in entries {
-            let view_arc = views
-                .entry(delta.view)
-                .or_default()
-                .clone();
+            let view_arc = views.entry(delta.view).or_default().clone();
             let mut next = (*view_arc).clone();
+            if !delta.view_name.is_empty() {
+                next.name = delta.view_name;
+            }
             match &delta.final_entry {
                 Some((ordinal, key, value)) => {
-                    next.insert(*ordinal, SnapshotEntry {
-                        key: Arc::clone(key),
-                        value: Arc::clone(value),
-                    });
+                    next.insert(
+                        *ordinal,
+                        SnapshotEntry {
+                            key: Arc::clone(key),
+                            value: Arc::clone(value),
+                        },
+                    );
                 }
                 None => next.remove(delta.key.as_ref()),
             }
@@ -1706,6 +1916,7 @@ impl SnapshotRoot {
 /// One key's committed delta extracted from the journal at commit.
 pub(crate) struct JournalDelta {
     pub view: TypeId,
+    pub view_name: &'static str,
     pub key: Arc<dyn KeyValue>,
     /// `Some((ordinal, key, value))` when present after commit.
     pub final_entry: Option<(u64, Arc<dyn KeyValue>, Arc<dyn Value>)>,
@@ -1736,8 +1947,15 @@ impl FactJournal {
                         Arc::clone(&slot.fact.value),
                     )
                 });
+                let view_name = entry
+                    .staged
+                    .as_ref()
+                    .or(entry.first.as_ref())
+                    .map(|slot| slot.fact.name)
+                    .unwrap_or("");
                 Some(JournalDelta {
                     view: entry.key.view,
+                    view_name,
                     key: Arc::clone(&entry.key.key),
                     final_entry,
                 })
@@ -1782,7 +2000,9 @@ impl DependencyIndex {
     }
 
     fn insert_row(rows: &mut Vec<DepRow>, row: DepRow) {
-        if rows.iter().any(|existing| existing.invocation == row.invocation && existing.key_hash == row.key_hash) {
+        if rows.iter().any(|existing| {
+            existing.invocation == row.invocation && existing.key_hash == row.key_hash
+        }) {
             return;
         }
         rows.push(row);
@@ -1896,7 +2116,10 @@ impl DependencyIndex {
             if let Some(key) = key {
                 if let Some(rows) = self.current_exact.get(&dep_hash(*view, key.as_ref())) {
                     for row in rows {
-                        if row.exact_key.as_ref().is_some_and(|stored| stored.eq_value(key.as_ref()))
+                        if row
+                            .exact_key
+                            .as_ref()
+                            .is_some_and(|stored| stored.eq_value(key.as_ref()))
                             && seen.insert(row.invocation)
                         {
                             visit(row.invocation);
@@ -1939,7 +2162,10 @@ impl DependencyIndex {
             if let Some(key) = key {
                 if let Some(rows) = self.previous_exact.get(&dep_hash(*view, key.as_ref())) {
                     for row in rows {
-                        if row.exact_key.as_ref().is_some_and(|stored| stored.eq_value(key.as_ref()))
+                        if row
+                            .exact_key
+                            .as_ref()
+                            .is_some_and(|stored| stored.eq_value(key.as_ref()))
                             && seen.insert(row.invocation)
                         {
                             visit(row.invocation);
@@ -1971,12 +2197,95 @@ impl DependencyIndex {
     }
 }
 
+impl DependencyIndex {
+    /// Liveness audit (follow-up plan §4 item 12): whether one
+    /// invocation's exact/wildcard/keyset row exists in the expected
+    /// temporal half of the reverse index.
+    pub(crate) fn contains_row(
+        &self,
+        view: TypeId,
+        key: Option<&Arc<dyn KeyValue>>,
+        temporal: bool,
+        keyset: bool,
+        invocation: u64,
+    ) -> bool {
+        match (key, keyset) {
+            (Some(key), _) => {
+                let map = if temporal {
+                    &self.previous_exact
+                } else {
+                    &self.current_exact
+                };
+                map.get(&dep_hash(view, key.as_ref()))
+                    .is_some_and(|rows| rows.iter().any(|row| row.invocation == invocation))
+            }
+            (None, true) => {
+                let map = if temporal {
+                    &self.previous_keyset
+                } else {
+                    &self.current_keyset
+                };
+                map.get(&view)
+                    .is_some_and(|rows| rows.contains(&invocation))
+            }
+            (None, false) => {
+                let map = if temporal {
+                    &self.previous_wildcard
+                } else {
+                    &self.current_wildcard
+                };
+                map.get(&view)
+                    .is_some_and(|rows| rows.contains(&invocation))
+            }
+        }
+    }
+
+    /// Iterates every reverse-index row for auditing: `(temporal, kind,
+    /// view, invocation)` where kind is 0=exact, 1=keyset, 2=wildcard.
+    pub(crate) fn iter_rows(&self) -> impl Iterator<Item = (bool, u8, TypeId, u64)> + '_ {
+        let exact = self.current_exact.iter().flat_map(|((_, view), rows)| {
+            rows.iter()
+                .map(move |row| (false, 0u8, *view, row.invocation))
+        });
+        let previous_exact = self.previous_exact.iter().flat_map(|((_, view), rows)| {
+            rows.iter()
+                .map(move |row| (true, 0u8, *view, row.invocation))
+        });
+        let keyset = self
+            .current_keyset
+            .iter()
+            .flat_map(|(view, rows)| rows.iter().map(move |row| (false, 1u8, *view, *row)));
+        let previous_keyset = self
+            .previous_keyset
+            .iter()
+            .flat_map(|(view, rows)| rows.iter().map(move |row| (true, 1u8, *view, *row)));
+        let wildcard = self
+            .current_wildcard
+            .iter()
+            .flat_map(|(view, rows)| rows.iter().map(move |row| (false, 2u8, *view, *row)));
+        let previous_wildcard = self
+            .previous_wildcard
+            .iter()
+            .flat_map(|(view, rows)| rows.iter().map(move |row| (true, 2u8, *view, *row)));
+        exact
+            .chain(previous_exact)
+            .chain(keyset)
+            .chain(previous_keyset)
+            .chain(wildcard)
+            .chain(previous_wildcard)
+    }
+}
+
 fn remove_invocation_rows(rows: &mut Vec<u64>, invocation: u64) {
     rows.retain(|candidate| *candidate != invocation);
 }
 
-fn current_wild<'a>(map: &'a mut HashMap<TypeId, Vec<u64>>) -> &'a mut HashMap<TypeId, Vec<u64>> { map }
-fn previous_wild<'a>(map: &'a mut HashMap<TypeId, Vec<u64>>) -> &'a mut HashMap<TypeId, Vec<u64>> { map }
+fn current_wild<'a>(map: &'a mut HashMap<TypeId, Vec<u64>>) -> &'a mut HashMap<TypeId, Vec<u64>> {
+    map
+}
+fn previous_wild<'a>(map: &'a mut HashMap<TypeId, Vec<u64>>) -> &'a mut HashMap<TypeId, Vec<u64>> {
+    map
+}
 
 /// Deterministic dirty ordering: root installation ordinal then invocation
 /// ordinal, both monotonic and never hash-derived.
@@ -1997,18 +2306,21 @@ pub(crate) struct DirtyQueue {
 
 impl DirtyQueue {
     pub(crate) fn insert(&mut self, key: DirtyKey) {
+        pathwork::note_operation(StructureKind::DirtyQueue);
         if self.present.insert(key.invocation) {
             self.ordered.insert(key);
         }
     }
 
     pub(crate) fn pop(&mut self) -> Option<DirtyKey> {
+        pathwork::note_operation(StructureKind::DirtyQueue);
         let key = self.ordered.pop_first()?;
         self.present.remove(&key.invocation);
         Some(key)
     }
 
     pub(crate) fn clear(&mut self) {
+        pathwork::note_operation(StructureKind::DirtyQueue);
         self.ordered.clear();
         self.present.clear();
     }
@@ -2022,299 +2334,132 @@ impl DirtyQueue {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Persistent sequence (plan §5.5)
-// ---------------------------------------------------------------------------
-
-/// A clone-cheap persistent sequence: inline storage up to eight values,
-/// then a path-copying 32-way vector. Indexed lookup, iteration, and an
-/// explicitly allocating `to_vec`; appends cost `O(log n)` past the inline
-/// window (plan §5.5).
-#[derive(Debug, Clone)]
-pub(crate) enum PersistentSeq<T: Clone> {
-    Inline(ArrayVec8<T>),
-    Tree { len: usize, root: Arc<SeqBranch<T>> },
-}
-
-#[derive(Debug)]
-pub(crate) struct ArrayVec8<T> {
-    values: [Option<T>; 8],
-    len: u8,
-}
-
-impl<T: Clone> Default for ArrayVec8<T> {
-    fn default() -> Self {
-        Self { values: std::array::from_fn(|_| None), len: 0 }
-    }
-}
-
-impl<T: Clone> Clone for ArrayVec8<T> {
-    fn clone(&self) -> Self {
-        Self { values: std::array::from_fn(|index| self.values[index].clone()), len: self.len }
-    }
-}
-
-const SEQ_LEAF_CAP: usize = 32;
-const SEQ_BRANCH: usize = 32;
-
-#[derive(Debug, Clone)]
-pub(crate) struct SeqBranch<T> {
-    children: Vec<Arc<SeqNode<T>>>,
-    /// 1 = children are leaves; each extra level multiplies capacity.
-    height: u8,
-}
-
-#[derive(Debug, Clone)]
-enum SeqNode<T> {
-    Leaf(Arc<[T]>),
-    Branch(Arc<SeqBranch<T>>),
-}
-
-impl<T: Clone> Default for PersistentSeq<T> {
-    fn default() -> Self {
-        PersistentSeq::Inline(ArrayVec8::default())
-    }
-}
-
-impl<T: Clone> PersistentSeq<T> {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            PersistentSeq::Inline(inline) => inline.len as usize,
-            PersistentSeq::Tree { len, .. } => *len,
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub(crate) fn push(&mut self, value: T) {
-        match self {
-            PersistentSeq::Inline(inline) => {
-                if (inline.len as usize) < 8 {
-                    inline.values[inline.len as usize] = Some(value);
-                    inline.len += 1;
-                    return;
-                }
-                let spilled: Vec<T> = inline
-                    .values
-                    .iter()
-                    .take(inline.len as usize)
-                    .filter_map(|slot| slot.clone())
-                    .chain(std::iter::once(value))
-                    .collect();
-                let len = spilled.len();
-                let leaf: Arc<SeqNode<T>> = Arc::new(SeqNode::Leaf(spilled.into()));
-                *self = PersistentSeq::Tree {
-                    len,
-                    root: Arc::new(SeqBranch { children: vec![leaf], height: 1 }),
-                };
-            }
-            PersistentSeq::Tree { len, root } => {
-                let index = *len;
-                let new_root = SeqBranch::push(Arc::clone(root), value, index);
-                *len += 1;
-                *root = new_root;
-            }
-        }
-    }
-
-    pub(crate) fn get(&self, index: usize) -> Option<&T> {
-        match self {
-            PersistentSeq::Inline(inline) => inline.values.get(index).and_then(|slot| slot.as_ref()),
-            PersistentSeq::Tree { len, root } => {
-                if index >= *len {
-                    return None;
-                }
-                SeqBranch::get(root, index)
-            }
-        }
-    }
-
-    pub(crate) fn iter(&self) -> IterSeq<'_, T> {
-        let mut frames: Vec<IterFrame<'_, T>> = Vec::new();
-        match self {
-            PersistentSeq::Inline(inline) => {
-                let values: &[Option<T>] = &inline.values;
-                frames.push(IterFrame::Inline { values, next: 0, len: inline.len as usize });
-            }
-            PersistentSeq::Tree { root, .. } => {
-                frames.push(IterFrame::Root(root.as_ref()));
-            }
-        }
-        IterSeq { frames }
-    }
-
-    pub(crate) fn to_vec(&self) -> Vec<T> {
-        match self {
-            PersistentSeq::Inline(inline) => inline
-                .values
-                .iter()
-                .take(inline.len as usize)
-                .filter_map(|slot| slot.clone())
-                .collect(),
-            PersistentSeq::Tree { .. } => self.iter().cloned().collect(),
-        }
-    }
-}
-
-impl<T: Clone> SeqBranch<T> {
-    fn capacity(height: u8) -> usize {
-        let mut cap = SEQ_LEAF_CAP;
-        for _ in 1..height {
-            cap *= SEQ_BRANCH;
-        }
-        cap
-    }
-
-    fn push(node: Arc<Self>, value: T, index: usize) -> Arc<Self> {
-        let mut node = (*node).clone();
-        let child_cap = Self::capacity(node.height);
-        let child_index = index / child_cap;
-        if child_index < node.children.len() {
-            let existing = Arc::clone(&node.children[child_index]);
-            let replaced: SeqNode<T> = match existing.as_ref() {
-                SeqNode::Leaf(values) => {
-                    debug_assert_eq!(node.height, 1, "leaves sit at height one");
-                    let mut next: Vec<T> = values.to_vec();
-                    next.push(value);
-                    SeqNode::Leaf(next.into())
-                }
-                SeqNode::Branch(branch) => {
-                    debug_assert!(node.height > 1, "nested levels hold branches");
-                    SeqNode::Branch(Self::push(Arc::clone(branch), value, index % child_cap))
-                }
-            };
-            node.children[child_index] = Arc::new(replaced);
-        } else {
-            debug_assert_eq!(child_index, node.children.len(), "pushes are dense");
-            let fresh: SeqNode<T> = if node.height == 1 {
-                SeqNode::Leaf(vec![value].into())
-            } else {
-                SeqNode::Branch(Self::push(
-                    Arc::new(SeqBranch { children: Vec::new(), height: node.height - 1 }),
-                    value,
-                    index % child_cap,
-                ))
-            };
-            node.children.push(Arc::new(fresh));
-        }
-        Arc::new(node)
-    }
-
-    fn get<'a>(node: &'a SeqBranch<T>, mut index: usize) -> Option<&'a T> {
-        let child_cap = Self::capacity(node.height);
-        let child_index = index / child_cap;
-        let child = node.children.get(child_index)?;
-        index %= child_cap;
-        match child.as_ref() {
-            SeqNode::Leaf(values) => values.get(index),
-            SeqNode::Branch(branch) => Self::get(branch, index),
-        }
-    }
-}
-
-enum IterFrame<'a, T> {
-    Inline { values: &'a [Option<T>], next: usize, len: usize },
-    Node(&'a SeqNode<T>),
-    Root(&'a SeqBranch<T>),
-    LeafPos { values: &'a [T], next: usize },
-}
-
-/// Borrowing iterator over a persistent sequence.
-pub(crate) struct IterSeq<'a, T> {
-    frames: Vec<IterFrame<'a, T>>,
-}
-
-impl<'a, T> Iterator for IterSeq<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<&'a T> {
-        loop {
-            let mut frame = self.frames.pop()?;
-            match &mut frame {
-                IterFrame::Inline { values, next, len } => {
-                    if *next >= *len {
-                        continue;
-                    }
-                    let index = *next;
-                    let out = (*values)[index].as_ref();
-                    let advanced = *next + 1;
-                    let slice: &'a [Option<T>] = *values;
-                    let total = *len;
-                    self.frames
-                        .push(IterFrame::Inline { values: slice, next: advanced, len: total });
-                    return out;
-                }
-                IterFrame::Root(branch) => {
-                    for child in branch.children.iter().rev() {
-                        self.frames.push(IterFrame::Node(child.as_ref()));
-                    }
-                }
-                IterFrame::Node(SeqNode::Branch(branch)) => {
-                    for child in branch.children.iter().rev() {
-                        self.frames.push(IterFrame::Node(child.as_ref()));
-                    }
-                }
-                IterFrame::Node(SeqNode::Leaf(values)) => {
-                    self.frames.push(IterFrame::LeafPos { values, next: 0 });
-                }
-                IterFrame::LeafPos { values, next } => {
-                    if *next >= values.len() {
-                        continue;
-                    }
-                    let index = *next;
-                    let out = &(*values)[index];
-                    let advanced = *next + 1;
-                    let slice: &'a [T] = *values;
-                    self.frames.push(IterFrame::LeafPos { values: slice, next: advanced });
-                    return Some(out);
-                }
-            }
-        }
-    }
-}
-
 
 #[cfg(test)]
-mod seq_tests {
+mod pathwork_primitive_tests {
     use super::*;
+    use crate::reactive::pathwork::{self, StructureKind};
 
+    /// Plan §4 item 7: primitive tests at 0/1/8/16/32/128/4,096/100,000
+    /// entries. Radix work is bounded by key width: a point operation
+    /// descends at most eight branch levels plus one leaf.
     #[test]
-    fn persistent_seq_inline_spill_and_iteration() {
-        let mut seq: PersistentSeq<usize> = PersistentSeq::new();
-        for value in 0..100usize {
-            seq.push(value);
+    fn radix_point_work_is_bounded_by_key_width() {
+        for size in [0usize, 1, 8, 16, 32, 128, 4_096, 100_000] {
+            let mut map: RadixMap<u64> = RadixMap::with_kind(StructureKind::ParserRadix);
+            for ordinal in 0..size as u64 {
+                map.insert(ordinal.wrapping_mul(0x9E37_79B9_7F4A_7C15), ordinal);
+            }
+            let build = pathwork::take();
+            assert!(
+                build.get(StructureKind::ParserRadix).max_depth <= 9,
+                "size {size}: build depth {:?}",
+                build.get(StructureKind::ParserRadix)
+            );
+
+            let probe = (size as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let _ = map.get(probe);
+            let _ = map.get(u64::MAX);
+            let _ = map.remove(u64::MAX);
+            let page = pathwork::take().get(StructureKind::ParserRadix);
+            assert_eq!(page.operations, 3, "size {size}");
+            // Three point paths, each at most eight branches plus a leaf.
+            assert!(page.nodes_visited <= 27, "size {size}: {page:?}");
+            assert!(page.max_depth <= 9, "size {size}: {page:?}");
         }
-        assert_eq!(seq.len(), 100);
-        for index in 0..100usize {
-            assert_eq!(seq.get(index), Some(&index));
-        }
-        assert_eq!(seq.get(100), None);
-        let walked: Vec<usize> = seq.iter().copied().collect();
-        assert_eq!(walked, (0..100).collect::<Vec<_>>());
-        // Clone-cheap: snapshots observe their own revision.
-        let snapshot = seq.clone();
-        seq.push(100);
-        assert_eq!(snapshot.len(), 100);
-        assert_eq!(seq.len(), 101);
     }
 
+    /// Distinct-key HAMT work is bounded by trie depth (13 fragments).
+    /// Equal-hash keys share one terminal bucket; until the persistent
+    /// collision tree lands (Phase 2), a bucket scan compares at most its
+    /// own cardinality and never leaves the bucket.
     #[test]
-    fn persistent_seq_deep_levels() {
-        let mut seq: PersistentSeq<u8> = PersistentSeq::new();
-        for index in 0..5_000usize {
-            seq.push((index % 256) as u8);
+    fn hamt_point_work_is_bounded_by_trie_depth() {
+        for size in [0usize, 1, 8, 16, 32, 128, 4_096] {
+            let mut map: Hamt<ProbeKey, i64> = Hamt::default();
+            for index in 0..size as u64 {
+                map.insert(probe_key(index, index), index as i64);
+            }
+            let build = pathwork::take();
+            assert!(
+                build.get(StructureKind::FactHamt).max_depth <= 13,
+                "size {size}: {:?}",
+                build.get(StructureKind::FactHamt)
+            );
+
+            pathwork::reset();
+            let _ = map.get(&probe_key(7, 7));
+            let _ = map.get(&probe_key(u64::MAX, u64::MAX));
+            let _ = map.remove(&probe_key(u64::MAX, u64::MAX));
+            let page = pathwork::take().get(StructureKind::FactHamt);
+            assert_eq!(page.operations, 3, "size {size}");
+            assert!(page.nodes_visited <= 39, "size {size}: {page:?}");
+            assert!(page.max_depth <= 13, "size {size}: {page:?}");
         }
-        assert_eq!(seq.len(), 5_000);
-        for index in [0usize, 1, 31, 32, 33, 1_023, 1_024, 4_999] {
-            let expected = (index % 256) as u8;
-            assert_eq!(seq.get(index), Some(&expected));
+    }
+
+    /// All keys under one forced hash collapse into one inline bucket:
+    /// point edits stay inside that bucket, visiting exactly it.
+    #[test]
+    fn forced_hash_collision_edits_never_leave_the_bucket() {
+        let mut map: Hamt<ProbeKey, i64> = Hamt::default();
+        for index in 0..64u64 {
+            map.insert(probe_key(index, 42), index as i64);
         }
-        assert_eq!(seq.iter().count(), 5_000);
+        pathwork::reset();
+        let _ = map.get(&probe_key(31, 42));
+        let page = pathwork::take().get(StructureKind::FactHamt);
+        assert_eq!(page.operations, 1);
+        assert!(page.nodes_visited <= 14, "{page:?}");
+        // Exact comparisons cover at most the bucket's cardinality.
+        assert!(page.key_comparisons <= 64, "{page:?}");
+    }
+
+    /// Iteration counters remain zero on point paths: enumeration never
+    /// masquerades as lookup work.
+    #[test]
+    fn point_paths_record_no_enumeration_operations() {
+        let mut map: RadixMap<u64> = RadixMap::default();
+        map.insert(1, 1);
+        map.insert(2, 2);
+        let mut hamt: Hamt<ProbeKey, i64> = Hamt::default();
+        hamt.insert(probe_key(1, 1), 1);
+        pathwork::reset();
+        let _hit = map.get(1);
+        let _h = hamt.get(&probe_key(1, 1));
+        let radix = pathwork::snapshot().get(StructureKind::ParserRadix);
+        assert_eq!(radix.operations, 1);
+        assert_eq!(radix.key_comparisons, 1);
+    }
+
+
+    fn probe_key(index: u64, forced: u64) -> ProbeKey {
+        if forced == u64::MAX {
+            ProbeKey {
+                index,
+                hash: splitmix(index),
+            }
+        } else {
+            ProbeKey {
+                index,
+                hash: splitmix(forced),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ProbeKey {
+        index: u64,
+        hash: u64,
+    }
+
+    impl TrieKey for ProbeKey {
+        fn trie_hash(&self) -> u64 {
+            self.hash
+        }
+
+        fn trie_eq(&self, other: &Self) -> bool {
+            self.index == other.index
+        }
     }
 }

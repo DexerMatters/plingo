@@ -23,8 +23,8 @@ use crate::{
             identity::{error_fingerprint, token_fingerprint},
         },
         tape::{
-            ExactHashPrefilter, PersistentOccurrenceIndex, SequenceMetric, StableTape,
-            TapeEntry, TapeIdAllocator,
+            ExactHashPrefilter, PersistentOccurrenceIndex, SequenceMetric, StableTape, TapeEntry,
+            TapeIdAllocator,
         },
     },
     reactive::{
@@ -142,7 +142,10 @@ impl<R: LexerRoot> LexerStateInterner<R> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         canonical.stack.hash(&mut hasher);
         let bucket = self.buckets.entry(hasher.finish()).or_default();
-        if let Some(existing) = bucket.iter().find(|existing| existing.as_ref() == &canonical) {
+        if let Some(existing) = bucket
+            .iter()
+            .find(|existing| existing.as_ref() == &canonical)
+        {
             return Arc::clone(existing);
         }
         let canonical = Arc::new(canonical);
@@ -150,6 +153,71 @@ impl<R: LexerRoot> LexerStateInterner<R> {
         canonical
     }
 }
+/// A persistent URI-keyed map used for lexer document roots and metrics.
+///
+/// The HAMT root is copied by `Arc`; changing one URI copies only its lookup
+/// path and preserves every unrelated document root without cloning a map of
+/// all open documents.
+#[derive(Clone, Debug)]
+pub(crate) struct PersistentUriMap<V: Clone> {
+    entries: crate::reactive::store::Hamt<UriMapKey, V>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UriMapKey(Uri<String>);
+
+impl UriMapKey {
+    pub(crate) fn uri(&self) -> &Uri<String> {
+        &self.0
+    }
+}
+
+impl crate::reactive::store::TrieKey for UriMapKey {
+    fn trie_hash(&self) -> u64 {
+        crate::framework::source::fnv1a_uri(self.0.as_str())
+    }
+
+    fn trie_eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<V: Clone> Default for PersistentUriMap<V> {
+    fn default() -> Self {
+        Self {
+            entries: crate::reactive::store::Hamt::with_kind(
+                crate::reactive::pathwork::StructureKind::LexerDocumentIndex,
+            ),
+        }
+    }
+}
+
+impl<V: Clone> PersistentUriMap<V> {
+    pub(crate) fn get(&self, uri: &Uri<String>) -> Option<&V> {
+        self.entries.get(&UriMapKey(uri.clone()))
+    }
+
+    pub(crate) fn contains_key(&self, uri: &Uri<String>) -> bool {
+        self.get(uri).is_some()
+    }
+
+    pub(crate) fn insert(&mut self, uri: Uri<String>, value: V) {
+        self.entries.insert(UriMapKey(uri), value);
+    }
+
+    pub(crate) fn remove(&mut self, uri: &Uri<String>) -> bool {
+        self.entries.remove(&UriMapKey(uri.clone()))
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Uri<String>, &V)> {
+        self.entries.iter().map(|(key, value)| (key.uri(), value))
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
+        self.entries.iter().map(|(_, value)| value)
+    }
+}
+
 
 /// One local immutable lexical occurrence.  The occurrence never carries a
 /// global byte offset; its span is the prefix-source-byte metric at its rank.
@@ -196,7 +264,8 @@ impl<R: LexerRoot> LexicalOccurrence<R> {
     }
 
     pub(crate) fn terminal_key(&self) -> usize {
-        self.terminal.map_or(usize::MAX, |terminal| terminal.token_id as usize)
+        self.terminal
+            .map_or(usize::MAX, |terminal| terminal.token_id as usize)
     }
 
     pub(crate) fn fingerprint(&self) -> TokenFingerprint {
@@ -249,7 +318,9 @@ impl<R: LexerRoot> TapeEntry for LexicalOccurrence<R> {
     fn metric(&self) -> SequenceMetric {
         // This is a rejection prefilter only.  Semantic value deliberately does
         // not participate: same-terminal value edits preserve parser shape.
-        let terminal = self.terminal.map_or(u64::MAX, |terminal| terminal.token_id as u64);
+        let terminal = self
+            .terminal
+            .map_or(u64::MAX, |terminal| terminal.token_id as u64);
         let error = self.error.map_or(0, |kind| match kind {
             LexErrorKind::UnexpectedInput => 1,
             LexErrorKind::RequiredBoundary => 2,
@@ -259,9 +330,7 @@ impl<R: LexerRoot> TapeEntry for LexicalOccurrence<R> {
             semantic_count: u64::from(self.is_semantic()),
             source_bytes: self.byte_len as u64,
             structural_hash: ExactHashPrefilter(
-                terminal
-                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                    .rotate_left(17)
+                terminal.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17)
                     ^ error
                     ^ u64::from(self.skip),
             ),
@@ -284,7 +353,9 @@ impl TapeEntry for ParseTokenRef {
     }
 
     fn metric(&self) -> SequenceMetric {
-        let terminal = self.terminal.map_or(u64::MAX, |terminal| terminal.token_id as u64);
+        let terminal = self
+            .terminal
+            .map_or(u64::MAX, |terminal| terminal.token_id as u64);
         SequenceMetric {
             lexical_count: 0,
             semantic_count: 1,
@@ -323,7 +394,9 @@ impl TapeEntry for TokenLayoutEntry {
     }
 
     fn metric(&self) -> SequenceMetric {
-        let terminal = self.terminal.map_or(u64::MAX, |terminal| terminal.token_id as u64);
+        let terminal = self
+            .terminal
+            .map_or(u64::MAX, |terminal| terminal.token_id as u64);
         SequenceMetric {
             lexical_count: 1,
             semantic_count: u64::from(self.error || (!self.skip && self.terminal.is_some())),
@@ -350,9 +423,15 @@ impl<R: LexerRoot> From<&LexicalOccurrence<R>> for TokenLayoutEntry {
 
 /// Per-document persistent state.  It owns every mutable identity allocator;
 /// snapshots only retain immutable roots and no global token arena exists.
-#[derive(Clone)]
+// The command-local interner is intentionally reset when a document root is
+// cloned.  All committed lexical state is represented by `initial_state` and
+// occurrence state arcs; replay only needs a cache for states visited in the
+// current bounded window.
 pub(crate) struct LexicalDocument<R: LexerRoot> {
     pub(crate) document: StableDocumentId,
+    /// Source revision that produced this lexical root.  Lexer adjacency is
+    /// proved by this handle, never by comparing source bytes.
+    pub(crate) source_revision: crate::framework::source::SourceRevisionId,
     pub(crate) source: Arc<ropey::Rope>,
     pub(crate) lexical: StableTape<LexicalOccurrence<R>>,
     pub(crate) lexical_index: PersistentOccurrenceIndex,
@@ -370,6 +449,30 @@ pub(crate) struct LexicalDocument<R: LexerRoot> {
     pub(crate) structure_revision: TokenStructureRevisionId,
 }
 
+impl<R: LexerRoot> Clone for LexicalDocument<R> {
+    fn clone(&self) -> Self {
+        Self {
+            document: self.document,
+            source_revision: self.source_revision,
+            source: Arc::clone(&self.source),
+            lexical: self.lexical.clone(),
+            lexical_index: self.lexical_index.clone(),
+            layout: self.layout.clone(),
+            layout_index: self.layout_index.clone(),
+            semantic: self.semantic.clone(),
+            semantic_index: self.semantic_index.clone(),
+            initial_state: Arc::clone(&self.initial_state),
+            state_interner: LexerStateInterner::default(),
+            tape_ids: self.tape_ids.clone(),
+            next_occurrence: self.next_occurrence,
+            layout_revision: self.layout_revision,
+            semantic_revision: self.semantic_revision,
+            value_revision: self.value_revision,
+            structure_revision: self.structure_revision,
+        }
+    }
+}
+
 impl<R: LexerRoot> std::fmt::Debug for LexicalDocument<R> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -384,7 +487,6 @@ impl<R: LexerRoot> std::fmt::Debug for LexicalDocument<R> {
             .finish()
     }
 }
-
 impl<R: LexerRoot> LexicalDocument<R> {
     pub(crate) fn empty(document: StableDocumentId, root: State<R>) -> Self {
         let initial = LexerState::new(root);
@@ -392,6 +494,7 @@ impl<R: LexerRoot> LexicalDocument<R> {
         let initial_state = state_interner.intern(&initial);
         Self {
             document,
+            source_revision: crate::framework::source::SourceRevisionId(0),
             source: Arc::new(ropey::Rope::new()),
             lexical: StableTape::new(),
             lexical_index: PersistentOccurrenceIndex::default(),
@@ -415,8 +518,7 @@ impl<R: LexerRoot> LexicalDocument<R> {
     }
 
     pub(crate) fn semantic_rank_of(&self, occurrence: TokenOccurrenceId) -> Option<usize> {
-        self.semantic
-            .rank_of_id(occurrence.0, &self.semantic_index)
+        self.semantic.rank_of_id(occurrence.0, &self.semantic_index)
     }
 
     pub(crate) fn lexical_start(&self, rank: usize) -> usize {
@@ -434,7 +536,10 @@ impl<R: LexerRoot> LexicalDocument<R> {
 
     pub(crate) fn state_before_rank(&self, rank: usize) -> LexerState<R> {
         let offset = self.lexical_start(rank);
-        match rank.checked_sub(1).and_then(|previous| self.lexical.get(previous)) {
+        match rank
+            .checked_sub(1)
+            .and_then(|previous| self.lexical.get(previous))
+        {
             Some(previous) => previous.state_after.materialize(offset),
             None => self.initial_state.materialize(offset),
         }
@@ -445,7 +550,9 @@ impl<R: LexerRoot> LexicalDocument<R> {
         R: Clone,
     {
         let rank = self.lexical_rank_of(occurrence)?;
-        self.lexical.get(rank)?.materialize(self.lexical_start(rank))
+        self.lexical
+            .get(rank)?
+            .materialize(self.lexical_start(rank))
     }
 
     pub(crate) fn token_data_at_semantic_rank(&self, rank: usize) -> Option<TokenData> {
@@ -582,7 +689,7 @@ pub struct SemanticTokenDocument<R: LexerRoot + std::fmt::Debug> {
 
 impl<R: LexerRoot + std::fmt::Debug> PartialEq for SemanticTokenDocument<R> {
     fn eq(&self, other: &Self) -> bool {
-        self.revision == other.revision
+        self.document_id == other.document_id && self.revision == other.revision
     }
 }
 impl<R: LexerRoot + std::fmt::Debug> Eq for SemanticTokenDocument<R> {}
@@ -628,7 +735,7 @@ pub struct TokenLayoutDocument<R: LexerRoot + std::fmt::Debug> {
 
 impl<R: LexerRoot + std::fmt::Debug> PartialEq for TokenLayoutDocument<R> {
     fn eq(&self, other: &Self) -> bool {
-        self.layout_revision == other.layout_revision
+        self.document_id == other.document_id && self.layout_revision == other.layout_revision
     }
 }
 impl<R: LexerRoot + std::fmt::Debug> Eq for TokenLayoutDocument<R> {}

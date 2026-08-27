@@ -154,7 +154,10 @@ impl<'snapshot, 'formatter> AstRenderer<'snapshot, 'formatter> {
                     "{}",
                     cformat!(
                         "<green>{}</>",
-                        T::pretty_terminal(token.terminal, &self.snapshot.source_text(token.span.clone()))
+                        T::pretty_terminal(
+                            token.terminal,
+                            &self.snapshot.source_text(token.span.clone())
+                        )
                     )
                 )
             }

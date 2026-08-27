@@ -11,10 +11,8 @@ use parking_lot::Mutex;
 
 use crate::reactive::engine::{EngineWork, InvocationIdentity, InvocationWork};
 use crate::reactive::error::{Error, Result};
-use crate::reactive::store::{
-    FactJournal, PlainState, SnapshotRoot,
-};
 pub(crate) use crate::reactive::store::PlainState as PlainStatePub;
+use crate::reactive::store::{FactJournal, PlainState, SnapshotRoot};
 use crate::reactive::value::{KeyValue, Value};
 use crate::reactive::view::View;
 
@@ -50,7 +48,10 @@ pub(crate) struct FactChange {
 pub(crate) enum Undo {
     /// Restore (or remove) one invocation's full record. `None` restores
     /// "did not exist".
-    Invocation { root: u64, before: Option<Invocation> },
+    Invocation {
+        root: u64,
+        before: Option<Invocation>,
+    },
     /// Remove a root inserted by this command.
     RootInserted { root: u64 },
     /// Reinsert a removed root with its prior runtime.
@@ -70,6 +71,10 @@ pub(crate) struct CommandTxn {
     pub journal: FactJournal,
     undo: Vec<Undo>,
     touched_invocations: HashMap<(u64, u64, TypeId), ()>,
+    /// Command-private machine participants (Cut B bridge): framework
+    /// components push infallible restore closures that run in reverse
+    /// after fact rollback on any failure. A committed command drops them.
+    pub private_undos: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 impl CommandTxn {
@@ -93,6 +98,7 @@ impl CommandTxn {
                 journal: FactJournal::default(),
                 undo: Vec::new(),
                 touched_invocations: HashMap::new(),
+                private_undos: Vec::new(),
             },
         )
     }
@@ -123,6 +129,10 @@ thread_local! {
     /// Pre-eval write/read sets of running evaluations, keyed by id.
     static OLD_WRITES: RefCell<Vec<(u64, Vec<PlainWrite>, Vec<ReadDep>)>> =
         const { RefCell::new(Vec::new()) };
+    /// Innermost evaluating invocation's PRE-evaluation owned writes
+    /// (Cut E ownership diff): a stable snapshot immune to the mutation
+    /// of invocation.writes during publication.
+    static PRE_EVAL_OWNED: RefCell<Vec<PlainWrite>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Pops the transaction frame on drop, including unwind paths.
@@ -168,23 +178,29 @@ fn with_txn<R>(f: impl FnOnce(&mut CommandTxn) -> R) -> R {
 
 /// Applies the full inverse of the active transaction to the runtime:
 /// journal rollback first (facts), then undo entries in reverse order.
-fn rollback_txn(txn: CommandTxn, state: &Arc<Mutex<PlainState>>, roots: &mut BTreeMap<u64, RootRuntime>) {
+fn rollback_txn(
+    mut txn: CommandTxn,
+    state: &Arc<Mutex<PlainState>>,
+    roots: &mut BTreeMap<u64, RootRuntime>,
+) {
     txn.journal.rollback(&mut state.lock());
+    // Private participants restore in reverse registration order (Cut B):
+    // staged machine roots return to their pre-command values.
+    for undo in txn.private_undos.drain(..).rev() {
+        undo();
+    }
     // Dependency rows rebuild from restored reads; the dirty queue resets.
     for undo in txn.undo.iter().rev() {
         if let Undo::Invocation { root, before } = undo {
-            let Some(root_runtime) = roots.get(root) else { continue };
+            let Some(root_runtime) = roots.get(root) else {
+                continue;
+            };
             let mut graph = root_runtime.graph.lock();
             match before {
                 Some(before_invocation) => {
                     // Drop whatever rows the aborted evaluation installed,
                     // then reinstall the pre-command rows verbatim.
-                    let current_reads: Vec<(
-                        TypeId,
-                        Option<Arc<dyn KeyValue>>,
-                        bool,
-                        bool,
-                    )> = graph
+                    let current_reads: Vec<(TypeId, Option<Arc<dyn KeyValue>>, bool, bool)> = graph
                         .invocations
                         .iter()
                         .find(|inv| inv.id == before_invocation.id)
@@ -199,18 +215,14 @@ fn rollback_txn(txn: CommandTxn, state: &Arc<Mutex<PlainState>>, roots: &mut BTr
                         .unwrap_or_default();
                     graph.deps.remove_all(&current_reads, before_invocation.id);
                     if !before_invocation.retired {
-                        let restored: Vec<(
-                            TypeId,
-                            Option<Arc<dyn KeyValue>>,
-                            bool,
-                            bool,
-                        )> = before_invocation
-                            .reads
-                            .iter()
-                            .map(|read| {
-                                (read.view, read.key.clone(), read.temporal, read.keyset)
-                            })
-                            .collect();
+                        let restored: Vec<(TypeId, Option<Arc<dyn KeyValue>>, bool, bool)> =
+                            before_invocation
+                                .reads
+                                .iter()
+                                .map(|read| {
+                                    (read.view, read.key.clone(), read.temporal, read.keyset)
+                                })
+                                .collect();
                         graph.deps.replace(&restored, &[], before_invocation.id);
                     }
                 }
@@ -225,10 +237,8 @@ fn rollback_txn(txn: CommandTxn, state: &Arc<Mutex<PlainState>>, roots: &mut BTr
                     let mut graph = root_runtime.graph.lock();
                     match before {
                         Some(before) => {
-                            if let Some(slot) = graph
-                                .invocations
-                                .iter_mut()
-                                .find(|inv| inv.id == before.id)
+                            if let Some(slot) =
+                                graph.invocations.iter_mut().find(|inv| inv.id == before.id)
                             {
                                 *slot = before;
                             } else {
@@ -237,11 +247,7 @@ fn rollback_txn(txn: CommandTxn, state: &Arc<Mutex<PlainState>>, roots: &mut BTr
                         }
                         None => {
                             // Creation undone: remove the newest matching id.
-                            if let Some(position) = graph
-                                .invocations
-                                .iter()
-                                .rposition(|inv| true)
-                            {
+                            if let Some(position) = graph.invocations.iter().rposition(|inv| true) {
                                 graph.invocations.remove(position);
                             }
                         }
@@ -339,6 +345,9 @@ pub(crate) trait ErasedCall: Send + Sync {
 }
 
 struct TypedCall<F, A, B> {
+    /// Component-definition marker when this call belongs to a first-class
+    /// component (Cut C): identity and cycle checks compare against it.
+    definition: Option<TypeId>,
     function: F,
     input: A,
     _marker: std::marker::PhantomData<fn() -> B>,
@@ -393,6 +402,27 @@ where
     B: Clone + PartialEq + Debug + Send + Sync + 'static,
 {
     Arc::new(TypedCall {
+        definition: None,
+        function,
+        input,
+        _marker: std::marker::PhantomData,
+    })
+}
+
+/// Like [`erased_call`], but stamps a component-definition marker as the
+/// effective identity type (Cut C).
+pub(crate) fn erased_call_with_definition<F, A, B>(
+    definition: TypeId,
+    function: F,
+    input: A,
+) -> Arc<dyn ErasedCall>
+where
+    F: Fn(A) -> Result<B> + Clone + Send + Sync + 'static,
+    A: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
+    B: Clone + PartialEq + Debug + Send + Sync + 'static,
+{
+    Arc::new(TypedCall {
+        definition: Some(definition),
         function,
         input,
         _marker: std::marker::PhantomData,
@@ -434,7 +464,8 @@ pub(crate) struct PlainGraph {
 impl PlainGraph {
     /// Function name of one invocation by id.
     pub(crate) fn function_name_of(&self, id: u64) -> Result<&'static str> {
-        self.invocation(id).map(|invocation| invocation.function_name)
+        self.invocation(id)
+            .map(|invocation| invocation.function_name)
     }
 
     pub(crate) fn invocation_identity(&self, id: u64) -> Result<InvocationIdentity> {
@@ -453,9 +484,7 @@ impl PlainGraph {
     pub(crate) fn live_child_ids(&self) -> Vec<u64> {
         self.invocations
             .iter()
-            .filter(|invocation| {
-                invocation.parent == Some(self.root) && !invocation.retired
-            })
+            .filter(|invocation| invocation.parent == Some(self.root) && !invocation.retired)
             .map(|invocation| invocation.id)
             .collect()
     }
@@ -494,7 +523,9 @@ impl PlainGraph {
             .iter()
             .find(|invocation| invocation.id == id && !invocation.retired)
             .ok_or_else(|| {
-                Error::Internal(format!("invocation {id} missing/retired in root {}", self.root).into())
+                Error::Internal(
+                    format!("invocation {id} missing/retired in root {}", self.root).into(),
+                )
             })
     }
 
@@ -503,11 +534,20 @@ impl PlainGraph {
             .iter_mut()
             .find(|invocation| invocation.id == id && !invocation.retired)
             .ok_or_else(|| {
-                Error::Internal(format!("invocation {id} missing/retired (mut) in root {}", self.root).into())
+                Error::Internal(
+                    format!(
+                        "invocation {id} missing/retired (mut) in root {}",
+                        self.root
+                    )
+                    .into(),
+                )
             })
     }
 
     fn register<V: View>(&mut self) {
+        if std::env::var_os("PLINGO_TRACE_FACTS").is_some() {
+            eprintln!("registered {:?} {}", TypeId::of::<V>(), V::name());
+        }
         self.metadata.insert(TypeId::of::<V>(), V::name());
     }
 
@@ -556,7 +596,9 @@ impl MetricExtensions {
     }
 
     pub(crate) fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
-        self.slots.get(&TypeId::of::<T>()).and_then(|slot| slot.downcast_ref::<T>())
+        self.slots
+            .get(&TypeId::of::<T>())
+            .and_then(|slot| slot.downcast_ref::<T>())
     }
 }
 
@@ -760,16 +802,10 @@ impl PendingOverlay {
     }
 
     fn put(&self, view: TypeId, key: &Arc<dyn KeyValue>, value: Option<Arc<dyn Value>>) {
-        self.entries
-            .borrow_mut()
-            .put(view, Arc::clone(key), value);
+        self.entries.borrow_mut().put(view, Arc::clone(key), value);
     }
 
-    fn get(
-        &self,
-        view: TypeId,
-        key: &Arc<dyn KeyValue>,
-    ) -> Option<Option<Arc<dyn Value>>> {
+    fn get(&self, view: TypeId, key: &Arc<dyn KeyValue>) -> Option<Option<Arc<dyn Value>>> {
         self.entries.borrow().get(view, key.as_ref())
     }
 }
@@ -777,6 +813,9 @@ impl PendingOverlay {
 struct ActiveEval {
     graph: Arc<Mutex<PlainGraph>>,
     id: u64,
+    /// The invocation's owned writes as they stood when this evaluation
+    /// started (Cut E ownership diff baseline).
+    pre_eval_writes: PreEvalOwned,
     occurrences: RefCell<Vec<(CallBase, u64)>>,
 }
 
@@ -785,6 +824,7 @@ impl Clone for ActiveEval {
         Self {
             graph: Arc::clone(&self.graph),
             id: self.id,
+            pre_eval_writes: self.pre_eval_writes.clone(),
             occurrences: RefCell::new(self.occurrences.borrow().clone()),
         }
     }
@@ -798,6 +838,21 @@ enum ActiveDispatcher {
 thread_local! {
     static ACTIVE: RefCell<Vec<ActiveDispatcher>> = const { RefCell::new(Vec::new()) };
     static ACTIVE_EVALS: RefCell<Vec<ActiveEval>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Cut E ownership-diff baseline: the full pre-evaluation owned write set
+/// across every view the invocation touched.
+#[derive(Clone, Default)]
+pub(crate) struct PreEvalOwned {
+    writes: Vec<PlainWrite>,
+}
+
+impl PreEvalOwned {
+    fn snapshot(writes: &[PlainWrite]) -> Self {
+        Self {
+            writes: writes.iter().cloned().collect(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -890,8 +945,7 @@ impl EffectContext {
                 let mut graph = graph.lock();
                 graph.register::<V>();
                 let value = graph.state.lock().read(TypeId::of::<V>(), key.as_ref());
-                Ok(value
-                    .and_then(downcast_arc::<V::Output>))
+                Ok(value.and_then(downcast_arc::<V::Output>))
             }
             ActiveDispatcherHandle::Command(..) => Err(Error::InvalidCommandEffect {
                 effect: "peek".to_string(),
@@ -956,37 +1010,28 @@ impl EffectContext {
         }
     }
 
-
     /// Records the handle's latest write for one fact so later reads inside
     /// the SAME invocation observe it (the invocation's writes commit only
     /// when it retires).
     pub fn pending_put<V: View>(&self, key: V::Input, value: Option<Arc<V::Output>>) {
         let key: Arc<dyn KeyValue> = Arc::new(key);
-        let value: Option<Arc<dyn Value>> =
-            value.map(|value| value as Arc<dyn Value>);
+        let value: Option<Arc<dyn Value>> = value.map(|value| value as Arc<dyn Value>);
         match &self.dispatcher {
             ActiveDispatcherHandle::Eval(_, _, pending)
-                | ActiveDispatcherHandle::Command(pending, _) => {
+            | ActiveDispatcherHandle::Command(pending, _) => {
                 pending.put(TypeId::of::<V>(), &key, value);
             }
         }
     }
 
     /// Looks up the invocation's pending write for one fact, if any.
-    pub fn pending_get<V: View>(
-        &self,
-        key: &V::Input,
-    ) -> Option<Option<Arc<V::Output>>> {
+    pub fn pending_get<V: View>(&self, key: &V::Input) -> Option<Option<Arc<V::Output>>> {
         let key: Arc<dyn KeyValue> = Arc::new(key.clone());
         match &self.dispatcher {
             ActiveDispatcherHandle::Eval(_, _, pending)
-                | ActiveDispatcherHandle::Command(pending, _) => {
-                pending
-                    .get(TypeId::of::<V>(), &key)
-                    .map(|value| {
-                        value.and_then(downcast_arc::<V::Output>)
-                    })
-            }
+            | ActiveDispatcherHandle::Command(pending, _) => pending
+                .get(TypeId::of::<V>(), &key)
+                .map(|value| value.and_then(downcast_arc::<V::Output>)),
         }
     }
 
@@ -995,11 +1040,45 @@ impl EffectContext {
     /// Modes freeze per (invocation, view): mixing [`emit_view`] with
     /// [`EffectContext::emit_patch`] for the same view returns
     /// [`Error::MixedEmissionMode`].
-    pub fn emit_patch<V: View>(
-        &self,
-        key: V::Input,
-        value: Option<V::Output>,
-    ) -> Result<()> {
+    /// Cut E ownership diff: stage a Remove op from an already-erased key.
+    pub(crate) fn emit_patch_erased<V: View>(&self, key: Arc<dyn KeyValue>) -> Result<()> {
+        let view = TypeId::of::<V>();
+        match &self.dispatcher {
+            ActiveDispatcherHandle::Eval(graph, id, pending) => {
+                let mut graph_guard = graph.lock();
+                graph_guard.register::<V>();
+                let invocation = graph_guard.invocation_mut(*id)?;
+                match invocation.emission_modes.get(&view) {
+                    Some(EmissionMode::Replace) => {
+                        return Err(Error::MixedEmissionMode {
+                            view: V::name().to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+                drop(graph_guard);
+                pending.push_patch(PatchOp {
+                    view,
+                    view_name: V::name(),
+                    key,
+                    kind: PatchOpKind::Remove,
+                });
+                Ok(())
+            }
+            ActiveDispatcherHandle::Command(_, buffer) => {
+                buffer.lock().modes.insert(view, EmissionMode::Patch);
+                buffer.lock().patch_ops.push(PatchOp {
+                    view,
+                    view_name: V::name(),
+                    key,
+                    kind: PatchOpKind::Remove,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    pub fn emit_patch<V: View>(&self, key: V::Input, value: Option<V::Output>) -> Result<()> {
         let key: Arc<dyn KeyValue> = Arc::new(key);
         let view = TypeId::of::<V>();
         match &self.dispatcher {
@@ -1072,7 +1151,9 @@ impl EffectContext {
                     }
                     Some(EmissionMode::Replace) => {}
                     None => {
-                        invocation.emission_modes.insert(view, EmissionMode::Replace);
+                        invocation
+                            .emission_modes
+                            .insert(view, EmissionMode::Replace);
                     }
                 }
                 invocation.writes.push(PlainWrite {
@@ -1131,10 +1212,7 @@ fn context_for_mode(effect: &str, view: &str, passive: bool) -> Result<EffectCon
                 ActiveDispatcherHandle::Eval(Arc::clone(graph), *id, std::rc::Rc::clone(pending))
             }
             ActiveDispatcher::Command(buffer, pending) => {
-                ActiveDispatcherHandle::Command(
-                    std::rc::Rc::clone(pending),
-                    Arc::clone(buffer),
-                )
+                ActiveDispatcherHandle::Command(std::rc::Rc::clone(pending), Arc::clone(buffer))
             }
         };
         Ok(EffectContext {
@@ -1171,6 +1249,14 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
     let call = {
         let mut graph_guard = graph.lock();
         let invocation = graph_guard.invocation_mut(id)?;
+        if std::env::var_os("PLINGO_TRACE_EVAL").is_some()
+            && invocation.function_name.contains("name_resolve")
+        {
+            eprintln!(
+                "eval-start id={} function={} children={:?}",
+                id, invocation.function_name, invocation.children
+            );
+        }
         let old_writes = std::mem::take(&mut invocation.writes);
         let old_reads = std::mem::take(&mut invocation.reads);
         invocation.fresh_sites.clear();
@@ -1178,25 +1264,41 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
         // Emission modes freeze per evaluation only (plan §5.5).
         invocation.emission_modes.clear();
         invocation.dirty = false;
-        OLD_WRITES.with(|slot| {
-            slot.borrow_mut()
-                .push((id, old_writes, old_reads))
-        });
+        OLD_WRITES.with(|slot| slot.borrow_mut().push((id, old_writes, old_reads)));
         Arc::clone(&invocation.call)
     };
+    if std::env::var_os("PLINGO_TRACE_EVAL").is_some() {
+        eprintln!(
+            "eval id={} function={} input_hash={}",
+            id,
+            call.function_name(),
+            call.input_key().hash_value()
+        );
+    }
 
     let pending = std::rc::Rc::new(PendingOverlay::default());
+    let pre_eval_owned = OLD_WRITES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .rev()
+            .find(|(eval_id, _, _)| *eval_id == id)
+            .map(|(_, writes, _)| PreEvalOwned::snapshot(writes))
+            .unwrap_or_default()
+    });
     ACTIVE_EVALS.with(|active| {
         active.borrow_mut().push(ActiveEval {
             graph: Arc::clone(graph),
             id,
+            pre_eval_writes: pre_eval_owned,
             occurrences: RefCell::new(Vec::new()),
         });
     });
     ACTIVE.with(|active| {
-        active
-            .borrow_mut()
-            .push(ActiveDispatcher::Eval(Arc::clone(graph), id, std::rc::Rc::clone(&pending)));
+        active.borrow_mut().push(ActiveDispatcher::Eval(
+            Arc::clone(graph),
+            id,
+            std::rc::Rc::clone(&pending),
+        ));
     });
     let result = catch_unwind(AssertUnwindSafe(|| call.invoke()));
     ACTIVE.with(|active| {
@@ -1216,20 +1318,14 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
     };
 
     let mut graph_guard = graph.lock();
-    let (old_writes, old_read_deps) = OLD_WRITES
-        .with(|slot| {
-            slot.borrow_mut()
-                .iter_mut()
-                .rev()
-                .find(|(eval_id, _, _)| *eval_id == id)
-                .map(|(_, writes, reads)| {
-                    (
-                        std::mem::take(writes),
-                        std::mem::take(reads),
-                    )
-                })
-                .unwrap_or((Vec::new(), Vec::new()))
-        });
+    let (old_writes, old_read_deps) = OLD_WRITES.with(|slot| {
+        slot.borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|(eval_id, _, _)| *eval_id == id)
+            .map(|(_, writes, reads)| (std::mem::take(writes), std::mem::take(reads)))
+            .unwrap_or((Vec::new(), Vec::new()))
+    });
     let emission_modes = graph_guard.invocation(id)?.emission_modes.clone();
     let mut patch_views: HashSet<TypeId> = old_writes
         .iter()
@@ -1238,28 +1334,34 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
         .map(|write| write.view)
         .collect();
     patch_views.extend(
-        emission_modes.iter().filter_map(|(view, mode)| {
-            matches!(mode, EmissionMode::Patch).then_some(*view)
-        }),
+        emission_modes
+            .iter()
+            .filter_map(|(view, mode)| matches!(mode, EmissionMode::Patch).then_some(*view)),
     );
 
-    // Build one exact-key index for this candidate. Old patch-owned keys are
-    // retained only when the invocation remains in patch mode; touched keys
-    // replace them in O(1) expected time without scanning unrelated writes.
+    // Build one exact-key index for this candidate (Cut D touched-key
+    // patching, follow-up plan sections 16.2-16.3): only keys the body
+    // authored this evaluation enter the journal. Untouched patch-owned
+    // keys keep ownership pointer-identically via `retained` and are never
+    // re-journalled, so one-key work is independent of the instance's
+    // owned domain.
     let direct_writes = std::mem::take(&mut graph_guard.invocation_mut(id)?.writes);
     let mut candidate_index = IndexedWrites::from_writes(direct_writes);
     let patch_ops = std::mem::take(&mut *pending.patch_ops.borrow_mut());
     let patch_index = patch_ops_to_indexed(patch_ops)?;
-    for previous in old_writes
-        .iter()
-        .filter(|write| patch_views.contains(&write.view))
-    {
-        candidate_index.insert_if_absent(previous.clone());
-    }
     for write in patch_index.into_writes() {
         candidate_index.replace(write);
     }
     let candidate = candidate_index.ordered();
+    let retained: Vec<PlainWrite> = if patch_views.is_empty() {
+        Vec::new()
+    } else {
+        old_writes
+            .iter()
+            .filter(|write| patch_views.contains(&write.view) && !candidate_index.contains(write))
+            .cloned()
+            .collect()
+    };
     graph_guard.invocation_mut(id)?.writes = candidate.clone();
     let seen_children = graph_guard.invocation(id)?.seen_children.clone();
 
@@ -1289,7 +1391,12 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
         let state = Arc::clone(&graph_guard.state);
         let retracts: Vec<PlainWrite> = old_writes
             .iter()
-            .filter(|previous| !candidate_index.contains(previous))
+            .filter(|previous| {
+                !candidate_index.contains(previous)
+                    && !retained.iter().any(|keep| {
+                        keep.view == previous.view && keep.key.eq_value(previous.key.as_ref())
+                    })
+            })
             .cloned()
             .collect();
         drop(graph_guard);
@@ -1326,36 +1433,138 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
         graph_guard = graph.lock();
     }
 
+    // Owned tombstones never persist (follow-up plan section 16.1): a
+    // patch Remove op stays visible to the journal above but leaves
+    // ownership, so the committed write set keeps only present values.
+    let committed_writes: Vec<PlainWrite> = candidate
+        .iter()
+        .filter(|write| write.value.is_some())
+        .cloned()
+        .chain(retained.iter().cloned())
+        .collect();
+
     let previous_result = graph_guard.invocation(id)?.result.clone();
     let changed = previous_result
         .as_ref()
         .is_none_or(|old| !old.value_eq(result.as_ref()));
+    // Reaction capture: record the exact driving element, read edges, and
+    // output edges of this evaluation (observation-only; the metric frame
+    // is discarded with a failed command). Gated: consumers opt in.
+    if crate::reactive::reaction::capture_enabled() {
+        let invocation = graph_guard.invocation(id)?;
+        let definition = invocation.function_name;
+        let (callsite, driving_element) = match invocation.identity.as_ref() {
+            Some(identity) => (
+                format!("{}:{}:{}", identity.file, identity.line, identity.column),
+                format!("{:?}", identity.input),
+            ),
+            None => (String::new(), String::new()),
+        };
+        let mut reads: Vec<crate::reactive::reaction::ElementEdge> = Vec::new();
+        for read in &invocation.reads {
+            match read.key.as_ref() {
+                Some(key) => {
+                    let mut element = format!("{key:?}");
+                    if read.temporal {
+                        element.push_str("@previous");
+                    }
+                    reads.push(crate::reactive::reaction::ElementEdge {
+                        view: read.name,
+                        element,
+                    });
+                }
+                None => {
+                    record_command_metric::<crate::reactive::reaction::ReactionDigest>(|digest| {
+                        digest.push_broad_enumeration(crate::reactive::reaction::ElementEdge {
+                            view: read.name,
+                            element: "<domain>".to_owned(),
+                        });
+                    })
+                }
+            }
+        }
+        let mut outputs: Vec<crate::reactive::reaction::OutputEdge> = Vec::new();
+        for write in candidate.iter() {
+            let changed_here = changes
+                .iter()
+                .any(|change| change.view == write.view && change.key.eq_value(write.key.as_ref()));
+            let committed = if !changed_here {
+                None
+            } else if old_writes
+                .iter()
+                .any(|old| old.view == write.view && old.key.eq_value(write.key.as_ref()))
+            {
+                Some("update")
+            } else {
+                Some("insert")
+            };
+            outputs.push(crate::reactive::reaction::OutputEdge {
+                view: write.view_name,
+                element: format!("{:?}", write.key),
+                committed,
+            });
+        }
+        for write in old_writes.iter() {
+            let retained = candidate
+                .iter()
+                .any(|next| next.view == write.view && next.key.eq_value(write.key.as_ref()));
+            if !retained {
+                outputs.push(crate::reactive::reaction::OutputEdge {
+                    view: write.view_name,
+                    element: format!("{:?}", write.key),
+                    committed: Some("retract"),
+                });
+            }
+        }
+        record_command_metric::<crate::reactive::reaction::ReactionDigest>(|digest| {
+            digest.push_evaluation(crate::reactive::reaction::EvaluatedComponent {
+                definition,
+                callsite,
+                driving_element,
+                reads,
+                outputs,
+            });
+        });
+    }
+
     {
-        let new_read_rows: Vec<(
-            TypeId,
-            Option<Arc<dyn KeyValue>>,
-            bool,
-            bool,
-        )> = graph_guard
+        let new_read_rows: Vec<(TypeId, Option<Arc<dyn KeyValue>>, bool, bool)> = graph_guard
             .invocation(id)?
             .reads
             .iter()
             .map(|read| (read.view, read.key.clone(), read.temporal, read.keyset))
             .collect();
-        let old_read_rows: Vec<(
-            TypeId,
-            Option<Arc<dyn KeyValue>>,
-            bool,
-            bool,
-        )> = old_read_deps
+        let old_read_rows: Vec<(TypeId, Option<Arc<dyn KeyValue>>, bool, bool)> = old_read_deps
             .iter()
             .map(|read| (read.view, read.key.clone(), read.temporal, read.keyset))
             .collect();
         graph_guard.deps.replace(&new_read_rows, &old_read_rows, id);
         let invocation = graph_guard.invocation_mut(id)?;
+        if std::env::var_os("PLINGO_TRACE_QUEUE").is_some()
+            && invocation.function_name.contains("tree_semantic")
+        {
+            eprintln!(
+                "reads function={} id={} reads={:?}",
+                invocation.function_name,
+                id,
+                invocation
+                    .reads
+                    .iter()
+                    .map(|read| (read.name, read.view, read.key.is_some(), read.temporal, read.keyset))
+                    .collect::<Vec<_>>()
+            );
+        }
         invocation.result = Some(Arc::clone(&result));
-        invocation.writes = candidate;
-        invocation.children = seen_children;
+        invocation.writes = committed_writes;
+        invocation.children = seen_children.clone();
+        if std::env::var_os("PLINGO_TRACE_EVAL").is_some()
+            && invocation.function_name.contains("name_resolve")
+        {
+            eprintln!(
+                "eval-end id={} function={} children={:?} seen={:?}",
+                id, invocation.function_name, invocation.children, seen_children
+            );
+        }
         invocation.dirty = false;
     }
     graph_guard.change_log.extend(changes);
@@ -1445,10 +1654,7 @@ impl IndexedWrites {
     /// entry keeps its own ordinal, so merging preserves historical
     /// semantics and the single final canonical sort stays deterministic.
     fn into_writes(self) -> Vec<PlainWrite> {
-        self.entries
-            .into_iter()
-            .map(|entry| entry.write)
-            .collect()
+        self.entries.into_iter().map(|entry| entry.write).collect()
     }
 
     fn ordered(&self) -> Vec<PlainWrite> {
@@ -1488,9 +1694,10 @@ fn patch_ops_to_indexed(ops: Vec<PatchOp>) -> Result<IndexedWrites> {
             },
             shareable: false,
         };
+        let duplicate_view = write.view_name;
         if !writes.insert_if_absent(write) {
             return Err(Error::DuplicatePatchKey {
-                view: op.view_name.to_string(),
+                view: duplicate_view.to_string(),
             });
         }
     }
@@ -1527,9 +1734,65 @@ fn retract_invocation(
                 .collect::<Vec<_>>(),
         )
     };
+    if std::env::var_os("PLINGO_TRACE_RETRACT").is_some() {
+        eprintln!(
+            "retract id={} function={} children={children:?} writes={}",
+            id,
+            name,
+            writes.len()
+        );
+    }
     let mut changes = Vec::new();
     for child in children {
         changes.extend(retract_invocation(graph, child, name)?);
+    }
+    // Reaction capture: attribute the exact retraction domain to this
+    // invocation (observation-only). Gated: consumers opt in.
+    if crate::reactive::reaction::capture_enabled() {
+        let retired_edges: Vec<crate::reactive::reaction::ElementEdge> = {
+            let graph_guard = graph.lock();
+            graph_guard
+                .invocations
+                .iter()
+                .find(|invocation| invocation.id == id)
+                .map(|invocation| {
+                    invocation
+                        .writes
+                        .iter()
+                        .map(|write| crate::reactive::reaction::ElementEdge {
+                            view: write.view_name,
+                            element: format!("{:?}", write.key),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let identity_info = {
+            let graph_guard = graph.lock();
+            graph_guard
+                .invocations
+                .iter()
+                .find(|invocation| invocation.id == id)
+                .and_then(|invocation| invocation.identity.clone())
+                .map(|identity| {
+                    (
+                        format!("{}:{}:{}", identity.file, identity.line, identity.column),
+                        format!("{:?}", identity.input),
+                    )
+                })
+        };
+        let (retired_callsite, retired_driving) = match &identity_info {
+            Some((callsite, driving)) => (callsite.clone(), driving.clone()),
+            None => (String::new(), String::new()),
+        };
+        record_command_metric::<crate::reactive::reaction::ReactionDigest>(|digest| {
+            digest.push_retirement(crate::reactive::reaction::RetiredComponent {
+                definition: name,
+                callsite: retired_callsite,
+                driving_element: retired_driving,
+                retracted_outputs: retired_edges,
+            });
+        });
     }
     // Retired invocations hold no dependency rows: they must never be
     // marked again by later changes.
@@ -1538,10 +1801,14 @@ fn retract_invocation(
     with_txn(|txn| -> Result<()> {
         let mut state = state.lock();
         for write in writes {
-            if let Some(change) =
-                txn.journal
-                    .retract(&mut state, write.view, write.name, write.key.as_ref(), id, name)?
-            {
+            if let Some(change) = txn.journal.retract(
+                &mut state,
+                write.view,
+                write.name,
+                write.key.as_ref(),
+                id,
+                name,
+            )? {
                 changes.push(change);
             }
         }
@@ -1560,6 +1827,64 @@ fn retract_invocation(
     graph_guard.state_slots.remove(&id);
     Ok(changes)
 }
+/// Retires stable keyed children from one enumeration group before the
+/// enumerator evaluates any replacement child.  Cleanup after the parent
+/// body is too late: a replacement child can publish the same fact while a
+/// removed sibling still owns it.
+pub(crate) fn reconcile_keyed_children(
+    group: &'static std::panic::Location<'static>,
+    keep: &[Arc<dyn KeyValue>],
+) -> Result<()> {
+    let (graph, parent) = ACTIVE_EVALS.with(|active| {
+        active
+            .borrow()
+            .last()
+            .map(|frame| (Arc::clone(&frame.graph), frame.id))
+            .ok_or_else(|| Error::EffectOutsideRun {
+                effect: "run_each_child".to_string(),
+                view: "<computation>".to_string(),
+            })
+    })?;
+    let stale = {
+        let graph_guard = graph.lock();
+        let parent_invocation = graph_guard.invocation(parent)?;
+        parent_invocation
+            .children
+            .iter()
+            .filter_map(|child| {
+                graph_guard
+                    .invocations
+                    .iter()
+                    .find(|invocation| invocation.id == *child && !invocation.retired)
+            })
+            .filter(|invocation| {
+                invocation.identity.as_ref().is_some_and(|identity| {
+                    identity.stable_input
+                        && identity.file == group.file()
+                        && identity.line == group.line()
+                        && identity.column == group.column()
+                        && !keep
+                            .iter()
+                            .any(|key| identity.input.eq_value(key.as_ref()))
+                })
+            })
+            .map(|invocation| invocation.id)
+            .collect::<Vec<_>>()
+    };
+    for stale_child in stale {
+        let changes = retract_invocation(&graph, stale_child, "<keyed-enumeration>")?;
+        graph.lock().change_log.extend(changes);
+        let mut graph_guard = graph.lock();
+        with_txn(|txn| txn.touch_invocation(graph_guard.root, &graph_guard, parent));
+        let parent_invocation = graph_guard.invocation_mut(parent)?;
+        parent_invocation.children.retain(|child| *child != stale_child);
+        parent_invocation
+            .seen_children
+            .retain(|child| *child != stale_child);
+    }
+    Ok(())
+}
+
 
 #[track_caller]
 pub(crate) fn run_effect<F, A, B>(function: F, input: A) -> Result<B>
@@ -1579,6 +1904,19 @@ where
     B: Clone + PartialEq + Debug + Send + Sync + 'static,
 {
     run_effect_at(function, input, true, std::panic::Location::caller())
+}
+
+pub(crate) fn run_keyed_effect_at<F, A, B>(
+    function: F,
+    input: A,
+    location: &'static std::panic::Location<'static>,
+) -> Result<B>
+where
+    F: Fn(A) -> Result<B> + Clone + Send + Sync + 'static,
+    A: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
+    B: Clone + PartialEq + Debug + Send + Sync + 'static,
+{
+    run_effect_at(function, input, true, location)
 }
 
 fn run_effect_at<F, A, B>(
@@ -1642,6 +1980,17 @@ where
         stable_input,
     };
     let call = erased_call(function, input);
+    if std::env::var_os("PLINGO_TRACE_EFFECTS").is_some() {
+        eprintln!(
+            "effect function={} input={:?} hash={} parent={} occurrence={} stable={}",
+            call.function_name(),
+            key,
+            key.hash_value(),
+            parent,
+            occurrence,
+            stable_input
+        );
+    }
 
     let ancestors = active_ids();
     {
@@ -1692,6 +2041,10 @@ where
                     .map(|invocation| invocation.id)
             });
             let stale = if existing.is_none() && !identity.stable_input {
+                // A changed positional child invalidates the remaining
+                // siblings from the same callsite.  Retire the suffix before
+                // evaluating the replacement; otherwise an old later sibling
+                // can still own a fact that the new subtree publishes.
                 children
                     .iter()
                     .filter_map(|child| {
@@ -1706,7 +2059,7 @@ where
                                 && have.line == identity.line
                                 && have.column == identity.column
                                 && have.function == identity.function
-                                && have.occurrence == identity.occurrence
+                                && have.occurrence >= identity.occurrence
                         })
                     })
                     .map(|invocation| invocation.id)
@@ -1779,11 +2132,88 @@ where
         .cloned()
         .ok_or_else(|| Error::Internal("child result type mismatch".into()))
 }
-/// Mints a deterministic typed node identity for the active computation
-/// invocation. The identity excludes the parent/root instance so equal
-/// constructor calls in independent roots share one node.
+/// Mints the deterministic identity for one generated component output port.
+///
+/// The erased key retains the complete component marker, view type, driving
+/// element, and output ordinal. The cached hash is an index accelerator only;
+/// [`Node`] equality compares the retained key on collisions.
+pub(crate) fn automatic_node_id<V, M, K>(
+    key: K,
+    port: u16,
+) -> Result<crate::reactive::view::Node<V>>
+where
+    V: View,
+    M: crate::reactive::component::ComponentDefinition + 'static,
+    K: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
+{
+    let active = ACTIVE_EVALS.with(|stack| !stack.borrow().is_empty());
+    if !active {
+        return Err(Error::EffectOutsideRun {
+            effect: "component_output".to_string(),
+            view: V::name().to_string(),
+        });
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct AutomaticKey<K> {
+        view: TypeId,
+        component: TypeId,
+        port: u16,
+        driving_key: K,
+    }
+    let identity = AutomaticKey {
+        view: TypeId::of::<V>(),
+        component: TypeId::of::<M>(),
+        port,
+        driving_key: key,
+    };
+    let mut hasher = DefaultHasher::new();
+    identity.hash(&mut hasher);
+    let raw = hasher.finish();
+    Ok(crate::reactive::view::Node::from_automatic(
+        raw,
+        Arc::new(identity),
+    ))
+}
+
+#[derive(Clone, Debug)]
+struct AutomaticEffectKey {
+    view: TypeId,
+    function: TypeId,
+    file: &'static str,
+    line: u32,
+    column: u32,
+    occurrence: u64,
+    input: Arc<dyn KeyValue>,
+}
+
+impl PartialEq for AutomaticEffectKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.view == other.view
+            && self.function == other.function
+            && self.file == other.file
+            && self.line == other.line
+            && self.column == other.column
+            && self.occurrence == other.occurrence
+            && self.input.eq_value(other.input.as_ref())
+    }
+}
+
+impl Eq for AutomaticEffectKey {}
+
+impl Hash for AutomaticEffectKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.view.hash(state);
+        self.function.hash(state);
+        self.file.hash(state);
+        self.line.hash(state);
+        self.column.hash(state);
+        self.occurrence.hash(state);
+        self.input.hash_value().hash(state);
+    }
+}
+
 #[track_caller]
-pub(crate) fn fresh_node_id<V: View>() -> Result<crate::reactive::view::Node<V>> {
+pub(crate) fn automatic_effect_node_id<V: View>() -> Result<crate::reactive::view::Node<V>> {
     let location = std::panic::Location::caller();
     let (graph, id) = ACTIVE_EVALS.with(|active| {
         active
@@ -1791,15 +2221,22 @@ pub(crate) fn fresh_node_id<V: View>() -> Result<crate::reactive::view::Node<V>>
             .last()
             .map(|frame| (Arc::clone(&frame.graph), frame.id))
             .ok_or_else(|| Error::EffectOutsideRun {
-                effect: "fresh_node_id".to_string(),
+                effect: "automatic_effect_node_id".to_string(),
                 view: V::name().to_string(),
             })
     })?;
-    let mut graph_guard = graph.lock();
-    let invocation = graph_guard.invocation_mut(id)?;
-    let function = invocation.call.function_type();
-    let input_hash = invocation.call.input_key().hash_value();
+    let (function, input) = {
+        let graph_guard = graph.lock();
+        let invocation = graph_guard.invocation(id)?;
+        (
+            invocation.call.function_type(),
+            invocation.call.input_key(),
+        )
+    };
+    let input_hash = input.hash_value();
     let occurrence = {
+        let mut graph_guard = graph.lock();
+        let invocation = graph_guard.invocation_mut(id)?;
         let key = (
             location.file(),
             location.line(),
@@ -1812,15 +2249,21 @@ pub(crate) fn fresh_node_id<V: View>() -> Result<crate::reactive::view::Node<V>>
         *next = next.saturating_add(1);
         occurrence
     };
+    let identity = AutomaticEffectKey {
+        view: TypeId::of::<V>(),
+        function,
+        file: location.file(),
+        line: location.line(),
+        column: location.column(),
+        occurrence,
+        input,
+    };
     let mut hasher = DefaultHasher::new();
-    TypeId::of::<V>().hash(&mut hasher);
-    function.hash(&mut hasher);
-    input_hash.hash(&mut hasher);
-    location.file().hash(&mut hasher);
-    location.line().hash(&mut hasher);
-    location.column().hash(&mut hasher);
-    occurrence.hash(&mut hasher);
-    Ok(crate::reactive::view::Node::from_raw(hasher.finish()))
+    identity.hash(&mut hasher);
+    Ok(crate::reactive::view::Node::from_automatic(
+        hasher.finish(),
+        Arc::new(identity),
+    ))
 }
 
 #[derive(Default)]
@@ -1870,6 +2313,8 @@ pub(crate) struct PlainRuntime {
     pub dirty: crate::reactive::store::DirtyQueue,
     /// Keyed component families (plan §5.4), by family id and root token.
     pub families: HashMap<u64, FamilyRuntime>,
+    /// Installed first-class component definitions (Cut C).
+    pub components: crate::reactive::component::DefinitionRegistry,
     pub(crate) family_by_root: HashMap<u64, u64>,
     pub(crate) next_install_ordinal: u64,
 }
@@ -1882,12 +2327,17 @@ pub(crate) struct FamilyRuntime {
     pub view_name: &'static str,
     pub install_ordinal: u64,
     pub build_call: Arc<dyn Fn(Arc<dyn KeyValue>) -> Arc<dyn ErasedCall> + Send + Sync>,
+    /// Component definition when this family backs a `#[component]`
+    /// EachKey driver (Cut C): children take the definition marker as
+    /// their identity type and its descriptor as their name.
+    pub definition: Option<(&'static str, TypeId)>,
 }
 
 impl Default for PlainRuntime {
     fn default() -> Self {
         Self {
             state: Arc::new(Mutex::new(PlainState::default())),
+            components: crate::reactive::component::DefinitionRegistry::default(),
             committed: SnapshotRoot::default(),
             epoch: 0,
             roots: BTreeMap::new(),
@@ -1919,6 +2369,22 @@ impl PlainSnapshot {
             .sum()
     }
 
+    pub(crate) fn view_counts(&self) -> Vec<(String, u64)> {
+        let mut counts = self
+            .root
+            .views()
+            .iter()
+            .map(|(view_id, view)| {
+                (
+                    format!("{view_id:?}:{}", view.name()),
+                    view.len() as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        counts.sort_by(|left, right| left.0.cmp(&right.0));
+        counts
+    }
+
     pub(crate) fn observe<V: View>(&self, input: V::Input) -> Option<Arc<V::Output>> {
         record_command_metric::<EngineWork>(|work| {
             work.fact_reads += 1;
@@ -1927,10 +2393,15 @@ impl PlainSnapshot {
         let view = self.root.view(TypeId::of::<V>())?;
         let key: Arc<dyn KeyValue> = Arc::new(input);
         let entry = view.lookup(key.as_ref())?;
-        entry.value.as_any().downcast_ref::<V::Output>().map(|_| {
-            let value: Arc<dyn Value> = Arc::clone(&entry.value);
-            value
-        }).and_then(downcast_arc::<V::Output>)
+        entry
+            .value
+            .as_any()
+            .downcast_ref::<V::Output>()
+            .map(|_| {
+                let value: Arc<dyn Value> = Arc::clone(&entry.value);
+                value
+            })
+            .and_then(downcast_arc::<V::Output>)
     }
 
     pub(crate) fn inputs<V: View>(&self) -> Vec<V::Input> {
@@ -1995,6 +2466,171 @@ where
     ))
 }
 
+/// Debug/test liveness audit over the production view and invocation
+/// indexes (follow-up plan §4 item 12). Read-only: it adds no facts, no
+/// dependencies, and no repair paths. Returns one human-readable row per
+/// violated invariant; an empty vector means the indexes are consistent.
+pub(crate) fn liveness_audit(runtime: &PlainRuntime) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut violations = Vec::new();
+    let state = runtime.state.lock();
+
+    // Every live graph: installed roots plus keyed-family graphs.
+    let graphs: Vec<(String, Arc<Mutex<PlainGraph>>)> = runtime
+        .roots
+        .iter()
+        .map(|(token, root)| (format!("root:{token}"), Arc::clone(&root.graph)))
+        .chain(runtime.families.iter().map(|(id, family)| {
+            (
+                format!("family:{id}:{}", family.view_name),
+                Arc::clone(&family.graph),
+            )
+        }))
+        .collect();
+
+    for (label, graph) in &graphs {
+        let graph_guard = graph.lock();
+        for invocation in &graph_guard.invocations {
+            let where_ = format!("{label}/{}#{}", invocation.function_name, invocation.id);
+            if invocation.retired {
+                if !invocation.writes.is_empty() {
+                    violations.push(format!(
+                        "{where_}: retired instance retains {} output facts",
+                        invocation.writes.len()
+                    ));
+                }
+                if !invocation.reads.is_empty() || !invocation.children.is_empty() {
+                    violations.push(format!("{where_}: retired instance retains reads/children"));
+                }
+                continue;
+            }
+            // Forward ownership: every owned output exists in the store
+            // with this instance among its writers.
+            for write in &invocation.writes {
+                match state.slot_index(write.view, write.key.as_ref()) {
+                    Some(index) => {
+                        let slot = state.slots[index].as_ref().expect("occupied slot");
+                        if !slot.fact.writers.contains(invocation.id) {
+                            violations.push(format!(
+                                "{where_}: owns {:?} on {} without writer membership",
+                                write.key, write.view_name
+                            ));
+                        }
+                    }
+                    None => violations.push(format!(
+                        "{where_}: owns absent fact {:?} on {}",
+                        write.key, write.view_name
+                    )),
+                }
+            }
+            // Bijection: forward read rows ↔ reverse dependency index.
+            for read in &invocation.reads {
+                if !graph_guard.deps.contains_row(
+                    read.view,
+                    read.key.as_ref(),
+                    read.temporal,
+                    read.keyset,
+                    invocation.id,
+                ) {
+                    violations.push(format!(
+                        "{where_}: read row missing from reverse index ({})",
+                        read.name
+                    ));
+                }
+            }
+        }
+        // Converse bijection: every reverse row names a live invocation
+        // whose forward rows justify it (no dangling endpoints).
+        let mut seen_rows: HashSet<(bool, u8, TypeId, u64)> = HashSet::new();
+        for (temporal, kind, view, invocation_id) in graph_guard.deps.iter_rows() {
+            if !seen_rows.insert((temporal, kind, view, invocation_id)) {
+                continue;
+            }
+            let Some(target) = graph_guard
+                .invocations
+                .iter()
+                .find(|candidate| candidate.id == invocation_id)
+            else {
+                violations.push(format!(
+                    "{label}: dangling dependency endpoint {invocation_id}"
+                ));
+                continue;
+            };
+            if target.retired {
+                violations.push(format!(
+                    "{label}: dependency row targets retired {invocation_id}"
+                ));
+                continue;
+            }
+            let justified = target.reads.iter().any(|read| {
+                graph_guard.deps.contains_row(
+                    view,
+                    read.key.as_ref(),
+                    temporal,
+                    matches!(kind, 1),
+                    invocation_id,
+                ) && (kind != 0 || read.key.is_some())
+            });
+            if !justified {
+                violations.push(format!(
+                    "{label}/{target_function}#{invocation_id}: unjustified reverse row",
+                    target_function = target.function_name
+                ));
+            }
+        }
+    }
+
+    // Owner multiplicity: a non-shareable fact never carries two writers;
+    // shareable facts expose their full owner set (nothing to reject).
+    for slots in state.by_view.values() {
+        for (_, index) in slots {
+            let Some(slot) = state.slots[*index].as_ref() else {
+                continue;
+            };
+            if !slot.fact.shared && slot.fact.writers.len() > 1 {
+                violations.push(format!(
+                    "fact {:?} on {} has {} writers but is non-shareable",
+                    slot.fact.key,
+                    slot.fact.name,
+                    slot.fact.writers.len()
+                ));
+            }
+        }
+    }
+
+    // Family DIRECT children only: driving elements exist while the child
+    // lives. Nested descendants belong to their parent chain, not to the
+    // family driver (Cut C lifecycle model).
+    for family in runtime.families.values() {
+        let graph_guard = family.graph.lock();
+        let family_root = graph_guard.root;
+        for invocation in &graph_guard.invocations {
+            if invocation.retired || invocation.parent != Some(family_root) {
+                continue;
+            }
+            let Some(identity) = invocation.identity.as_ref() else {
+                continue;
+            };
+            let present = runtime
+                .committed
+                .view(family.view)
+                .map(|view| {
+                    view.entries()
+                        .any(|entry| entry.key.eq_value(identity.input.as_ref()))
+                })
+                .unwrap_or(false);
+            if !present {
+                violations.push(format!(
+                    "family {}:{}#{} drives on a missing key of {}",
+                    family.view_name, invocation.function_name, invocation.id, family.view_name
+                ));
+            }
+        }
+    }
+
+    violations.sort();
+    violations
+}
 pub(crate) fn recapture_plan(
     plan: &mut PlainPlan,
     state: PlainState,
@@ -2053,7 +2689,14 @@ pub(crate) fn promote_plan(
     });
     let install_ordinal = runtime.next_install_ordinal;
     runtime.next_install_ordinal += 1;
-    runtime.roots.insert(plan.root, RootRuntime { graph, sink, install_ordinal });
+    runtime.roots.insert(
+        plan.root,
+        RootRuntime {
+            graph,
+            sink,
+            install_ordinal,
+        },
+    );
     Ok(plan.output)
 }
 
@@ -2064,13 +2707,18 @@ fn change_matches(read: &ReadDep, changes: &[FactChange], temporal: bool) -> boo
 /// Temporal::Previous fact read: the journal's first-touch value when the
 /// command touched the key, else the committed value (identical for
 /// untouched keys).
-fn previous_read(state: &Mutex<PlainState>, view: TypeId, key: &dyn KeyValue) -> Option<Arc<dyn Value>> {
-    ACTIVE_TXN.with(|txn| {
-        let frame = txn.borrow().as_ref()?.clone();
-        let guard = frame.borrow();
-        guard.journal.first_value(view, key)
-    })
-    .or_else(|| state.lock().read(view, key))
+fn previous_read(
+    state: &Mutex<PlainState>,
+    view: TypeId,
+    key: &dyn KeyValue,
+) -> Option<Arc<dyn Value>> {
+    ACTIVE_TXN
+        .with(|txn| {
+            let frame = txn.borrow().as_ref()?.clone();
+            let guard = frame.borrow();
+            guard.journal.first_value(view, key)
+        })
+        .or_else(|| state.lock().read(view, key))
 }
 
 /// Temporal::Previous input enumeration with journal adjustment.
@@ -2089,6 +2737,16 @@ fn mark_changes(runtime: &mut PlainRuntime, changes: &[FactChange]) {
     if changes.is_empty() {
         return;
     }
+    if std::env::var_os("PLINGO_TRACE_QUEUE").is_some() {
+        for change in changes {
+            eprintln!(
+                "mark change view={:?} key_hash={} presence={}",
+                change.view,
+                change.key.hash_value(),
+                change.presence_changed
+            );
+        }
+    }
     // Keyed families schedule their children directly per changed key
     // (plan §5.4); no root re-discovers keys through enumeration.
     schedule_families(runtime, changes);
@@ -2103,12 +2761,33 @@ fn mark_changes(runtime: &mut PlainRuntime, changes: &[FactChange]) {
         })
         .collect();
     let mut queued = 0usize;
-    for root in runtime.roots.values() {
-        let install_ordinal = root.install_ordinal;
-        let graph = root.graph.lock();
+    // Roots and keyed families share one wake contract: every invocation
+    // wakes through its OWN recorded dependency rows (follow-up plan §6.1
+    // membership-only drivers rely on this for family members).
+    let graphs = runtime
+        .roots
+        .values()
+        .map(|root| (root.install_ordinal, &root.graph))
+        .chain(
+            runtime
+                .families
+                .values()
+                .map(|family| (family.install_ordinal, &family.graph)),
+        );
+    for (install_ordinal, graph) in graphs {
+        let graph = graph.lock();
         let mut ids: Vec<u64> = Vec::new();
         graph.deps.mark_current(&changes, |id| ids.push(id));
         for id in ids {
+            if std::env::var_os("PLINGO_TRACE_QUEUE").is_some() {
+                eprintln!(
+                    "queue install={} root={} invocation={} function={}",
+                    install_ordinal,
+                    graph.root,
+                    id,
+                    graph.function_name_of(id).unwrap_or("<missing>")
+                );
+            }
             runtime.dirty.insert(crate::reactive::store::DirtyKey {
                 root_install_ordinal: install_ordinal,
                 invocation_ordinal: id,
@@ -2303,14 +2982,23 @@ fn retract_invocation_owned(
             .iter()
             .find(|inv| inv.id == id)
             .ok_or_else(|| {
-                Error::Internal(format!("owned invocation {id} absent in root {}", graph_guard.root).into())
+                Error::Internal(
+                    format!("owned invocation {id} absent in root {}", graph_guard.root).into(),
+                )
             })?;
         (invocation.writes.clone(), invocation.function_name)
     };
     with_txn(|txn| -> Result<()> {
         let mut state = state.lock();
         for write in writes {
-            txn.journal.retract(&mut state, write.view, write.name, write.key.as_ref(), id, name)?;
+            txn.journal.retract(
+                &mut state,
+                write.view,
+                write.name,
+                write.key.as_ref(),
+                id,
+                name,
+            )?;
         }
         Ok(())
     })
@@ -2339,9 +3027,21 @@ pub(crate) fn initialize_dirty(runtime: &mut PlainRuntime, changes: &[FactChange
         })
         .collect();
     let mut queued = 0usize;
-    for root in runtime.roots.values() {
-        let install_ordinal = root.install_ordinal;
-        let mut graph = root.graph.lock();
+    // Roots and keyed-family/component graphs share one epoch wake pass
+    // (follow-up plan §6.1: component members wake through their own
+    // recorded dependencies).
+    let graphs = runtime
+        .roots
+        .values()
+        .map(|root| (root.install_ordinal, &root.graph))
+        .chain(
+            runtime
+                .families
+                .values()
+                .map(|family| (family.install_ordinal, &family.graph)),
+        );
+    for (install_ordinal, graph_handle) in graphs {
+        let mut graph = graph_handle.lock();
         if !Arc::ptr_eq(&graph.state, &runtime.state) {
             // Graphs created by isolated captures adopt the committed store.
             graph.state = Arc::clone(&runtime.state);
@@ -2455,7 +3155,100 @@ pub(crate) fn queue_family_child(
 
 /// Schedules every family watching a changed view.
 pub(crate) fn schedule_families(runtime: &mut PlainRuntime, changes: &[FactChange]) {
+    // Removals retire BEFORE additions evaluate: a child whose input
+    // vanished must retract its owned keys before a concurrently-queued
+    // new instance writes overlapping keys in the same command (plan
+    // §23.5 "edge removal/move retires the old expectation before the new
+    // edge settles"). Otherwise the store sees the retired writer's staged
+    // value and raises a spurious writer conflict.
     for change in changes {
+        if !change.presence_changed {
+            continue;
+        }
+        let still_present = runtime
+            .state
+            .lock()
+            .slot_index(change.view, change.key.as_ref())
+            .is_some();
+        if std::env::var_os("PLINGO_TRACE_FAMILY").is_some() {
+            eprintln!(
+                "family-removal? view={:?} hash={} present={}",
+                change.view,
+                change.key.hash_value(),
+                still_present
+            );
+        }
+        if still_present {
+            continue;
+        }
+        let watchers: Vec<u64> = runtime
+            .families
+            .iter()
+            .filter(|(_, family)| family.view == change.view)
+            .map(|(family_id, _)| *family_id)
+            .collect();
+        for family_id in watchers {
+            let family = runtime.families.get(&family_id);
+            let Some(family) = family else { continue };
+            let graph = Arc::clone(&family.graph);
+            let root = graph.lock().root;
+            drop(family);
+            let function_name = graph.lock().function_name_of(root);
+            let Ok(function_name) = function_name else { continue };
+            let removed: Vec<u64> = {
+                let graph_guard = graph.lock();
+                graph_guard
+                    .invocations
+                    .iter()
+                    .filter(|invocation| {
+                        !invocation.retired
+                            && invocation.parent == Some(graph_guard.root)
+                            && invocation
+                                .identity
+                                .as_ref()
+                                .is_some_and(|identity| identity.input.eq_value(change.key.as_ref()))
+                    })
+                    .map(|invocation| invocation.id)
+                    .collect()
+            };
+            for id in removed {
+                if std::env::var_os("PLINGO_TRACE_FAMILY").is_some() {
+                    eprintln!("family-retire id={id}");
+                }
+                let changes = match retract_invocation(&graph, id, function_name) {
+                    Ok(changes) => changes,
+                    Err(_) => continue,
+                };
+                {
+                    let mut graph_guard = graph.lock();
+                    if let Some(position) = graph_guard
+                        .invocations
+                        .iter()
+                        .position(|invocation| invocation.id == id)
+                    {
+                        graph_guard.invocations.remove(position);
+                    }
+                }
+                mark_changes(runtime, &changes);
+            }
+        }
+    }
+    for change in changes {
+        // Families own MEMBERSHIP lifecycle only (follow-up plan §6.1): an
+        // instance exists iff its key exists. A payload change reruns a
+        // member only through the member's OWN recorded read dependency
+        // (mark_current above); membership drivers stay cold otherwise.
+        if !change.presence_changed {
+            continue;
+        }
+        let still_present = runtime
+            .state
+            .lock()
+            .slot_index(change.view, change.key.as_ref())
+            .is_some();
+        if !still_present {
+            continue;
+        }
         let watchers: Vec<u64> = runtime
             .families
             .iter()
@@ -2519,7 +3312,24 @@ pub(crate) fn quiesce(runtime: &mut PlainRuntime) -> Result<u32> {
         mark_changes(runtime, &graph_changes);
 
         // A keyed child whose input vanished retires with its publication.
-        if let Some(family_id) = runtime.family_by_root.get(&root).copied() {
+        // DIRECT family children only: nested descendants inherit lifecycle
+        // from their parent chain (Cut C), so a grandchild requeued by its
+        // own dependency rows must never be driver-checked.
+        let popped_is_family_child = runtime.family_by_root.contains_key(&root)
+            && runtime
+                .family_by_root
+                .get(&root)
+                .and_then(|family_id| runtime.families.get(family_id))
+                .map(|family| {
+                    let graph_guard = family.graph.lock();
+                    graph_guard
+                        .invocation(id)
+                        .is_ok_and(|inv| inv.parent == Some(graph_guard.root))
+                })
+                .unwrap_or(false);
+        if popped_is_family_child
+            && let Some(family_id) = runtime.family_by_root.get(&root).copied()
+        {
             let (view, input_key) = {
                 let graph_guard = graph.lock();
                 let invocation = graph_guard
@@ -2604,9 +3414,10 @@ pub(crate) fn update_sinks(runtime: &PlainRuntime) {
     for root in runtime.roots.values() {
         let graph = root.graph.lock();
         if let Ok(invocation) = graph.invocation(graph.root)
-            && let Some(output) = &invocation.result {
-                (root.sink.update)(Arc::clone(output));
-            }
+            && let Some(output) = &invocation.result
+        {
+            (root.sink.update)(Arc::clone(output));
+        }
     }
 }
 pub(crate) fn run_command<F>(runtime: &mut PlainRuntime, effects: F) -> Result<PlainCommandReport>
@@ -2616,6 +3427,7 @@ where
     let buffer = Arc::new(Mutex::new(CommandBuffer::default()));
     let pending = std::rc::Rc::new(PendingOverlay::default());
     let _metrics = push_metric_frame();
+    crate::reactive::pathwork::reset();
     let txn_frame = push_txn();
     ACTIVE.with(|active| {
         active.borrow_mut().push(ActiveDispatcher::Command(
@@ -2666,10 +3478,7 @@ where
     let round_changes = with_txn(|txn| -> Result<Vec<FactChange>> {
         let (direct_writes, patch_ops) = {
             let mut buffer = buffer.lock();
-            (
-                buffer.writes.clone(),
-                std::mem::take(&mut buffer.patch_ops),
-            )
+            (buffer.writes.clone(), std::mem::take(&mut buffer.patch_ops))
         };
         let mut writes = IndexedWrites::from_writes(direct_writes);
         for write in patch_ops_to_indexed(patch_ops)?.into_writes() {
@@ -2710,7 +3519,11 @@ where
             epoch: runtime.epoch,
             rounds: 0,
             changes: Vec::new(),
-            engine: take_engine_work(),
+            engine: {
+                let mut engine = take_engine_work();
+                engine.path_work = crate::reactive::pathwork::take();
+                engine
+            },
             invocation_work: take_frame_metric::<InvocationWork>(),
             metrics: freeze_metric_frame(),
         });
@@ -2763,8 +3576,12 @@ where
     Ok(PlainCommandReport {
         epoch: runtime.epoch,
         rounds,
+        engine: {
+            let mut engine = take_engine_work();
+            engine.path_work = crate::reactive::pathwork::take();
+            engine
+        },
         changes: final_changes,
-        engine: take_engine_work(),
         invocation_work: take_frame_metric::<InvocationWork>(),
         metrics: freeze_metric_frame(),
     })
@@ -2807,6 +3624,55 @@ pub(crate) fn peek_committed_pub<V: View>(input: V::Input) -> Result<Option<Arc<
             None => Ok(None),
         }
     })
+}
+
+/// Cut E ownership-diff seam: keys the innermost evaluating invocation
+/// owned BEFORE its current body ran (its pre-evaluation write set),
+/// filtered to one view.
+pub(crate) fn pre_eval_owned_keys<V: View>() -> Vec<Arc<dyn KeyValue>> {
+    let view = TypeId::of::<V>();
+    ACTIVE_EVALS.with(|active| {
+        let active = active.borrow();
+        let Some(frame) = active.last() else {
+            return Vec::new();
+        };
+        frame
+            .pre_eval_writes
+            .writes
+            .iter()
+            .filter(|write| write.view == view)
+            .map(|write| Arc::clone(&write.key))
+            .collect()
+    })
+}
+
+/// Cut E ownership-diff seam: keys buffered for one view by the innermost
+/// evaluation's authoring so far (the desired post-publication set).
+pub(crate) fn pending_view_keys<V: View>() -> Vec<Arc<dyn KeyValue>> {
+    let view = TypeId::of::<V>();
+    let mut keys = Vec::new();
+    ACTIVE.with(|active| {
+        let active = active.borrow();
+        if let Some(dispatcher) = active.last() {
+            match dispatcher {
+                ActiveDispatcher::Eval(_, _, pending) => {
+                    for op in pending.patch_ops.borrow().iter() {
+                        if op.view == view {
+                            keys.push(Arc::clone(&op.key));
+                        }
+                    }
+                }
+                ActiveDispatcher::Command(buffer, _) => {
+                    for op in buffer.lock().patch_ops.iter() {
+                        if op.view == view {
+                            keys.push(Arc::clone(&op.key));
+                        }
+                    }
+                }
+            }
+        }
+    });
+    keys
 }
 
 pub(crate) fn erased_noop_pub() -> Arc<dyn ErasedCall> {
@@ -2863,7 +3729,6 @@ pub(crate) struct PlainCommandReport {
     pub metrics: Arc<MetricExtensions>,
 }
 
-
 // ---------------------------------------------------------------------------
 // Invocation-local state slots (plan §5.6)
 // ---------------------------------------------------------------------------
@@ -2885,15 +3750,32 @@ macro_rules! impl_state_value {
     };
 }
 
-impl_state_value!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, bool, char, String, ());
+impl_state_value!(
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    isize,
+    bool,
+    char,
+    String,
+    ()
+);
 unsafe impl<T: StateValue> StateValue for Arc<T> {}
 unsafe impl<T: StateValue> StateValue for Vec<T> {}
 unsafe impl<T: StateValue> StateValue for Option<T> {}
 unsafe impl<K: StateValue, V: StateValue> StateValue for std::collections::BTreeMap<K, V> {}
-unsafe impl<K: StateValue, V: StateValue> StateValue for std::collections::HashMap<K, V>
-where
-    K: std::hash::Hash + Eq,
-{}
+unsafe impl<K: StateValue, V: StateValue> StateValue for std::collections::HashMap<K, V> where
+    K: std::hash::Hash + Eq
+{
+}
 unsafe impl<A: StateValue, B: StateValue> StateValue for (A, B) {}
 
 /// One stored slot: type-checked value plus a generation for stale-handle
@@ -2997,5 +3879,125 @@ impl<T: StateValue> StateCell<T> {
             graph_guard.state_slots.remove(&id);
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod liveness_audit_tests {
+    use super::*;
+
+    /// Negative test: an owned write with no committed fact store slot is
+    /// flagged as an absent-fact violation.
+    #[test]
+    fn audit_flags_owned_fact_missing_from_store() {
+        let runtime = PlainRuntime::default();
+        let call = erased_call(|_: u64| Ok(()), 7u64);
+        let graph = Arc::new(Mutex::new(PlainGraph::new(
+            (*runtime.state.lock()).clone(),
+            call,
+            fresh_token(),
+        )));
+        {
+            let mut graph_guard = graph.lock();
+            graph_guard.invocations[0].writes.push(PlainWrite {
+                view: TypeId::of::<u64>(),
+                name: "emit",
+                view_name: "ghost",
+                key: Arc::new(1u64),
+                value: None,
+                shareable: false,
+            });
+        }
+        let mut probe = PlainRuntime::default();
+        probe.roots.insert(
+            0,
+            RootRuntime {
+                graph,
+                sink: Arc::new(OutputSink {
+                    update: Box::new(|_| {}),
+                }),
+                install_ordinal: 0,
+            },
+        );
+        let violations = liveness_audit(&probe);
+        assert!(
+            violations.iter().any(|row| row.contains("absent fact")),
+            "violations: {violations:?}"
+        );
+    }
+
+    /// Negative test: a retired invocation that still lists outputs is
+    /// flagged ("no component output remains after its driver retires").
+    #[test]
+    fn audit_flags_retired_instance_retaining_outputs() {
+        let runtime = PlainRuntime::default();
+        let call = erased_call(|_: u64| Ok(()), 7u64);
+        let key: Arc<dyn KeyValue> = Arc::new(1u64);
+        let graph = Arc::new(Mutex::new(PlainGraph::new(
+            (*runtime.state.lock()).clone(),
+            call,
+            fresh_token(),
+        )));
+        {
+            let mut graph_guard = graph.lock();
+            let invocation = &mut graph_guard.invocations[0];
+            invocation.retired = true;
+            invocation.writes.push(PlainWrite {
+                view: TypeId::of::<u64>(),
+                name: "emit",
+                view_name: "ghost",
+                key,
+                value: None,
+                shareable: false,
+            });
+        }
+        let mut probe = PlainRuntime::default();
+        probe.roots.insert(
+            0,
+            RootRuntime {
+                graph,
+                sink: Arc::new(OutputSink {
+                    update: Box::new(|_| {}),
+                }),
+                install_ordinal: 0,
+            },
+        );
+        let violations = liveness_audit(&probe);
+        assert!(
+            violations
+                .iter()
+                .any(|row| row.contains("retired instance retains")),
+            "violations: {violations:?}"
+        );
+    }
+
+    /// A freshly constructed runtime audits clean.
+    #[test]
+    fn audit_is_clean_on_a_fresh_runtime() {
+        let runtime = PlainRuntime::default();
+        assert!(liveness_audit(&runtime).is_empty());
+    }
+
+    /// Participant restore closures run in reverse registration order
+    /// during rollback (Cut B section 20.1).
+    #[test]
+    fn private_participants_restore_in_reverse_order() {
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut txn = CommandTxn::default();
+        for name in ["first", "second", "third"] {
+            let order = std::sync::Arc::clone(&order);
+            let name = name.to_owned();
+            txn.private_undos.push(Box::new(move || {
+                order.lock().unwrap().push(name);
+            }));
+        }
+        // Simulate the rollback handoff.
+        let state: Arc<Mutex<PlainState>> = Arc::new(Mutex::new(PlainState::default()));
+        let mut roots: BTreeMap<u64, RootRuntime> = BTreeMap::new();
+        rollback_txn(txn, &state, &mut roots);
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["third".to_owned(), "second".to_owned(), "first".to_owned()]
+        );
     }
 }

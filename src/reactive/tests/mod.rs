@@ -3,6 +3,7 @@
 //! The old shape-handle fixtures intentionally disappeared with the public
 //! cutover. Behavioural coverage lives in the focused plain-function module.
 
+mod cut_d_ownership;
 mod kinds;
 mod plain_functions;
 mod sugar;

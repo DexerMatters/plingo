@@ -9,10 +9,10 @@
 
 mod build;
 mod component;
-pub mod cursor;
-pub mod lexed;
 mod context;
+pub mod cursor;
 mod incremental;
+pub mod lexed;
 mod mode;
 mod scan;
 mod state;
@@ -23,12 +23,9 @@ pub mod __macro_private;
 
 pub use component::{TokenVec, Tokens, install_lexer};
 pub use context::{Slot, SlotStore, WhenCx, WithCx};
-pub use mode::{LexerState, State, StateAction, StateInfo};
-pub use state::{Lexer, LexerSnapshotState};
-pub use token::{
-    FromLexeme, GenerateError, IncrementalLexStats, LexErrorInfo, LexErrorKind, LexInterrupt,
-    LexMoment, LexerWork, LexToken, LexerCreationError, LexerRoot, ResolvedToken, TokenAction,
-    TokenState, UnsupportedDefaultParseError,
+pub(crate) use lexed::{
+    CanonicalLexerState, LexicalDocument, LexicalOccurrence, ParseTokenRef, PersistentUriMap,
+    TokenLayoutEntry,
 };
 pub use lexed::{
     LayoutRevisionId, LexedDocument, LexedDocuments, SemanticRevisionId, SemanticToken,
@@ -37,7 +34,11 @@ pub use lexed::{
     TokenLayoutDocuments, TokenOccurrenceId, TokenPatch, TokenStructureRevisionId,
     TokenValueRevisionId, observe_token,
 };
-pub(crate) use lexed::{
-    CanonicalLexerState, LexicalDocument, LexicalOccurrence, ParseTokenRef, TokenLayoutEntry,
-};
+pub use mode::{LexerState, State, StateAction, StateInfo};
+pub use state::{Lexer, LexerSnapshotState};
 pub(crate) use token::ScannedToken;
+pub use token::{
+    FromLexeme, GenerateError, IncrementalLexStats, LexErrorInfo, LexErrorKind, LexInterrupt,
+    LexMoment, LexToken, LexerCreationError, LexerRoot, LexerWork, ResolvedToken, TokenAction,
+    TokenState, UnsupportedDefaultParseError,
+};

@@ -39,8 +39,16 @@ pub struct Parser<Root = ()> {
     pub(crate) actions: Vec<ActionSet>,
     pub(crate) gotos: Vec<Option<LRStateId>>,
     pub(crate) session_arenas: HashMap<Uri<String>, SessionArenas>,
+    /// Tree publication supplies the generated abstract-family member
+    /// classifier so parser deltas exclude grammar-internal/token records
+    /// from child topology.
+    pub(crate) tree_member_kind:
+        Option<fn(&crate::framework::parse::data::ast::AstArena, u64) -> Option<u8>>,
+    /// Tree publication supplies generated AST child-field topology. This
+    /// includes optional/list fields that product reachability may omit.
+    pub(crate) tree_child_records:
+        Option<fn(&crate::framework::parse::data::ast::AstArena, u64) -> Vec<u64>>,
     pub(crate) config: ParserConfig,
-
     pub(crate) latest: Arc<ParserSnapshotState>,
     /// Snapshot IDs distinguish immutable publications while snapshots held by
     /// consumers remain isolated from later parser mutations.
@@ -49,6 +57,29 @@ pub struct Parser<Root = ()> {
 }
 
 impl<Root> Parser<Root> {
+    /// Drops all private state for a document whose reactive semantic
+    /// component was retired between publications.
+    ///
+    /// Component ownership retracts the published tree facts on retirement,
+    /// but the parser machine is shared by the component definition and does
+    /// not receive a final body call. A later equal-text reopen therefore
+    /// must start from an empty replay state rather than reusing the old
+    /// arena/session.
+    pub(crate) fn forget_document(&mut self, uri: &Uri<String>) {
+        self.session_arenas.remove(uri);
+        let mut latest = (*self.latest).clone();
+        latest.sessions.remove(uri);
+        latest.roots.remove(uri);
+        latest.tokens.remove(uri);
+        latest.incremental_stats.remove(uri);
+        latest.tree_facts.remove(uri);
+        latest.tree_deltas.remove(uri);
+        latest.semantic_revisions.remove(uri);
+        latest.published_status.remove(uri);
+        latest.published_diagnostics.remove(uri);
+        self.latest = Arc::new(latest);
+    }
+
     /// Replays the exact lexer-authored structural patch against persistent
     /// parser token roots. Ordinary replay decodes only tokens between the
     /// restart checkpoint and convergence; no document token vector is built.
@@ -73,7 +104,7 @@ impl<Root> Parser<Root> {
                 .latest
                 .sessions
                 .get(&uri)
-                .map(|session| session.columns.len())
+                .map(|session| session.column_count())
                 .unwrap_or_default();
             crate::framework::workspace::record_parser_work(&uri.to_string(), |work| {
                 work.restart_columns += changed_column as u64;
@@ -183,10 +214,12 @@ impl<Root> Parser<Root> {
             .unwrap_or(&[]);
         diagnostics::collect_parse_diagnostics(
             state,
-            self.session_arenas.get(&uri).map(|arenas| diagnostics::DiagnosticArenas {
-                trees: &arenas.trees,
-                products: &arenas.products,
-            }),
+            self.session_arenas
+                .get(&uri)
+                .map(|arenas| diagnostics::DiagnosticArenas {
+                    trees: &arenas.trees,
+                    products: &arenas.products,
+                }),
             roots,
         )
     }

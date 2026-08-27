@@ -285,6 +285,8 @@ pub enum LexInterrupt {
         lexeme: String,
         err: String,
     },
+    #[error("stale source revision: {uri}")]
+    StaleSourceRevision { uri: String },
     #[error("Parse error: {0}")]
     ParseError(String, String),
     #[error("Internal error: {0}")]

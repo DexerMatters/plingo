@@ -52,24 +52,41 @@ pub trait View: Sized + Send + Sync + 'static {
 
 /// An opaque typed node identity used by generated tree and scope façades.
 ///
-/// The raw ordinal is crate-private and its debug representation intentionally
-/// does not reveal it.
+/// The identity is either a generated syntax key or an automatic component
+/// output key. The cached raw hash is only an index hint; equality always
+/// checks the complete logical key.
 pub struct Node<V: 'static> {
     raw: u64,
+    identity: Option<Arc<dyn crate::reactive::value::KeyValue>>,
     marker: PhantomData<fn() -> V>,
 }
 
-impl<V: 'static> Copy for Node<V> {}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SyntaxNodeIdentity {
+    pub(crate) view: std::any::TypeId,
+    pub(crate) uri: Arc<str>,
+    pub(crate) lineage: u64,
+    pub(crate) member: u8,
+    pub(crate) root: bool,
+}
+
 
 impl<V: 'static> Clone for Node<V> {
     fn clone(&self) -> Self {
-        *self
+        Self {
+            raw: self.raw,
+            identity: self.identity.as_ref().map(Arc::clone),
+            marker: PhantomData,
+        }
     }
 }
 
 impl<V: 'static> PartialEq for Node<V> {
     fn eq(&self, other: &Self) -> bool {
-        self.raw == other.raw
+        match (&self.identity, &other.identity) {
+            (Some(left), Some(right)) => left.eq_value(right.as_ref()),
+            _ => self.raw == other.raw,
+        }
     }
 }
 
@@ -82,24 +99,77 @@ impl<V: 'static> std::hash::Hash for Node<V> {
 }
 
 impl<V: 'static> Node<V> {
+    /// Constructs a generated syntax identity from its complete logical key.
     #[doc(hidden)]
-    pub(crate) const fn from_raw(raw: u64) -> Self {
+    pub(crate) fn from_syntax(
+        raw: u64,
+        uri: &str,
+        lineage: u64,
+        member: u8,
+        root: bool,
+    ) -> Self {
         Self {
             raw,
+            identity: Some(Arc::new(SyntaxNodeIdentity {
+                view: std::any::TypeId::of::<V>(),
+                uri: Arc::from(uri),
+                lineage,
+                member,
+                root,
+            })),
             marker: PhantomData,
         }
     }
 
-    /// The stable raw identity, used as a link id in tree order/root facts
-    /// and by generated façades. Public only for macro-generated code.
+    /// Returns the complete generated syntax identity when this node carries
+    /// one. Publication snapshots use this instead of retaining only the
+    /// cached raw hash, because a later command may need to rehydrate the
+    /// exact node after its originating arena has been replaced.
+    pub(crate) fn syntax_identity(&self) -> Option<SyntaxNodeIdentity> {
+        self.identity
+            .as_ref()?
+            .as_any()
+            .downcast_ref::<SyntaxNodeIdentity>()
+            .cloned()
+    }
+
+    /// Rehydrates an opaque identity from a committed adjacency fact.
+    ///
+    /// This is used only while applying an already-published delta whose
+    /// complete syntax identity is stored by the surrounding publication
+    /// record. New identities must use [`Self::from_syntax`] or
+    /// [`Self::from_automatic`].
     #[doc(hidden)]
-    pub fn raw_id(self) -> u64 {
+    pub(crate) fn from_cached_raw(raw: u64) -> Self {
+        Self {
+            raw,
+            identity: None,
+            marker: PhantomData,
+        }
+    }
+
+    /// Constructs an automatic identity with its complete erased logical key.
+    #[doc(hidden)]
+    pub(crate) fn from_automatic(
+        raw: u64,
+        identity: Arc<dyn crate::reactive::value::KeyValue>,
+    ) -> Self {
+        Self {
+            raw,
+            identity: Some(identity),
+            marker: PhantomData,
+        }
+    }
+
+    /// The stable cached hash, used only by legacy fact encodings.
+    #[doc(hidden)]
+    pub fn raw_id(&self) -> u64 {
         self.raw
     }
 }
 
 impl<V: 'static> std::fmt::Debug for Node<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Node")
+        write!(formatter, "Node({})", self.raw)
     }
 }

@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use plingo::framework::source::{source_snapshot, SourceDelta};
+use plingo::framework::source::{SourceDelta, source_snapshot};
 use plingo::framework::{SourceEdit, SourceEdits, SourceRevisions, Workspace};
 use plingo::reactive::kind::Map;
 use plingo::reactive::prelude::*;
@@ -20,7 +20,7 @@ fn ws_build<F: FnOnce(&mut Engine) -> plingo::reactive::Result<()>>(
     workers: usize,
     f: F,
 ) -> Workspace {
-    Workspace::build( f).unwrap()
+    Workspace::build(f).unwrap()
 }
 
 fn text_of(ws: &Workspace, u: &fluent_uri::Uri<String>) -> Option<String> {
@@ -30,27 +30,21 @@ fn text_of(ws: &Workspace, u: &fluent_uri::Uri<String>) -> Option<String> {
 #[view]
 pub struct TextLog(Map<String, String>);
 
-fn text_logger(_: ()) -> Result<()> {
+#[reactive_macros::component]
+fn text_logger_component(key: EachKey<SourceRevisions>) -> Result<()> {
+    // Cut C: one instance per document writes exactly its own entry
+    // (previous-epoch value when the current revision is absent, i.e. the
+    // close-tombstone case).
     let text = observe_view::<SourceRevisions>()?;
-    let mut keys: Vec<String> = text.keys_previous()?;
-    for key in text.keys()? {
-        keys.push(key);
-    }
-    keys.sort();
-    keys.dedup();
-    for key in keys {
-        let value = text
-            .get_previous(&key)?
-            .map(|revision| revision.text().to_string())
-            .unwrap_or_default();
-        emit_view::<TextLog>()?.insert(key, value)?;
-    }
-    Ok(())
+    let value = text
+        .get_previous(&key)?
+        .map(|revision| revision.text().to_string())
+        .unwrap_or_default();
+    emit_view::<TextLog>()?.insert(key, value)
 }
 
 fn install_logger(engine: &mut Engine) -> Result<()> {
-    let plan = engine.plan(text_logger, ())?;
-    let _running = engine.run(&plan)?;
+    text_logger_component_install(engine)?;
     Ok(())
 }
 
@@ -213,7 +207,11 @@ fn open_order_does_not_affect_committed_state() {
             // position: the same trace with a different open order must
             // converge on the same per-document text.
             let u = uri(name);
-            let text = if *name == "big" { "x := 0\ny := 1" } else { "a := 2" };
+            let text = if *name == "big" {
+                "x := 0\ny := 1"
+            } else {
+                "a := 2"
+            };
             ws.open(u.clone(), text).unwrap();
         }
         // Edit the document opened LAST and the one opened FIRST in the

@@ -34,7 +34,8 @@ static LEAF_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 fn double(cell: u64) -> Result<i64> {
     DOUBLE_RUNS.fetch_add(1, Ordering::SeqCst);
-    let value = observe_view::<PlainSource>()?.get(&cell)?
+    let value = observe_view::<PlainSource>()?
+        .get(&cell)?
         .map(|value| *value)
         .unwrap_or_default();
     let result = value * 2;
@@ -47,7 +48,8 @@ fn derive(cell: u64) -> Result<i64> {
     let dependency = observe_view::<Deps>()?.get(&cell)?;
     let value = match dependency {
         Some(next) => run(derive, *next)? + 1,
-        None => observe_view::<Cells>()?.get(&cell)?
+        None => observe_view::<Cells>()?
+            .get(&cell)?
             .map(|value| *value)
             .unwrap_or_default(),
     };
@@ -60,7 +62,8 @@ fn cycle(cell: u64) -> Result<i64> {
 }
 
 fn previous_source(cell: u64) -> Result<i64> {
-    let value = observe_view::<PlainSource>()?.get_previous(&cell)?
+    let value = observe_view::<PlainSource>()?
+        .get_previous(&cell)?
         .map(|value| *value)
         .unwrap_or_default();
     emit_view::<PlainDerived>()?.insert(cell, value)?;
@@ -84,7 +87,8 @@ fn optional_output(cell: u64) -> Result<i64> {
 }
 
 fn fail_after_emit(cell: u64) -> Result<i64> {
-    let value = observe_view::<PlainSource>()?.get(&cell)?
+    let value = observe_view::<PlainSource>()?
+        .get(&cell)?
         .map(|value| *value)
         .unwrap_or_default();
     emit_view::<PlainDerived>()?.insert(cell, value)?;
@@ -95,7 +99,8 @@ fn fail_after_emit(cell: u64) -> Result<i64> {
 }
 
 fn cycle_a(_: ()) -> Result<i64> {
-    let value = observe_view::<CycleB>()?.get(&())?
+    let value = observe_view::<CycleB>()?
+        .get(&())?
         .map(|value| *value)
         .unwrap_or_default();
     emit_view::<CycleA>()?.insert((), value + 1)?;
@@ -103,7 +108,8 @@ fn cycle_a(_: ()) -> Result<i64> {
 }
 
 fn cycle_b(_: ()) -> Result<i64> {
-    let value = observe_view::<CycleA>()?.get(&())?
+    let value = observe_view::<CycleA>()?
+        .get(&())?
         .map(|value| *value)
         .unwrap_or_default();
     emit_view::<CycleB>()?.insert((), value + 1)?;

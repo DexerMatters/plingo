@@ -15,8 +15,8 @@ use fluent_uri::Uri;
 use crate::framework::lex::LexerWork;
 use crate::framework::parse::ParserWork;
 use crate::framework::source::{
-    apply_splices, normalize_edits, DocumentId, SourceCommand, SourceCommandId, SourceDelta,
-    SourceEdit, SourceEdits, SourceRevisions, SourceWork, install_source,
+    DocumentId, SourceCommand, SourceCommandId, SourceDelta, SourceEdit, SourceEdits,
+    SourceRevisions, SourceWork, apply_splices, install_source, normalize_edits,
 };
 use crate::reactive::kind::emit_view;
 use crate::reactive::plain;
@@ -83,8 +83,12 @@ pub struct LiveBytes {
 impl LiveBytes {
     /// Total bytes across all categories.
     pub fn total(&self) -> u64 {
-        self.tape_nodes + self.trie_nodes + self.owner_set_nodes
-            + self.segments + self.intern_indexes + self.repair_nodes
+        self.tape_nodes
+            + self.trie_nodes
+            + self.owner_set_nodes
+            + self.segments
+            + self.intern_indexes
+            + self.repair_nodes
             + self.state_roots
     }
 }
@@ -166,14 +170,11 @@ impl WorkspaceReport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Facade
-// ---------------------------------------------------------------------------
-
 /// The workspace facade.
 pub struct Workspace {
     engine: Engine,
 }
+
 
 impl Workspace {
     /// Builds a workspace: installs the source pipeline plus any user
@@ -196,54 +197,45 @@ impl Workspace {
     }
 
     /// Opens a document with the given full text. Re-opening an existing
-    /// uri replaces its text (one load command).
+    /// URI is represented as one full-range source replacement; same-content
+    /// replacements are filtered by the exact normalized delta path when
+    /// callers use `edit`.
     pub fn open(&mut self, uri: Uri<String>, text: &str) -> Result<WorkspaceReport> {
         let uri_string = uri.to_string();
-        // Reopening an open URI with equal text is cold (plan §6): compare
-        // Rope chunks against supplied bytes without materializing.
         let existing = self.current_revision(&uri_string);
-        let rope = ropey::Rope::from_str(text);
-        let equal = existing
+        let next_text = Arc::new(ropey::Rope::from_str(text));
+
+        // Reopening with identical content is an external no-op.  This
+        // comparison is confined to the explicit full-document `open`
+        // operation; incremental edits never compare complete Ropes.
+        if existing
             .as_ref()
-            .map(|revision| revision.text.len_bytes() == rope.len_bytes())
-            .unwrap_or(false)
-            && existing
-                .as_ref()
-                .map(|revision| {
-                    let mut cursor = 0usize;
-                    for chunk in revision.text.chunks() {
-                        if &rope.slice(cursor..cursor + chunk.len()).to_string() != chunk {
-                            return false;
-                        }
-                        cursor += chunk.len();
-                    }
-                    true
-                })
-                .unwrap_or(false);
-        if equal {
-            return Ok(Self::assemble_with_validations(
-                self.engine
-                    .command::<fn() -> Result<()>>(|| Ok(()))?,
-                Vec::new(),
-            ));
+            .is_some_and(|revision| revision.text.as_ref() == next_text.as_ref())
+        {
+            let report = self.engine.command::<fn() -> Result<()>>(|| Ok(()))?;
+            return Ok(Self::assemble(report));
         }
 
-        let base = existing.as_ref().map(|revision| (revision.document.id, revision.id));
+        let base = existing
+            .as_ref()
+            .map(|revision| (revision.document.id, revision.id));
         let delta = match &existing {
             Some(revision) => {
-                // Unequal reopen becomes one full-range edit.
+                // Reopening becomes one full-range replacement. Avoid a
+                // complete old/new Rope equality scan on the command path.
                 let len = revision.text.len_bytes();
                 SourceDelta::Edit {
                     splices: vec![crate::framework::source::SourceSplice {
                         old_range: 0..len,
                         new_range: 0..text.len(),
                     }]
-                    .into(),
+                    .into()
                 }
             }
-            None => SourceDelta::Load { new_len: text.len() },
+            None => SourceDelta::Load {
+                new_len: text.len(),
+            },
         };
-        let next_text = Arc::new(rope);
         let command = self.engine.command(move || {
             emit_view::<SourceEdits>()?.insert(
                 uri_string.clone(),
@@ -259,11 +251,9 @@ impl Workspace {
         Ok(Self::assemble(command))
     }
 
+
     /// The committed revision for one document, if any.
-    fn current_revision(
-        &self,
-        uri: &str,
-    ) -> Option<Arc<crate::framework::source::SourceRevision>> {
+    fn current_revision(&self, uri: &str) -> Option<Arc<crate::framework::source::SourceRevision>> {
         self.engine
             .snapshot()
             .observe::<SourceRevisions>(uri.to_string())
@@ -285,23 +275,27 @@ impl Workspace {
         for (uri, uri_edits) in &by_uri {
             let frame = plain::push_metric_frame();
             let revision = self.current_revision(uri);
-            let normalized = normalize_edits(revision.as_ref().map(|r| r.text.as_ref()), uri_edits)?;
+            let normalized =
+                normalize_edits(revision.as_ref().map(|r| r.text.as_ref()), uri_edits)?;
             let mut validation = plain::take_frame_metric::<SourceWork>();
             validation.validated_operations = normalized.validated_operations;
             validation.effective_splices += normalized.effective_splices;
             validation.bytes_removed += normalized.bytes_removed;
             validation.bytes_inserted += normalized.bytes_inserted;
-            validations.push((uri.clone(), validation));
+            validation.rope_chunks_traversed += normalized.rope_chunks_traversed;
             if normalized.splices.is_empty() {
                 // Idle batch: no epoch, no write (plan §6 step 5).
+                validations.push((uri.clone(), validation));
                 continue;
             }
             let previous = revision.expect("normalize requires an opened document");
             let base = (previous.document.id, previous.id);
             // Apply descending splices to an O(1) Rope clone.
-            let next_rope = apply_splices(&previous.text, &normalized.splices, &normalized.inserted)?;
+            let next_rope =
+                apply_splices(&previous.text, &normalized.splices, &normalized.inserted)?;
             let new_len = next_rope.len_bytes();
             let old_len = previous.text.len_bytes();
+            validations.push((uri.clone(), validation));
             // Splices were computed against old coordinates; convert to the
             // exact old/new ranges the delta format stores.
             let shift_total = new_len as isize - old_len as isize;
@@ -320,9 +314,7 @@ impl Workspace {
             ));
         }
         if commands.is_empty() {
-            let report = self
-                .engine
-                .command::<fn() -> Result<()>>(|| Ok(()))?;
+            let report = self.engine.command::<fn() -> Result<()>>(|| Ok(()))?;
             return Ok(Self::assemble_with_validations(report, validations));
         }
         let command = self.engine.command(move || {
@@ -375,6 +367,13 @@ impl Workspace {
         subscriber: impl Fn(Snapshot, usize) + Send + Sync + 'static,
     ) -> Result<()> {
         self.engine.subscribe::<V>(subscriber)
+    }
+
+    /// Debug/test liveness audit over the production indexes (follow-up
+    /// plan §4 item 12). Read-only; empty output means consistent.
+    #[doc(hidden)]
+    pub fn __liveness_audit(&self) -> Vec<String> {
+        self.engine.__liveness_audit()
     }
 }
 impl std::fmt::Debug for Workspace {

@@ -9,6 +9,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
+use syn::spanned::Spanned;
 use syn::{GenericArgument, ItemStruct, PathArguments, ReturnType, Type, TypePath};
 
 mod abstract_tree;
@@ -196,7 +197,7 @@ fn expand_witness(item: proc_macro2::TokenStream) -> syn::Result<proc_macro2::To
             return Err(syn::Error::new_spanned(
                 &item,
                 "a view declares exactly one kind-witness tuple field",
-            ))
+            ));
         }
     };
     let witness = Witness::classify(&witness_type)?;
@@ -245,7 +246,10 @@ fn expand_witness(item: proc_macro2::TokenStream) -> syn::Result<proc_macro2::To
                 }
             }
         }
-        Witness::List { key, item: list_item } => {
+        Witness::List {
+            key,
+            item: list_item,
+        } => {
             let core = core(
                 &syn::parse_quote!(::plingo::reactive::kind::ListKey<#key>),
                 &syn::parse_quote!(::plingo::reactive::kind::ListFact<#list_item>),
@@ -399,7 +403,8 @@ pub fn derive_state_value(item: TokenStream) -> TokenStream {
     let mut predicates: Vec<syn::WherePredicate> = Vec::new();
     for ty in &field_types {
         let duplicate = predicates.iter().any(|existing| {
-            quote::quote!(#existing).to_string() == quote::quote!(#ty: ::plingo::reactive::StateValue).to_string()
+            quote::quote!(#existing).to_string()
+                == quote::quote!(#ty: ::plingo::reactive::StateValue).to_string()
         });
         if duplicate {
             continue;
@@ -408,7 +413,10 @@ pub fn derive_state_value(item: TokenStream) -> TokenStream {
         predicates.push(parsed);
     }
 
-    let mut where_clause = generics.where_clause.clone().unwrap_or_else(|| syn::parse_quote!(where));
+    let mut where_clause = generics
+        .where_clause
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(where));
     for predicate in predicates {
         where_clause.predicates.push(predicate);
     }
@@ -420,11 +428,8 @@ pub fn derive_state_value(item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-
 /// Expands a family member of a typed abstract tree.
 #[proc_macro_attribute]
-
-
 
 pub fn abstract_tree(args: TokenStream, item: TokenStream) -> TokenStream {
     let mut parsed = abstract_tree::AbstractTreeArgs { members: None };
@@ -434,7 +439,16 @@ pub fn abstract_tree(args: TokenStream, item: TokenStream) -> TokenStream {
         Err(error) => return error.to_compile_error().into(),
     };
     match abstract_tree::expand(&parsed, item.into()) {
-        Ok(tokens) => tokens.into(),
+        Ok(tokens) => {
+            let text = tokens.to_string();
+            std::fs::write("/tmp/tree_expansion.txt", &text).ok();
+            if let Some(pos) = text.find("emit_update") {
+                let begin = pos.saturating_sub(2000);
+                let end = (pos + 4000).min(text.len());
+                std::fs::write("/tmp/tree_update_context.rs", &text[begin..end]).ok();
+            }
+            tokens.into()
+        }
         Err(error) => error.to_compile_error().into(),
     }
 }
@@ -443,3 +457,304 @@ pub fn abstract_tree(args: TokenStream, item: TokenStream) -> TokenStream {
 // accepted grammar explicit in rustdoc-generated diagnostics.
 #[allow(dead_code)]
 fn _result_type_shape(_: ReturnType, _: GenericArgument, _: PathArguments, _: TypePath) {}
+// ---------------------------------------------------------------------------
+// #[component] (follow-up plan §6.1 / Cut C)
+// ---------------------------------------------------------------------------
+
+/// One parsed port of a `#[component]` signature.
+enum ComponentPort {
+    /// Membership driver: one instance per present map key.
+    EachKey {
+        ident: syn::Ident,
+        view: Box<syn::Type>,
+    },
+    /// Exact recorded reads over one view.
+    Read {
+        ident: syn::Ident,
+        view: Box<syn::Type>,
+    },
+    /// Owned writes to one view.
+    Write {
+        ident: syn::Ident,
+        view: Box<syn::Type>,
+    },
+    /// One generated automatic node output port.
+    Output {
+        ident: syn::Ident,
+        view: Box<syn::Type>,
+    },
+}
+
+impl ComponentPort {
+    fn ident(&self) -> &syn::Ident {
+        match self {
+            ComponentPort::EachKey { ident, .. }
+            | ComponentPort::Read { ident, .. }
+            | ComponentPort::Write { ident, .. }
+            | ComponentPort::Output { ident, .. } => ident,
+        }
+    }
+
+    fn view(&self) -> &syn::Type {
+        match self {
+            ComponentPort::EachKey { view, .. }
+            | ComponentPort::Read { view, .. }
+            | ComponentPort::Write { view, .. }
+            | ComponentPort::Output { view, .. } => view,
+        }
+    }
+
+    fn is_driver(&self) -> bool {
+        matches!(self, ComponentPort::EachKey { .. })
+    }
+
+    fn is_output(&self) -> bool {
+        matches!(self, ComponentPort::Output { .. })
+    }
+}
+
+
+/// Extracts `<T>` from a port type whose last path segment is `segment`.
+fn port_view_argument<'t>(ty: &'t syn::Type) -> Option<&'t syn::Type> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    let last = type_path.path.segments.last()?;
+    let PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+    match args.args.iter().next()? {
+        GenericArgument::Type(view) => Some(view),
+        _ => None,
+    }
+}
+
+/// Declares a first-class reactive component (follow-up plan §6.1).
+///
+/// The function's parameters are TYPED PORTS and nothing else; exactly one
+/// `EachKey<V>` driver is required in Cut C. The macro generates a
+/// zero-sized definition marker (identity = marker + driving element), the
+/// [`ComponentDefinition`] impl with the module-qualified descriptor, and
+/// an installer. A second install of the same definition is a
+/// deterministic error.
+///
+/// ```ignore
+/// #[component]
+/// fn record(
+///     key: EachKey<Names>,
+///     names: Read<Names>,
+///     records: Write<Records>,
+/// ) -> Result<()> { /* pure control flow plus port operations */ }
+/// ```
+#[proc_macro_attribute]
+pub fn component(args: TokenStream, item: TokenStream) -> TokenStream {
+    if !args.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`#[component]` takes no arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let function = syn::parse::<syn::ItemFn>(item);
+    match function.and_then(expand_component) {
+        Ok(tokens) => {
+            if std::env::var_os("PLINGO_DUMP_COMPONENT").is_some() {
+                std::fs::write("/tmp/component_expansion.rs", tokens.to_string()).ok();
+            }
+            tokens.into()
+        }
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+fn expand_component(mut item: syn::ItemFn) -> syn::Result<proc_macro2::TokenStream> {
+    use syn::{FnArg, Pat};
+
+    if !item.sig.generics.params.is_empty() || item.sig.generics.where_clause.is_some() {
+        return Err(syn::Error::new(
+            item.sig.ident.span(),
+            "`#[component]` functions may not be generic",
+        ));
+    }
+    if item.sig.asyncness.is_some() || item.sig.variadic.is_some() {
+        return Err(syn::Error::new(
+            item.sig.ident.span(),
+            "`#[component]` functions are synchronous and non-variadic",
+        ));
+    }
+
+    let mut ports: Vec<ComponentPort> = Vec::new();
+    for arg in &item.sig.inputs {
+        let FnArg::Typed(pat_type) = arg else {
+            return Err(syn::Error::new(
+                item.sig.ident.span(),
+                "`#[component]` takes no receiver",
+            ));
+        };
+        let ident = match pat_type.pat.as_ref() {
+            Pat::Ident(pat_ident) => pat_ident.ident.clone(),
+            _ => {
+                return Err(syn::Error::new(
+                    syn::spanned::Spanned::span(pat_type.pat.as_ref()),
+                    "component ports must be plain identifiers",
+                ));
+            }
+        };
+        let ty = pat_type.ty.as_ref();
+        let kind = match ty {
+            syn::Type::Path(type_path) => type_path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let view = Box::new(port_view_argument(ty).cloned().ok_or_else(|| {
+            syn::Error::new(
+                syn::spanned::Spanned::span(ty),
+                "port type must carry its view parameter",
+            )
+        })?);
+        let port = match kind.as_str() {
+            "EachKey" => ComponentPort::EachKey { ident, view },
+            "Read" => ComponentPort::Read { ident, view },
+            "Write" => ComponentPort::Write { ident, view },
+            "Output" | "NodeOutput" => ComponentPort::Output { ident, view },
+            other => {
+                return Err(syn::Error::new(
+                    syn::spanned::Spanned::span(ty),
+                    format!(
+                        "`{other}` is not a component port; expected EachKey<V>, Read<V>, Write<V>, or Output<V>"
+                    ),
+                ));
+            }
+        };
+        ports.push(port);
+    }
+
+    let drivers: Vec<&ComponentPort> = ports.iter().filter(|port| port.is_driver()).collect();
+    if drivers.len() != 1 {
+        return Err(syn::Error::new(
+            item.sig.ident.span(),
+            "`#[component]` requires exactly one EachKey<V> driver port (Cut C)",
+        ));
+    }
+    let driver_view = drivers[0].view().clone();
+
+    // The authored body becomes the trampoline's inner call: every port is
+    // rewritten to its runtime form.
+    let inner_params = ports.iter().map(|port| {
+        let ident = port.ident();
+        let ty = match port {
+            ComponentPort::EachKey { view, .. } => quote! {
+                <#view as ::plingo::reactive::View>::Input
+            },
+            ComponentPort::Read { view, .. } => quote! {
+                ::plingo::reactive::component::Read<#view>
+            },
+            ComponentPort::Write { view, .. } => quote! {
+                ::plingo::reactive::component::Write<#view>
+            },
+            ComponentPort::Output { view, .. } => quote! {
+                ::plingo::reactive::component::Output<#view>
+            },
+        };
+        quote! { #ident: #ty }
+    });
+
+    let fn_ident = &item.sig.ident;
+    let marker_ident =
+        quote::format_ident!("Component{}", to_pascal_case(&item.sig.ident.to_string()));
+    let installer_ident = quote::format_ident!("{}_install", item.sig.ident);
+    let key_ident = drivers[0].ident().clone();
+    let mut output_ordinal = 0u16;
+
+    // Inside the trampoline, non-driver ports attach through the crate seam;
+    // the driver arrives as the plain input value.
+    let attach_lets = ports.iter().filter_map(|port| {
+        if port.is_driver() {
+            return None;
+        }
+        let ident = port.ident();
+        let view = port.view();
+        match port {
+            ComponentPort::Read { .. } => Some(quote! {
+                let #ident =
+                    ::plingo::reactive::component::Read::<#view>::__attach();
+            }),
+            ComponentPort::Write { .. } => Some(quote! {
+                let #ident =
+                    ::plingo::reactive::component::Write::<#view>::__attach();
+            }),
+            ComponentPort::Output { .. } => {
+                let ordinal = output_ordinal;
+                output_ordinal = output_ordinal.saturating_add(1);
+                Some(quote! {
+                    let #ident =
+                        ::plingo::reactive::component::Output::<#view>::__attach::<
+                            #marker_ident,
+                            _,
+                        >(#key_ident.clone(), #ordinal)?;
+                })
+            }
+            ComponentPort::EachKey { .. } => unreachable!(),
+        }
+    });
+
+    let body_args = ports.iter().map(|port| port.ident());
+
+    let vis = &item.vis;
+    let attrs = &item.attrs;
+    let ret = &item.sig.output;
+    let body = &item.block;
+
+    Ok(quote! {
+        /// Definition marker (Cut C): identity derives from this type plus
+        /// the exact driving element.
+        #[derive(Clone, Copy, Debug)]
+        #[allow(missing_docs)]
+        #vis struct #marker_ident;
+
+        impl ::plingo::reactive::component::ComponentDefinition for #marker_ident {
+            fn __descriptor() -> &'static str {
+                ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#fn_ident))
+            }
+        }
+
+        #[doc = "Authored component body; invoked only by the generated trampoline."]
+        #(#attrs)*
+        #[doc(hidden)]
+        #[allow(clippy::too_many_arguments)]
+        #vis fn #fn_ident (
+            #(#inner_params),*
+        ) #ret #body
+
+        /// Installs this component into an engine (Cut C). A second install
+        /// of the same definition fails before mutating anything.
+        #vis fn #installer_ident (
+            engine: &mut ::plingo::reactive::Engine,
+        ) -> ::plingo::Result<::plingo::reactive::KeyedFamily<#driver_view>> {
+            engine.install_component_each_key::<#marker_ident, #driver_view, _>(
+                move |#key_ident| {
+                    #(#attach_lets)*
+                    #fn_ident(#(#body_args),*)
+                },
+            )
+        }
+    })
+}
+
+fn to_pascal_case(name: &str) -> String {
+    name.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}

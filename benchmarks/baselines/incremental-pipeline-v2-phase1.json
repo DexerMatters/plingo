@@ -1,0 +1,59 @@
+{
+  "schema_version": 2,
+  "recovery_policy_version": "RECOVERY_POLICY_VERSION@phase1-interim",
+  "percentile_policy": "nearest_rank_v1",
+  "phase": "follow-up-phase1-interim",
+  "date": "2026-08-25",
+  "status": "in-progress: core lineage/publication repairs landed; Cut C/E-dependent gates remain frozen",
+  "landed": [
+    {
+      "item": "\u00a718 lineage state machine",
+      "detail": "fresh_lineages/pending/settle against final accepted-root liveness; holders mutate only inside settle; debug post-settle bijectivity validation; dormant cached products assigned on accept"
+    },
+    {
+      "item": "freeze ordering (\u00193.3)",
+      "detail": "settle runs at freeze steps 2-3 before payload classification so context proofs feed update classification"
+    },
+    {
+      "item": "\u00a75 items 6-7 removal metadata",
+      "detail": "ParseDelta.removed_records now carry RemovedRecord{lineage, record, parent_record, child_records}; generated remover retracts payload/parent/own child links/former-parent link from delta metadata only and stages keys for canonical dedup; dying arena never consulted"
+    },
+    {
+      "item": "owned-tombstone removal (\u00a716.1)",
+      "detail": "patch Remove ops no longer persist value=None entries in committed invocation write sets; fixed the terminal-kind +108-class residual surfaced by the Phase 0 liveness audit"
+    }
+  ],
+  "gate_scorecard": {
+    "no_panic_or_full_rebuild": "pass",
+    "warm_equals_cold_after_each_command": "pass (all active traces)",
+    "reverse_restores_exact_semantic_digest": "pass",
+    "reverse_restores_exact_live_facts": {
+      "pass": ["equal replacement", "trivia", "number literal", "variable-use change", "document isolation", "used-binder rename (was +2)", "terminal-kind cycle (+108 class root cause fixed)"],
+      "frozen_failures": [
+        {
+          "trace": "expression child insert/remove reverse",
+          "residual": "+4 StlcTree ChildLink facts",
+          "owner": "Cut E exact ParserSyntax* dimension publication (\u001919.6)",
+          "evidence": "three-point link trace in phase report; forward publishes two Add-shaped stable ids linked from Document; reverse removes only the resolver-resolved one"
+        },
+        {
+          "trace": "declaration append/delete reverse",
+          "residual": "ConflictingWrites on StlcTypeDiagnostics Len(Node) between two type_node writers during deletion reparse",
+          "owner": "Cut C component identity model (nested run() occurrence churn); \u00a716.5 wave coalescing lands with it"
+        },
+        {
+          "trace": "close+reopen complete digest incl graph",
+          "residual": "check-owned anchored Type-scope identities drift after session restart",
+          "owner": "Cut C/E automatic identity work (\u00a721.5)"
+        }
+      ]
+    },
+    "parser_delta_domains_equal_slow_oracle": "pass (existing oracle green)",
+    "failed_commands_byte_identical": "pass (rollback suite green)"
+  },
+  "next": [
+    "Cut B participant staging (ParserDocumentTxn/LexDocumentTxn) with failure-injection proofs",
+    "Cut C first-class #[component] backbone and automatic identities (removes nested-run identity churn)",
+    "Cut E exact dimension publication (removes broad updated-record emission; restores strict live-fact equality on structural reverses)"
+  ]
+}

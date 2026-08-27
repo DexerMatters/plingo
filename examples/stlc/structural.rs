@@ -1,8 +1,10 @@
-//! Plain reactive structural products for the STLC syntax family: one fact
-//! per syntax node (smallest-unit granularity, plan §5.1) — no aggregate
-//! bubbling.
+//! Reactive structural products for the STLC syntax family: one fact
+//! per syntax node (smallest-unit granularity, plan §5.1, §24.6) — no
+//! aggregate bubbling and no nested effectful recursion. One component
+//! instance per syntax node is driven by the exact parser payload.
 
-use plingo::framework::parse::TreeParseUnits;
+use plingo::framework::parse::{ParserTreePayloads, TreeParseUnits};
+use plingo::reactive::component::{EachKey, Write};
 use plingo::reactive::kind::{emit_view, observe_view};
 use plingo::reactive::prelude::*;
 use plingo::reactive::view::Node;
@@ -39,60 +41,44 @@ pub struct StlcLoweringDiagnostics(List<Node<StlcTree>, String>);
 #[view]
 pub struct StlcLoweredSummary(Map<Node<StlcTree>, String>);
 
-pub fn structural_pass(_: ()) -> Result<()> {
-    run_each_key::<TreeParseUnits<StlcDocument>, _>(classify_document)
-}
-
-pub fn classify_document(uri: String) -> Result<()> {
-    let Some(unit) = observe_view::<TreeParseUnits<StlcDocument>>()?.get(&uri)? else {
-        return Ok(());
-    };
-    let Some(root) = unit.root else {
-        return Ok(());
-    };
-    run(
-        |(uri, id): (String, Node<StlcTree>)| classify_node(uri, id),
-        (uri, root),
-    )?;
-    Ok(())
-}
-
-/// Classifies ONE node and recurses. Each node owns its own facts; a
-/// changed subtree rewrites only its own nodes' facts.
-fn classify_node(uri: String, id: Node<StlcTree>) -> Result<()> {
-    let kind = match StlcTree::observe_case(id)? {
+/// One structural instance per syntax node, driven by the exact parser
+/// payload. It reads only its own case and owns exactly its own facts; a
+/// changed subtree rewrites only its own nodes' facts. Removal retires the
+/// instance and its outputs automatically.
+#[reactive_macros::component]
+pub fn structural_node(
+    key: EachKey<ParserTreePayloads<StlcDocument>>,
+    index: Write<StlcNodeIndex>,
+    lowered: Write<StlcLowered>,
+    origins: Write<StlcLoweredOrigin>,
+    summaries: Write<StlcLoweredSummary>,
+) -> Result<()> {
+    let id = key;
+    let kind = match StlcTree::observe_case(id.clone())? {
         Some(StlcCase::Document(_)) => StlcNodeKind::Document,
         Some(StlcCase::Declaration(_)) => StlcNodeKind::Declaration,
         Some(StlcCase::Expr(_)) => StlcNodeKind::Expression,
         Some(StlcCase::Type(_)) | Some(StlcCase::TypeAtom(_)) => StlcNodeKind::Type,
         _ => StlcNodeKind::Other,
     };
-    let lowered = format!("untyped::{kind:?}");
+    let lowered_text = format!("untyped::{kind:?}");
     let is_other = matches!(kind, StlcNodeKind::Other);
-    let kind = kind.clone();
 
-    let index = emit_view::<StlcNodeIndex>()?;
-    let lowered_view = emit_view::<StlcLowered>()?;
-    let origins = emit_view::<StlcLoweredOrigin>()?;
-    let diagnostics = emit_view::<StlcLoweringDiagnostics>()?;
-    let summaries = emit_view::<StlcLoweredSummary>()?;
-
-    index.insert(id, kind)?;
-    lowered_view.insert(id, lowered.clone())?;
-    origins.insert(id, id)?;
+    index.insert(id.clone(), kind)?;
+    lowered.insert(id.clone(), lowered_text.clone())?;
+    origins.insert(id.clone(), id.clone())?;
     if is_other {
-        diagnostics
+        emit_view::<StlcLoweringDiagnostics>()?
             .replace(&id, vec![format!("unclassified source node {id:?}")])?;
     } else {
-        diagnostics.replace(&id, Vec::new())?;
+        emit_view::<StlcLoweringDiagnostics>()?.replace(&id, Vec::new())?;
     }
-    summaries.insert(id, format!("summary:{lowered}"),)?;
+    summaries.insert(id, format!("summary:{lowered_text}"))?;
+    Ok(())
+}
 
-    for child in StlcTree::observe_children(id)?.iter().copied() {
-        run(
-            |(uri, child): (String, Node<StlcTree>)| classify_node(uri, child),
-            (uri.clone(), child),
-        )?;
-    }
+/// Back-compat installer: the structural pass is the per-node component.
+pub fn structural_pass_install(engine: &mut plingo::reactive::Engine) -> Result<()> {
+    structural_node_install(engine)?;
     Ok(())
 }

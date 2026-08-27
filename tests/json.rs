@@ -3,9 +3,9 @@ mod common;
 use std::sync::Arc;
 
 use common::json::{JsonDocument, JsonToken};
-use plingo::framework::{SourceEdit, Workspace};
 use plingo::framework::lex::{TokenVec, Tokens, install_lexer};
 use plingo::framework::parse::{ParseDiagnostics, ParseStatus, ParseUnits, install_parser};
+use plingo::framework::{SourceEdit, Workspace};
 use plingo::utils::Span;
 
 fn uri(name: &str) -> fluent_uri::Uri<String> {
@@ -13,7 +13,7 @@ fn uri(name: &str) -> fluent_uri::Uri<String> {
 }
 
 fn build(workers: usize) -> Workspace {
-    Workspace::build( |engine| {
+    Workspace::build(|engine| {
         install_lexer::<JsonToken>(engine)?;
         install_parser::<JsonToken, JsonDocument>(engine)?;
         Ok(())
@@ -77,7 +77,9 @@ fn nested_parse_publishes_units_and_clean_status() {
 fn recovery_publishes_diagnostics() {
     let mut ws = build(1);
     ws.open(uri("recover"), r#"{"a": 1"#).unwrap();
-    let diagnostics = ws.snapshot().list::<ParseDiagnostics>(&"test://recover".to_owned());
+    let diagnostics = ws
+        .snapshot()
+        .list::<ParseDiagnostics>(&"test://recover".to_owned());
     assert!(!diagnostics.is_empty());
 }
 
@@ -137,7 +139,9 @@ fn diagnostics_are_per_document_slot_facts() {
         "the truncated document reports diagnostics"
     );
     assert!(
-        snapshot.list::<ParseDiagnostics>(&good.to_string()).is_empty(),
+        snapshot
+            .list::<ParseDiagnostics>(&good.to_string())
+            .is_empty(),
         "the clean document has none"
     );
 
@@ -149,9 +153,11 @@ fn diagnostics_are_per_document_slot_facts() {
     }])
     .unwrap();
     let snapshot = ws.snapshot();
-    assert!(snapshot
-        .list::<ParseDiagnostics>(&bad.to_string())
-        .is_empty());
+    assert!(
+        snapshot
+            .list::<ParseDiagnostics>(&bad.to_string())
+            .is_empty()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +172,8 @@ mod determinism_matrix {
 
     fn scenario_a(ws: &mut Workspace, name: &str) {
         let u = uri(name);
-        ws.open(u.clone(), r#"{"alpha": [1, 2], "beta": {"gamma": "x"}}"#).unwrap();
+        ws.open(u.clone(), r#"{"alpha": [1, 2], "beta": {"gamma": "x"}}"#)
+            .unwrap();
         let edits = |ws: &mut Workspace| {
             ws.edit(vec![SourceEdit::Insert {
                 key: Span::point_uri(u.clone(), 12).unwrap(),
@@ -234,11 +241,7 @@ mod determinism_matrix {
         // Same engine replays; compare per-document projections.
         let pa = projection(&first_a, "matrix-a");
         let pb = projection(&first_a, "matrix-b");
-        assert_eq!(
-            pa.tokens.len(),
-            5,
-            "document A token count drifted: {pa:?}"
-        );
+        assert_eq!(pa.tokens.len(), 5, "document A token count drifted: {pa:?}");
         assert_eq!(pb.parse_status.as_deref(), Some("clean"));
         // And a fresh engine reproduces both exactly.
         let mut replay = build(3);

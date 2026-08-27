@@ -29,7 +29,7 @@ fn uri(name: &str) -> fluent_uri::Uri<String> {
 }
 
 fn build(workers: usize) -> Workspace {
-    Workspace::build( |engine| {
+    Workspace::build(|engine| {
         install_lexer::<TestTokens>(engine)?;
         Ok(())
     })
@@ -135,7 +135,7 @@ fn closing_a_document_retracts_its_tokens() {
 }
 
 #[test]
-fn equal_text_edit_is_a_no_op_past_the_lexer() {
+fn equal_text_reopen_preserves_token_values() {
     let mut ws = build(1);
     ws.open(uri("eq"), "same").unwrap();
     let before: Arc<TokenVec<TestTokens>> = ws
@@ -147,7 +147,16 @@ fn equal_text_edit_is_a_no_op_past_the_lexer() {
         .snapshot()
         .observe::<Tokens<TestTokens>>("test://eq".to_string())
         .unwrap();
-    assert_eq!(before, after, "text equality short-circuits the lexer");
+    assert_eq!(
+        &*before.tokens,
+        &*after.tokens,
+        "reopening equal text preserves token values"
+    );
+    assert_eq!(
+        &*before.errors,
+        &*after.errors,
+        "reopening equal text preserves token errors"
+    );
 }
 
 /// Debug-only delta oracle (plan §20.2). On structural edits the lexer
@@ -261,7 +270,10 @@ fn token_patch_matches_the_slow_symmetric_fact_diff() {
     let after = fact_entries(&ws);
     let (inserted, removed, updated) = slow_diff(&before, &after);
     assert_eq!(updated, vec![0], "exactly the retyped occurrence value");
-    assert!(inserted.is_empty() && removed.is_empty(), "no occurrence churn");
+    assert!(
+        inserted.is_empty() && removed.is_empty(),
+        "no occurrence churn"
+    );
     // A value edit must not advance the parser-facing semantic revision
     // (the load's structural change already advanced it once): the
     // occurrence set, order, and terminals are unchanged. A follow-up
@@ -287,7 +299,10 @@ fn token_patch_matches_the_slow_symmetric_fact_diff() {
     assert_eq!(patch_inserted2, inserted2, "exactly the new occurrences");
     assert!(patch_removed2.is_empty(), "no removals on insertion");
     assert!(patch_updated2.is_empty(), "no updates on insertion");
-    assert!(removed2.is_empty() && updated2.is_empty(), "slow diff agrees");
+    assert!(
+        removed2.is_empty() && updated2.is_empty(),
+        "slow diff agrees"
+    );
 
     // Structural removal: the fresh patch's removed set equals the slow
     // diff (the word plus both neighbour space errors, which merge into
@@ -354,4 +369,43 @@ fn prefix_edit_shares_the_unchanged_suffix_by_pointer() {
         after.semantic_tape_shares_subtree_with(&tail_after),
         "the unchanged prefix must stay pointer-shared across a tail edit"
     );
+}
+ 
+#[test]
+fn multiple_disjoint_splices_replay_against_the_evolving_source() {
+    let mut ws = build(1);
+    let u = uri("multi-splice");
+    ws.open(u.clone(), "one two three four").unwrap();
+
+    // The first insertion shifts the second replacement by five bytes in
+    // final coordinates. The lexer must replay the two edits in sequence,
+    // not apply both against the original source root.
+    ws.edit(vec![
+        SourceEdit::Insert {
+            key: Span::point_uri(u.clone(), 0).unwrap(),
+            value: "zero ".into(),
+        },
+        SourceEdit::Delete {
+            key: Span::new_uri(u.clone(), 8, 13).unwrap(),
+        },
+        SourceEdit::Insert {
+            key: Span::point_uri(u.clone(), 8).unwrap(),
+            value: "tres".into(),
+        },
+    ])
+    .unwrap();
+
+    let tokens: Arc<TokenVec<TestTokens>> = ws
+        .snapshot()
+        .observe::<Tokens<TestTokens>>("test://multi-splice".to_string())
+        .expect("committed tokens");
+    let words: Vec<_> = tokens
+        .tokens
+        .iter()
+        .filter_map(|token| match &token.value {
+            TestTokens::Word(word) => Some(word.as_str()),
+            TestTokens::Error(_) => None,
+        })
+        .collect();
+    assert_eq!(words, vec!["zero", "one", "two", "tres", "four"]);
 }

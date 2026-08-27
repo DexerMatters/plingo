@@ -10,9 +10,9 @@ mod common;
 use common::fixtures;
 use common::json::{JsonDocument, JsonToken};
 use common::oracle::{self, TraceRunner};
+use plingo::framework::Workspace;
 use plingo::framework::lex::install_lexer;
 use plingo::framework::parse::install_parser;
-use plingo::framework::Workspace;
 use plingo::utils::Span;
 
 fn build() -> Workspace {
@@ -116,7 +116,10 @@ fn editing_one_of_one_hundred_documents_wakes_only_that_document() {
 
     // This is a same-terminal string edit. The lexer runs only for the
     // affected document; its value fact updates without waking its parser.
-    let edited_work = report.work().parser("test://doc-000").expect("layout snapshot work");
+    let edited_work = report
+        .work()
+        .parser("test://doc-000")
+        .expect("layout snapshot work");
     assert_eq!(
         edited_work.component_runs, 0,
         "same-terminal token value changes must keep semantic parsing cold"
@@ -133,10 +136,7 @@ fn suffix_shifting_insertion_keeps_projection_exact() {
     // projections must still match a fresh workspace exactly.
     runner.step(vec![insert_at_head(&u)]);
     runner.step(vec![insert_at_head(&u)]);
-    let projection = oracle::project(
-        &runner.workspace().snapshot(),
-        &u.to_string(),
-    );
+    let projection = oracle::project(&runner.workspace().snapshot(), &u.to_string());
     assert!(projection.source_len > base.len());
 }
 
@@ -146,7 +146,6 @@ fn insert_at_head(u: &fluent_uri::Uri<String>) -> plingo::framework::source::Sou
         value: " ".into(),
     }
 }
-
 
 #[test]
 fn fixed_size_edit_soak_does_not_grow_unboundedly() {
@@ -221,7 +220,11 @@ fn trivia_only_edit_keeps_parser_cold() {
 
     // Trivia keeps semantic parser/tree work cold, while the framework refreshes
     // the editor-facing coordinate facade from the layout view.
-    assert_eq!(report.rounds(), 3, "source, lexer, and layout facade commit");
+    assert_eq!(
+        report.rounds(),
+        3,
+        "source, lexer, and layout facade commit"
+    );
     assert_eq!(
         report
             .work()
@@ -236,12 +239,15 @@ fn trivia_only_edit_keeps_parser_cold() {
     let text_with_space = format!("{} {}", &base[..pos + 1], &base[pos + 1..]);
     let needle_pos = text_with_space.find("\"s").expect("string token");
     let report2 = ws
-        .edit(vec![plingo::framework::source::SourceEdit::Delete {
-            key: Span::new_uri(u.clone(), needle_pos, needle_pos + 3).unwrap(),
-        }, plingo::framework::source::SourceEdit::Insert {
-            key: Span::point_uri(u.clone(), needle_pos).unwrap(),
-            value: "\"ZZ\"".into(),
-        }])
+        .edit(vec![
+            plingo::framework::source::SourceEdit::Delete {
+                key: Span::new_uri(u.clone(), needle_pos, needle_pos + 3).unwrap(),
+            },
+            plingo::framework::source::SourceEdit::Insert {
+                key: Span::point_uri(u.clone(), needle_pos).unwrap(),
+                value: "\"ZZ\"".into(),
+            },
+        ])
         .expect("semantic edit commits");
 
     // The parser MUST fire for a semantic edit.
@@ -257,8 +263,8 @@ fn scanner_characterization_token_stream_baseline() {
     // Stage 0 characterization (barrier-solutions §5.1): capture the complete
     // observable token stream for a known document. After rope cursor
     // conversion, this exact stream must be reproduced.
-    use plingo::framework::lex::{TokenVec, Tokens};
     use common::json::JsonToken;
+    use plingo::framework::lex::{TokenVec, Tokens};
 
     let base = fixtures::json_array(32);
     let mut ws = build();

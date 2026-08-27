@@ -9,14 +9,14 @@ use std::sync::atomic::AtomicBool;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::reactive::kind::MapView;
 use crate::reactive::error::Result;
+use crate::reactive::kind::MapView;
 
 /// An isolated capture of one plain function and its effects.
 ///
 /// The captured graph is intentionally private: callers can inspect only the
 /// function's typed result and must promote it through [`Engine::run`].
-pub struct Planned<B> {
+pub(crate) struct Planned<B> {
     pub(crate) engine_id: usize,
     pub(crate) token: u64,
     pub(crate) output: Arc<RwLock<Arc<B>>>,
@@ -35,7 +35,7 @@ impl<B> Planned<B> {
 /// The engine updates the private output cell after successful reactive
 /// reruns. Dropping this handle intentionally does not retire the root;
 /// [`Engine::remove`] is the sole retirement operation.
-pub struct Running<B> {
+pub(crate) struct Running<B> {
     pub(crate) engine_id: usize,
     pub(crate) token: u64,
     pub(crate) output: Arc<RwLock<Arc<B>>>,
@@ -67,10 +67,7 @@ where
 #[track_caller]
 pub fn run_each_key<V, F>(function: F) -> Result<()>
 where
-    V: MapView
-        + crate::reactive::kind::ViewKind<
-            Observe = crate::reactive::kind::MapObserve<V>,
-        >,
+    V: MapView + crate::reactive::kind::ViewKind<Observe = crate::reactive::kind::MapObserve<V>>,
     F: Fn(V::Input) -> Result<()> + Clone + Send + Sync + 'static,
     V::Input: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
 {
@@ -94,19 +91,15 @@ where
 pub fn run_each_child<V, F>(function: F) -> Result<()>
 where
     V: crate::reactive::kind::TreeView
-        + crate::reactive::kind::ViewKind<
-            Observe = crate::reactive::kind::TreeObserve<V>,
-        >,
-    F: Fn(
-            crate::reactive::view::Node<V>,
-            crate::reactive::view::Node<V>,
-        ) -> Result<()>
+        + crate::reactive::kind::ViewKind<Observe = crate::reactive::kind::TreeObserve<V>>,
+    F: Fn(crate::reactive::view::Node<V>, crate::reactive::view::Node<V>) -> Result<()>
         + Clone
         + Send
         + Sync
         + 'static,
 {
     use crate::reactive::kind::{TreeKey, observe_view};
+    let group = std::panic::Location::caller();
     let observe = observe_view::<V>()?;
     let mut parents: Vec<crate::reactive::view::Node<V>> = Vec::new();
     for input in observe.all_keys(crate::reactive::plain::Temporal::Current)? {
@@ -114,11 +107,22 @@ where
             parents.push(parent);
         }
     }
+    let mut pairs = Vec::new();
     for parent in parents {
-        let children = observe.children(parent)?;
-        for child in children {
-            spawn_child_adapt(&function, parent, child)?;
+        for child in observe.children(parent.clone())? {
+            pairs.push((parent.clone(), child));
         }
+    }
+    let keep = pairs
+        .iter()
+        .map(|(parent, child)| {
+            Arc::new((parent.clone(), child.clone()))
+                as Arc<dyn crate::reactive::value::KeyValue>
+        })
+        .collect::<Vec<_>>();
+    crate::reactive::plain::reconcile_keyed_children(group, &keep)?;
+    for (parent, child) in pairs {
+        spawn_child_adapt(&function, parent, child, group)?;
     }
     Ok(())
 }
@@ -135,22 +139,29 @@ where
 pub fn run_each_child_of<V, F>(parent: crate::reactive::view::Node<V>, function: F) -> Result<()>
 where
     V: crate::reactive::kind::TreeView
-        + crate::reactive::kind::ViewKind<
-            Observe = crate::reactive::kind::TreeObserve<V>,
-        >,
-    F: Fn(
-            crate::reactive::view::Node<V>,
-            crate::reactive::view::Node<V>,
-        ) -> Result<()>
+        + crate::reactive::kind::ViewKind<Observe = crate::reactive::kind::TreeObserve<V>>,
+    F: Fn(crate::reactive::view::Node<V>, crate::reactive::view::Node<V>) -> Result<()>
         + Clone
         + Send
         + Sync
         + 'static,
 {
+    let group = std::panic::Location::caller();
     let observe = crate::reactive::kind::observe_view::<V>()?;
-    let children = observe.children(parent)?;
+    let children = observe.children(parent.clone())?;
+    if std::env::var_os("PLINGO_TRACE_CHILD_EFFECTS").is_some() {
+        eprintln!("child-effects parent={parent:?} children={children:?}");
+    }
+    let keep = children
+        .iter()
+        .map(|child| {
+            Arc::new((parent.clone(), child.clone()))
+                as Arc<dyn crate::reactive::value::KeyValue>
+        })
+        .collect::<Vec<_>>();
+    crate::reactive::plain::reconcile_keyed_children(group, &keep)?;
     for child in children {
-        spawn_child_adapt(&function, parent, child)?;
+        spawn_child_adapt(&function, parent.clone(), child, group)?;
     }
     Ok(())
 }
@@ -159,26 +170,23 @@ fn spawn_child_adapt<V, F>(
     function: &F,
     parent: crate::reactive::view::Node<V>,
     child: crate::reactive::view::Node<V>,
+    group: &'static std::panic::Location<'static>,
 ) -> Result<()>
 where
     V: crate::reactive::kind::TreeView,
-    F: Fn(
-            crate::reactive::view::Node<V>,
-            crate::reactive::view::Node<V>,
-        ) -> Result<()>
+    F: Fn(crate::reactive::view::Node<V>, crate::reactive::view::Node<V>) -> Result<()>
         + Clone
         + Send
         + Sync
         + 'static,
 {
     let function = function.clone();
-    crate::reactive::plain::run_keyed_effect(
+    crate::reactive::plain::run_keyed_effect_at(
         move |(parent, child): (
             crate::reactive::view::Node<V>,
             crate::reactive::view::Node<V>,
         )| function(parent, child),
         (parent, child),
+        group,
     )
 }
-
-

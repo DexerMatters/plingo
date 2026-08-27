@@ -1,0 +1,109 @@
+{
+  "schema_version": 2,
+  "recovery_policy_version": "RECOVERY_POLICY_VERSION@phase0",
+  "percentile_policy": "nearest_rank_v1",
+  "phase": "follow-up-phase0",
+  "date": "2026-08-25",
+  "source_state": {
+    "git_head": "working-tree (uncommitted follow-up Phase 0/1 work on 0bb541d)",
+    "profile": "release",
+    "toolchain": "stable-x86_64-unknown-linux-gnu",
+    "notes": "PathWork counters, gated ReactionDigest capture, lineage settle state machine, and delta-carried removal metadata are present in this tree."
+  },
+  "target": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu": "12th Gen Intel(R) Core(TM) i7-1280P"
+  },
+  "cases": [
+    {
+      "name": "stlc_64_literal",
+      "outcome": { "status": "recorded" },
+      "declarations": 64,
+      "source_bytes": 3780,
+      "semantic_tokens": 1088,
+      "live_facts": 10582,
+      "warmups": 10,
+      "samples": 50,
+      "median_us": 192404,
+      "p95_us": 197383,
+      "avg_alloc_count": 32376,
+      "avg_alloc_bytes": 8163004,
+      "work": {
+        "candidate_writes_note": "see raw JSONL in repository /tmp capture at measurement time; deterministic counters unchanged in shape from V1 plus path_work extension",
+        "status": "recorded"
+      }
+    },
+    {
+      "name": "json_512_replace_s1",
+      "outcome": { "status": "recorded" },
+      "source_bytes": 2700,
+      "lexical_occurrences": 1227,
+      "semantic_tokens": 1330,
+      "live_facts": 1546,
+      "warmups": 10,
+      "samples": 50,
+      "median_us": 913965,
+      "p95_us": 1628039,
+      "work": { "status": "recorded" }
+    },
+    {
+      "name": "json_trivia_insert",
+      "outcome": { "status": "recorded" },
+      "samples": 8,
+      "median_us": 2058338,
+      "p95_us": 2145629,
+      "work": { "status": "recorded" }
+    },
+    {
+      "name": "json_two_distant_edits",
+      "outcome": { "status": "recorded" },
+      "samples": 8,
+      "median_us": 2048441,
+      "p95_us": 2204557,
+      "work": { "status": "recorded" }
+    },
+    {
+      "name": "two_documents_edit_a",
+      "outcome": { "status": "recorded" },
+      "samples": 50,
+      "median_us": 1118724,
+      "p95_us": 1141388,
+      "work": { "status": "recorded" }
+    },
+    {
+      "name": "json_4096_replace_true",
+      "outcome": {
+        "status": "invalid",
+        "reason": { "kind": "no_samples" }
+      },
+      "reason_detail": "A single in-process run of the full case matrix was OOM-killed (SIGKILL) during this case, and an isolated re-run exceeded a 900 s wall budget before completing its sample window. Recorded as invalid rather than fabricated; Phase 6 re-measures after the ownership and parser-locality phases land.",
+      "work": { "status": "aborted", "code": -9 }
+    },
+    {
+      "name": "json_12000_replace_null",
+      "outcome": {
+        "status": "invalid",
+        "reason": { "kind": "no_samples" }
+      },
+      "reason_detail": "Skipped for the same budget reason as json_4096_replace_true; never started after the 4096 case overran.",
+      "work": { "status": "aborted", "code": -9 }
+    }
+  ],
+  "percentile_selftest": {
+    "vectors": [
+      { "input": [1, 2, 3, 4, 5, 6, 7, 8], "median": 4, "p95": 8 },
+      { "input_n": 10, "median": 5, "p95": 10 },
+      { "input_n": 50, "median": 25, "p95": 48 },
+      { "input": [1, 1, 1, 2, 2, 9, 9, 9], "median": 2, "p95": 9 }
+    ],
+    "implementation": "nearest-rank ceil(p*n)-1 clamped; asserted on every bench invocation via assert_percentile_vectors()"
+  },
+  "lifecycle_oracle_status": {
+    "expression_child_insert_remove_reverse": "panic reproduced pre-fix; reverse now commits with digest-exact restoration after lineage settle; strict live-fact twin still frozen (+4 residual StlcTree ChildLink facts) — owner: Cut E exact dimension publication",
+    "used_binder_rename_reverse": "strict liveness restored exactly (was +2)",
+    "terminal_kind_cycle": "strict liveness restored exactly (was +108 observed pre-settle; residual was stale patch tombstones, fixed by owned-tombstone removal)",
+    "declaration_append_delete_reverse": "still frozen: ConflictingWrites on StlcTypeDiagnostics Len(Node) between two type_node writers during deletion reparse — owner: Phase 1 continuation / Cut C identity model",
+    "close_reopen_full_digest": "still frozen: check-owned anchored Type-scope identities drift across session restart — owner: Cut C/E automatic identity work"
+  }
+}

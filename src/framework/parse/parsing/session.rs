@@ -2,7 +2,6 @@ use indexmap::IndexSet;
 
 use super::{
     ParseColumn, ParseError, ParseToken, ReductionKey, ReductionPath, SessionContext,
-    product_direct_record,
 };
 use crate::framework::parse::{
     TokenData,
@@ -142,21 +141,9 @@ impl SessionContext<'_> {
         Ok(product)
     }
 
-    /// Records one product into a column's segment and adopts its direct
-    /// AST record into that segment's live set (plan §9.2). Only the
-    /// product's own record enters the segment — the transitive closure
-    /// is implied by the parent chain, so the cost is O(1) per product.
+    /// Records one product into a column's parser-cache segment.
     fn record_column_product(&mut self, product: ProductId, column: usize) -> bool {
-        let direct_record = product_direct_record(self.products, product);
-        let inserted = self.state.columns[column].push_product(product);
-        if inserted
-            && let Some(record) = direct_record
-            && !self.state.columns[column].records.contains(&record)
-        {
-            self.state.columns[column].records.push(record);
-            self.state.record_became_live(record);
-        }
-        inserted
+        self.state.columns[column].push_product(product)
     }
 
     pub(crate) fn reduce_until_stable(
@@ -221,12 +208,6 @@ impl SessionContext<'_> {
                                     changed = true;
                                 }
                                 if self.state.columns[column].push_accepted(product) {
-                                    if let Some(record) = product_direct_record(self.products, product)
-                                        && !self.state.columns[column].records.contains(&record)
-                                    {
-                                        self.state.columns[column].records.push(record);
-                                        self.state.record_became_live(record);
-                                    }
                                     changed = true;
                                 }
                             }
@@ -340,19 +321,18 @@ impl SessionContext<'_> {
                         next_active.insert(next_node);
                     }
                 } else {
-                    if !self.state.token_products.contains_key(&token.column) {
+                    if self.state.token_product(token.column).is_none() {
                         // One source token can shift through multiple GSS paths;
                         // every path must share its single token product.
                         let mut cx = self.build_cx(token.column);
-                        let product = cx.alloc_token(
-                            token.length,
-                            token.terminal,
-                            token.entry,
-                            token.column,
-                        );
+                        let product =
+                            cx.alloc_token(token.length, token.terminal, token.entry, token.column);
                         self.state.token_products.insert(token.column, product);
                     }
-                    let product = self.state.token_products[&token.column];
+                    let product = self
+                        .state
+                        .token_product(token.column)
+                        .expect("token product was inserted");
                     let next_node =
                         self.gss
                             .node(next_state, from_column + 1, self.state.generation);
@@ -394,7 +374,10 @@ impl SessionContext<'_> {
             self.state.columns[next_column].set_error_derived();
             self.reduce_until_stable(next_column, self.grammar.error_terminal, token.column)?;
         } else {
-            let product = self.state.token_products[&token.column];
+            let product = self
+                .state
+                .token_product(token.column)
+                .expect("token product was inserted");
             self.state
                 .columns
                 .push(ParseColumn::new(Some(token.column), next_active));
@@ -539,9 +522,12 @@ impl SessionContext<'_> {
                     let synthetic = tail.get(index).map(|token| token.column);
                     if let Some(anchor_occ) = tail.get(index).map(|token| token.column) {
                         self.state.record_witness(anchor_occ, recovery_segment);
-                        crate::framework::workspace::record_parser_work(&self.uri.to_string(), |work| {
-                            work.recovery_witness_tokens += 1;
-                        });
+                        crate::framework::workspace::record_parser_work(
+                            &self.uri.to_string(),
+                            |work| {
+                                work.recovery_witness_tokens += 1;
+                            },
+                        );
                     }
                     self.reduce_until_stable(
                         column,
@@ -558,9 +544,12 @@ impl SessionContext<'_> {
                         return Ok(None);
                     };
                     self.state.record_witness(token.column, recovery_segment);
-                    crate::framework::workspace::record_parser_work(&self.uri.to_string(), |work| {
-                        work.recovery_witness_tokens += 1;
-                    });
+                    crate::framework::workspace::record_parser_work(
+                        &self.uri.to_string(),
+                        |work| {
+                            work.recovery_witness_tokens += 1;
+                        },
+                    );
                     let _ = synthetic_anchor(Some(token.column), column, self);
                     self.delete_parse_token(column, token)?;
                     index += 1;

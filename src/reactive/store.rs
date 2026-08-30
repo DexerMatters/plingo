@@ -2334,7 +2334,6 @@ impl DirtyQueue {
     }
 }
 
-
 #[cfg(test)]
 mod pathwork_primitive_tests {
     use super::*;
@@ -2431,7 +2430,6 @@ mod pathwork_primitive_tests {
         assert_eq!(radix.operations, 1);
         assert_eq!(radix.key_comparisons, 1);
     }
-
 
     fn probe_key(index: u64, forced: u64) -> ProbeKey {
         if forced == u64::MAX {

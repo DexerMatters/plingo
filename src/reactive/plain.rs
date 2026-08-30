@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 
 use crate::reactive::engine::{EngineWork, InvocationIdentity, InvocationWork};
 use crate::reactive::error::{Error, Result};
 pub(crate) use crate::reactive::store::PlainState as PlainStatePub;
-use crate::reactive::store::{FactJournal, PlainState, SnapshotRoot};
+use crate::reactive::store::{ErasedFactKey, FactJournal, Hamt, PlainState, SnapshotRoot};
 use crate::reactive::value::{KeyValue, Value};
 use crate::reactive::view::View;
 
@@ -119,20 +120,15 @@ impl CommandTxn {
         self.undo.push(undo);
     }
 }
-
 thread_local! {
     /// The active command transaction. Commands are synchronous, so a
     /// thread-local frame is sufficient and keeps evaluation paths free of
     /// runtime plumbing.
     static ACTIVE_TXN: RefCell<Option<std::rc::Rc<std::cell::RefCell<CommandTxn>>>> =
         const { RefCell::new(None) };
-    /// Pre-eval write/read sets of running evaluations, keyed by id.
-    static OLD_WRITES: RefCell<Vec<(u64, Vec<PlainWrite>, Vec<ReadDep>)>> =
+    /// Pre-eval ownership roots and read sets of running evaluations.
+    static OLD_WRITES: RefCell<Vec<(u64, ComponentWrites, Vec<ReadDep>)>> =
         const { RefCell::new(Vec::new()) };
-    /// Innermost evaluating invocation's PRE-evaluation owned writes
-    /// (Cut E ownership diff): a stable snapshot immune to the mutation
-    /// of invocation.writes during publication.
-    static PRE_EVAL_OWNED: RefCell<Vec<PlainWrite>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Pops the transaction frame on drop, including unwind paths.
@@ -247,7 +243,8 @@ fn rollback_txn(
                         }
                         None => {
                             // Creation undone: remove the newest matching id.
-                            if let Some(position) = graph.invocations.iter().rposition(|inv| true) {
+                            if let Some(position) = graph.invocations.iter().rposition(|_inv| true)
+                            {
                                 graph.invocations.remove(position);
                             }
                         }
@@ -312,6 +309,123 @@ struct PlainWrite {
     shareable: bool,
 }
 
+/// Persistent ownership of one component instance's outputs.
+///
+/// Each view keeps an independent HAMT root. Evaluating a patch-mode
+/// component clones these roots and path-copies only the touched keys;
+/// complete enumeration is reserved for replace-mode omission diffs,
+/// retirement, and explicit audits.
+#[derive(Clone, Default)]
+pub(crate) struct ComponentWrites {
+    views: SmallVec<[OwnedView; 2]>,
+}
+
+#[derive(Clone)]
+struct OwnedView {
+    view: TypeId,
+    name: &'static str,
+    mode: EmissionMode,
+    facts: Hamt<ErasedFactKey, PlainWrite>,
+}
+
+impl ComponentWrites {
+    fn view(&self, view: TypeId) -> Option<&OwnedView> {
+        self.views.iter().find(|owned| owned.view == view)
+    }
+
+    fn view_mut(&mut self, view: TypeId) -> Option<&mut OwnedView> {
+        self.views.iter_mut().find(|owned| owned.view == view)
+    }
+
+    fn ensure_view(
+        &mut self,
+        view: TypeId,
+        name: &'static str,
+        mode: EmissionMode,
+    ) -> &mut OwnedView {
+        if let Some(index) = self.views.iter().position(|owned| owned.view == view) {
+            let owned = &mut self.views[index];
+            owned.name = name;
+            owned.mode = mode;
+            return owned;
+        }
+        self.views.push(OwnedView {
+            view,
+            name,
+            mode,
+            facts: Hamt::default(),
+        });
+        self.views.last_mut().expect("just inserted")
+    }
+
+    fn mode(&self, view: TypeId) -> Option<EmissionMode> {
+        self.view(view).map(|owned| owned.mode)
+    }
+
+    fn lookup(&self, view: TypeId, key: &dyn KeyValue) -> Option<&PlainWrite> {
+        let owned = self.view(view)?;
+        let key = ErasedFactKey::new(view, key.clone_key());
+        owned.facts.get(&key)
+    }
+
+    fn insert(&mut self, write: PlainWrite, mode: EmissionMode) -> Option<PlainWrite> {
+        let view = write.view;
+        let key = ErasedFactKey::new(view, Arc::clone(&write.key));
+        let previous = self
+            .view(view)
+            .and_then(|owned| owned.facts.get(&key))
+            .cloned();
+        self.ensure_view(view, write.view_name, mode)
+            .facts
+            .insert(key, write);
+        previous
+    }
+
+    fn remove(&mut self, view: TypeId, key: &dyn KeyValue) -> Option<PlainWrite> {
+        let erased = ErasedFactKey::new(view, key.clone_key());
+        let previous = self
+            .view(view)
+            .and_then(|owned| owned.facts.get(&erased))
+            .cloned();
+        if let Some(owned) = self.view_mut(view) {
+            owned.facts.remove(&erased);
+        }
+        previous
+    }
+
+    /// Enumerates one view's owned facts. Callers use this only for
+    /// replace-mode diffs, retirement, audits, and report materialization.
+    fn view_entries(&self, view: TypeId) -> Vec<PlainWrite> {
+        self.view(view)
+            .map(|owned| owned.facts.iter().map(|(_, write)| write.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Enumerates all owned facts for lifecycle teardown and audits.
+    fn all_entries(&self) -> Vec<PlainWrite> {
+        self.views
+            .iter()
+            .flat_map(|owned| owned.facts.iter().map(|(_, write)| write.clone()))
+            .collect()
+    }
+
+    fn contains(&self, view: TypeId, key: &dyn KeyValue) -> bool {
+        self.lookup(view, key).is_some()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.views.iter().all(|owned| owned.facts.is_empty())
+    }
+
+    fn len(&self) -> usize {
+        self.views.iter().map(|owned| owned.facts.len()).sum()
+    }
+
+    fn iter_views(&self) -> impl Iterator<Item = &OwnedView> {
+        self.views.iter()
+    }
+}
+
 #[derive(Clone)]
 struct CallIdentity {
     file: &'static str,
@@ -327,21 +441,39 @@ struct CallIdentity {
 
 impl CallIdentity {
     fn same(&self, other: &Self) -> bool {
-        self.file == other.file
-            && self.line == other.line
-            && self.column == other.column
-            && self.function == other.function
+        self.function == other.function
             && self.input.eq_value(other.input.as_ref())
-            && (self.stable_input == other.stable_input
-                && (self.stable_input || self.occurrence == other.occurrence))
+            && if self.stable_input && other.stable_input {
+                true
+            } else {
+                self.file == other.file
+                    && self.line == other.line
+                    && self.column == other.column
+                    && self.occurrence == other.occurrence
+            }
     }
 }
 
 pub(crate) trait ErasedCall: Send + Sync {
     fn invoke(&self) -> Result<Arc<dyn Value>>;
     fn function_type(&self) -> TypeId;
+    fn definition_type(&self) -> Option<TypeId> {
+        None
+    }
     fn input_key(&self) -> Arc<dyn KeyValue>;
     fn function_name(&self) -> &'static str;
+    /// Compares replaceable value parameters for the key-matched component
+    /// call. Legacy calls have no separate props and always compare equal.
+    fn props_equal(&self, _other: &dyn ErasedCall) -> bool {
+        true
+    }
+    fn props_any(&self) -> Option<&(dyn Any + Send + Sync)> {
+        None
+    }
+    /// Stable member descriptor used only for diagnostics/reaction reports.
+    fn case_name(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 struct TypedCall<F, A, B> {
@@ -350,9 +482,9 @@ struct TypedCall<F, A, B> {
     definition: Option<TypeId>,
     function: F,
     input: A,
+    apply_output: Option<Arc<dyn Fn(&B) -> Result<()> + Send + Sync>>,
     _marker: std::marker::PhantomData<fn() -> B>,
 }
-
 impl<F, A, B> ErasedCall for TypedCall<F, A, B>
 where
     F: Fn(A) -> Result<B> + Clone + Send + Sync + 'static,
@@ -360,11 +492,18 @@ where
     B: Clone + PartialEq + Debug + Send + Sync + 'static,
 {
     fn invoke(&self) -> Result<Arc<dyn Value>> {
-        Ok(Arc::new((self.function)(self.input.clone())?))
+        let output = (self.function)(self.input.clone())?;
+        if let Some(apply_output) = &self.apply_output {
+            apply_output(&output)?;
+        }
+        Ok(Arc::new(output))
+    }
+    fn function_type(&self) -> TypeId {
+        self.definition.unwrap_or_else(|| TypeId::of::<F>())
     }
 
-    fn function_type(&self) -> TypeId {
-        TypeId::of::<F>()
+    fn definition_type(&self) -> Option<TypeId> {
+        self.definition
     }
 
     fn input_key(&self) -> Arc<dyn KeyValue> {
@@ -373,6 +512,62 @@ where
 
     fn function_name(&self) -> &'static str {
         std::any::type_name::<F>()
+    }
+}
+
+/// An ordinary component call with identity separated from replaceable props.
+/// The erased call owns both values so a dirty invocation can be reevaluated
+/// without changing its lifecycle or output ownership roots.
+struct ComponentCall<F, K, P, B> {
+    definition: TypeId,
+    function: F,
+    key: K,
+    props: P,
+    descriptor: &'static str,
+    case: Option<&'static str>,
+    _marker: std::marker::PhantomData<fn() -> B>,
+}
+
+impl<F, K, P, B> ErasedCall for ComponentCall<F, K, P, B>
+where
+    F: Fn(K, P) -> Result<B> + Clone + Send + Sync + 'static,
+    K: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
+    P: Clone + PartialEq + Debug + Send + Sync + 'static,
+    B: Clone + PartialEq + Debug + Send + Sync + 'static,
+{
+    fn invoke(&self) -> Result<Arc<dyn Value>> {
+        Ok(Arc::new((self.function)(self.key.clone(), self.props.clone())?))
+    }
+
+    fn function_type(&self) -> TypeId {
+        self.definition
+    }
+
+    fn definition_type(&self) -> Option<TypeId> {
+        Some(self.definition)
+    }
+
+    fn input_key(&self) -> Arc<dyn KeyValue> {
+        Arc::new(self.key.clone())
+    }
+
+    fn function_name(&self) -> &'static str {
+        self.descriptor
+    }
+
+    fn props_equal(&self, other: &dyn ErasedCall) -> bool {
+        let Some(other) = other.props_any().and_then(|value| value.downcast_ref::<P>()) else {
+            return false;
+        };
+        self.props == *other
+    }
+
+    fn props_any(&self) -> Option<&(dyn Any + Send + Sync)> {
+        Some(&self.props)
+    }
+
+    fn case_name(&self) -> Option<&'static str> {
+        self.case
     }
 }
 /// Placeholder call for keyed-child placeholders and family roots.
@@ -405,10 +600,10 @@ where
         definition: None,
         function,
         input,
+        apply_output: None,
         _marker: std::marker::PhantomData,
     })
 }
-
 /// Like [`erased_call`], but stamps a component-definition marker as the
 /// effective identity type (Cut C).
 pub(crate) fn erased_call_with_definition<F, A, B>(
@@ -421,10 +616,50 @@ where
     A: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
     B: Clone + PartialEq + Debug + Send + Sync + 'static,
 {
+    erased_call_with_definition_and_apply(definition, function, input, None)
+}
+
+pub(crate) fn erased_call_with_definition_and_apply<F, A, B>(
+    definition: TypeId,
+    function: F,
+    input: A,
+    apply_output: Option<Arc<dyn Fn(&B) -> Result<()> + Send + Sync>>,
+) -> Arc<dyn ErasedCall>
+where
+    F: Fn(A) -> Result<B> + Clone + Send + Sync + 'static,
+    A: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
+    B: Clone + PartialEq + Debug + Send + Sync + 'static,
+{
     Arc::new(TypedCall {
         definition: Some(definition),
         function,
         input,
+        apply_output,
+        _marker: std::marker::PhantomData,
+    })
+}
+
+pub(crate) fn erased_component_call_with_definition<F, K, P, B>(
+    definition: TypeId,
+    descriptor: &'static str,
+    case: Option<&'static str>,
+    function: F,
+    key: K,
+    props: P,
+) -> Arc<dyn ErasedCall>
+where
+    F: Fn(K, P) -> Result<B> + Clone + Send + Sync + 'static,
+    K: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
+    P: Clone + PartialEq + Debug + Send + Sync + 'static,
+    B: Clone + PartialEq + Debug + Send + Sync + 'static,
+{
+    Arc::new(ComponentCall {
+        definition,
+        function,
+        key,
+        props,
+        descriptor,
+        case,
         _marker: std::marker::PhantomData,
     })
 }
@@ -439,7 +674,12 @@ struct Invocation {
     result: Option<Arc<dyn Value>>,
     fresh_sites: HashMap<(&'static str, u32, u32, TypeId, u64), u64>,
     reads: Vec<ReadDep>,
-    writes: Vec<PlainWrite>,
+    /// Committed ownership roots. This is never rebuilt by ordinary
+    /// patch-mode evaluations.
+    writes: ComponentWrites,
+    /// Writes authored by the body currently being evaluated. These are
+    /// transient and are folded into `writes` only after the body succeeds.
+    pending_writes: Vec<PlainWrite>,
     children: Vec<u64>,
     seen_children: Vec<u64>,
     /// Frozen emission modes per view for THIS evaluation (plan §5.5).
@@ -502,12 +742,13 @@ impl PlainGraph {
                 call,
                 function_name,
                 result: None,
+                fresh_sites: HashMap::new(),
                 reads: Vec::new(),
-                writes: Vec::new(),
+                writes: ComponentWrites::default(),
+                pending_writes: Vec::new(),
                 children: Vec::new(),
                 seen_children: Vec::new(),
                 emission_modes: HashMap::new(),
-                fresh_sites: HashMap::new(),
                 dirty: false,
                 retired: false,
             }],
@@ -817,6 +1058,7 @@ struct ActiveEval {
     /// started (Cut E ownership diff baseline).
     pre_eval_writes: PreEvalOwned,
     occurrences: RefCell<Vec<(CallBase, u64)>>,
+    rendered_slots: RefCell<HashSet<TypeId>>,
 }
 
 impl Clone for ActiveEval {
@@ -826,6 +1068,7 @@ impl Clone for ActiveEval {
             id: self.id,
             pre_eval_writes: self.pre_eval_writes.clone(),
             occurrences: RefCell::new(self.occurrences.borrow().clone()),
+            rendered_slots: RefCell::new(self.rendered_slots.borrow().clone()),
         }
     }
 }
@@ -848,9 +1091,9 @@ pub(crate) struct PreEvalOwned {
 }
 
 impl PreEvalOwned {
-    fn snapshot(writes: &[PlainWrite]) -> Self {
+    fn snapshot(writes: &ComponentWrites) -> Self {
         Self {
-            writes: writes.iter().cloned().collect(),
+            writes: writes.all_entries(),
         }
     }
 }
@@ -1156,7 +1399,7 @@ impl EffectContext {
                             .insert(view, EmissionMode::Replace);
                     }
                 }
-                invocation.writes.push(PlainWrite {
+                invocation.pending_writes.push(PlainWrite {
                     view,
                     name: V::name(),
                     view_name: V::name(),
@@ -1259,6 +1502,7 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
         }
         let old_writes = std::mem::take(&mut invocation.writes);
         let old_reads = std::mem::take(&mut invocation.reads);
+        invocation.pending_writes.clear();
         invocation.fresh_sites.clear();
         invocation.seen_children.clear();
         // Emission modes freeze per evaluation only (plan §5.5).
@@ -1267,15 +1511,6 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
         OLD_WRITES.with(|slot| slot.borrow_mut().push((id, old_writes, old_reads)));
         Arc::clone(&invocation.call)
     };
-    if std::env::var_os("PLINGO_TRACE_EVAL").is_some() {
-        eprintln!(
-            "eval id={} function={} input_hash={}",
-            id,
-            call.function_name(),
-            call.input_key().hash_value()
-        );
-    }
-
     let pending = std::rc::Rc::new(PendingOverlay::default());
     let pre_eval_owned = OLD_WRITES.with(|slot| {
         slot.borrow()
@@ -1291,6 +1526,7 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
             id,
             pre_eval_writes: pre_eval_owned,
             occurrences: RefCell::new(Vec::new()),
+            rendered_slots: RefCell::new(HashSet::new()),
         });
     });
     ACTIVE.with(|active| {
@@ -1308,6 +1544,21 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
         active.borrow_mut().pop();
     });
 
+    // Pop this evaluation's baseline slot unconditionally: failed
+    // evaluations must not leak pre-eval ownership entries.
+    let (old_writes, old_read_deps) = OLD_WRITES.with(|slot| {
+        let index = slot
+            .borrow_mut()
+            .iter()
+            .rposition(|(eval_id, _, _)| *eval_id == id);
+        match index {
+            Some(index) => {
+                let (_, writes, reads) = slot.borrow_mut().remove(index);
+                (writes, reads)
+            }
+            None => (ComponentWrites::default(), Vec::new()),
+        }
+    });
     let result = match result {
         Ok(result) => result,
         Err(payload) => return Err(panic_error(payload)),
@@ -1318,26 +1569,23 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
     };
 
     let mut graph_guard = graph.lock();
-    let (old_writes, old_read_deps) = OLD_WRITES.with(|slot| {
-        slot.borrow_mut()
-            .iter_mut()
-            .rev()
-            .find(|(eval_id, _, _)| *eval_id == id)
-            .map(|(_, writes, reads)| (std::mem::take(writes), std::mem::take(reads)))
-            .unwrap_or((Vec::new(), Vec::new()))
-    });
     let emission_modes = graph_guard.invocation(id)?.emission_modes.clone();
+    // Patch-mode views carried over from the previous evaluation keep
+    // their ownership unless this body switched the view to Replace.
     let mut patch_views: HashSet<TypeId> = old_writes
-        .iter()
-        .filter(|write| write.name == "patch")
-        .filter(|write| !matches!(emission_modes.get(&write.view), Some(EmissionMode::Replace)))
-        .map(|write| write.view)
+        .iter_views()
+        .filter(|owned| owned.mode == EmissionMode::Patch)
+        .filter(|owned| !matches!(emission_modes.get(&owned.view), Some(EmissionMode::Replace)))
+        .map(|owned| owned.view)
         .collect();
     patch_views.extend(
         emission_modes
             .iter()
             .filter_map(|(view, mode)| matches!(mode, EmissionMode::Patch).then_some(*view)),
     );
+    // One enumeration of the pre-eval ownership roots feeds both the
+    // reaction capture and the replace-mode omission diff below.
+    let old_entries = old_writes.all_entries();
 
     // Build one exact-key index for this candidate (Cut D touched-key
     // patching, follow-up plan sections 16.2-16.3): only keys the body
@@ -1345,7 +1593,7 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
     // keys keep ownership pointer-identically via `retained` and are never
     // re-journalled, so one-key work is independent of the instance's
     // owned domain.
-    let direct_writes = std::mem::take(&mut graph_guard.invocation_mut(id)?.writes);
+    let direct_writes = std::mem::take(&mut graph_guard.invocation_mut(id)?.pending_writes);
     let mut candidate_index = IndexedWrites::from_writes(direct_writes);
     let patch_ops = std::mem::take(&mut *pending.patch_ops.borrow_mut());
     let patch_index = patch_ops_to_indexed(patch_ops)?;
@@ -1356,13 +1604,12 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
     let retained: Vec<PlainWrite> = if patch_views.is_empty() {
         Vec::new()
     } else {
-        old_writes
+        patch_views
             .iter()
-            .filter(|write| patch_views.contains(&write.view) && !candidate_index.contains(write))
-            .cloned()
+            .flat_map(|view| old_writes.view_entries(*view))
+            .filter(|write| !candidate_index.contains(write))
             .collect()
     };
-    graph_guard.invocation_mut(id)?.writes = candidate.clone();
     let seen_children = graph_guard.invocation(id)?.seen_children.clone();
 
     // Retire unseen children first; every mutation flows through the
@@ -1386,63 +1633,74 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
     let _ = &mut graph_guard;
 
     // Retract omitted writes and apply candidate writes through the journal.
-    {
-        let function_name = graph_guard.invocation(id)?.function_name;
-        let state = Arc::clone(&graph_guard.state);
-        let retracts: Vec<PlainWrite> = old_writes
-            .iter()
-            .filter(|previous| {
-                !candidate_index.contains(previous)
-                    && !retained.iter().any(|keep| {
-                        keep.view == previous.view && keep.key.eq_value(previous.key.as_ref())
-                    })
-            })
-            .cloned()
-            .collect();
-        drop(graph_guard);
-        with_txn(|txn| -> Result<()> {
-            let mut state = state.lock();
-            for write in &retracts {
-                if let Some(change) = txn.journal.retract(
-                    &mut state,
-                    write.view,
-                    write.name,
-                    write.key.as_ref(),
-                    id,
-                    function_name,
-                )? {
-                    changes.push(change);
-                }
+    let retracts: Vec<PlainWrite> = old_entries
+        .iter()
+        .filter(|previous| {
+            !candidate_index.contains(previous)
+                && !retained.iter().any(|keep| {
+                    keep.view == previous.view && keep.key.eq_value(previous.key.as_ref())
+                })
+        })
+        .cloned()
+        .collect();
+    let function_name = graph_guard.invocation(id)?.function_name;
+    let state = Arc::clone(&graph_guard.state);
+    drop(graph_guard);
+    with_txn(|txn| -> Result<()> {
+        let mut state = state.lock();
+        for write in &retracts {
+            if let Some(change) = txn.journal.retract(
+                &mut state,
+                write.view,
+                write.name,
+                write.key.as_ref(),
+                id,
+                function_name,
+            )? {
+                changes.push(change);
             }
-            for write in &candidate {
-                if let Some(change) = txn.journal.write(
-                    &mut state,
-                    write.view,
-                    write.name,
-                    Arc::clone(&write.key),
-                    write.value.clone(),
-                    id,
-                    function_name,
-                    write.shareable,
-                )? {
-                    changes.push(change);
-                }
+        }
+        for write in &candidate {
+            if let Some(change) = txn.journal.write(
+                &mut state,
+                write.view,
+                write.name,
+                Arc::clone(&write.key),
+                write.value.clone(),
+                id,
+                function_name,
+                write.shareable,
+            )? {
+                changes.push(change);
             }
-            Ok(())
-        })?;
-        graph_guard = graph.lock();
+        }
+        Ok(())
+    })?;
+
+    // Ownership fold: retracted keys and patch tombstones leave the
+    // invocation's persistent roots; authored upserts enter. Patch-view
+    // keys the body never touched keep their HAMT position (structural
+    // sharing), so ordinary patch evaluations never enumerate their whole
+    // owned domain.
+    let mut owned = old_writes;
+    for write in &retracts {
+        owned.remove(write.view, write.key.as_ref());
+    }
+    for write in candidate.iter().filter(|write| write.value.is_none()) {
+        owned.remove(write.view, write.key.as_ref());
+    }
+    for write in candidate.iter().filter(|write| write.value.is_some()) {
+        let mode = emission_modes.get(&write.view).copied().unwrap_or_else(|| {
+            if write.name == "patch" {
+                EmissionMode::Patch
+            } else {
+                EmissionMode::Replace
+            }
+        });
+        owned.insert(write.clone(), mode);
     }
 
-    // Owned tombstones never persist (follow-up plan section 16.1): a
-    // patch Remove op stays visible to the journal above but leaves
-    // ownership, so the committed write set keeps only present values.
-    let committed_writes: Vec<PlainWrite> = candidate
-        .iter()
-        .filter(|write| write.value.is_some())
-        .cloned()
-        .chain(retained.iter().cloned())
-        .collect();
-
+    let mut graph_guard = graph.lock();
     let previous_result = graph_guard.invocation(id)?.result.clone();
     let changed = previous_result
         .as_ref()
@@ -1490,7 +1748,7 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
                 .any(|change| change.view == write.view && change.key.eq_value(write.key.as_ref()));
             let committed = if !changed_here {
                 None
-            } else if old_writes
+            } else if old_entries
                 .iter()
                 .any(|old| old.view == write.view && old.key.eq_value(write.key.as_ref()))
             {
@@ -1504,7 +1762,7 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
                 committed,
             });
         }
-        for write in old_writes.iter() {
+        for write in old_entries.iter() {
             let retained = candidate
                 .iter()
                 .any(|next| next.view == write.view && next.key.eq_value(write.key.as_ref()));
@@ -1550,12 +1808,18 @@ fn evaluate_graph(graph: &Arc<Mutex<PlainGraph>>, id: u64) -> Result<(Arc<dyn Va
                 invocation
                     .reads
                     .iter()
-                    .map(|read| (read.name, read.view, read.key.is_some(), read.temporal, read.keyset))
+                    .map(|read| (
+                        read.name,
+                        read.view,
+                        read.key.is_some(),
+                        read.temporal,
+                        read.keyset
+                    ))
                     .collect::<Vec<_>>()
             );
         }
         invocation.result = Some(Arc::clone(&result));
-        invocation.writes = committed_writes;
+        invocation.writes = owned;
         invocation.children = seen_children.clone();
         if std::env::var_os("PLINGO_TRACE_EVAL").is_some()
             && invocation.function_name.contains("name_resolve")
@@ -1725,7 +1989,7 @@ fn retract_invocation(
         with_txn(|txn| txn.touch_invocation(graph_guard.root, &graph_guard, id));
         (
             invocation.children.clone(),
-            invocation.writes.clone(),
+            invocation.writes.all_entries(),
             invocation.function_name,
             invocation
                 .reads
@@ -1758,6 +2022,7 @@ fn retract_invocation(
                 .map(|invocation| {
                     invocation
                         .writes
+                        .all_entries()
                         .iter()
                         .map(|write| crate::reactive::reaction::ElementEdge {
                             view: write.view_name,
@@ -1819,7 +2084,7 @@ fn retract_invocation(
     invocation.retired = true;
     invocation.result = None;
     invocation.reads.clear();
-    invocation.writes.clear();
+    invocation.writes = ComponentWrites::default();
     invocation.children.clear();
     invocation.seen_children.clear();
     invocation.dirty = false;
@@ -1863,9 +2128,7 @@ pub(crate) fn reconcile_keyed_children(
                         && identity.file == group.file()
                         && identity.line == group.line()
                         && identity.column == group.column()
-                        && !keep
-                            .iter()
-                            .any(|key| identity.input.eq_value(key.as_ref()))
+                        && !keep.iter().any(|key| identity.input.eq_value(key.as_ref()))
                 })
             })
             .map(|invocation| invocation.id)
@@ -1877,14 +2140,15 @@ pub(crate) fn reconcile_keyed_children(
         let mut graph_guard = graph.lock();
         with_txn(|txn| txn.touch_invocation(graph_guard.root, &graph_guard, parent));
         let parent_invocation = graph_guard.invocation_mut(parent)?;
-        parent_invocation.children.retain(|child| *child != stale_child);
+        parent_invocation
+            .children
+            .retain(|child| *child != stale_child);
         parent_invocation
             .seen_children
             .retain(|child| *child != stale_child);
     }
     Ok(())
 }
-
 
 #[track_caller]
 pub(crate) fn run_effect<F, A, B>(function: F, input: A) -> Result<B>
@@ -1893,7 +2157,14 @@ where
     A: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
     B: Clone + PartialEq + Debug + Send + Sync + 'static,
 {
-    run_effect_at(function, input, false, std::panic::Location::caller())
+    run_effect_at_with_definition(
+        function,
+        input,
+        false,
+        std::panic::Location::caller(),
+        None,
+        None,
+    )
 }
 
 #[track_caller]
@@ -1903,9 +2174,17 @@ where
     A: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
     B: Clone + PartialEq + Debug + Send + Sync + 'static,
 {
-    run_effect_at(function, input, true, std::panic::Location::caller())
+    run_effect_at_with_definition(
+        function,
+        input,
+        true,
+        std::panic::Location::caller(),
+        None,
+        None,
+    )
 }
 
+#[track_caller]
 pub(crate) fn run_keyed_effect_at<F, A, B>(
     function: F,
     input: A,
@@ -1916,14 +2195,15 @@ where
     A: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
     B: Clone + PartialEq + Debug + Send + Sync + 'static,
 {
-    run_effect_at(function, input, true, location)
+    run_effect_at_with_definition(function, input, true, location, None, None)
 }
-
-fn run_effect_at<F, A, B>(
+fn run_effect_at_with_definition<F, A, B>(
     function: F,
     input: A,
     stable_input: bool,
     location: &'static std::panic::Location<'static>,
+    definition: Option<TypeId>,
+    apply_output: Option<Arc<dyn Fn(&B) -> Result<()> + Send + Sync>>,
 ) -> Result<B>
 where
     F: Fn(A) -> Result<B> + Clone + Send + Sync + 'static,
@@ -1935,12 +2215,12 @@ where
         let Some(frame) = active.last() else {
             return Ok(None);
         };
-        let key: Arc<dyn KeyValue> = Arc::new(input.clone());
+        let _key: Arc<dyn KeyValue> = Arc::new(input.clone());
         let base = CallBase {
             file: location.file(),
             line: location.line(),
             column: location.column(),
-            function: TypeId::of::<F>(),
+            function: definition.unwrap_or(TypeId::of::<F>()),
         };
         let mut occurrences = frame.occurrences.borrow_mut();
         let entry = occurrences.iter_mut().find(|(have, _)| have.same(&base));
@@ -1974,12 +2254,17 @@ where
         file: location.file(),
         line: location.line(),
         column: location.column(),
-        function: TypeId::of::<F>(),
+        function: definition.unwrap_or(TypeId::of::<F>()),
         input: Arc::clone(&key),
         occurrence,
         stable_input,
     };
-    let call = erased_call(function, input);
+    let call = match definition {
+        Some(definition) => {
+            erased_call_with_definition_and_apply(definition, function, input, apply_output)
+        }
+        None => erased_call(function, input),
+    };
     if std::env::var_os("PLINGO_TRACE_EFFECTS").is_some() {
         eprintln!(
             "effect function={} input={:?} hash={} parent={} occurrence={} stable={}",
@@ -2041,10 +2326,6 @@ where
                     .map(|invocation| invocation.id)
             });
             let stale = if existing.is_none() && !identity.stable_input {
-                // A changed positional child invalidates the remaining
-                // siblings from the same callsite.  Retire the suffix before
-                // evaluating the replacement; otherwise an old later sibling
-                // can still own a fact that the new subtree publishes.
                 children
                     .iter()
                     .filter_map(|child| {
@@ -2093,7 +2374,8 @@ where
                 call: Arc::clone(&call),
                 function_name: call.function_name(),
                 reads: Vec::new(),
-                writes: Vec::new(),
+                writes: ComponentWrites::default(),
+                pending_writes: Vec::new(),
                 result: None,
                 fresh_sites: HashMap::new(),
                 children: Vec::new(),
@@ -2132,15 +2414,361 @@ where
         .cloned()
         .ok_or_else(|| Error::Internal("child result type mismatch".into()))
 }
+
+/// Runs one generated component instance as a stable keyed child.
+#[track_caller]
+pub(crate) fn run_component_effect<D, F, A, B>(function: F, input: A) -> Result<B>
+where
+    D: crate::reactive::component::ComponentDefinition + 'static,
+    F: Fn(A) -> Result<B> + Clone + Send + Sync + 'static,
+    A: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
+    B: crate::reactive::component::Effects + Clone + PartialEq + Debug + Send + Sync + 'static,
+{
+    let apply_output: Arc<dyn Fn(&B) -> Result<()> + Send + Sync> =
+        Arc::new(|output| output.__apply());
+    run_effect_at_with_definition(
+        function,
+        input,
+        true,
+        std::panic::Location::caller(),
+        Some(TypeId::of::<D>()),
+        Some(apply_output),
+    )
+}
+
+/// Runs a v2 component call. Matching is function-definition plus stable key;
+/// props are compared separately and update the same invocation in place.
+#[track_caller]
+pub(crate) fn run_component_value<D, F, K, P, B>(function: F, key: K, props: P) -> Result<B>
+where
+    D: crate::reactive::component::ComponentDefinition + 'static,
+    F: Fn(K, P) -> Result<B> + Clone + Send + Sync + 'static,
+    K: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
+    P: Clone + PartialEq + Debug + Send + Sync + 'static,
+    B: Clone + PartialEq + Debug + Send + Sync + 'static,
+{
+    let (graph, parent) = ACTIVE_EVALS.with(|active| {
+        let active = active.borrow();
+        let frame = active.last().ok_or_else(|| Error::EffectOutsideRun {
+            effect: "component_call".to_string(),
+            view: "<component>".to_string(),
+        })?;
+        Ok((Arc::clone(&frame.graph), frame.id))
+    })?;
+    let location = std::panic::Location::caller();
+    let key_for_identity: Arc<dyn KeyValue> = Arc::new(key.clone());
+    let identity = CallIdentity {
+        file: location.file(),
+        line: location.line(),
+        column: location.column(),
+        function: TypeId::of::<D>(),
+        input: Arc::clone(&key_for_identity),
+        occurrence: 0,
+        stable_input: true,
+    };
+    let call = erased_component_call_with_definition(
+        TypeId::of::<D>(),
+        D::__descriptor(),
+        None,
+        function,
+        key,
+        props,
+    );
+
+    {
+        let graph_guard = graph.lock();
+        if let Some(cycle_start) = active_ids().iter().position(|ancestor| {
+            graph_guard
+                .invocation(*ancestor)
+                .ok()
+                .is_some_and(|invocation| {
+                    invocation.call.function_type() == identity.function
+                        && invocation
+                            .call
+                            .input_key()
+                            .eq_value(identity.input.as_ref())
+                })
+        }) {
+            let mut functions = active_ids()[cycle_start..]
+                .iter()
+                .filter_map(|ancestor| graph_guard.invocation(*ancestor).ok())
+                .map(|invocation| invocation.function_name.to_string())
+                .collect::<Vec<_>>();
+            functions.push(call.function_name().to_string());
+            return Err(Error::ComputationCycle { functions });
+        }
+    }
+
+    let (child, props_changed) = {
+        let mut graph_guard = graph.lock();
+        let children = graph_guard.invocation(parent)?.children.clone();
+        let mut seen_match = None;
+        let mut unseen_match = None;
+        for child in children {
+            let Some(invocation) = graph_guard
+                .invocations
+                .iter()
+                .find(|invocation| invocation.id == child && !invocation.retired)
+            else {
+                continue;
+            };
+            let matches_key = invocation
+                .identity
+                .as_ref()
+                .is_some_and(|have| have.function == identity.function && have.input.eq_value(identity.input.as_ref()));
+            if !matches_key {
+                continue;
+            }
+            if graph_guard
+                .invocation(parent)?
+                .seen_children
+                .contains(&invocation.id)
+            {
+                seen_match = Some(invocation.id);
+            } else {
+                unseen_match = Some(invocation.id);
+            }
+        }
+        let selected = seen_match.or(unseen_match);
+        if let Some(child) = selected {
+            let old_props_differ = {
+                let existing = &graph_guard.invocation(child)?.call;
+                !existing.props_equal(call.as_ref())
+            };
+            if seen_match == Some(child) && old_props_differ {
+                let function = graph_guard.invocation(child)?.function_name.to_string();
+                return Err(Error::ConflictingComponentInputs {
+                    function,
+                    key: format!("{key_for_identity:?}"),
+                    previous: "<previous props>".to_string(),
+                    current: "<current props>".to_string(),
+                });
+            }
+            with_txn(|txn| txn.touch_invocation(graph_guard.root, &graph_guard, child));
+            graph_guard.invocation_mut(child)?.call = Arc::clone(&call);
+            graph_guard.invocation_mut(child)?.dirty |= old_props_differ;
+            (child, old_props_differ)
+        } else {
+            let child = fresh_token();
+            with_txn(|txn| txn.touch_invocation(graph_guard.root, &graph_guard, child));
+            graph_guard.invocations.push(Invocation {
+                id: child,
+                parent: Some(parent),
+                identity: Some(identity),
+                call: Arc::clone(&call),
+                function_name: call.function_name(),
+                reads: Vec::new(),
+                writes: ComponentWrites::default(),
+                pending_writes: Vec::new(),
+                result: None,
+                fresh_sites: HashMap::new(),
+                children: Vec::new(),
+                seen_children: Vec::new(),
+                emission_modes: HashMap::new(),
+                dirty: false,
+                retired: false,
+            });
+            graph_guard.invocation_mut(parent)?.children.push(child);
+            (child, true)
+        }
+    };
+    {
+        let mut graph_guard = graph.lock();
+        with_txn(|txn| txn.touch_invocation(graph_guard.root, &graph_guard, parent));
+        let parent_invocation = graph_guard.invocation_mut(parent)?;
+        if !parent_invocation.seen_children.contains(&child) {
+            parent_invocation.seen_children.push(child);
+        }
+        if props_changed {
+            graph_guard.dirty.insert(child);
+        }
+    }
+
+    let evaluate = {
+        let graph_guard = graph.lock();
+        let invocation = graph_guard.invocation(child)?;
+        invocation.result.is_none() || invocation.dirty
+    };
+    if evaluate {
+        evaluate_graph(&graph, child)?;
+    }
+    let graph_guard = graph.lock();
+    let result = graph_guard
+        .invocation(child)?
+        .result
+        .as_ref()
+        .ok_or_else(|| Error::Internal("child computation produced no result".into()))?;
+    result
+        .as_any()
+        .downcast_ref::<B>()
+        .cloned()
+        .ok_or_else(|| Error::Internal("child result type mismatch".into()))
+}
+
+/// Declares a tree child by identity and queues its body for later
+/// evaluation.  The parent receives the stable output box immediately, so
+/// recursive authored calls do not recurse through Rust evaluation frames.
+#[track_caller]
+pub(crate) fn run_tree_component_effect<D, F, A, T>(
+    function: F,
+    input: A,
+) -> Result<crate::reactive::abstract_tree::AstBox<T>>
+where
+    D: crate::reactive::component::ComponentDefinition + 'static,
+    F: Fn(A) -> Result<crate::reactive::abstract_tree::AstBox<T>> + Clone + Send + Sync + 'static,
+    A: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
+    T: crate::reactive::abstract_tree::AbstractTreeNode,
+{
+    let (graph, parent, occurrence) = ACTIVE_EVALS.with(|active| {
+        let active = active.borrow();
+        let frame = active.last().ok_or_else(|| Error::EffectOutsideRun {
+            effect: "component_call".to_string(),
+            view: "<component>".to_string(),
+        })?;
+        let base = CallBase {
+            file: std::panic::Location::caller().file(),
+            line: std::panic::Location::caller().line(),
+            column: std::panic::Location::caller().column(),
+            function: TypeId::of::<D>(),
+        };
+        let mut occurrences = frame.occurrences.borrow_mut();
+        let occurrence =
+            if let Some((_, count)) = occurrences.iter_mut().find(|(have, _)| have.same(&base)) {
+                let value = *count;
+                *count += 1;
+                value
+            } else {
+                occurrences.push((base, 1));
+                0
+            };
+        Ok((Arc::clone(&frame.graph), frame.id, occurrence))
+    })?;
+    let key: Arc<dyn KeyValue> = Arc::new(input.clone());
+    let output_input = input.clone();
+    let call = erased_call_with_definition(TypeId::of::<D>(), function, input);
+    let identity = CallIdentity {
+        file: std::panic::Location::caller().file(),
+        line: std::panic::Location::caller().line(),
+        column: std::panic::Location::caller().column(),
+        function: TypeId::of::<D>(),
+        input: Arc::clone(&key),
+        occurrence,
+        stable_input: true,
+    };
+    let cycle = {
+        let graph_guard = graph.lock();
+        let mut cursor = Some(parent);
+        let mut path = Vec::new();
+        let mut found = false;
+        while let Some(id) = cursor {
+            let invocation = graph_guard.invocation(id)?;
+            path.push(invocation.function_name.to_string());
+            if invocation.identity.as_ref().is_some_and(|have| {
+                have.function == identity.function && have.input.eq_value(identity.input.as_ref())
+            }) {
+                found = true;
+                break;
+            }
+            cursor = invocation.parent;
+        }
+        found.then(|| {
+            path.reverse();
+            path.push(call.function_name().to_string());
+            path
+        })
+    };
+    if let Some(functions) = cycle {
+        return Err(Error::ComputationCycle { functions });
+    }
+    let child = {
+        let mut graph_guard = graph.lock();
+        let existing = graph_guard
+            .invocations
+            .iter()
+            .find(|invocation| {
+                !invocation.retired
+                    && invocation.parent == Some(parent)
+                    && invocation.identity.as_ref().is_some_and(|have| {
+                        have.function == identity.function
+                            && have.input.eq_value(identity.input.as_ref())
+                    })
+            })
+            .map(|invocation| invocation.id);
+        if let Some(child) = existing {
+            with_txn(|txn| txn.touch_invocation(graph_guard.root, &graph_guard, child));
+            graph_guard.invocation_mut(child)?.call = Arc::clone(&call);
+            child
+        } else {
+            let child = fresh_token();
+            with_txn(|txn| txn.touch_invocation(graph_guard.root, &graph_guard, child));
+            graph_guard.invocations.push(Invocation {
+                id: child,
+                parent: Some(parent),
+                identity: Some(identity),
+                call: Arc::clone(&call),
+                function_name: call.function_name(),
+                result: None,
+                fresh_sites: HashMap::new(),
+                reads: Vec::new(),
+                writes: ComponentWrites::default(),
+                pending_writes: Vec::new(),
+                children: Vec::new(),
+                seen_children: Vec::new(),
+                emission_modes: HashMap::new(),
+                dirty: true,
+                retired: false,
+            });
+            graph_guard.invocation_mut(parent)?.children.push(child);
+            child
+        }
+    };
+    {
+        let mut graph_guard = graph.lock();
+        graph_guard
+            .invocation_mut(parent)?
+            .seen_children
+            .push(child);
+        graph_guard.dirty.insert(child);
+    }
+    automatic_component_ast_box::<
+        D,
+        <T as crate::reactive::abstract_tree::AbstractTreeNode>::Family,
+        A,
+        T,
+    >(&output_input)
+}
+
+#[derive(Clone, Debug)]
+struct AutomaticTreeKey {
+    family: TypeId,
+    component: TypeId,
+    input: Arc<dyn KeyValue>,
+}
+
+impl PartialEq for AutomaticTreeKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.family == other.family
+            && self.component == other.component
+            && self.input.eq_value(other.input.as_ref())
+    }
+}
+
+impl Eq for AutomaticTreeKey {}
+
+impl Hash for AutomaticTreeKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.family.hash(state);
+        self.component.hash(state);
+        self.input.hash_value().hash(state);
+    }
+}
+
 /// Mints the deterministic identity for one generated component output port.
 ///
-/// The erased key retains the complete component marker, view type, driving
-/// element, and output ordinal. The cached hash is an index accelerator only;
-/// [`Node`] equality compares the retained key on collisions.
-pub(crate) fn automatic_node_id<V, M, K>(
-    key: K,
-    port: u16,
-) -> Result<crate::reactive::view::Node<V>>
+/// This hidden helper is used by generated/advanced effect constructors. The
+/// complete component marker and driving key remain inside the opaque node.
+#[doc(hidden)]
+pub fn automatic_node_id<V, M, K>(key: K, port: u16) -> Result<crate::reactive::view::Node<V>>
 where
     V: View,
     M: crate::reactive::component::ComponentDefinition + 'static,
@@ -2175,6 +2803,102 @@ where
     ))
 }
 
+/// Allocates the one stable abstract-tree output identity for the active
+/// component invocation.
+pub(crate) fn automatic_ast_box<F: View>() -> Result<crate::reactive::abstract_tree::AstBox<()>> {
+    let (identity, raw) = ACTIVE_EVALS.with(|active| {
+        let active = active.borrow();
+        let frame = active.last().ok_or_else(|| Error::EffectOutsideRun {
+            effect: "tree_render".to_string(),
+            view: F::name().to_string(),
+        })?;
+        if !frame.rendered_slots.borrow_mut().insert(TypeId::of::<F>()) {
+            return Err(Error::Internal(
+                "abstract-tree output slot rendered more than once".into(),
+            ));
+        }
+        let graph = frame.graph.lock();
+        let invocation = graph.invocation(frame.id)?;
+        let component = invocation
+            .call
+            .definition_type()
+            .unwrap_or_else(|| invocation.call.function_type());
+        let identity = AutomaticTreeKey {
+            family: TypeId::of::<F>(),
+            component,
+            input: invocation.call.input_key(),
+        };
+        let mut hasher = DefaultHasher::new();
+        identity.hash(&mut hasher);
+        Ok((Arc::new(identity) as Arc<dyn KeyValue>, hasher.finish()))
+    })?;
+    Ok(crate::reactive::abstract_tree::AstBox::from_parts(
+        raw, identity,
+    ))
+}
+/// Allocates the one automatic graph-node identity for the active component
+/// invocation.  Graph outputs use the same complete identity model as tree
+/// outputs, but keep their publication as a returned `GraphRender` effect.
+pub(crate) fn automatic_graph_node_id<V: View>() -> Result<crate::reactive::view::Node<V>> {
+    let (identity, raw) = ACTIVE_EVALS.with(|active| {
+        let active = active.borrow();
+        let frame = active.last().ok_or_else(|| Error::EffectOutsideRun {
+            effect: "graph_render".to_string(),
+            view: V::name().to_string(),
+        })?;
+        if !frame.rendered_slots.borrow_mut().insert(TypeId::of::<V>()) {
+            return Err(Error::Internal(
+                "graph output slot rendered more than once".into(),
+            ));
+        }
+        let graph = frame.graph.lock();
+        let invocation = graph.invocation(frame.id)?;
+        let component = invocation
+            .call
+            .definition_type()
+            .unwrap_or_else(|| invocation.call.function_type());
+        let identity = AutomaticTreeKey {
+            family: TypeId::of::<V>(),
+            component,
+            input: invocation.call.input_key(),
+        };
+        let mut hasher = DefaultHasher::new();
+        identity.hash(&mut hasher);
+        Ok((Arc::new(identity) as Arc<dyn KeyValue>, hasher.finish()))
+    })?;
+    Ok(crate::reactive::view::Node::from_automatic(raw, identity))
+}
+
+/// Derives a tree output identity for a child before its body is evaluated.
+pub(crate) fn automatic_component_ast_box<D, F, A, T>(
+    input: &A,
+) -> Result<crate::reactive::abstract_tree::AstBox<T>>
+where
+    D: crate::reactive::component::ComponentDefinition + 'static,
+    F: View,
+    A: Clone + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
+    T: 'static,
+{
+    let active = ACTIVE_EVALS.with(|stack| !stack.borrow().is_empty());
+    if !active {
+        return Err(Error::EffectOutsideRun {
+            effect: "tree_render".to_string(),
+            view: F::name().to_string(),
+        });
+    }
+    let identity = AutomaticTreeKey {
+        family: TypeId::of::<F>(),
+        component: TypeId::of::<D>(),
+        input: Arc::new(input.clone()),
+    };
+    let mut hasher = DefaultHasher::new();
+    identity.hash(&mut hasher);
+    Ok(crate::reactive::abstract_tree::AstBox::from_parts(
+        hasher.finish(),
+        Arc::new(identity),
+    ))
+}
+
 #[derive(Clone, Debug)]
 struct AutomaticEffectKey {
     view: TypeId,
@@ -2185,7 +2909,6 @@ struct AutomaticEffectKey {
     occurrence: u64,
     input: Arc<dyn KeyValue>,
 }
-
 impl PartialEq for AutomaticEffectKey {
     fn eq(&self, other: &Self) -> bool {
         self.view == other.view
@@ -2228,10 +2951,7 @@ pub(crate) fn automatic_effect_node_id<V: View>() -> Result<crate::reactive::vie
     let (function, input) = {
         let graph_guard = graph.lock();
         let invocation = graph_guard.invocation(id)?;
-        (
-            invocation.call.function_type(),
-            invocation.call.input_key(),
-        )
+        (invocation.call.function_type(), invocation.call.input_key())
     };
     let input_hash = input.hash_value();
     let occurrence = {
@@ -2319,6 +3039,33 @@ pub(crate) struct PlainRuntime {
     pub(crate) next_install_ordinal: u64,
 }
 
+/// The external selector that owns a keyed family. Tree families must filter
+/// the shared fact view to the exact semantic dimension they mount; treating
+/// every tree fact as a child key would feed `Kind`, `Leaf`, and link facts to
+/// typed component bodies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FamilySelector {
+    MapEntry,
+    TreeRoot,
+    TreeNode(&'static str),
+}
+
+impl FamilySelector {
+    fn accepts<D: crate::reactive::kind::KeyBounds>(self, key: &dyn KeyValue) -> bool {
+        match self {
+            Self::MapEntry => true,
+            Self::TreeRoot => key
+                .as_any()
+                .downcast_ref::<crate::reactive::abstract_tree::TreeKey<D>>()
+                .is_some_and(|key| matches!(key, crate::reactive::abstract_tree::TreeKey::RootLink(_, _))),
+            Self::TreeNode(member) => key
+                .as_any()
+                .downcast_ref::<crate::reactive::abstract_tree::TreeKey<D>>()
+                .is_some_and(|key| matches!(key, crate::reactive::abstract_tree::TreeKey::Member(_, actual) if *actual == member)),
+        }
+    }
+}
+
 /// One installed keyed family: its dedicated graph plus watch metadata and
 /// the erased constructor that stamps typed calls onto children.
 pub(crate) struct FamilyRuntime {
@@ -2326,10 +3073,12 @@ pub(crate) struct FamilyRuntime {
     pub view: TypeId,
     pub view_name: &'static str,
     pub install_ordinal: u64,
+    pub selector: FamilySelector,
+    pub accept_key: Arc<dyn Fn(&dyn KeyValue) -> bool + Send + Sync>,
     pub build_call: Arc<dyn Fn(Arc<dyn KeyValue>) -> Arc<dyn ErasedCall> + Send + Sync>,
     /// Component definition when this family backs a `#[component]`
-    /// EachKey driver (Cut C): children take the definition marker as
-    /// their identity type and its descriptor as their name.
+    /// EachKey driver (Cut C): children take the definition marker as their
+    /// identity type and its descriptor as their name.
     pub definition: Option<(&'static str, TypeId)>,
 }
 
@@ -2349,7 +3098,6 @@ impl Default for PlainRuntime {
         }
     }
 }
-
 
 /// A frozen committed view of all facts: one outer-map clone per snapshot.
 #[derive(Clone)]
@@ -2374,12 +3122,7 @@ impl PlainSnapshot {
             .root
             .views()
             .iter()
-            .map(|(view_id, view)| {
-                (
-                    format!("{view_id:?}:{}", view.name()),
-                    view.len() as u64,
-                )
-            })
+            .map(|(view_id, view)| (format!("{view_id:?}:{}", view.name()), view.len() as u64))
             .collect::<Vec<_>>();
         counts.sort_by(|left, right| left.0.cmp(&right.0));
         counts
@@ -2506,7 +3249,7 @@ pub(crate) fn liveness_audit(runtime: &PlainRuntime) -> Vec<String> {
             }
             // Forward ownership: every owned output exists in the store
             // with this instance among its writers.
-            for write in &invocation.writes {
+            for write in invocation.writes.all_entries() {
                 match state.slot_index(write.view, write.key.as_ref()) {
                     Some(index) => {
                         let slot = state.slots[index].as_ref().expect("occupied slot");
@@ -2866,6 +3609,7 @@ pub(crate) fn dependency_cycle(runtime: &PlainRuntime) -> Option<Vec<String>> {
                 .collect();
             let writes: Vec<usize> = invocation
                 .writes
+                .all_entries()
                 .iter()
                 .map(|write| {
                     index_of(
@@ -2986,7 +3730,7 @@ fn retract_invocation_owned(
                     format!("owned invocation {id} absent in root {}", graph_guard.root).into(),
                 )
             })?;
-        (invocation.writes.clone(), invocation.function_name)
+        (invocation.writes.all_entries(), invocation.function_name)
     };
     with_txn(|txn| -> Result<()> {
         let mut state = state.lock();
@@ -3084,9 +3828,11 @@ pub(crate) fn queue_family_child(
     let Some(family) = runtime.families.get(&family_id) else {
         return Ok(None);
     };
+    if !(family.accept_key)(key.as_ref()) {
+        return Ok(None);
+    }
     let graph = Arc::clone(&family.graph);
     let install_ordinal = family.install_ordinal;
-    let view = family.view;
     let root_token = graph.lock().root;
 
     let call = (family.build_call)(Arc::clone(&key));
@@ -3129,7 +3875,8 @@ pub(crate) fn queue_family_child(
                 call,
                 function_name: family.view_name,
                 reads: Vec::new(),
-                writes: Vec::new(),
+                writes: ComponentWrites::default(),
+                pending_writes: Vec::new(),
                 result: None,
                 fresh_sites: HashMap::new(),
                 children: Vec::new(),
@@ -3149,8 +3896,38 @@ pub(crate) fn queue_family_child(
         root: root_token,
         invocation: child,
     });
-    let _ = view;
     Ok(Some(child))
+}
+fn drain_deferred_children(runtime: &mut PlainRuntime) {
+    let graphs: Vec<(u64, u64, Arc<Mutex<PlainGraph>>)> = runtime
+        .roots
+        .values()
+        .map(|root| {
+            (
+                root.install_ordinal,
+                root.graph.lock().root,
+                Arc::clone(&root.graph),
+            )
+        })
+        .chain(runtime.families.values().map(|family| {
+            (
+                family.install_ordinal,
+                family.graph.lock().root,
+                Arc::clone(&family.graph),
+            )
+        }))
+        .collect();
+    for (install_ordinal, root, graph) in graphs {
+        let pending = graph.lock().dirty.drain().collect::<Vec<_>>();
+        for invocation in pending {
+            runtime.dirty.insert(crate::reactive::store::DirtyKey {
+                root_install_ordinal: install_ordinal,
+                invocation_ordinal: invocation,
+                root,
+                invocation,
+            });
+        }
+    }
 }
 
 /// Schedules every family watching a changed view.
@@ -3184,7 +3961,9 @@ pub(crate) fn schedule_families(runtime: &mut PlainRuntime, changes: &[FactChang
         let watchers: Vec<u64> = runtime
             .families
             .iter()
-            .filter(|(_, family)| family.view == change.view)
+            .filter(|(_, family)| {
+                family.view == change.view && (family.accept_key)(change.key.as_ref())
+            })
             .map(|(family_id, _)| *family_id)
             .collect();
         for family_id in watchers {
@@ -3194,7 +3973,9 @@ pub(crate) fn schedule_families(runtime: &mut PlainRuntime, changes: &[FactChang
             let root = graph.lock().root;
             drop(family);
             let function_name = graph.lock().function_name_of(root);
-            let Ok(function_name) = function_name else { continue };
+            let Ok(function_name) = function_name else {
+                continue;
+            };
             let removed: Vec<u64> = {
                 let graph_guard = graph.lock();
                 graph_guard
@@ -3203,10 +3984,9 @@ pub(crate) fn schedule_families(runtime: &mut PlainRuntime, changes: &[FactChang
                     .filter(|invocation| {
                         !invocation.retired
                             && invocation.parent == Some(graph_guard.root)
-                            && invocation
-                                .identity
-                                .as_ref()
-                                .is_some_and(|identity| identity.input.eq_value(change.key.as_ref()))
+                            && invocation.identity.as_ref().is_some_and(|identity| {
+                                identity.input.eq_value(change.key.as_ref())
+                            })
                     })
                     .map(|invocation| invocation.id)
                     .collect()
@@ -3252,7 +4032,9 @@ pub(crate) fn schedule_families(runtime: &mut PlainRuntime, changes: &[FactChang
         let watchers: Vec<u64> = runtime
             .families
             .iter()
-            .filter(|(_, family)| family.view == change.view)
+            .filter(|(_, family)| {
+                family.view == change.view && (family.accept_key)(change.key.as_ref())
+            })
             .map(|(family_id, _)| *family_id)
             .collect();
         for family_id in watchers {
@@ -3263,7 +4045,11 @@ pub(crate) fn schedule_families(runtime: &mut PlainRuntime, changes: &[FactChang
 
 pub(crate) fn quiesce(runtime: &mut PlainRuntime) -> Result<u32> {
     let mut rounds = 0u32;
-    while let Some(key) = runtime.dirty.pop() {
+    loop {
+        drain_deferred_children(runtime);
+        let Some(key) = runtime.dirty.pop() else {
+            break;
+        };
         let (root, id) = (key.root, key.invocation);
         if rounds >= 1_000_000 {
             return Err(Error::Internal(
@@ -3897,17 +4683,18 @@ mod liveness_audit_tests {
             call,
             fresh_token(),
         )));
-        {
-            let mut graph_guard = graph.lock();
-            graph_guard.invocations[0].writes.push(PlainWrite {
+        let root = graph.lock().root;
+        graph.lock().invocation_mut(root).unwrap().writes.insert(
+            PlainWrite {
                 view: TypeId::of::<u64>(),
                 name: "emit",
                 view_name: "ghost",
                 key: Arc::new(1u64),
                 value: None,
                 shareable: false,
-            });
-        }
+            },
+            EmissionMode::Replace,
+        );
         let mut probe = PlainRuntime::default();
         probe.roots.insert(
             0,
@@ -3938,18 +4725,26 @@ mod liveness_audit_tests {
             call,
             fresh_token(),
         )));
+        let root = graph.lock().root;
         {
             let mut graph_guard = graph.lock();
-            let invocation = &mut graph_guard.invocations[0];
+            let invocation = graph_guard
+                .invocations
+                .iter_mut()
+                .find(|invocation| invocation.id == root)
+                .expect("root invocation exists");
             invocation.retired = true;
-            invocation.writes.push(PlainWrite {
-                view: TypeId::of::<u64>(),
-                name: "emit",
-                view_name: "ghost",
-                key,
-                value: None,
-                shareable: false,
-            });
+            invocation.writes.insert(
+                PlainWrite {
+                    view: TypeId::of::<u64>(),
+                    name: "emit",
+                    view_name: "ghost",
+                    key,
+                    value: None,
+                    shareable: false,
+                },
+                EmissionMode::Replace,
+            );
         }
         let mut probe = PlainRuntime::default();
         probe.roots.insert(

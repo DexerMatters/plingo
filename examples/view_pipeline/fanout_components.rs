@@ -1,13 +1,10 @@
-//! Fan-out rewritten as first-class components (follow-up plan §6.1, §24.3).
+//! Keyed fan-out components using semantic inputs and returned effects.
 //!
-//! Three definitions share ONLY key-membership lifecycle through an
-//! `EachKey<Names>` driver: `record` reads the name text, `score` and
-//! `alert` do not. Identity is `(definition marker, exact key)`; a payload
-//! update reruns an instance only when its body records that read.
+//! Membership is driven by `Names`, while each body records only the payload
+//! reads it needs. Returned effects own the derived rows and retract them when
+//! an evaluation omits a value.
 
-use plingo::reactive::component::{EachKey, Read, Write};
-use plingo::reactive::prelude::*;
-use reactive_macros::component;
+use plingo::prelude::*;
 
 use super::fanout::{Alerts, Enabled, Names, Quantities, Record, Records, Scores};
 
@@ -17,77 +14,53 @@ pub static SCORE_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 pub static ALERT_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[component]
-pub fn record(
-    key: EachKey<Names>,
-    names: Read<Names>,
-    quantities: Read<Quantities>,
-    enabled: Read<Enabled>,
-    records: Write<Records>,
-) -> Result<()> {
+pub fn record(key: Each<Names>) -> Result<Set<Records>> {
     RECORD_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let name = names
-        .get(&key)?
+    let name = Names::get(key.key())?
         .map(|value| (*value).clone())
         .unwrap_or_default();
-    let quantity = quantities.get(&key)?.map(|value| *value);
-    let enabled = enabled.get(&key)?.map(|value| *value).unwrap_or(false);
-    records.insert(
+    let quantity = Quantities::get(key.key())?.map(|value| *value);
+    let enabled = Enabled::get(key.key())?
+        .map(|value| *value)
+        .unwrap_or(false);
+    let key = key.into_key();
+    Ok(Records::set(
         key,
         Record {
             name,
             quantity,
             enabled,
         },
-    )
+    ))
 }
 
 #[component]
-pub fn score(
-    key: EachKey<Names>,
-    quantities: Read<Quantities>,
-    enabled: Read<Enabled>,
-    scores: Write<Scores>,
-) -> Result<()> {
+pub fn score(key: Each<Names>) -> Result<Set<Scores>> {
     SCORE_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    // Membership-only over `Names`: the driver's payload is never read
-    // here, so a name-text edit must not wake this instance.
-    let _never_read_names = &key;
-    let quantity = quantities.get(&key)?.map(|value| *value);
-    let enabled = enabled.get(&key)?.map(|value| *value).unwrap_or(false);
+    // The membership key is intentionally not read through `Names::get`.
+    let quantity = Quantities::get(key.key())?.map(|value| *value);
+    let enabled = Enabled::get(key.key())?
+        .map(|value| *value)
+        .unwrap_or(false);
     let value = if enabled {
         quantity.unwrap_or_default()
     } else {
         0
     };
-    scores.insert(key, value)
+    Ok(Scores::set(key.into_key(), value))
 }
 
 #[component]
-pub fn alert(
-    key: EachKey<Names>,
-    quantities: Read<Quantities>,
-    enabled: Read<Enabled>,
-    alerts: Write<Alerts>,
-) -> Result<()> {
+pub fn alert(key: Each<Names>) -> Result<Replace<Alerts>> {
     ALERT_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let quantity = quantities.get(&key)?.map(|value| *value);
-    let enabled = enabled.get(&key)?.map(|value| *value).unwrap_or(false);
+    let quantity = Quantities::get(key.key())?.map(|value| *value);
+    let enabled = Enabled::get(key.key())?
+        .map(|value| *value)
+        .unwrap_or(false);
     let items = match (enabled, quantity) {
         (true, Some(0)) => vec!["enabled item has no quantity".to_owned()],
         (true, None) => vec!["enabled item is missing a quantity".to_owned()],
         _ => Vec::new(),
     };
-    alerts_replace(&key, items)
-}
-
-fn alerts_replace(key: &str, items: Vec<String>) -> Result<()> {
-    emit_view::<Alerts>()?.replace(&key.to_owned(), items)
-}
-
-/// Installs the three fan-out definitions in dependency-safe order.
-pub fn install(engine: &mut plingo::reactive::Engine) -> plingo::Result<()> {
-    record_install(engine)?;
-    score_install(engine)?;
-    alert_install(engine)?;
-    Ok(())
+    Ok(Alerts::replace(key.into_key(), items))
 }

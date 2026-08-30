@@ -8,6 +8,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::reactive::api::run_each_child;
 use crate::reactive::kind::{self, emit_view, observe_view};
 use crate::reactive::prelude::*;
 use crate::reactive::view::Node;
@@ -497,7 +498,6 @@ fn graph_construction_is_deterministic_across_engines() {
     assert_eq!(run(), run());
 }
 
-
 // ---------------------------------------------------------------------------
 // StateValue derive + StateCell (plan §5.6)
 // ---------------------------------------------------------------------------
@@ -959,7 +959,11 @@ fn child_lifecycle(_: ()) -> Result<()> {
         let echo = emit_view::<ChildEcho>()?;
         match link.as_deref() {
             Some(kind::TreeFact::Link(_)) => {
-                let payload = observe.payload(child.clone())?.as_deref().copied().unwrap_or(0);
+                let payload = observe
+                    .payload(child.clone())?
+                    .as_deref()
+                    .copied()
+                    .unwrap_or(0);
                 echo.insert((parent.clone(), child.clone()), payload)?;
             }
             _ => {
@@ -1096,14 +1100,26 @@ fn splice_builder(_: ()) -> Result<()> {
             // x between b and c, then y between x and c.
             let x = splice_mint(&tree, root.clone(), 99)?;
             let y = splice_mint(&tree, root.clone(), 88)?;
-            tree.splice_children(root.clone(), Some(b.clone()), &[], &[x.clone()], Some(c.clone()))?;
+            tree.splice_children(
+                root.clone(),
+                Some(b.clone()),
+                &[],
+                &[x.clone()],
+                Some(c.clone()),
+            )?;
             tree.splice_children(root, Some(x), &[], &[y], Some(c))?;
         }
         3 => {
             // Remove c between y and d: [a,b,x,y,d].
             let x = splice_mint(&tree, root.clone(), 99)?;
             let y = splice_mint(&tree, root.clone(), 88)?;
-            tree.splice_children(root.clone(), Some(b.clone()), &[], &[x.clone()], Some(c.clone()))?;
+            tree.splice_children(
+                root.clone(),
+                Some(b.clone()),
+                &[],
+                &[x.clone()],
+                Some(c.clone()),
+            )?;
             tree.splice_children(root.clone(), Some(x), &[], &[y.clone()], Some(c.clone()))?;
             tree.splice_children(root, Some(y), &[c], &[], Some(d))?;
         }
@@ -1112,9 +1128,27 @@ fn splice_builder(_: ()) -> Result<()> {
             let x = splice_mint(&tree, root.clone(), 99)?;
             let y = splice_mint(&tree, root.clone(), 88)?;
             let z = splice_mint(&tree, root.clone(), 77)?;
-            tree.splice_children(root.clone(), Some(b.clone()), &[], &[x.clone()], Some(c.clone()))?;
-            tree.splice_children(root.clone(), Some(x.clone()), &[], &[y.clone()], Some(c.clone()))?;
-            tree.splice_children(root.clone(), Some(y.clone()), &[c.clone()], &[], Some(d.clone()))?;
+            tree.splice_children(
+                root.clone(),
+                Some(b.clone()),
+                &[],
+                &[x.clone()],
+                Some(c.clone()),
+            )?;
+            tree.splice_children(
+                root.clone(),
+                Some(x.clone()),
+                &[],
+                &[y.clone()],
+                Some(c.clone()),
+            )?;
+            tree.splice_children(
+                root.clone(),
+                Some(y.clone()),
+                &[c.clone()],
+                &[],
+                Some(d.clone()),
+            )?;
             tree.splice_children(root, Some(x), &[y], &[z], Some(d))?;
         }
         5 => {

@@ -111,8 +111,15 @@ fn local_value_edit_has_no_document_sized_source_or_lexer_work() {
             "document-sized lexer work at size={size}: {lexer:?}"
         );
 
-        let parser = report.work().parser(u.as_str()).cloned().unwrap_or_default();
-        assert_eq!(parser.component_runs, 0, "value edit woke parser at size={size}");
+        let parser = report
+            .work()
+            .parser(u.as_str())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            parser.component_runs, 0,
+            "value edit woke parser at size={size}"
+        );
         assert_eq!(
             parser.parser_records_inserted
                 + parser.parser_records_updated
@@ -391,25 +398,23 @@ fn failed_command_isolates_documents_and_keeps_metrics_clean() {
 // ---------------------------------------------------------------------------
 // ReactionDigest oracle (follow-up plan §4 item 6)
 // ---------------------------------------------------------------------------
-use plingo::reactive::kind::{Map, emit_view};
+use plingo::reactive::kind::emit_view;
 use plingo::reactive::prelude::*;
 
 #[path = "../examples/view_pipeline/fanout.rs"]
 mod fanout;
+#[path = "../examples/view_pipeline/fanout_components.rs"]
+mod fanout_components;
 
-use fanout::{Alerts, Enabled, Names, Quantities, Records, Scores, fanout_one};
+use fanout::{Alerts, Enabled, Names, Quantities, Records, Scores};
+use fanout_components::{alert, record, score};
 use plingo::reactive::{Engine, ReactionDigest, View};
-use reactive_macros::component;
-use reactive_macros::view;
-
-#[reactive_macros::component]
-fn reaction_stage(key: EachKey<Names>) -> plingo::Result<()> {
-    fanout::fanout_one(key)
-}
 
 fn reaction_engine() -> Engine {
     let mut engine = Engine::new();
-    reaction_stage_install(&mut engine).expect("install fan-out stage");
+    record::Component::mount(&mut engine, Names::entries()).expect("install record");
+    score::Component::mount(&mut engine, Names::entries()).expect("install score");
+    alert::Component::mount(&mut engine, Names::entries()).expect("install alert");
     engine
 }
 
@@ -449,21 +454,32 @@ fn reaction_digest_records_exact_element_edges() {
         .map(|evaluation| evaluation.definition)
         .collect();
     assert!(
-        definitions.iter().any(|d| d.contains("reaction_stage")),
+        definitions.iter().any(|d| d.ends_with("::record")),
         "{definitions:?}"
     );
-    let fanout_evals: Vec<_> = digest
-        .evaluations_of("phase0_instrumentation::reaction_stage")
-        .collect();
-    if !fanout_evals.is_empty() {
-        for evaluation in fanout_evals {
-            let views: Vec<&str> = evaluation.reads.iter().map(|edge| edge.view).collect();
+    assert!(
+        definitions.iter().any(|d| d.ends_with("::score")),
+        "{definitions:?}"
+    );
+    assert!(
+        definitions.iter().any(|d| d.ends_with("::alert")),
+        "{definitions:?}"
+    );
+    for evaluation in &digest.evaluations {
+        let views: Vec<&str> = evaluation.reads.iter().map(|edge| edge.view).collect();
+        let outputs: Vec<&str> = evaluation.outputs.iter().map(|edge| edge.view).collect();
+        if evaluation.definition.ends_with("::record") {
             assert!(views.contains(&Names::name()));
             assert!(views.contains(&Quantities::name()));
             assert!(views.contains(&Enabled::name()));
-            let outputs: Vec<&str> = evaluation.outputs.iter().map(|edge| edge.view).collect();
             assert!(outputs.contains(&Records::name()));
+        } else if evaluation.definition.ends_with("::score") {
+            assert!(views.contains(&Quantities::name()));
+            assert!(views.contains(&Enabled::name()));
             assert!(outputs.contains(&Scores::name()));
+        } else if evaluation.definition.ends_with("::alert") {
+            assert!(views.contains(&Quantities::name()));
+            assert!(views.contains(&Enabled::name()));
             assert!(outputs.contains(&Alerts::name()));
         }
     }

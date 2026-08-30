@@ -2,8 +2,7 @@
 //! maps plus a list. It is intentionally independent of parsing and trees so
 //! consumers can test view ownership and exact-key dependencies directly.
 
-use plingo::reactive::kind::{List, Map};
-use reactive_macros::view;
+use plingo::prelude::*;
 
 #[view]
 pub struct Names(Map<String, String>);
@@ -30,7 +29,6 @@ pub struct Scores(Map<String, i64>);
 #[view]
 pub struct Alerts(List<String, String>);
 
-
 // ---------------------------------------------------------------------------
 // Semantic digest (follow-up plan §4 item 1): complete public-view content,
 // ID-erased and canonically ordered.
@@ -51,7 +49,6 @@ fn render_record(record: &Record) -> String {
 
 /// Captures every present entry of every public view of this family.
 pub fn semantic_digest(snapshot: &plingo::reactive::Snapshot) -> SemanticDigest {
-    use plingo::reactive::kind::ListKey;
     let mut digest = SemanticDigest::new();
 
     let mut names = snapshot.inputs::<Names>();
@@ -105,59 +102,12 @@ pub fn semantic_digest(snapshot: &plingo::reactive::Snapshot) -> SemanticDigest 
         digest.insert("scores", &key, &row);
     }
 
-    let mut alert_keys: Vec<String> = snapshot
-        .inputs::<Alerts>()
-        .into_iter()
-        .filter_map(|input| match input {
-            ListKey::Slot(key, _) => Some(key),
-            ListKey::Len(key) => Some(key),
-        })
-        .collect();
+    let mut alert_keys = snapshot.list_domains::<Alerts>();
     alert_keys.sort();
-    alert_keys.dedup();
     for key in alert_keys {
         let items = snapshot.list::<Alerts>(&key);
         let rendered: Vec<String> = items.iter().map(|item| format!("{item:?}")).collect();
         digest.insert("alerts", &key, &format!("[{}]", rendered.join(",")));
     }
     digest
-}
-/// Compatibility stage used by the phase-0 reaction oracle. New production
-/// callers use the three first-class components in `fanout_components`; this
-/// helper keeps the historical single-stage fixture available to the oracle.
-pub fn fanout_one(key: String) -> plingo::Result<()> {
-    use plingo::reactive::kind::{emit_view, observe_view};
-
-    let name = observe_view::<Names>()?
-        .get(&key)?
-        .map(|value| (*value).clone())
-        .unwrap_or_default();
-    let quantity = observe_view::<Quantities>()?.get(&key)?.map(|value| *value);
-    let enabled = observe_view::<Enabled>()?
-        .get(&key)?
-        .map(|value| *value)
-        .unwrap_or(false);
-
-    emit_view::<Records>()?.insert(
-        key.clone(),
-        Record {
-            name,
-            quantity,
-            enabled,
-        },
-    )?;
-    emit_view::<Scores>()?.insert(
-        key.clone(),
-        if enabled {
-            quantity.unwrap_or_default()
-        } else {
-            0
-        },
-    )?;
-    let alerts = match (enabled, quantity) {
-        (true, Some(0)) => vec!["enabled item has no quantity".to_owned()],
-        (true, None) => vec!["enabled item is missing a quantity".to_owned()],
-        _ => Vec::new(),
-    };
-    emit_view::<Alerts>()?.replace(&key, alerts)
 }

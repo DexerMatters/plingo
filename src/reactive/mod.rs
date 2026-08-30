@@ -13,13 +13,18 @@
 
 use std::sync::Arc;
 
-pub mod api;
+pub mod abstract_tree;
+/// Ordinary `run` combinators: framework/test seam only after the Cut H
+/// cutover (plan §7). Components own recursion and fan-out through child
+/// calls; these helpers remain for crate-internal fixtures.
+pub(crate) mod api;
 pub mod component;
 pub mod digest;
 pub(crate) mod engine;
 pub(crate) mod error;
+pub mod framework_mount;
 pub mod kind;
-pub mod pathwork;
+pub(crate) mod pathwork;
 pub(crate) mod plain;
 pub(crate) mod reaction;
 pub(crate) mod store;
@@ -46,8 +51,17 @@ pub mod __macro_private {
     }
     pub use super::plain::{EffectContext, Temporal};
 }
-pub use api::{run, run_each_key};
-pub use component::{ComponentDefinition, EachKey, NodeOutput, Output, Read, Write};
+pub use abstract_tree::{
+    AbstractTreeFamily, AbstractTreeNode, AstBox, ChildList, NodeSelector, RootSelector,
+    SnapshotTree,
+};
+#[doc(hidden)]
+/// Macro ABI for generated view implementations; see `abstract_tree`.
+pub use abstract_tree::{TreeFact, TreeKey};
+pub use component::{
+    CaseChain, ComponentDefinition, Each, Effect, Effects, FamilyNode, GraphRender, Remove,
+    Replace, Set, emit,
+};
 pub use digest::{FamilyState, SemanticDigest, render_diff};
 pub use engine::{
     CommandReport, Engine, EngineWork, InvocationIdentity, InvocationWork, KeyedFamily, Snapshot,
@@ -66,20 +80,33 @@ pub use view::View;
 #[cfg(test)]
 mod tests;
 
-/// The one-import authoring surface for plain reactive functions.
+/// The one-import authoring surface for reactive applications.
+///
+/// Components take semantic inputs ([`Each`], [`AstBox<T>`] nodes, plain
+/// values), read exact view effects, and return desired outputs. Raw
+/// effect handles, ports, and free `run` combinators are framework
+/// internals after the Cut H cutover (plan §7).
 pub mod prelude {
-    pub use super::api::{run, run_each_child, run_each_child_of, run_each_key};
-    pub use super::component::{EachKey, NodeOutput, Output, Read, Write};
-    pub use super::engine::{CommandReport, Engine, InvocationIdentity, InvocationWork, Snapshot};
+    pub use super::abstract_tree::{
+        AbstractTreeFamily, AbstractTreeNode, AstBox, ChildList, NodeSelector, RootSelector,
+        SnapshotTree,
+    };
+    pub use super::component::{
+        CaseChain, ComponentDefinition, Each, Effect, Effects, FamilyNode, GraphRender, Remove,
+        Replace, Set, emit,
+    };
+    pub use super::engine::{Engine, Snapshot};
     pub use super::error::{Error, Result};
-    /// The box-kind witness is deliberately absent from the glob (it would
-    /// shadow `std::boxed::Box`); import it from `reactive::kind` where a
-    /// box view is declared.
+    pub use super::framework_mount::{
+        BoxCell, MapEntries, MountComponent, MountComponentWithDomain, MountComponentWithProps,
+        MountToken, MountTokenWithProps,
+    };
+    /// Not `std::boxed::Box`; import from `reactive::kind` where a box
+    /// view is declared.
     pub use super::kind::BoxView;
     pub use super::kind::{
-        EmitHandle, Graph, GraphEmit, GraphObserve, GraphView, List, ListEmit, ListKey, ListView,
-        Map, MapEmit, MapObserve, MapView, ObserveHandle, Tree, TreeEmit, TreeObserve, TreeView,
-        ViewKind, emit_view, observe_view,
+        Graph, GraphView, List, ListView, Map, MapView, Tree, TreeView, ViewKind,
     };
     pub use super::view::View;
+    pub use crate::{abstract_tree, component, view};
 }

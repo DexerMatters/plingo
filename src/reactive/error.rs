@@ -41,6 +41,12 @@ pub enum Error {
     DuplicateComponent {
         descriptor: String,
     },
+    ConflictingComponentInputs {
+        function: String,
+        key: String,
+        previous: String,
+        current: String,
+    },
     DuplicatePatchKey {
         view: String,
     },
@@ -87,6 +93,15 @@ impl fmt::Display for Error {
             Error::DuplicateComponent { descriptor } => {
                 write!(f, "component `{descriptor}` is already installed")
             }
+            Error::ConflictingComponentInputs {
+                function,
+                key,
+                previous,
+                current,
+            } => write!(
+                f,
+                "component `{function}` received conflicting props for key {key}: {previous} vs {current}"
+            ),
             Error::DuplicatePatchKey { view } => {
                 write!(f, "duplicate patch key on `{view}`")
             }

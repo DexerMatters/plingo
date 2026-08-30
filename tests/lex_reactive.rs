@@ -6,8 +6,8 @@ use std::{fmt, sync::Arc};
 
 use plingo::framework::lex::{LexErrorInfo, TokenVec, Tokens, install_lexer};
 use plingo::framework::{SourceEdit, Workspace};
+use plingo::prelude::Terminal;
 use plingo::utils::Span;
-use plingo_macros::Terminal;
 
 #[derive(Terminal, Debug, Clone, PartialEq, Eq, Hash)]
 #[scopes(root { Word })]
@@ -148,13 +148,11 @@ fn equal_text_reopen_preserves_token_values() {
         .observe::<Tokens<TestTokens>>("test://eq".to_string())
         .unwrap();
     assert_eq!(
-        &*before.tokens,
-        &*after.tokens,
+        &*before.tokens, &*after.tokens,
         "reopening equal text preserves token values"
     );
     assert_eq!(
-        &*before.errors,
-        &*after.errors,
+        &*before.errors, &*after.errors,
         "reopening equal text preserves token errors"
     );
 }
@@ -370,7 +368,7 @@ fn prefix_edit_shares_the_unchanged_suffix_by_pointer() {
         "the unchanged prefix must stay pointer-shared across a tail edit"
     );
 }
- 
+
 #[test]
 fn multiple_disjoint_splices_replay_against_the_evolving_source() {
     let mut ws = build(1);

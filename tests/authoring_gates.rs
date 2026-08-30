@@ -40,6 +40,21 @@ const FORBIDDEN_IN_COMPONENT_FILES: &[(&str, &str)] = &[
         "identity-carrier input struct (URI/parent carrier)",
     ),
     ("LowerInput", "identity-carrier input struct"),
+    // Plan §9.5 negative gates: no raw tree ABI, raw handles, ports, or
+    // generated installers in application-authored files.
+    ("TreeKey", "encoded tree fact key"),
+    ("TreeFact", "encoded tree fact value"),
+    ("GraphKey<", "encoded graph fact key"),
+    ("GraphFact<", "encoded graph fact value"),
+    ("Node<V>", "raw runtime node handle"),
+    ("view::Node", "raw runtime node handle"),
+    ("emit_view", "raw emit handle"),
+    ("observe_view", "raw observe handle"),
+    ("emit_patch", "raw patch handle"),
+    ("EachKey<", "legacy membership port"),
+    ("fresh_node_id", "hidden node-id mint"),
+    ("raw_id", "raw identity accessor"),
+    ("_install(engine", "generated installer call"),
 ];
 
 /// Files that must additionally be free of nested effectful `run`
@@ -84,16 +99,16 @@ fn component_authored_examples_avoid_forbidden_authoring_surface() {
     }
 }
 
-/// The view-pipeline scope example must keep its element-component shape:
-/// every pass installs per-node definitions and no single component walks
-/// the tree recursively.
+/// The scope-pipeline source keeps one named component per semantic stage:
+/// recursive tree lowering, scope projection, resolution, analysis, and
+/// summary.  The test deliberately checks the public component definitions,
+/// not generated installer names or runtime topology.
 #[test]
 fn scope_lowering_installs_element_components() {
     let path = repo_root().join("examples/view_pipeline/scope_lowering.rs");
     let source = std::fs::read_to_string(&path).expect("scope lowering readable");
     for definition in [
         "pub fn lower_node(",
-        "pub fn lower_root(",
         "pub fn emit_document_scope(",
         "pub fn emit_node_scope(",
         "pub fn publish_candidate(",
@@ -103,7 +118,6 @@ fn scope_lowering_installs_element_components() {
         "pub fn analysis_scope_presence(",
         "pub fn analysis_diagnostics(",
         "pub fn join_analyses(",
-        "pub fn inverse_provenance(",
         "pub fn node_summary(",
         "pub fn document_summary(",
     ] {
@@ -113,7 +127,7 @@ fn scope_lowering_installs_element_components() {
         );
     }
     // The old recursive walkers are gone; per-node components read only
-    // their exact children summaries (plan §24.5).
+    // their exact children summaries.
     for old_walker in ["fn summarize_node(", "fn scope_node(", "fn analyze_node("] {
         assert!(
             !source.contains(old_walker),
@@ -122,21 +136,58 @@ fn scope_lowering_installs_element_components() {
     }
 }
 
-/// The tree-transform projection must keep per-element payload/edge/order/
-/// root components (plan §24.1).
+/// The tree-transform lowering must keep its recursive per-node components
+/// (plan §8 Cut G): one component per source node kind, visibly recursive
+/// through component calls.
 #[test]
-fn tree_transform_keeps_projection_components() {
+fn tree_transform_keeps_recursive_lowering_components() {
     let path = repo_root().join("examples/tree_transform/lower.rs");
     let source = std::fs::read_to_string(&path).expect("lower.rs readable");
     for definition in [
-        "pub fn lower_source_node(",
-        "pub fn lower_source_edge(",
-        "pub fn lower_source_order(",
-        "pub fn lower_source_root(",
+        "pub fn lower_document(",
+        "pub fn lower_declaration(",
+        "pub fn lower_expr(",
     ] {
         assert!(
             source.contains(definition),
             "tree transform missing projection component {definition:?}"
         );
     }
+    // The lowering visibly recurses by calling components, never by manual
+    // child enumeration into identity maps.
+    assert!(
+        source.contains("lower_expr(add.left()?)"),
+        "lower_expr must recurse through component calls"
+    );
+}
+
+/// Positive gates (plan §9.5): lowered tree enums visibly use `AstBox`
+/// children and lowering components visibly recurse by calling components.
+#[test]
+fn lowered_trees_use_ast_box_children_and_recursive_calls() {
+    for (path, marker) in [
+        ("examples/tree_transform/lower.rs", "AstBox<LoweredExpr>"),
+        (
+            "examples/tree_transform/view_harness.rs",
+            "AstBox<CoreExpr>",
+        ),
+        (
+            "examples/view_pipeline/scope_lowering.rs",
+            "AstBox<LoweredNode>",
+        ),
+    ] {
+        let source = std::fs::read_to_string(repo_root().join(path))
+            .unwrap_or_else(|error| panic!("{path} readable: {error}"));
+        assert!(
+            source.contains(marker),
+            "{path} does not declare {marker:?} children"
+        );
+    }
+    let scope =
+        std::fs::read_to_string(repo_root().join("examples/view_pipeline/scope_lowering.rs"))
+            .expect("scope lowering readable");
+    assert!(
+        scope.contains("node_summary(node: AstBox<LoweredNode>)"),
+        "summaries must flow through per-node components reading child summaries"
+    );
 }

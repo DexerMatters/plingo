@@ -1,29 +1,24 @@
+use std::sync::Arc;
+
+use crate::framework::lex::TokenOccurrenceId;
 use indexmap::IndexSet;
+use smallvec::SmallVec;
 
 use super::{
-    ParseColumn, ParseError, ParseToken, ReductionKey, ReductionPath, SessionContext,
+    OccurrenceKey, OriginKey, ParseColumn, ParseError, ParseToken, RecoveryJournalEntry,
+    ReductionKey, ReductionPath, SessionContext, checkpoint,
 };
 use crate::framework::parse::{
-    TokenData,
     build::Action,
     data::{
         green::ErrorKind,
         product::{Product, ProductData, ProductId},
     },
     grammar::{BuildCx, NonTerminalId, Symbol, TerminalId},
-    identity::eof_fingerprint,
     recovery::{self, Repair},
 };
 
 impl SessionContext<'_> {
-    pub(crate) fn resolve_terminal(&self, data: &TokenData) -> TerminalId {
-        match data.terminal {
-            Some(terminal) => terminal,
-            None if data.fingerprint == eof_fingerprint() => self.grammar.eof,
-            None => self.grammar.error_terminal,
-        }
-    }
-
     fn action_set(
         &self,
         state: usize,
@@ -36,14 +31,14 @@ impl SessionContext<'_> {
         self.gotos[self.grammar.goto_index(state, non_terminal)]
     }
 
-    fn build_cx(&mut self, boundary: usize) -> BuildCx<'_> {
+    fn build_cx(&mut self, boundary: TokenOccurrenceId) -> BuildCx<'_> {
         BuildCx {
             productions: &self.grammar.productions,
             trees: self.trees,
             products: self.products,
             ast: self.ast,
             lineage: &mut self.state.lineage,
-            boundary,
+            boundary: usize::try_from(boundary.0).unwrap_or(usize::MAX),
         }
     }
 
@@ -56,7 +51,7 @@ impl SessionContext<'_> {
         expected: Symbol,
         recovered: bool,
         location: Option<usize>,
-        anchor: usize,
+        anchor: TokenOccurrenceId,
     ) -> Result<ProductId, ParseError> {
         let green = self.trees.error(
             length,
@@ -69,9 +64,13 @@ impl SessionContext<'_> {
             location,
         );
         let extent = if length == 0 {
-            crate::framework::parse::data::ast::AnchoredSpan::point(anchor)
+            crate::framework::parse::data::ast::AnchoredSpan::point(
+                usize::try_from(anchor.0).unwrap_or(usize::MAX),
+            )
         } else {
-            crate::framework::parse::data::ast::AnchoredSpan::token(anchor)
+            crate::framework::parse::data::ast::AnchoredSpan::token(
+                usize::try_from(anchor.0).unwrap_or(usize::MAX),
+            )
         };
         let product = self
             .products
@@ -105,9 +104,10 @@ impl SessionContext<'_> {
         _column: usize,
         info: crate::framework::parse::data::green::ParseErrorInfo,
     ) {
-        let diagnostics = &mut self.state.diagnostics;
-        if !diagnostics.contains(&info) {
-            diagnostics.push(info);
+        // Indexed dedup: constant time against the session's recovery
+        // journal instead of a linear vector scan (Cut H).
+        if self.state.diagnostic_index.insert(info.clone()) {
+            self.state.diagnostics.push(info);
         }
     }
 
@@ -115,14 +115,14 @@ impl SessionContext<'_> {
         &mut self,
         production: u32,
         children: &[ProductId],
-        boundary: usize,
+        boundary: TokenOccurrenceId,
     ) -> Result<ProductId, ParseError> {
         // Empty reductions are position-sensitive. Including their stable
         // lookahead anchor prevents a cached zero-width product from being
         // reused at a different source boundary.
         let key = ReductionKey {
             production,
-            children: children.to_vec(),
+            children: children.iter().copied().collect(),
             boundary: children.is_empty().then_some(boundary),
         };
         if let Some(&product) = self.state.reduced_products.get(&key) {
@@ -136,7 +136,7 @@ impl SessionContext<'_> {
         // former origin scan excluded it as well; omitting it here makes reuse
         // reject that suffix instead of recursing indefinitely.
         if !key.children.contains(&product) {
-            self.state.reduction_origins.insert(product, key);
+            self.state.reduction_origins.insert(OriginKey(product), key);
         }
         Ok(product)
     }
@@ -150,19 +150,27 @@ impl SessionContext<'_> {
         &mut self,
         column: usize,
         lookahead: TerminalId,
-        boundary: usize,
+        boundary: TokenOccurrenceId,
     ) -> Result<(), ParseError> {
+        let mut active_nodes = std::mem::take(&mut self.active_scratch);
         loop {
             let mut changed = false;
-            let active_nodes: Vec<_> = self.state.columns[column].active_nodes().collect();
+            active_nodes.clear();
+            active_nodes.extend(self.state.columns[column].active_nodes());
 
-            for node_id in active_nodes {
+            for &node_id in &active_nodes {
                 let Some(node) = self.gss.get_node(node_id) else {
                     return Err(ParseError::MissingGssNode { node: node_id });
                 };
                 let state = node.state;
 
-                for action in self.action_set(state, lookahead).inner.clone() {
+                let actions: SmallVec<[Action; 8]> = self
+                    .action_set(state, lookahead)
+                    .inner
+                    .iter()
+                    .cloned()
+                    .collect();
+                for action in actions {
                     match action {
                         Action::Reduce(production) => {
                             let rhs_len = self.grammar.production_rhs_len(production);
@@ -221,6 +229,7 @@ impl SessionContext<'_> {
                 break;
             }
         }
+        self.active_scratch = active_nodes;
         Ok(())
     }
 
@@ -278,7 +287,9 @@ impl SessionContext<'_> {
         token: &ParseToken,
     ) -> Result<usize, ParseError> {
         let mut next_active = IndexSet::new();
-        let active_nodes: Vec<_> = self.state.columns[from_column].active_nodes().collect();
+        let mut active_nodes = std::mem::take(&mut self.active_scratch);
+        active_nodes.clear();
+        active_nodes.extend(self.state.columns[from_column].active_nodes());
         let next_column = from_column + 1;
 
         let is_error_token = token.terminal == self.grammar.error_terminal;
@@ -298,12 +309,17 @@ impl SessionContext<'_> {
             None
         };
 
-        for node_id in active_nodes {
+        for &node_id in &active_nodes {
             let Some(node) = self.gss.get_node(node_id) else {
                 return Err(ParseError::MissingGssNode { node: node_id });
             };
             let state = node.state;
-            let actions = self.action_set(state, token.terminal).inner.clone();
+            let actions: SmallVec<[Action; 8]> = self
+                .action_set(state, token.terminal)
+                .inner
+                .iter()
+                .cloned()
+                .collect();
             for action in actions {
                 let Action::Shift(next_state) = action else {
                     continue;
@@ -325,8 +341,12 @@ impl SessionContext<'_> {
                         // One source token can shift through multiple GSS paths;
                         // every path must share its single token product.
                         let mut cx = self.build_cx(token.column);
-                        let product =
-                            cx.alloc_token(token.length, token.terminal, token.entry, token.column);
+                        let product = cx.alloc_token(
+                            token.length,
+                            token.terminal,
+                            token.entry,
+                            token.column.0 as usize,
+                        );
                         self.state.token_products.insert(token.column, product);
                     }
                     let product = self
@@ -345,6 +365,7 @@ impl SessionContext<'_> {
                 }
             }
         }
+        self.active_scratch = active_nodes;
 
         if next_active.is_empty() {
             return Err(ParseError::NoActiveStacks {
@@ -392,7 +413,7 @@ impl SessionContext<'_> {
         from_column: usize,
         terminal: TerminalId,
         unexpected: Option<Symbol>,
-        location: Option<usize>,
+        location: Option<TokenOccurrenceId>,
     ) -> Result<usize, ParseError> {
         let next_column = from_column + 1;
         let product = self.alloc_error_node(
@@ -403,17 +424,25 @@ impl SessionContext<'_> {
             Symbol::T(terminal),
             true,
             Some(next_column),
-            location.unwrap_or(0),
+            location.unwrap_or(TokenOccurrenceId(u64::MAX)),
         )?;
         let mut next_active = IndexSet::new();
-        let active_nodes: Vec<_> = self.state.columns[from_column].active_nodes().collect();
+        let mut active_nodes = std::mem::take(&mut self.active_scratch);
+        active_nodes.clear();
+        active_nodes.extend(self.state.columns[from_column].active_nodes());
 
-        for node_id in active_nodes {
+        for &node_id in &active_nodes {
             let Some(node) = self.gss.get_node(node_id) else {
                 return Err(ParseError::MissingGssNode { node: node_id });
             };
             let state = node.state;
-            for action in self.action_set(state, terminal).inner.clone() {
+            let actions: SmallVec<[Action; 8]> = self
+                .action_set(state, terminal)
+                .inner
+                .iter()
+                .cloned()
+                .collect();
+            for action in actions {
                 let Action::Shift(next_state) = action else {
                     continue;
                 };
@@ -428,6 +457,7 @@ impl SessionContext<'_> {
                 }
             }
         }
+        self.active_scratch = active_nodes;
 
         if next_active.is_empty() {
             return Err(ParseError::NoActiveStacks { column: None });
@@ -448,7 +478,11 @@ impl SessionContext<'_> {
             ),
         );
         self.state.columns[next_column].set_error_derived();
-        self.reduce_until_stable(next_column, terminal, location.unwrap_or(0))?;
+        self.reduce_until_stable(
+            next_column,
+            terminal,
+            location.unwrap_or(TokenOccurrenceId(u64::MAX)),
+        )?;
         Ok(next_column)
     }
 
@@ -495,6 +529,7 @@ impl SessionContext<'_> {
         &mut self,
         start: usize,
         tail: &mut crate::framework::parse::parsing::TokenTail,
+        trigger: TokenOccurrenceId,
     ) -> Result<Option<usize>, ParseError> {
         if !self.error_recovery {
             return Ok(None);
@@ -509,77 +544,26 @@ impl SessionContext<'_> {
         }
 
         let start_column = self.state.current_column();
-        let mut index = start;
         // Plan §14: synthetic tokens carry a deterministic identity beyond
         // this command — a per-document recovery-segment serial plus a
         // within-segment action ordinal. Each repair allocates its identity
         // against the token occurrence it synthesizes or deletes.
         let recovery_segment = self.state.begin_recovery_segment();
-        for repair in result.repairs {
-            let column = self.state.current_column();
-            match repair {
-                Repair::Insert(terminal) => {
-                    let synthetic = tail.get(index).map(|token| token.column);
-                    if let Some(anchor_occ) = tail.get(index).map(|token| token.column) {
-                        self.state.record_witness(anchor_occ, recovery_segment);
-                        crate::framework::workspace::record_parser_work(
-                            &self.uri.to_string(),
-                            |work| {
-                                work.recovery_witness_tokens += 1;
-                            },
-                        );
-                    }
-                    self.reduce_until_stable(
-                        column,
-                        terminal,
-                        tail.get(index).map_or(0, |token| token.column),
-                    )?;
-                    let unexpected = tail.get(index).map(|token| Symbol::T(token.terminal));
-                    let location = tail.get(index).map(|token| token.column);
-                    let _ = synthetic_anchor(synthetic, column, self);
-                    self.shift_synthetic_terminal(column, terminal, unexpected, location)?;
-                }
-                Repair::Delete => {
-                    let Some(token) = tail.get(index) else {
-                        return Ok(None);
-                    };
-                    self.state.record_witness(token.column, recovery_segment);
-                    crate::framework::workspace::record_parser_work(
-                        &self.uri.to_string(),
-                        |work| {
-                            work.recovery_witness_tokens += 1;
-                        },
-                    );
-                    let _ = synthetic_anchor(Some(token.column), column, self);
-                    self.delete_parse_token(column, token)?;
-                    index += 1;
-                }
-                Repair::Shift => {
-                    let Some(token) = tail.get(index) else {
-                        return Ok(None);
-                    };
-                    self.state.record_witness(token.column, recovery_segment);
-                    self.reduce_until_stable(column, token.terminal, token.column)?;
-                    self.shift_parse_token(column, token)?;
-                    index += 1;
-                }
-                Repair::ShiftAsError => {
-                    let Some(token) = tail.get(index) else {
-                        return Ok(None);
-                    };
-                    self.state.record_witness(token.column, recovery_segment);
-                    let modified = ParseToken {
-                        entry: token.entry,
-                        column: token.column,
-                        start: token.start,
-                        terminal: self.grammar.error_terminal,
-                        merge_source_terminal: Some(token.terminal),
-                        ..*token
-                    };
-                    self.reduce_until_stable(column, self.grammar.error_terminal, token.column)?;
-                    self.shift_parse_token(column, &modified)?;
-                    index += 1;
-                }
+        let mut witnesses: Vec<(TokenOccurrenceId, TerminalId)> = Vec::new();
+        let mut journaled: Vec<(Repair, TokenOccurrenceId)> = Vec::new();
+        let mut index = start;
+        for repair in result.repairs.iter().copied() {
+            match self.apply_repair(
+                repair,
+                index,
+                tail,
+                recovery_segment,
+                &mut witnesses,
+                &mut journaled,
+            )? {
+                Some(next) => index = next,
+                // The tail ran out mid-repair; the attempt is abandoned.
+                None => return Ok(None),
             }
         }
 
@@ -587,8 +571,155 @@ impl SessionContext<'_> {
             return Ok(None);
         }
 
+        // Journal the proven repair plan (plan §14): a later replay that
+        // re-enters this region at an equal frontier with the same witnessed
+        // tokens replays these repairs without re-running the search.
+        let frontier = {
+            let mut cache = crate::framework::parse::data::gss::CanonicalFrontierCache::default();
+            checkpoint::frontier_checkpoint_for_column(
+                &mut self.state.columns[start_column],
+                self.gss,
+                self.products,
+                &mut cache,
+            )
+            .clone()
+        };
+        self.state.recovery_journal.insert(
+            OccurrenceKey(recovery_segment),
+            Arc::new(RecoveryJournalEntry {
+                anchor: trigger,
+                frontier,
+                witnesses,
+                repairs: journaled,
+            }),
+        );
         crate::framework::workspace::record_parser_work(&self.uri.to_string(), |work| {
             work.recovery_interval_probes += 1;
+        });
+        Ok(Some(index))
+    }
+
+    /// Applies one recovery repair. Returns the advanced tail index, or
+    /// `None` when the tail ran out under the repair.
+    fn apply_repair(
+        &mut self,
+        repair: Repair,
+        index: usize,
+        tail: &mut crate::framework::parse::parsing::TokenTail,
+        recovery_segment: u64,
+        witnesses: &mut Vec<(TokenOccurrenceId, TerminalId)>,
+        journaled: &mut Vec<(Repair, TokenOccurrenceId)>,
+    ) -> Result<Option<usize>, ParseError> {
+        let column = self.state.current_column();
+        match repair {
+            Repair::Insert(terminal) => {
+                let synthetic = tail.get(index).map(|token| token.column);
+                if let Some(anchor_occ) = tail.get(index).map(|token| token.column) {
+                    self.state.record_witness(anchor_occ, recovery_segment);
+                    witnesses.push((anchor_occ, tail.get(index).map_or(terminal, |t| t.terminal)));
+                    crate::framework::workspace::record_parser_work(
+                        &self.uri.to_string(),
+                        |work| {
+                            work.recovery_witness_tokens += 1;
+                        },
+                    );
+                }
+                self.reduce_until_stable(
+                    column,
+                    terminal,
+                    tail.get(index)
+                        .map_or(TokenOccurrenceId(u64::MAX), |token| token.column),
+                )?;
+                let unexpected = tail.get(index).map(|token| Symbol::T(token.terminal));
+                let location = tail.get(index).map(|token| token.column);
+                let _ = synthetic_anchor(synthetic, column, self);
+                self.shift_synthetic_terminal(column, terminal, unexpected, location)?;
+                if let Some(anchor_occ) = synthetic {
+                    journaled.push((repair, anchor_occ));
+                }
+            }
+            Repair::Delete => {
+                let Some(token) = tail.get(index) else {
+                    return Ok(None);
+                };
+                self.state.record_witness(token.column, recovery_segment);
+                witnesses.push((token.column, token.terminal));
+                crate::framework::workspace::record_parser_work(&self.uri.to_string(), |work| {
+                    work.recovery_witness_tokens += 1;
+                });
+                let _ = synthetic_anchor(Some(token.column), column, self);
+                self.delete_parse_token(column, token)?;
+                journaled.push((repair, token.column));
+                return Ok(Some(index + 1));
+            }
+            Repair::Shift => {
+                let Some(token) = tail.get(index) else {
+                    return Ok(None);
+                };
+                self.state.record_witness(token.column, recovery_segment);
+                witnesses.push((token.column, token.terminal));
+                self.reduce_until_stable(column, token.terminal, token.column)?;
+                self.shift_parse_token(column, token)?;
+                journaled.push((repair, token.column));
+                return Ok(Some(index + 1));
+            }
+            Repair::ShiftAsError => {
+                let Some(token) = tail.get(index) else {
+                    return Ok(None);
+                };
+                self.state.record_witness(token.column, recovery_segment);
+                witnesses.push((token.column, token.terminal));
+                let modified = ParseToken {
+                    entry: token.entry,
+                    column: token.column,
+                    start: token.start,
+                    terminal: self.grammar.error_terminal,
+                    merge_source_terminal: Some(token.terminal),
+                    ..*token
+                };
+                self.reduce_until_stable(column, self.grammar.error_terminal, token.column)?;
+                self.shift_parse_token(column, &modified)?;
+                journaled.push((repair, token.column));
+                return Ok(Some(index + 1));
+            }
+        }
+        Ok(Some(index))
+    }
+
+    /// Replays a journaled recovery segment (plan §14 reuse path). The
+    /// caller has already proven the frontier and witness identity; this
+    /// only re-walks the recorded repairs under the original segment serial
+    /// so synthetic identities stay deterministic.
+    pub(crate) fn replay_recovery_journal(
+        &mut self,
+        serial: u64,
+        entry: &RecoveryJournalEntry,
+        start: usize,
+        tail: &mut crate::framework::parse::parsing::TokenTail,
+    ) -> Result<Option<usize>, ParseError> {
+        self.state.active_recovery_segment = Some(serial);
+        self.state.next_synthetic_ordinal = 0;
+        let mut witnesses = Vec::new();
+        let mut journaled = Vec::new();
+        let mut index = start;
+        for (repair, anchor) in entry.repairs.iter().copied() {
+            // Anchor alignment: the consumed token must be exactly the one
+            // the proven plan named.
+            if !matches!(repair, Repair::Insert(_)) {
+                match tail.get(index) {
+                    Some(token) if token.column == anchor => {}
+                    _ => return Ok(None),
+                }
+            } else if tail.get(index).map(|token| token.column) != Some(anchor) {
+                return Ok(None);
+            }
+            match self.apply_repair(repair, index, tail, serial, &mut witnesses, &mut journaled)? {
+                Some(next) => index = next,
+                None => return Ok(None),
+            }
+        }
+        crate::framework::workspace::record_parser_work(&self.uri.to_string(), |work| {
+            work.recovery_segments_reused += 1;
         });
         Ok(Some(index))
     }
@@ -597,11 +728,12 @@ impl SessionContext<'_> {
 /// Records a deterministic synthetic-token identity for one recovery
 /// action, anchored at the token occurrence it synthesizes or removes.
 fn synthetic_anchor(
-    occurrence: Option<usize>,
+    occurrence: Option<TokenOccurrenceId>,
     fallback_column: usize,
     ctx: &mut SessionContext<'_>,
 ) -> u64 {
-    let anchor = occurrence.unwrap_or(fallback_column);
+    let anchor = occurrence
+        .unwrap_or_else(|| TokenOccurrenceId(u64::try_from(fallback_column).unwrap_or(u64::MAX)));
     let identity = ctx.state.next_synthetic_identity(anchor);
     identity
 }

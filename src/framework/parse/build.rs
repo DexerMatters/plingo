@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, VecDeque},
     marker::PhantomData,
 };
 
@@ -119,12 +119,13 @@ impl Grammar {
             conflicts: Vec::new(),
             transitions,
             states,
-            session_arenas: HashMap::new(),
             config,
             tree_member_kind: None,
             tree_child_records: None,
-            latest: ParserSnapshotState::default().into(),
-            next_snapshot: 0,
+            latest: std::sync::Arc::new(parking_lot::RwLock::new(std::sync::Arc::new(
+                ParserSnapshotState::default(),
+            ))),
+            next_snapshot: std::sync::atomic::AtomicU64::new(0),
             _root: PhantomData,
         };
 

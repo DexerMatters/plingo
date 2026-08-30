@@ -1,9 +1,8 @@
-use indexmap::IndexSet;
-
 use super::{ParseColumn, ParserSessionState, checkpoint::FrontierCheckpoint};
+use crate::framework::lex::TokenOccurrenceId;
 use crate::framework::parse::{
     data::{gss::GssNodeId, product::ProductId},
-    types::TokenOccurrenceId,
+    types::ParserBoundaryId,
 };
 
 impl ParseColumn {
@@ -17,6 +16,16 @@ impl ParseColumn {
 
     pub fn accepted(&self) -> &[ProductId] {
         &self.accepted
+    }
+    pub(crate) fn set_boundary(&mut self, boundary: Option<ParserBoundaryId>) {
+        if self.boundary != boundary {
+            self.boundary = boundary;
+            self.invalidate_checkpoint_cache();
+        }
+    }
+
+    pub(crate) fn boundary(&self) -> Option<ParserBoundaryId> {
+        self.boundary
     }
 
     pub(crate) fn push_product(&mut self, product: ProductId) -> bool {
@@ -97,17 +106,28 @@ impl ParserSessionState {
                 .map_or(0, |segment| segment.len())
     }
 
-    pub(crate) fn column_for_token(&self, token: TokenOccurrenceId) -> Option<usize> {
-        self.token_columns
-            .get(&token)
-            .copied()
-            .filter(|column| *column < self.columns.len())
-            .or_else(|| {
-                self.retained_suffix
-                    .as_ref()
-                    .and_then(|segment| segment.token_column(token))
-                    .map(|column| self.columns.len() + column)
-            })
+    pub(crate) fn set_column_boundary(&mut self, index: usize, boundary: Option<ParserBoundaryId>) {
+        let Some(column) = self.columns.get_mut(index) else {
+            return;
+        };
+        if let Some(previous) = column.boundary() {
+            if self.boundary_columns.get(&previous).copied() == Some(index) {
+                self.boundary_columns.remove(&previous);
+            }
+        }
+        column.set_boundary(boundary);
+        if let Some(boundary) = boundary {
+            self.boundary_columns.insert(boundary, index);
+        }
+    }
+
+    pub(crate) fn column_for_boundary(&self, boundary: ParserBoundaryId) -> Option<usize> {
+        self.boundary_columns.get(&boundary).copied().or_else(|| {
+            self.retained_suffix
+                .as_ref()
+                .and_then(|segment| segment.boundary_column(boundary))
+                .map(|column| self.columns.len() + column)
+        })
     }
 
     pub(crate) fn token_product(&self, token: TokenOccurrenceId) -> Option<ProductId> {
@@ -151,34 +171,40 @@ impl ParserSessionState {
     /// Freezes the mutable prefix into one immutable segment. Segment
     /// construction is charged once to the materialized prefix; an already
     /// retained suffix is concatenated by metadata only.
-    pub(crate) fn seal(&mut self, gss: &crate::framework::parse::data::gss::GssArena) {
+    pub(crate) fn seal(
+        &mut self,
+        gss: &crate::framework::parse::data::gss::GssArena,
+        products: &crate::framework::parse::data::product::ProductArena,
+        document: crate::framework::lex::StableDocumentId,
+    ) {
         if self.columns.is_empty() {
             return;
         }
         let columns = std::mem::take(&mut self.columns);
-        let prefix = super::ParseSegment::from_columns(columns, gss);
+        let prefix = super::ParseSegment::from_columns(columns, gss, products, document);
         self.retained_suffix = Some(match self.retained_suffix.take() {
             Some(suffix) => super::ParseSegment::concat(prefix, suffix),
             None => prefix,
         });
+        self.boundary_columns.clear();
         self.token_columns.clear();
         self.token_products.clear();
     }
 
     /// Detaches columns at `start` into a persistent suffix. Existing
-    /// retained pieces are sliced/concatenated by metadata only; only a newly
-    /// exposed mutable prefix tail is materialized.
     pub(crate) fn detach_suffix(
         &mut self,
         start: usize,
         gss: &crate::framework::parse::data::gss::GssArena,
+        products: &crate::framework::parse::data::product::ProductArena,
+        document: crate::framework::lex::StableDocumentId,
     ) -> Option<std::sync::Arc<super::ParseSegment>> {
         let total = self.column_count();
         let start = start.min(total);
         let existing = self.retained_suffix.take();
         let detached = if start < self.columns.len() {
             let tail = self.columns.split_off(start);
-            let prefix_segment = super::ParseSegment::from_columns(tail, gss);
+            let prefix_segment = super::ParseSegment::from_columns(tail, gss, products, document);
             existing.map_or(prefix_segment.clone(), |segment| {
                 super::ParseSegment::concat(prefix_segment.clone(), segment)
             })
@@ -188,6 +214,8 @@ impl ParserSessionState {
             return None;
         };
         self.columns.truncate(start.min(self.columns.len()));
+        self.boundary_columns
+            .retain(|_, column| *column < self.columns.len());
         self.token_columns.retain(|_, column| *column < start);
         self.token_products.retain(|token, _| {
             self.token_columns.contains_key(token)
@@ -197,15 +225,17 @@ impl ParserSessionState {
         });
         Some(detached)
     }
-
     pub fn truncate_to_column(&mut self, column: usize) {
         assert!(column < self.columns.len(), "parse column out of range");
         self.retained_suffix = None;
         self.generation += 1;
+        self.columns.truncate(column.saturating_add(1));
         self.columns[column].reset_for_replay();
         self.diagnostics
             .retain(|info| info.location.is_some_and(|loc| loc < column));
+        self.diagnostic_index = self.diagnostics.iter().cloned().collect();
 
+        self.boundary_columns.retain(|_, c| *c <= column);
         self.token_columns.retain(|_, c| *c <= column);
         self.token_products
             .retain(|token, _| self.token_columns.contains_key(token));
@@ -215,6 +245,9 @@ impl ParserSessionState {
         debug_assert!(self.retained_suffix.is_none());
         for column in columns {
             let index = self.columns.len();
+            if let Some(boundary) = column.boundary() {
+                self.boundary_columns.insert(boundary, index);
+            }
             if let Some(token) = column.token {
                 self.token_columns.insert(token, index);
                 if !column.error_derived
@@ -224,7 +257,7 @@ impl ParserSessionState {
                 }
             }
             for diagnostic in &column.diagnostics {
-                if !self.diagnostics.contains(diagnostic) {
+                if self.diagnostic_index.insert(diagnostic.clone()) {
                     self.diagnostics.push(diagnostic.clone());
                 }
             }
@@ -239,7 +272,6 @@ impl ParserSessionState {
     fn append_materialized_prefix(&mut self, columns: impl IntoIterator<Item = ParseColumn>) {
         self.append_columns(columns);
     }
-
 
     pub(crate) fn append_reused_segment(&mut self, segment: std::sync::Arc<super::ParseSegment>) {
         debug_assert!(self.retained_suffix.is_none());

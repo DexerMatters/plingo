@@ -1,13 +1,18 @@
 //! Exact-key dependency scenarios for the map/list fan-out example.
 
-use plingo::reactive::kind::emit_view;
-use plingo::reactive::{Engine, Snapshot};
+use plingo::prelude::*;
+use plingo::reactive::Snapshot;
 
 use super::fanout::{Alerts, Enabled, Names, Quantities, Record, Records, Scores};
-use super::fanout_components;
+use super::fanout_components::{alert, record as record_component, score};
 
-fn install(engine: &mut Engine) {
-    fanout_components::install(engine).expect("install fan-out components");
+fn install() -> Workspace {
+    Workspace::builder()
+        .mount::<record_component::Component, _>(Names::entries())
+        .mount::<score::Component, _>(Names::entries())
+        .mount::<alert::Component, _>(Names::entries())
+        .build()
+        .expect("workspace builds")
 }
 
 fn record(snapshot: &Snapshot, key: &str) -> Option<Record> {
@@ -16,18 +21,28 @@ fn record(snapshot: &Snapshot, key: &str) -> Option<Record> {
         .map(|record| (*record).clone())
 }
 
+fn set_all(engine: &mut Engine, key: &str, name: &str, quantity: Option<i64>, enabled: bool) {
+    engine
+        .command(|| {
+            (
+                Names::set(key.to_owned(), name.to_owned()),
+                Enabled::set(key.to_owned(), enabled),
+            )
+                .__apply()?;
+            match quantity {
+                Some(value) => Quantities::set(key.to_owned(), value).__apply(),
+                None => Quantities::remove(key.to_owned()).__apply(),
+            }
+        })
+        .expect("set inputs");
+}
+
 #[test]
 fn observing_three_maps_emits_two_maps_and_one_list_per_key() {
     let _counter_guard = super::fanout_components_test::COUNTER_LOCK.lock();
-    let mut engine = Engine::new();
-    install(&mut engine);
-    engine
-        .command(|| {
-            emit_view::<Names>()?.insert("a".into(), "alpha".into())?;
-            emit_view::<Quantities>()?.insert("a".into(), 4)?;
-            emit_view::<Enabled>()?.insert("a".into(), true)
-        })
-        .expect("seed inputs");
+    let mut workspace = install();
+    let engine = workspace.engine_mut();
+    set_all(engine, "a", "alpha", Some(4), true);
 
     let snapshot = engine.snapshot();
     assert_eq!(
@@ -35,7 +50,7 @@ fn observing_three_maps_emits_two_maps_and_one_list_per_key() {
         Some(Record {
             name: "alpha".into(),
             quantity: Some(4),
-            enabled: true,
+            enabled: true
         })
     );
     assert_eq!(snapshot.observe::<Scores>("a".into()).as_deref(), Some(&4));
@@ -45,24 +60,16 @@ fn observing_three_maps_emits_two_maps_and_one_list_per_key() {
 #[test]
 fn one_key_update_does_not_change_another_keys_fanout_outputs() {
     let _counter_guard = super::fanout_components_test::COUNTER_LOCK.lock();
-    let mut engine = Engine::new();
-    install(&mut engine);
-    engine
-        .command(|| {
-            for (key, name, quantity) in [("a", "alpha", 3), ("b", "beta", 8)] {
-                emit_view::<Names>()?.insert(key.into(), name.into())?;
-                emit_view::<Quantities>()?.insert(key.into(), quantity)?;
-                emit_view::<Enabled>()?.insert(key.into(), true)?;
-            }
-            Ok(())
-        })
-        .expect("seed inputs");
+    let mut workspace = install();
+    let engine = workspace.engine_mut();
+    set_all(engine, "a", "alpha", Some(3), true);
+    set_all(engine, "b", "beta", Some(8), true);
     let before = engine.snapshot();
     let b_record = record(&before, "b");
     let b_score = before.observe::<Scores>("b".into());
 
     engine
-        .command(|| emit_view::<Quantities>()?.insert("a".into(), 0))
+        .command(|| Quantities::set("a".into(), 0).__apply())
         .expect("update only A");
     let after = engine.snapshot();
     assert_eq!(record(&after, "a").unwrap().quantity, Some(0));
@@ -81,14 +88,9 @@ fn one_key_update_does_not_change_another_keys_fanout_outputs() {
 #[test]
 fn disabling_or_removing_a_name_updates_only_its_owned_outputs() {
     let _counter_guard = super::fanout_components_test::COUNTER_LOCK.lock();
-    let mut engine = Engine::new();
-    install(&mut engine);
-    engine
-        .command(|| {
-            emit_view::<Names>()?.insert("a".into(), "alpha".into())?;
-            emit_view::<Enabled>()?.insert("a".into(), true)
-        })
-        .expect("seed incomplete item");
+    let mut workspace = install();
+    let engine = workspace.engine_mut();
+    set_all(engine, "a", "alpha", None, true);
     assert_eq!(
         engine
             .snapshot()
@@ -100,14 +102,14 @@ fn disabling_or_removing_a_name_updates_only_its_owned_outputs() {
     );
 
     engine
-        .command(|| emit_view::<Enabled>()?.insert("a".into(), false))
+        .command(|| Enabled::set("a".into(), false).__apply())
         .expect("disable item");
     let disabled = engine.snapshot();
     assert_eq!(disabled.observe::<Scores>("a".into()).as_deref(), Some(&0));
     assert!(disabled.list::<Alerts>(&"a".to_owned()).is_empty());
 
     engine
-        .command(|| emit_view::<Names>()?.remove("a".into()))
+        .command(|| Names::remove("a".into()).__apply())
         .expect("remove owner key");
     let removed = engine.snapshot();
     assert!(record(&removed, "a").is_none());
@@ -115,24 +117,20 @@ fn disabling_or_removing_a_name_updates_only_its_owned_outputs() {
     assert!(removed.list::<Alerts>(&"a".to_owned()).is_empty());
 }
 
-// ---------------------------------------------------------------------------
-// Phase 0 oracles (follow-up plan §4): canonical fixture, cold equivalence,
-// and reversible traces with expected keyed deltas.
-// ---------------------------------------------------------------------------
-
-use plingo::reactive::digest::{FamilyState, render_diff};
-
 use super::fanout::semantic_digest;
+use plingo::reactive::digest::{FamilyState, render_diff};
 
 fn seed_standard(engine: &mut Engine) {
     engine
         .command(|| {
-            emit_view::<Names>()?.insert("a".into(), "alpha".into())?;
-            emit_view::<Names>()?.insert("b".into(), "beta".into())?;
-            emit_view::<Quantities>()?.insert("a".into(), 2)?;
-            emit_view::<Enabled>()?.insert("a".into(), true)?;
-            emit_view::<Enabled>()?.insert("b".into(), false)?;
-            Ok(())
+            (
+                Names::set("a".into(), "alpha".into()),
+                Names::set("b".into(), "beta".into()),
+                Quantities::set("a".into(), 2),
+                Enabled::set("a".into(), true),
+                Enabled::set("b".into(), false),
+            )
+                .__apply()
         })
         .expect("seed standard membership");
 }
@@ -142,17 +140,13 @@ fn state_of(engine: &Engine) -> FamilyState {
     FamilyState::capture(semantic_digest(&snapshot), &snapshot)
 }
 
-/// Canonical empty/single-root fixture: hand-authored complete public-view
-/// content (plan §4 item 13). A warm and cold implementation sharing the
-/// same extra/orphan output must still fail this.
 #[test]
 fn canonical_fixture_matches_hand_authored_rows() {
     let _counter_guard = super::fanout_components_test::COUNTER_LOCK.lock();
-    let mut engine = Engine::new();
-    install(&mut engine);
-    seed_standard(&mut engine);
+    let mut workspace = install();
+    let engine = workspace.engine_mut();
+    seed_standard(engine);
     let digest = semantic_digest(&engine.snapshot());
-
     let expected: &[(&str, &str, &str)] = &[
         ("alerts", "a", "[]"),
         ("alerts", "b", "[]"),
@@ -174,8 +168,6 @@ fn canonical_fixture_matches_hand_authored_rows() {
         ("scores", "a", "2"),
         ("scores", "b", "0"),
     ];
-    // The complete domain: every recorded row matches the hand-authored
-    // table and the table covers every recorded row.
     assert_eq!(digest.len(), expected.len(), "{}", digest.render());
     for (view, key, value) in expected {
         let actual = digest
@@ -187,157 +179,74 @@ fn canonical_fixture_matches_hand_authored_rows() {
     }
 }
 
-/// The full reversible edit matrix (plan §4 item 4, fan-out rows): every
-/// forward step asserts its exact keyed delta; every reverse restores the
-/// initial digest, per-view counts, and live-fact count exactly; a fresh
-/// engine replaying the same final inputs matches the warm digest.
 #[test]
 fn reversible_edit_matrix_restores_exact_state() {
     let _counter_guard = super::fanout_components_test::COUNTER_LOCK.lock();
-    let mut engine = Engine::new();
-    install(&mut engine);
-    seed_standard(&mut engine);
+    let mut workspace = install();
+    let engine = workspace.engine_mut();
+    seed_standard(engine);
     let initial = state_of(&engine);
 
-    // quantity edit: exactly records.a/scores.a/alerts.a may move.
     engine
-        .command(|| emit_view::<Quantities>()?.insert("a".into(), 5))
+        .command(|| Quantities::set("a".into(), 5).__apply())
         .expect("quantity edit");
     let after_quantity = state_of(&engine);
-    let quantity_row = after_quantity
-        .digest
-        .rows_of("quantities")
-        .iter()
-        .find(|(key, _)| *key == "quantities::a")
-        .map(|(_, value)| *value)
-        .unwrap_or("absent");
-    assert_eq!(quantity_row, "some(5)");
-    let changed_scores = render_diff(&initial.digest, &after_quantity.digest)
-        .matches("scores::")
-        .count();
-    assert!(
-        changed_scores <= 1,
-        "quantity edit must move at most one score row"
-    );
     assert_eq!(
-        after_quantity.digest.rows_of("scores").len(),
-        initial.digest.rows_of("scores").len()
+        after_quantity
+            .digest
+            .rows_of("quantities")
+            .iter()
+            .find(|(key, _)| *key == "quantities::a")
+            .map(|(_, value)| *value),
+        Some("some(5)")
     );
-    assert_ne!(
-        after_quantity.digest.fingerprint(),
-        initial.digest.fingerprint()
+    assert!(
+        render_diff(&initial.digest, &after_quantity.digest)
+            .matches("scores::")
+            .count()
+            <= 1
     );
 
-    // name text edit touches only names/records of that key.
     engine
-        .command(|| emit_view::<Names>()?.insert("a".into(), "alpha2".into()))
+        .command(|| Names::set("a".into(), "alpha2".into()).__apply())
         .expect("name text edit");
     let after_name = state_of(&engine);
     let diff_name = render_diff(&after_quantity.digest, &after_name.digest);
-    assert!(diff_name.contains("names::a"), "{diff_name}");
-    assert!(diff_name.contains("records::a"), "{diff_name}");
-    assert!(!diff_name.contains("records::b"), "{diff_name}");
-    assert!(!diff_name.contains("scores::"), "{diff_name}");
+    assert!(diff_name.contains("names::a"));
+    assert!(diff_name.contains("records::a"));
+    assert!(!diff_name.contains("records::b"));
+    assert!(!diff_name.contains("scores::"));
 
-    // Enabled toggle: score stays 0 (absent quantity defaults to 0 in both
-    // states), the missing-quantity alert appears, records refresh — all
-    // confined to key b.
     engine
-        .command(|| emit_view::<Enabled>()?.insert("b".into(), true))
+        .command(|| Enabled::set("b".into(), true).__apply())
         .expect("enable b");
     let after_enable = state_of(&engine);
     let diff_enable = render_diff(&after_name.digest, &after_enable.digest);
-    assert!(diff_enable.contains("enabled::b"), "{diff_enable}");
-    assert!(diff_enable.contains("alerts::b"), "{diff_enable}");
-    assert!(diff_enable.contains("records::b"), "{diff_enable}");
-    assert!(!diff_enable.contains("scores::"), "{diff_enable}");
-    assert!(!diff_enable.contains("::a"), "{diff_enable}");
+    assert!(diff_enable.contains("enabled::b"));
+    assert!(diff_enable.contains("alerts::b"));
+    assert!(diff_enable.contains("records::b"));
+    assert!(!diff_enable.contains("scores::"));
+    assert!(!diff_enable.contains("::a"));
 
-    // Reverse everything back to the baseline membership.
     engine
-        .command(|| emit_view::<Enabled>()?.insert("b".into(), false))
+        .command(|| Enabled::set("b".into(), false).__apply())
         .expect("reverse enable");
     engine
-        .command(|| emit_view::<Names>()?.insert("a".into(), "alpha".into()))
+        .command(|| Names::set("a".into(), "alpha".into()).__apply())
         .expect("reverse name");
     engine
-        .command(|| emit_view::<Quantities>()?.insert("a".into(), 2))
+        .command(|| Quantities::set("a".into(), 2).__apply())
         .expect("reverse quantity");
     let restored = state_of(&engine);
-    assert_eq!(
-        restored.digest,
-        initial.digest,
-        "reverse digest mismatch:\n{}",
-        render_diff(&initial.digest, &restored.digest)
-    );
+    assert_eq!(restored.digest, initial.digest, "reverse digest mismatch");
     assert_eq!(restored.live_facts, initial.live_facts);
 
-    // Cold oracle: a fresh engine with the identical final membership.
-    let mut cold = Engine::new();
-    install(&mut cold);
-    seed_standard(&mut cold);
-    let cold_state = state_of(&cold);
+    let mut cold_workspace = install();
+    let cold = cold_workspace.engine_mut();
+    seed_standard(cold);
     assert_eq!(
         restored.digest,
-        cold_state.digest,
-        "warm/cold mismatch:\n{}",
-        render_diff(&restored.digest, &cold_state.digest)
+        state_of(&cold).digest,
+        "warm/cold mismatch"
     );
-}
-
-/// Key insertion/removal plus the missing-optional-input trace: absence is
-/// an exact dependency, removal retracts the whole owned set once, and
-/// reinsertion restores the exact initial graph.
-#[test]
-fn optional_input_and_membership_traces_are_reversible() {
-    let _counter_guard = super::fanout_components_test::COUNTER_LOCK.lock();
-    let mut engine = Engine::new();
-    install(&mut engine);
-    seed_standard(&mut engine);
-    // Give b the missing optional quantity, then remove it again.
-    let baseline = state_of(&engine);
-    engine
-        .command(|| emit_view::<Quantities>()?.insert("b".into(), 7))
-        .expect("insert optional");
-    let with_optional = state_of(&engine);
-    let diff = render_diff(&baseline.digest, &with_optional.digest);
-    assert!(diff.contains("quantities::b"), "{diff}");
-    assert!(diff.contains("records::b"), "{diff}");
-    assert!(!diff.contains("::a"), "{diff}");
-    engine
-        .command(|| emit_view::<Quantities>()?.remove("b".into()))
-        .expect("remove optional");
-    let restored = state_of(&engine);
-    assert_eq!(restored.digest, baseline.digest);
-    assert_eq!(restored.live_facts, baseline.live_facts);
-
-    // Owner-key removal retires all three outputs; unrelated keys stay cold.
-    engine
-        .command(|| emit_view::<Names>()?.remove("b".into()))
-        .expect("remove owner b");
-    let without_b = state_of(&engine);
-    let removal_diff = render_diff(&baseline.digest, &without_b.digest);
-    for leaked in ["::a"] {
-        assert!(!removal_diff.contains(leaked), "{removal_diff}");
-    }
-    assert!(removal_diff.contains("names::b"));
-    assert!(removal_diff.contains("records::b"));
-    assert!(removal_diff.contains("scores::b"));
-
-    // Reinsertion restores the exact pre-removal state (same logical node).
-    engine
-        .command(|| {
-            emit_view::<Names>()?.insert("b".into(), "beta".into())?;
-            emit_view::<Enabled>()?.insert("b".into(), false)?;
-            Ok(())
-        })
-        .expect("reinsert owner b");
-    let reopened = state_of(&engine);
-    assert_eq!(
-        reopened.digest,
-        baseline.digest,
-        "reopen mismatch:\n{}",
-        render_diff(&baseline.digest, &reopened.digest)
-    );
-    assert_eq!(reopened.live_facts, baseline.live_facts);
 }

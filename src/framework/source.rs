@@ -225,6 +225,7 @@ impl SourceRevision {
 #[derive(Clone)]
 pub struct SourceCommand {
     pub(crate) id: SourceCommandId,
+    pub(crate) fresh_document_id: Option<DocumentId>,
     pub base: Option<(DocumentId, SourceRevisionId)>,
     pub delta: SourceDelta,
     pub(crate) next_text: Arc<ropey::Rope>,
@@ -611,15 +612,18 @@ fn source_document(uri: String) -> Result<()> {
         return Err(Error::StaleSourceRevision { uri: uri.clone() });
     }
 
-    // Stable per-document identity (plan §3.2): derived from the URI, never
-    // from a process-global counter, so open order and process boundaries
-    // cannot change semantic identity.
+    // A reopened URI is a new document lineage. The workspace supplies a
+    // fresh id only for a URI whose previous membership was closed; the
+    // first open retains the deterministic URI-derived identity used by
+    // independent workspaces.
     let document_identity = || -> DocumentIdentity {
         previous
             .as_ref()
             .map(|revision| revision.document.clone())
             .unwrap_or(DocumentIdentity {
-                id: DocumentId(fnv1a_uri(&uri)),
+                id: command
+                    .fresh_document_id
+                    .unwrap_or(DocumentId(fnv1a_uri(uri.as_str()))),
                 uri: Arc::new(Uri::parse(uri.to_string()).expect("workspace uris parse")),
             })
     }();
@@ -692,7 +696,6 @@ fn next_command_id() -> u64 {
 ///
 /// Free-standing so the reactive module never names framework types.
 pub fn source_snapshot(snapshot: &crate::reactive::Snapshot, uri: &str) -> Option<SourceSnapshot> {
-    use crate::reactive::View;
     snapshot
         .observe::<SourceRevisions>(uri.to_string())
         .map(|value| SourceSnapshot(Arc::clone(&*value)))

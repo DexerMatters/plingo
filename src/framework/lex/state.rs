@@ -8,14 +8,13 @@ use crate::{
     framework::{
         lex::{
             __macro_private::{BuildErrorToken, TokenMatcher},
-            IncrementalLexStats, LexInterrupt, LexToken, LexerCreationError, LexerRoot, LexerState,
+            IncrementalLexStats, LexInterrupt, LexToken, LexerCreationError, LexerRoot,
             LexicalDocument, PersistentUriMap, TokenOccurrenceId, TokenPatch, build,
-            lexed::document_id,
             mode::{State, StateInfo},
             token::{CompiledState, StateMatcher},
         },
         parse::{TokenData, grammar::TerminalId},
-        source::{SourceDelta, SourceRevision, SourceRevisionId, SourceSplice},
+        source::{SourceDelta, SourceRevision, SourceSplice},
     },
     utils::{PrettyDisplay, Span},
 };
@@ -63,9 +62,7 @@ fn validate_source_delta(
             .checked_sub(splice.old_range.len())
             .and_then(|length| length.checked_add(splice.new_range.len()))
             .ok_or_else(|| {
-                LexInterrupt::InternalError(
-                    "source delta length arithmetic overflowed".to_string(),
-                )
+                LexInterrupt::InternalError("source delta length arithmetic overflowed".to_string())
             })?;
         old_cursor = splice.old_range.end;
         new_cursor = splice.new_range.end;
@@ -255,12 +252,16 @@ impl<Root: LexerRoot> Lexer<Root> {
             .ok_or(LexInterrupt::MissingState)?;
         let mut previous = next.documents.get(&uri).cloned();
         if let Some(current) = &previous {
-            if current.document.0 != revision.document.id.0 {
+            if revision.previous.is_none() {
+                // A fresh load starts a new document lineage.  Reset the
+                // private root before comparing document identities so a
+                // close/reopen with a fresh identity cannot look stale.
+                previous = None;
+            } else if current.document.0 != revision.document.id.0 {
                 return Err(LexInterrupt::StaleSourceRevision {
                     uri: uri.to_string(),
                 });
-            }
-            if revision.previous == Some(current.source_revision) {
+            } else if revision.previous == Some(current.source_revision) {
                 if revision.id == current.source_revision {
                     let structure = current.structure_revision;
                     return Ok(LexDocument {
@@ -268,12 +269,6 @@ impl<Root: LexerRoot> Lexer<Root> {
                         patch: TokenPatch::unchanged(structure),
                     });
                 }
-            } else if revision.previous.is_none() {
-                // A document can be closed and reopened while the lexer
-                // machine still owns the old private snapshot until the
-                // same command's retraction phase.  A fresh load starts a
-                // new source lineage and must not be rejected as stale.
-                previous = None;
             } else {
                 return Err(LexInterrupt::StaleSourceRevision {
                     uri: uri.to_string(),
@@ -337,8 +332,7 @@ impl<Root: LexerRoot> Lexer<Root> {
             } else {
                 Arc::new(snapshot.clone())
             };
-            let local =
-                self.relex_splice(&uri, &mut document, replay_source, &evolving)?;
+            let local = self.relex_splice(&uri, &mut document, replay_source, &evolving)?;
             total_relexed = total_relexed.saturating_add(local.replayed);
             total_reused = total_reused.saturating_add(local.reused);
             first_restart.get_or_insert(restart);

@@ -7,21 +7,22 @@
 //! no demand-lease API: installed stages materialize unconditionally, and
 //! closing a document retracts its whole downstream subtree.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use fluent_uri::Uri;
 
-use crate::framework::lex::LexerWork;
-use crate::framework::parse::ParserWork;
+use crate::framework::lex::{LexerRoot, LexerWork, install_lexer};
+use crate::framework::parse::{ParserWork, install_parser_tree};
 use crate::framework::source::{
     DocumentId, SourceCommand, SourceCommandId, SourceDelta, SourceEdit, SourceEdits,
     SourceRevisions, SourceWork, apply_splices, install_source, normalize_edits,
 };
+use crate::reactive::framework_mount::{MountComponent, MountComponentWithDomain};
 use crate::reactive::kind::emit_view;
 use crate::reactive::plain;
 use crate::reactive::{CommandReport, Engine, EngineWork, Result, Snapshot, View};
-
 // ---------------------------------------------------------------------------
 // Work reporting (plan §10.1).
 // ---------------------------------------------------------------------------
@@ -173,8 +174,107 @@ impl WorkspaceReport {
 /// The workspace facade.
 pub struct Workspace {
     engine: Engine,
+    /// URIs that have been opened in this workspace.  A close removes the
+    /// live source revision but deliberately keeps this tombstone so a later
+    /// open starts a fresh document identity rather than aliasing old facts.
+    opened_documents: HashSet<String>,
+}
+/// Staged workspace construction.
+///
+/// The builder installs the source pipeline first and then applies the
+/// requested lexer, parser, and externally mounted component roots.  The
+/// lexer type is carried at the type level so `.parser::<A>()` cannot be
+/// detached from the lexer it consumes.
+pub struct WorkspaceBuilder<R = ()> {
+    stages: Vec<Box<dyn FnOnce(&mut Engine) -> Result<()>>>,
+    marker: PhantomData<fn() -> R>,
 }
 
+impl Workspace {
+    /// Starts the public, typed workspace builder.
+    pub fn builder() -> WorkspaceBuilder {
+        WorkspaceBuilder {
+            stages: Vec::new(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<R> WorkspaceBuilder<R> {
+    fn stage(mut self, stage: impl FnOnce(&mut Engine) -> Result<()> + 'static) -> Self {
+        self.stages.push(Box::new(stage));
+        self
+    }
+
+    /// Adds an externally rooted component mount. The mount's removable
+    /// handle (a keyed family for map-entry mounts) is discarded here;
+    /// lifecycle is owned by the workspace for its whole life.
+    pub fn mount<C, S>(self, selector: S) -> Self
+    where
+        C: MountComponent<S>,
+        S: 'static,
+    {
+        self.stage(move |engine| {
+            C::mount(engine, selector)?;
+            Ok(())
+        })
+    }
+
+    /// Adds an externally rooted component mount with an explicit output
+    /// domain.  Use this when the selector domain and rendered tree domain
+    /// differ.
+    pub fn mount_with_domain<C, S, D>(self, selector: S, domain: D) -> Self
+    where
+        C: MountComponentWithDomain<S, D>,
+        S: 'static,
+        D: 'static,
+    {
+        self.stage(|engine| C::mount_with_domain(engine, selector, domain))
+    }
+
+    /// Completes construction and returns a committed workspace.
+    pub fn build(self) -> Result<Workspace> {
+        let mut engine = Engine::new();
+        install_source(&mut engine)?;
+        for stage in self.stages {
+            stage(&mut engine)?;
+        }
+        Ok(Workspace {
+            engine,
+            opened_documents: HashSet::new(),
+        })
+    }
+}
+
+impl WorkspaceBuilder<()> {
+    /// Adds the one lexer consumed by the parser and source pipeline.
+    pub fn lexer<R>(self) -> WorkspaceBuilder<R>
+    where
+        R: LexerRoot + Clone + std::fmt::Debug,
+    {
+        let stages = self.stage(|engine| install_lexer::<R>(engine)).stages;
+        WorkspaceBuilder {
+            stages,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<R> WorkspaceBuilder<R>
+where
+    R: LexerRoot + Clone + std::fmt::Debug,
+{
+    /// Adds the parser and its generated abstract-tree publication.
+    pub fn parser<A>(self) -> Self
+    where
+        A: crate::framework::parse::__macro_private::NonTerminalSpec
+            + crate::reactive::abstract_tree::AbstractTreeNode
+            + crate::reactive::abstract_tree::SyntaxFamilyPublication
+            + 'static,
+    {
+        self.stage(|engine| install_parser_tree::<R, A>(engine))
+    }
+}
 
 impl Workspace {
     /// Builds a workspace: installs the source pipeline plus any user
@@ -183,7 +283,10 @@ impl Workspace {
         let mut engine = Engine::new();
         install_source(&mut engine)?;
         install(&mut engine)?;
-        Ok(Workspace { engine })
+        Ok(Workspace {
+            engine,
+            opened_documents: HashSet::new(),
+        })
     }
 
     /// The underlying engine (for tests and advanced use).
@@ -229,28 +332,35 @@ impl Workspace {
                         old_range: 0..len,
                         new_range: 0..text.len(),
                     }]
-                    .into()
+                    .into(),
                 }
             }
             None => SourceDelta::Load {
                 new_len: text.len(),
             },
         };
-        let command = self.engine.command(move || {
-            emit_view::<SourceEdits>()?.insert(
-                uri_string.clone(),
-                SourceCommand {
-                    id: SourceCommandId(crate::framework::source::next_command_id_pub()),
-                    base,
-                    delta,
-                    next_text,
-                },
-            )?;
-            Ok(())
+        let command_id = crate::framework::source::next_command_id_pub();
+        let fresh_document_id = (existing.is_none() && self.opened_documents.contains(&uri_string))
+            .then_some(DocumentId(command_id));
+        let command = self.engine.command({
+            let uri_string = uri_string.clone();
+            move || {
+                emit_view::<SourceEdits>()?.insert(
+                    uri_string,
+                    SourceCommand {
+                        id: SourceCommandId(command_id),
+                        fresh_document_id,
+                        base,
+                        delta,
+                        next_text,
+                    },
+                )?;
+                Ok(())
+            }
         })?;
+        self.opened_documents.insert(uri_string);
         Ok(Self::assemble(command))
     }
-
 
     /// The committed revision for one document, if any.
     fn current_revision(&self, uri: &str) -> Option<Arc<crate::framework::source::SourceRevision>> {
@@ -273,7 +383,7 @@ impl Workspace {
         let mut validations: Vec<(String, SourceWork)> = Vec::with_capacity(by_uri.len());
         let mut commands = Vec::with_capacity(by_uri.len());
         for (uri, uri_edits) in &by_uri {
-            let frame = plain::push_metric_frame();
+            let _frame = plain::push_metric_frame();
             let revision = self.current_revision(uri);
             let normalized =
                 normalize_edits(revision.as_ref().map(|r| r.text.as_ref()), uri_edits)?;
@@ -288,9 +398,10 @@ impl Workspace {
                 validations.push((uri.clone(), validation));
                 continue;
             }
-            let previous = revision.expect("normalize requires an opened document");
-            let base = (previous.document.id, previous.id);
             // Apply descending splices to an O(1) Rope clone.
+            let previous = revision
+                .as_ref()
+                .expect("normalize requires an opened document");
             let next_rope =
                 apply_splices(&previous.text, &normalized.splices, &normalized.inserted)?;
             let new_len = next_rope.len_bytes();
@@ -303,10 +414,12 @@ impl Workspace {
             let delta = SourceDelta::Edit {
                 splices: normalized.splices.into(),
             };
+            let base = (previous.document.id, previous.id);
             commands.push((
                 uri.clone(),
                 SourceCommand {
                     id: SourceCommandId(crate::framework::source::next_command_id_pub()),
+                    fresh_document_id: None,
                     base: Some(base),
                     delta,
                     next_text: Arc::new(next_rope),

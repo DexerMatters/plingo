@@ -1,781 +1,480 @@
-//! Reusable view-level tree-transform harness.
+//! Parser-independent recursive tree transformation harness.
 //!
-//! `SurfacePrograms` is intentionally a tiny editable model. It publishes a
-//! source tree, then `lower_view_pass` maps that source tree to a distinct,
-//! heterogeneous core tree. The two stages meet only through public views:
-//! `SurfaceRoots`, `SurfaceTree`, `CoreTree`, and `CoreOrigin`.
-//!
-//! This keeps dependency tests independent of a parser's current lineage
-//! policy. A source payload update changes one `TreeKey::Payload`; a child
-//! insertion changes one `TreeKey::ChildOrder` plus one link. The transform
-//! mirrors those same smallest units in its target tree.
+//! The editable input is a map of semantic programs.  Components turn each
+//! map entry into a generated source tree, and a second recursive component
+//! family lowers that tree into a distinct target tree.  Stable component
+//! inputs, rather than identity tables or topology views, own node lifetime.
 
-use std::sync::Arc;
-use plingo::reactive::component::{EachKey, Read, Write};
-use plingo::reactive::kind::{Map, Tree, TreeFact, TreeKey, TreeView, emit_view};
-use plingo::reactive::prelude::*;
-use plingo::reactive::view::Node;
-use reactive_macros::{component, view};
+use plingo::prelude::*;
+use plingo::reactive::Snapshot;
+use plingo::reactive::digest::SemanticDigest;
+use std::collections::BTreeSet;
 
-/// Editable source fixture for one document.
-///
-/// The aggregate remains as a compatibility input for the original harness.
-/// New callers should write the four granular source views below in one
-/// command; the bridge component keeps both entry points equivalent.
+// ---------------------------------------------------------------------------
+// Semantic input and source/target trees
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SurfaceProgram {
     pub left: i64,
     pub right_name: Option<String>,
 }
 
-/// Source forest payloads. The source is structurally distinct from the core
-/// target: its expression is surface `Add`, not a semantic operation.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum SurfaceNode {
-    Document,
-    Binding,
-    /// A binding name is a payload dimension separate from the fixed tree
-    /// topology. Rendering intentionally keeps the historical `Binding` row.
-    BindingName(String),
-    Add,
-    Number(i64),
-    Name(String),
-}
-
-/// Target forest payloads. The lowered tree uses different roles and names.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum CoreNode {
-    Module,
-    LetBinding,
-    Integer(i64),
-    ApplyAdd,
-    Reference(String),
-}
-
-/// Stable source membership. The key is the only lifecycle driver for the
-/// document/add/binding/number components.
-#[view]
-pub struct ProgramMembership(Map<String, ()>);
-
-/// Independently editable source dimensions.
-#[view]
-pub struct BindingNames(Map<String, String>);
-
-#[view]
-pub struct NumberValues(Map<String, i64>);
-
-/// Absence removes the optional name subtree.
-#[view]
-pub struct ReferenceNames(Map<String, String>);
-
 #[view]
 pub struct SurfacePrograms(Map<String, SurfaceProgram>);
 
-/// One stable source root per document.
-#[view]
-pub struct SurfaceRoots(Map<String, Node<SurfaceTree>>);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SurfacePart {
-    Root,
-    Binding,
-    Add,
-    Number,
-    Name,
+#[abstract_tree(
+    domain = String,
+    tree = SurfaceTree,
+    members(SurfaceDocument, SurfaceDeclaration, SurfaceExpr)
+)]
+pub enum SurfaceDocument {
+    Program {
+        declarations: Vec<AstBox<SurfaceDeclaration>>,
+    },
+    Error {
+        diagnostic: String,
+    },
 }
 
-/// The generated source-node identity join. It is intentionally a derived
-/// map, not an editable identity table.
-#[view]
-pub struct SurfaceNodes(Map<(String, SurfacePart), Node<SurfaceTree>>);
-
-#[view]
-pub struct SurfaceTree(Tree<String, SurfaceNode>);
-
-#[view]
-pub struct CoreRoots(Map<String, Node<CoreTree>>);
-
-#[view]
-pub struct CoreNodes(Map<(String, SurfacePart), Node<CoreTree>>);
-
-#[view]
-pub struct CoreTree(Tree<String, CoreNode>);
-
-#[view]
-pub struct CoreOrigin(Map<Node<CoreTree>, Node<SurfaceTree>>);
-
-// ---------------------------------------------------------------------------
-// Granular source components
-// ---------------------------------------------------------------------------
-
-/// Compatibility bridge from the historical aggregate fixture to the
-/// independent source dimensions. It owns only source inputs, never tree
-/// facts, so direct writes to the granular views remain first-class.
-#[component]
-pub fn split_surface_program(
-    key: EachKey<SurfacePrograms>,
-    programs: Read<SurfacePrograms>,
-    membership: Write<ProgramMembership>,
-    bindings: Write<BindingNames>,
-    numbers: Write<NumberValues>,
-    references: Write<ReferenceNames>,
-) -> Result<()> {
-    let Some(program) = programs.get(&key)? else {
-        return Ok(());
-    };
-    membership.insert(key.clone(), ())?;
-    bindings.insert(key.clone(), program.right_name.clone().unwrap_or_default())?;
-    numbers.insert(key.clone(), program.left)?;
-    match &program.right_name {
-        Some(name) => references.insert(key, name.clone()),
-        None => references.remove(key),
-    }
+#[abstract_tree(member_of = SurfaceTree)]
+pub enum SurfaceDeclaration {
+    Binding { value: AstBox<SurfaceExpr> },
+    Error { diagnostic: String },
 }
 
-/// One source document owns the fixed tree topology and the identity join.
-/// Payloads for binding, add, and number nodes are owned by separate
-/// components so an editable dimension never republishes another payload.
-#[component]
-pub fn build_surface_root(
-    key: EachKey<ProgramMembership>,
-    roots: Write<SurfaceRoots>,
-    nodes: Write<SurfaceNodes>,
-) -> Result<()> {
-    let uri = key.clone();
-    let tree = emit_view::<SurfaceTree>()?;
-    let root = tree.allocate()?;
-    let binding = tree.allocate()?;
-    let add = tree.allocate()?;
-    let number = tree.allocate()?;
-
-    tree.put(
-        TreeKey::Payload(root.clone()),
-        Some(TreeFact::Payload(SurfaceNode::Document)),
-    )?;
-    tree.put(
-        TreeKey::Parent(root.clone()),
-        Some(TreeFact::Parent(None)),
-    )?;
-    tree.put(
-        TreeKey::ChildOrder(root.clone()),
-        Some(TreeFact::Order(Arc::from(vec![binding.clone()]))),
-    )?;
-    tree.put(
-        TreeKey::ChildLink(root.clone(), binding.clone()),
-        Some(TreeFact::Link(binding.clone())),
-    )?;
-    tree.put(
-        TreeKey::Parent(binding.clone()),
-        Some(TreeFact::Parent(Some(root.clone()))),
-    )?;
-    tree.put(
-        TreeKey::ChildOrder(binding.clone()),
-        Some(TreeFact::Order(Arc::from(vec![add.clone()]))),
-    )?;
-    tree.put(
-        TreeKey::ChildLink(binding.clone(), add.clone()),
-        Some(TreeFact::Link(add.clone())),
-    )?;
-    tree.put(
-        TreeKey::Parent(add.clone()),
-        Some(TreeFact::Parent(Some(binding.clone()))),
-    )?;
-    tree.put(
-        TreeKey::Parent(number.clone()),
-        Some(TreeFact::Parent(Some(add.clone()))),
-    )?;
-    tree.put(
-        TreeKey::ChildOrder(number.clone()),
-        Some(TreeFact::Order(Arc::from(Vec::new()))),
-    )?;
-    tree.put(
-        TreeKey::RootOrder(uri.clone()),
-        Some(TreeFact::RootOrder(Arc::from(vec![root.clone()]))),
-    )?;
-    tree.put(
-        TreeKey::RootLink(uri.clone(), root.clone()),
-        Some(TreeFact::RootLink(root.clone())),
-    )?;
-
-    roots.insert(uri.clone(), root.clone())?;
-    nodes.insert((uri.clone(), SurfacePart::Root), root)?;
-    nodes.insert((uri.clone(), SurfacePart::Binding), binding)?;
-    nodes.insert((uri.clone(), SurfacePart::Add), add)?;
-    nodes.insert((uri, SurfacePart::Number), number)
+#[abstract_tree(member_of = SurfaceTree)]
+pub enum SurfaceExpr {
+    Add { operands: Vec<AstBox<SurfaceExpr>> },
+    Number { value: i64 },
+    Name { value: String },
+    Error { diagnostic: String },
 }
 
-/// The reference identity is a separate output slot. It creates no topology
-/// or payload, and re-emits the existing identity on every reevaluation so
-/// ownership survives exact input changes.
-#[component]
-pub fn surface_reference_identity(
-    key: EachKey<ReferenceNames>,
-    names: Read<ReferenceNames>,
-    nodes: Read<SurfaceNodes>,
-    node_writes: Write<SurfaceNodes>,
-) -> Result<()> {
-    let Some(_name) = names.get(&key)? else {
-        return Ok(());
-    };
-    let Some(_add) = nodes.get(&(key.clone(), SurfacePart::Add))? else {
-        return Ok(());
-    };
-    let node = match nodes.get(&(key.clone(), SurfacePart::Name))? {
-        Some(node) => node.as_ref().clone(),
-        None => emit_view::<SurfaceTree>()?.allocate()?,
-    };
-    node_writes.insert((key, SurfacePart::Name), node)
+#[abstract_tree(
+    domain = String,
+    tree = CoreTree,
+    members(CoreDocument, CoreDeclaration, CoreExpr)
+)]
+pub enum CoreDocument {
+    Module {
+        declarations: Vec<AstBox<CoreDeclaration>>,
+    },
+    Error {
+        diagnostic: String,
+    },
 }
 
-/// Owns the aggregate child order for the source add node. Payload and
-/// optional-reference components therefore never compete for this fact.
-#[component]
-pub fn surface_child_edges(
-    key: EachKey<ProgramMembership>,
-    references: Read<ReferenceNames>,
-    nodes: Read<SurfaceNodes>,
-) -> Result<()> {
-    let reference = references.get(&key)?;
-    let Some(add) = nodes.get(&(key.clone(), SurfacePart::Add))? else {
-        return Ok(());
-    };
-    let Some(number) = nodes.get(&(key.clone(), SurfacePart::Number))? else {
-        return Ok(());
-    };
-
-    let tree = emit_view::<SurfaceTree>()?;
-    let mut children = vec![number.as_ref().clone()];
-    if reference.is_some()
-        && let Some(name_node) = nodes.get(&(key.clone(), SurfacePart::Name))?
-    {
-        tree.put(
-            TreeKey::Parent(name_node.as_ref().clone()),
-            Some(TreeFact::Parent(Some(add.as_ref().clone()))),
-        )?;
-        tree.put(
-            TreeKey::ChildOrder(name_node.as_ref().clone()),
-            Some(TreeFact::Order(Arc::from(Vec::new()))),
-        )?;
-        children.push(name_node.as_ref().clone());
-    }
-
-    tree.put(
-        TreeKey::ChildOrder(add.as_ref().clone()),
-        Some(TreeFact::Order(Arc::from(
-            children.iter().cloned().collect::<Vec<_>>(),
-        ))),
-    )?;
-    for child in children {
-        tree.put(
-            TreeKey::ChildLink(add.as_ref().clone(), child.clone()),
-            Some(TreeFact::Link(child)),
-        )?;
-    }
-    Ok(())
+#[abstract_tree(member_of = CoreTree)]
+pub enum CoreDeclaration {
+    Binding { value: AstBox<CoreExpr> },
+    Error { diagnostic: String },
 }
 
-/// The fixed source add payload has its own publication owner.
-#[component]
-pub fn surface_add_payload(
-    key: EachKey<ProgramMembership>,
-    nodes: Read<SurfaceNodes>,
-) -> Result<()> {
-    let Some(add) = nodes.get(&(key, SurfacePart::Add))? else {
-        return Ok(());
-    };
-    emit_view::<SurfaceTree>()?.put(
-        TreeKey::Payload(add.as_ref().clone()),
-        Some(TreeFact::Payload(SurfaceNode::Add)),
-    )
-}
-
-/// Binding text is a payload-only dimension. The optional map key is read
-/// exactly; absence restores the fixed binding payload.
-#[component]
-pub fn surface_binding_payload(
-    key: EachKey<ProgramMembership>,
-    names: Read<BindingNames>,
-    nodes: Read<SurfaceNodes>,
-) -> Result<()> {
-    let Some(binding) = nodes.get(&(key.clone(), SurfacePart::Binding))? else {
-        return Ok(());
-    };
-    let payload = match names.get(&key)? {
-        Some(name) => SurfaceNode::BindingName((*name).clone()),
-        None => SurfaceNode::Binding,
-    };
-    emit_view::<SurfaceTree>()?.put(
-        TreeKey::Payload(binding.as_ref().clone()),
-        Some(TreeFact::Payload(payload)),
-    )
-}
-
-
-// ---------------------------------------------------------------------------
-// Granular target components
-// ---------------------------------------------------------------------------
-
-/// The target root component maps only the fixed source topology. Payload
-/// components below update target leaves without reading source payloads.
-#[component]
-pub fn lower_view_root(
-    key: EachKey<SurfaceRoots>,
-    roots: Write<CoreRoots>,
-    nodes: Write<CoreNodes>,
-    source_nodes: Read<SurfaceNodes>,
-) -> Result<()> {
-    let uri = key.clone();
-    let Some(source_root) = observe_view::<SurfaceRoots>()?.get(&uri)? else {
-        return Ok(());
-    };
-    let source_root = source_root.as_ref().clone();
-    let tree = emit_view::<CoreTree>()?;
-    let root = tree.allocate()?;
-    let binding = tree.allocate()?;
-    let add = tree.allocate()?;
-    let number = tree.allocate()?;
-
-    tree.put(
-        TreeKey::Payload(root.clone()),
-        Some(TreeFact::Payload(CoreNode::Module)),
-    )?;
-    tree.put(
-        TreeKey::Parent(root.clone()),
-        Some(TreeFact::Parent(None)),
-    )?;
-    tree.put(
-        TreeKey::ChildOrder(root.clone()),
-        Some(TreeFact::Order(Arc::from(vec![binding.clone()]))),
-    )?;
-    tree.put(
-        TreeKey::ChildLink(root.clone(), binding.clone()),
-        Some(TreeFact::Link(binding.clone())),
-    )?;
-    tree.put(
-        TreeKey::Parent(binding.clone()),
-        Some(TreeFact::Parent(Some(root.clone()))),
-    )?;
-    tree.put(
-        TreeKey::ChildOrder(binding.clone()),
-        Some(TreeFact::Order(Arc::from(vec![add.clone()]))),
-    )?;
-    tree.put(
-        TreeKey::ChildLink(binding.clone(), add.clone()),
-        Some(TreeFact::Link(add.clone())),
-    )?;
-    tree.put(
-        TreeKey::Parent(add.clone()),
-        Some(TreeFact::Parent(Some(binding.clone()))),
-    )?;
-    tree.put(
-        TreeKey::Parent(number.clone()),
-        Some(TreeFact::Parent(Some(add.clone()))),
-    )?;
-    tree.put(
-        TreeKey::ChildOrder(number.clone()),
-        Some(TreeFact::Order(Arc::from(Vec::new()))),
-    )?;
-    tree.put(
-        TreeKey::RootOrder(uri.clone()),
-        Some(TreeFact::RootOrder(Arc::from(vec![root.clone()]))),
-    )?;
-    tree.put(
-        TreeKey::RootLink(uri.clone(), root.clone()),
-        Some(TreeFact::RootLink(root.clone())),
-    )?;
-
-    roots.insert(uri.clone(), root.clone())?;
-    nodes.insert((uri.clone(), SurfacePart::Root), root.clone())?;
-    nodes.insert((uri.clone(), SurfacePart::Binding), binding.clone())?;
-    nodes.insert((uri.clone(), SurfacePart::Add), add.clone())?;
-    nodes.insert((uri.clone(), SurfacePart::Number), number.clone())?;
-
-    let origin = emit_view::<CoreOrigin>()?;
-    for (part, target) in [
-        (SurfacePart::Root, root),
-        (SurfacePart::Binding, binding),
-        (SurfacePart::Add, add),
-        (SurfacePart::Number, number),
-    ] {
-        if let Some(source) = source_nodes.get(&(uri.clone(), part))? {
-            origin.insert(target, source.as_ref().clone())?;
-        }
-    }
-    // Keep the exact root join alive in the component dependency graph.
-    let _ = source_root;
-    Ok(())
-}
-
-/// The target reference identity has a separate automatic output slot.
-#[component]
-pub fn lower_reference_identity(
-    key: EachKey<ReferenceNames>,
-    names: Read<ReferenceNames>,
-    source_nodes: Read<SurfaceNodes>,
-    core_nodes: Read<CoreNodes>,
-    node_writes: Write<CoreNodes>,
-) -> Result<()> {
-    let Some(_name) = names.get(&key)? else {
-        return Ok(());
-    };
-    let Some(_source_add) = source_nodes.get(&(key.clone(), SurfacePart::Add))? else {
-        return Ok(());
-    };
-    let Some(_core_add) = core_nodes.get(&(key.clone(), SurfacePart::Add))? else {
-        return Ok(());
-    };
-    let node = match core_nodes.get(&(key.clone(), SurfacePart::Name))? {
-        Some(node) => node.as_ref().clone(),
-        None => emit_view::<CoreTree>()?.allocate()?,
-    };
-    node_writes.insert((key, SurfacePart::Name), node)
-}
-
-/// Owns the target add order and optional-reference topology.
-#[component]
-pub fn lower_child_edges(
-    key: EachKey<ProgramMembership>,
-    references: Read<ReferenceNames>,
-    source_nodes: Read<SurfaceNodes>,
-    core_nodes: Read<CoreNodes>,
-) -> Result<()> {
-    let reference = references.get(&key)?;
-    let Some(source_add) = source_nodes.get(&(key.clone(), SurfacePart::Add))? else {
-        return Ok(());
-    };
-    let Some(core_add) = core_nodes.get(&(key.clone(), SurfacePart::Add))? else {
-        return Ok(());
-    };
-    let Some(core_number) = core_nodes.get(&(key.clone(), SurfacePart::Number))? else {
-        return Ok(());
-    };
-    let tree = emit_view::<CoreTree>()?;
-    let mut children = vec![core_number.as_ref().clone()];
-    if reference.is_some()
-        && let Some(name_node) = core_nodes.get(&(key.clone(), SurfacePart::Name))?
-    {
-        tree.put(
-            TreeKey::Parent(name_node.as_ref().clone()),
-            Some(TreeFact::Parent(Some(core_add.as_ref().clone()))),
-        )?;
-        tree.put(
-            TreeKey::ChildOrder(name_node.as_ref().clone()),
-            Some(TreeFact::Order(Arc::from(Vec::new()))),
-        )?;
-        children.push(name_node.as_ref().clone());
-    }
-    tree.put(
-        TreeKey::ChildOrder(core_add.as_ref().clone()),
-        Some(TreeFact::Order(Arc::from(
-            children.iter().cloned().collect::<Vec<_>>(),
-        ))),
-    )?;
-    for child in children {
-        tree.put(
-            TreeKey::ChildLink(core_add.as_ref().clone(), child.clone()),
-            Some(TreeFact::Link(child)),
-        )?;
-    }
-    let _ = source_add;
-    Ok(())
-}
-
-/// Fixed target binding payload producer.
-#[component]
-pub fn lower_binding_payload(
-    key: EachKey<ProgramMembership>,
-    nodes: Read<CoreNodes>,
-) -> Result<()> {
-    let Some(binding) = nodes.get(&(key, SurfacePart::Binding))? else {
-        return Ok(());
-    };
-    emit_view::<CoreTree>()?.put(
-        TreeKey::Payload(binding.as_ref().clone()),
-        Some(TreeFact::Payload(CoreNode::LetBinding)),
-    )
-}
-
-/// Fixed target add payload producer.
-#[component]
-pub fn lower_add_payload(
-    key: EachKey<ProgramMembership>,
-    nodes: Read<CoreNodes>,
-) -> Result<()> {
-    let Some(add) = nodes.get(&(key, SurfacePart::Add))? else {
-        return Ok(());
-    };
-    emit_view::<CoreTree>()?.put(
-        TreeKey::Payload(add.as_ref().clone()),
-        Some(TreeFact::Payload(CoreNode::ApplyAdd)),
-    )
-}
-
-/// Number projection reads one source value and updates exactly two payload
-/// facts. It does not read roots, children, or sibling payloads.
-#[component]
-pub fn lower_number_payload(
-    key: EachKey<ProgramMembership>,
-    numbers: Read<NumberValues>,
-    source_nodes: Read<SurfaceNodes>,
-    core_nodes: Read<CoreNodes>,
-) -> Result<()> {
-    let Some(source) = source_nodes.get(&(key.clone(), SurfacePart::Number))? else {
-        return Ok(());
-    };
-    let Some(target) = core_nodes.get(&(key.clone(), SurfacePart::Number))? else {
-        return Ok(());
-    };
-    let (source_payload, target_payload) = match numbers.get(&key)? {
-        Some(value) => (
-            Some(SurfaceNode::Number(*value)),
-            Some(CoreNode::Integer(*value)),
-        ),
-        None => (None, None),
-    };
-    let source_tree = emit_view::<SurfaceTree>()?;
-    let target_tree = emit_view::<CoreTree>()?;
-    source_tree.put(
-        TreeKey::Payload(source.as_ref().clone()),
-        source_payload.map(TreeFact::Payload),
-    )?;
-    target_tree.put(
-        TreeKey::Payload(target.as_ref().clone()),
-        target_payload.map(TreeFact::Payload),
-    )
-}
-
-/// Optional reference payload. Its instance exists only while the
-/// reference-name membership key exists; topology and identity are owned by
-/// the field-edge component.
-#[component]
-pub fn lower_reference_payload(
-    key: EachKey<ReferenceNames>,
-    names: Read<ReferenceNames>,
-    source_nodes: Read<SurfaceNodes>,
-    core_nodes: Read<CoreNodes>,
-    origins: Write<CoreOrigin>,
-) -> Result<()> {
-    let Some(source_name) = source_nodes.get(&(key.clone(), SurfacePart::Name))? else {
-        return Ok(());
-    };
-    let Some(core_name) = core_nodes.get(&(key.clone(), SurfacePart::Name))? else {
-        return Ok(());
-    };
-    let Some(name) = names.get(&key)? else {
-        return Ok(());
-    };
-    let name = (*name).clone();
-    emit_view::<SurfaceTree>()?.put(
-        TreeKey::Payload(source_name.as_ref().clone()),
-        Some(TreeFact::Payload(SurfaceNode::Name(name.clone()))),
-    )?;
-    emit_view::<CoreTree>()?.put(
-        TreeKey::Payload(core_name.as_ref().clone()),
-        Some(TreeFact::Payload(CoreNode::Reference(name))),
-    )?;
-    origins.insert(core_name.as_ref().clone(), source_name.as_ref().clone())
-}
-
-/// Public installer retained for the harness while the generated definitions
-/// remain individually addressable for component-graph tests.
-pub fn build_surface_pass_install(engine: &mut plingo::reactive::Engine) -> plingo::Result<()> {
-    split_surface_program_install(engine)?;
-    build_surface_root_install(engine)?;
-    surface_reference_identity_install(engine)?;
-    surface_child_edges_install(engine)?;
-    surface_add_payload_install(engine)?;
-    surface_binding_payload_install(engine)?;
-    lower_number_payload_install(engine)?;
-    Ok(())
-}
-
-/// Installs the target-root, edge, and payload definitions.
-pub fn lower_view_pass_install(engine: &mut plingo::reactive::Engine) -> plingo::Result<()> {
-    lower_view_root_install(engine)?;
-    lower_reference_identity_install(engine)?;
-    lower_child_edges_install(engine)?;
-    lower_binding_payload_install(engine)?;
-    lower_add_payload_install(engine)?;
-    lower_reference_payload_install(engine)?;
-    Ok(())
+#[abstract_tree(member_of = CoreTree)]
+pub enum CoreExpr {
+    ApplyAdd { operands: Vec<AstBox<CoreExpr>> },
+    Integer { value: i64 },
+    Reference { name: String },
+    Error { diagnostic: String },
 }
 
 // ---------------------------------------------------------------------------
-// Semantic digest (follow-up plan §4 item 1): complete public-view content,
-// ID-erased and canonically ordered. Tree rows are keyed by structural DFS
-// paths (`surface:<uri>#0.1`), never by raw node ordinals, so a warm
-// workspace and a cold rebuild produce identical digests.
+// Recursive source construction
 // ---------------------------------------------------------------------------
 
-use plingo::reactive::digest::SemanticDigest;
-use std::collections::HashMap;
+/// Map membership owns one source-document component per URI.  The payload
+/// is deliberately not read here, so a payload edit does not recreate the
+/// document's root identity.
+#[component]
+pub fn build_surface(entry: Each<SurfacePrograms>) -> Result<AstBox<SurfaceDocument>> {
+    surface_document(entry.key().clone())
+}
 
-fn render_program(program: &SurfaceProgram) -> String {
-    let right_name = match &program.right_name {
-        Some(name) => format!("some({name:?})"),
-        None => "none".to_owned(),
+#[component]
+fn surface_document(uri: String) -> Result<AstBox<SurfaceDocument>> {
+    let declaration = surface_declaration(uri)?;
+    SurfaceDocument::render(SurfaceDocument::Program {
+        declarations: vec![declaration],
+    })
+}
+
+#[component]
+fn surface_declaration(uri: String) -> Result<AstBox<SurfaceDeclaration>> {
+    let value = surface_expr(uri)?;
+    SurfaceDeclaration::render(SurfaceDeclaration::Binding { value })
+}
+
+/// The only source component that reads the editable program.  It calls one
+/// stable child component per semantic leaf, so changing the optional name
+/// changes only the authored child list and the affected leaf.
+#[component]
+fn surface_expr(uri: String) -> Result<AstBox<SurfaceExpr>> {
+    let Some(program) = SurfacePrograms::get(&uri)? else {
+        return SurfaceExpr::render(SurfaceExpr::Error {
+            diagnostic: "missing program".to_owned(),
+        });
     };
-    format!("program{{left:{},right_name:{right_name}}}", program.left)
+    let number = surface_number(uri.clone())?;
+    let mut operands = vec![number];
+    if program.right_name.is_some() {
+        operands.push(surface_name(uri)?);
+    }
+    SurfaceExpr::render(SurfaceExpr::Add { operands })
 }
 
-fn render_surface(node: &SurfaceNode) -> String {
-    match node {
-        SurfaceNode::Document => "Document".to_owned(),
-        SurfaceNode::Binding | SurfaceNode::BindingName(_) => "Binding".to_owned(),
-        SurfaceNode::Add => "Add".to_owned(),
-        SurfaceNode::Number(value) => format!("Number({value})"),
-        SurfaceNode::Name(name) => format!("Name({name:?})"),
+#[component]
+fn surface_number(uri: String) -> Result<AstBox<SurfaceExpr>> {
+    let value = SurfacePrograms::get(&uri)?.map(|program| program.left);
+    match value {
+        Some(value) => SurfaceExpr::render(SurfaceExpr::Number { value }),
+        None => SurfaceExpr::render(SurfaceExpr::Error {
+            diagnostic: "missing number".to_owned(),
+        }),
     }
 }
 
-fn render_core(node: &CoreNode) -> String {
-    match node {
-        CoreNode::Module => "Module".to_owned(),
-        CoreNode::LetBinding => "LetBinding".to_owned(),
-        CoreNode::ApplyAdd => "ApplyAdd".to_owned(),
-        CoreNode::Integer(value) => format!("Integer({value})"),
-        CoreNode::Reference(name) => format!("Reference({name:?})"),
+#[component]
+fn surface_name(uri: String) -> Result<AstBox<SurfaceExpr>> {
+    let value = SurfacePrograms::get(&uri)?.and_then(|program| program.right_name.clone());
+    match value {
+        Some(value) => SurfaceExpr::render(SurfaceExpr::Name { value }),
+        None => SurfaceExpr::render(SurfaceExpr::Error {
+            diagnostic: "missing name".to_owned(),
+        }),
     }
 }
 
-/// Captures one tree family under one domain key as DFS path-keyed payload
-/// and parent rows plus the root-list row. Returns every visited node's path
-/// so provenance rows can be ID-erased too.
-fn capture_tree<V, F>(
-    digest: &mut SemanticDigest,
-    snapshot: &plingo::reactive::Snapshot,
+// ---------------------------------------------------------------------------
+// Recursive lowering
+// ---------------------------------------------------------------------------
+
+#[component]
+pub fn lower_document(source: AstBox<SurfaceDocument>) -> Result<AstBox<CoreDocument>> {
+    let value = match source.view()? {
+        SurfaceDocumentView::Program(program) => CoreDocument::Module {
+            declarations: program
+                .declarations()?
+                .iter()
+                .map(lower_declaration)
+                .collect::<Result<Vec<_>>>()?,
+        },
+        SurfaceDocumentView::Error(error) => CoreDocument::Error {
+            diagnostic: error.diagnostic()?.to_string(),
+        },
+    };
+    CoreDocument::render(value)
+}
+
+#[component]
+fn lower_declaration(source: AstBox<SurfaceDeclaration>) -> Result<AstBox<CoreDeclaration>> {
+    let value = match source.view()? {
+        SurfaceDeclarationView::Binding(binding) => CoreDeclaration::Binding {
+            value: lower_expr(binding.value()?)?,
+        },
+        SurfaceDeclarationView::Error(error) => CoreDeclaration::Error {
+            diagnostic: error.diagnostic()?.to_string(),
+        },
+    };
+    CoreDeclaration::render(value)
+}
+
+#[component]
+fn lower_expr(source: AstBox<SurfaceExpr>) -> Result<AstBox<CoreExpr>> {
+    let value = match source.view()? {
+        SurfaceExprView::Add(add) => CoreExpr::ApplyAdd {
+            operands: add
+                .operands()?
+                .iter()
+                .map(|child| lower_expr(child))
+                .collect::<Result<Vec<_>>>()?,
+        },
+        SurfaceExprView::Number(number) => CoreExpr::Integer {
+            value: *number.value()?,
+        },
+        SurfaceExprView::Name(name) => CoreExpr::Reference {
+            name: name.value()?.to_string(),
+        },
+        SurfaceExprView::Error(error) => CoreExpr::Error {
+            diagnostic: error.diagnostic()?.to_string(),
+        },
+    };
+    CoreExpr::render(value)
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot digest
+// ---------------------------------------------------------------------------
+
+fn child_path(parent: &str, index: usize) -> String {
+    if parent.is_empty() {
+        index.to_string()
+    } else {
+        format!("{parent}.{index}")
+    }
+}
+
+fn render_surface_document(
+    tree: &SnapshotTree<SurfaceTree>,
+    node: AstBox<SurfaceDocument>,
     uri: &str,
-    family: &str,
-    render: F,
-) -> HashMap<Node<V>, String>
-where
-    V: plingo::reactive::kind::TreeView<Key = String>,
-    F: Fn(&V::Payload) -> String,
-{
-    fn visit<V, F>(
-        digest: &mut SemanticDigest,
-        snapshot: &plingo::reactive::Snapshot,
-        node: Node<V>,
-        key: &str,
-        parent_key: Option<&str>,
-        family: &str,
-        identities: &mut HashMap<Node<V>, String>,
-        render: &F,
-    ) where
-        V: plingo::reactive::kind::TreeView<Key = String>,
-        F: Fn(&V::Payload) -> String,
-    {
-        identities.insert(node.clone(), key.to_owned());
-        let payload = snapshot
-            .tree_payload::<V>(node.clone())
-            .map(|payload| render(&payload))
-            .unwrap_or_else(|| "absent".to_owned());
-        digest.insert(&format!("{family}_tree"), key, &payload);
-        digest.insert(
-            &format!("{family}_parent"),
-            key,
-            parent_key.unwrap_or("none"),
-        );
-        for (index, child) in snapshot
-            .tree_children::<V>(node.clone())
-            .iter()
-            .enumerate()
-        {
-            let child_key = format!("{key}.{index}");
-            visit(
-                digest,
-                snapshot,
-                child.clone(),
-                &child_key,
-                Some(key),
-                family,
-                identities,
-                render,
-            );
+    path: &str,
+    parent: Option<&str>,
+    digest: &mut SemanticDigest,
+) -> Result<()> {
+    let key = format!("surface:{uri}#{path}");
+    let payload = match tree.view(node)? {
+        SurfaceDocumentView::Program(program) => {
+            let declarations = program.declarations()?;
+            for (index, child) in declarations.iter().enumerate() {
+                render_surface_declaration(
+                    tree,
+                    child,
+                    uri,
+                    &child_path(path, index),
+                    Some(&key),
+                    digest,
+                )?;
+            }
+            "Document".to_owned()
         }
-    }
-
-    let mut identities = HashMap::new();
-    let roots = snapshot.tree_roots_of::<V>(&uri.to_owned());
-    let root_paths: Vec<String> = roots
-        .iter()
-        .enumerate()
-        .map(|(index, _)| format!("{family}:{uri}#{index}"))
-        .collect();
-    digest.insert(
-        &format!("{family}_roots"),
-        uri,
-        &format!("[{}]", root_paths.join(",")),
-    );
-    for (index, root) in roots.iter().enumerate() {
-        let key = format!("{family}:{uri}#{index}");
-        visit(
-            digest,
-            snapshot,
-            root.clone(),
-            &key,
-            None,
-            family,
-            &mut identities,
-            &render,
-        );
-    }
-    identities
+        SurfaceDocumentView::Error(error) => format!("Error({:?})", error.diagnostic()?),
+    };
+    digest.insert("surface_tree", &key, &payload);
+    digest.insert("surface_parent", &key, parent.unwrap_or("none"));
+    Ok(())
 }
 
-/// Captures every present entry of every public view of this family.
-pub fn semantic_digest(snapshot: &plingo::reactive::Snapshot) -> SemanticDigest {
+fn render_surface_declaration(
+    tree: &SnapshotTree<SurfaceTree>,
+    node: AstBox<SurfaceDeclaration>,
+    uri: &str,
+    path: &str,
+    parent: Option<&str>,
+    digest: &mut SemanticDigest,
+) -> Result<()> {
+    let key = format!("surface:{uri}#{path}");
+    let payload = match tree.view(node)? {
+        SurfaceDeclarationView::Binding(binding) => {
+            render_surface_expr(
+                tree,
+                binding.value()?,
+                uri,
+                &child_path(path, 0),
+                Some(&key),
+                digest,
+            )?;
+            "Binding".to_owned()
+        }
+        SurfaceDeclarationView::Error(error) => format!("Error({:?})", error.diagnostic()?),
+    };
+    digest.insert("surface_tree", &key, &payload);
+    digest.insert("surface_parent", &key, parent.unwrap_or("none"));
+    Ok(())
+}
+
+fn render_surface_expr(
+    tree: &SnapshotTree<SurfaceTree>,
+    node: AstBox<SurfaceExpr>,
+    uri: &str,
+    path: &str,
+    parent: Option<&str>,
+    digest: &mut SemanticDigest,
+) -> Result<()> {
+    let key = format!("surface:{uri}#{path}");
+    let payload = match tree.view(node)? {
+        SurfaceExprView::Add(add) => {
+            for (index, child) in add.operands()?.iter().enumerate() {
+                render_surface_expr(
+                    tree,
+                    child,
+                    uri,
+                    &child_path(path, index),
+                    Some(&key),
+                    digest,
+                )?;
+            }
+            "Add".to_owned()
+        }
+        SurfaceExprView::Number(number) => format!("Number({})", number.value()?),
+        SurfaceExprView::Name(name) => format!("Name({:?})", name.value()?),
+        SurfaceExprView::Error(error) => format!("Error({:?})", error.diagnostic()?),
+    };
+    digest.insert("surface_tree", &key, &payload);
+    digest.insert("surface_parent", &key, parent.unwrap_or("none"));
+    Ok(())
+}
+
+fn render_core_document(
+    tree: &SnapshotTree<CoreTree>,
+    node: AstBox<CoreDocument>,
+    uri: &str,
+    path: &str,
+    parent: Option<&str>,
+    digest: &mut SemanticDigest,
+) -> Result<()> {
+    let key = format!("core:{uri}#{path}");
+    let payload = match tree.view(node)? {
+        CoreDocumentView::Module(module) => {
+            for (index, child) in module.declarations()?.iter().enumerate() {
+                render_core_declaration(
+                    tree,
+                    child,
+                    uri,
+                    &child_path(path, index),
+                    Some(&key),
+                    digest,
+                )?;
+            }
+            "Module".to_owned()
+        }
+        CoreDocumentView::Error(error) => format!("Error({:?})", error.diagnostic()?),
+    };
+    digest.insert("core_tree", &key, &payload);
+    digest.insert("core_parent", &key, parent.unwrap_or("none"));
+    digest.insert("core_origin", &key, &format!("surface:{uri}#{path}"));
+    Ok(())
+}
+
+fn render_core_declaration(
+    tree: &SnapshotTree<CoreTree>,
+    node: AstBox<CoreDeclaration>,
+    uri: &str,
+    path: &str,
+    parent: Option<&str>,
+    digest: &mut SemanticDigest,
+) -> Result<()> {
+    let key = format!("core:{uri}#{path}");
+    let payload = match tree.view(node)? {
+        CoreDeclarationView::Binding(binding) => {
+            render_core_expr(
+                tree,
+                binding.value()?,
+                uri,
+                &child_path(path, 0),
+                Some(&key),
+                digest,
+            )?;
+            "LetBinding".to_owned()
+        }
+        CoreDeclarationView::Error(error) => format!("Error({:?})", error.diagnostic()?),
+    };
+    digest.insert("core_tree", &key, &payload);
+    digest.insert("core_parent", &key, parent.unwrap_or("none"));
+    digest.insert("core_origin", &key, &format!("surface:{uri}#{path}"));
+    Ok(())
+}
+
+fn render_core_expr(
+    tree: &SnapshotTree<CoreTree>,
+    node: AstBox<CoreExpr>,
+    uri: &str,
+    path: &str,
+    parent: Option<&str>,
+    digest: &mut SemanticDigest,
+) -> Result<()> {
+    let key = format!("core:{uri}#{path}");
+    let payload = match tree.view(node)? {
+        CoreExprView::ApplyAdd(add) => {
+            for (index, child) in add.operands()?.iter().enumerate() {
+                render_core_expr(
+                    tree,
+                    child,
+                    uri,
+                    &child_path(path, index),
+                    Some(&key),
+                    digest,
+                )?;
+            }
+            "ApplyAdd".to_owned()
+        }
+        CoreExprView::Integer(integer) => format!("Integer({})", integer.value()?),
+        CoreExprView::Reference(reference) => format!("Reference({:?})", reference.name()?),
+        CoreExprView::Error(error) => format!("Error({:?})", error.diagnostic()?),
+    };
+    digest.insert("core_tree", &key, &payload);
+    digest.insert("core_parent", &key, parent.unwrap_or("none"));
+    digest.insert("core_origin", &key, &format!("surface:{uri}#{path}"));
+    Ok(())
+}
+
+/// Captures all semantic input and generated source/target snapshot rows.
+/// Traversal uses only generated family views and typed child accessors; no
+/// encoded fact keys or identity/projection maps are exposed to the example.
+pub fn semantic_digest(snapshot: &Snapshot) -> SemanticDigest {
     let mut digest = SemanticDigest::new();
+    let mut uris: BTreeSet<String> = snapshot.inputs::<SurfacePrograms>().into_iter().collect();
+    let surface = snapshot.tree::<SurfaceTree>();
+    let core = snapshot.tree::<CoreTree>();
 
-    // Complete domain enumeration: every URI known to any public view,
-    // including tree keys unreachable from an expected root.
-    let mut uris: Vec<String> = Vec::new();
-    uris.extend(snapshot.inputs::<SurfacePrograms>());
-    uris.extend(snapshot.inputs::<SurfaceRoots>());
-    for input in snapshot.inputs::<SurfaceTree>() {
-        if let TreeKey::RootOrder(uri) = input {
-            uris.push(uri);
-        }
-    }
-    for input in snapshot.inputs::<CoreTree>() {
-        if let TreeKey::RootOrder(uri) = input {
-            uris.push(uri);
-        }
-    }
-    uris.sort();
-    uris.dedup();
-
-    for uri in &uris {
-        let program = snapshot
-            .observe::<SurfacePrograms>(uri.clone())
-            .as_deref()
-            .map(render_program)
+    for uri in uris.iter() {
+        let program = SurfacePrograms::get_snapshot(snapshot, uri)
+            .map(|value| {
+                format!(
+                    "program{{left:{},right_name:{:?}}}",
+                    value.left, value.right_name
+                )
+            })
             .unwrap_or_else(|| "absent".to_owned());
         digest.insert("programs", uri, &program);
 
-        let surface_nodes =
-            capture_tree::<SurfaceTree, _>(&mut digest, snapshot, uri, "surface", render_surface);
-        let core_nodes =
-            capture_tree::<CoreTree, _>(&mut digest, snapshot, uri, "core", render_core);
+        let surface_roots: Vec<_> = surface.roots(uri).collect();
+        let surface_paths: Vec<String> = surface_roots
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("surface:{uri}#{index}"))
+            .collect();
+        digest.insert(
+            "surface_roots_map",
+            uri,
+            surface_paths
+                .first()
+                .map(String::as_str)
+                .unwrap_or("absent"),
+        );
+        digest.insert(
+            "surface_roots",
+            uri,
+            &format!("[{}]", surface_paths.join(",")),
+        );
+        for (index, root) in surface_roots.into_iter().enumerate() {
+            let path = index.to_string();
+            if let Err(error) =
+                render_surface_document(&surface, root, uri, &path, None, &mut digest)
+            {
+                digest.insert(
+                    "errors",
+                    &format!("surface:{uri}#{path}"),
+                    &error.to_string(),
+                );
+            }
+        }
 
-        let source_root_row = match snapshot.observe::<SurfaceRoots>(uri.clone()).as_deref() {
-            None => "absent".to_owned(),
-            Some(root) => surface_nodes
-                .get(root)
-                .cloned()
-                .unwrap_or_else(|| "unresolved-surface".to_owned()),
-        };
-        digest.insert("surface_roots_map", uri, &source_root_row);
-        for (core_node, core_path) in &core_nodes {
-            let origin_row = match snapshot.observe::<CoreOrigin>(core_node.clone()).as_deref() {
-                None => "absent".to_owned(),
-                Some(source) => surface_nodes
-                    .get(source)
-                    .cloned()
-                    .unwrap_or_else(|| "unresolved-surface".to_owned()),
-            };
-            digest.insert("core_origin", core_path, &origin_row);
+        let core_roots: Vec<_> = core.roots(uri).collect();
+        let core_paths: Vec<String> = core_roots
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("core:{uri}#{index}"))
+            .collect();
+        digest.insert("core_roots", uri, &format!("[{}]", core_paths.join(",")));
+        for (index, root) in core_roots.into_iter().enumerate() {
+            let path = index.to_string();
+            if let Err(error) = render_core_document(&core, root, uri, &path, None, &mut digest) {
+                digest.insert("errors", &format!("core:{uri}#{path}"), &error.to_string());
+            }
         }
     }
     digest
+}
+
+trait SnapshotSurfacePrograms {
+    fn get_snapshot(snapshot: &Snapshot, key: &String) -> Option<SurfaceProgram>;
+}
+
+impl SnapshotSurfacePrograms for SurfacePrograms {
+    fn get_snapshot(snapshot: &Snapshot, key: &String) -> Option<SurfaceProgram> {
+        snapshot
+            .observe::<SurfacePrograms>(key.clone())
+            .map(|value| (*value).clone())
+    }
 }

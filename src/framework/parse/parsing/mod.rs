@@ -5,22 +5,26 @@ use std::{
 };
 
 use indexmap::IndexSet;
+use smallvec::SmallVec;
 
 use crate::framework::parse::{
     build::ActionSet,
     data::{
         ast::{AstArena, TokenEntryId},
         green::{ParseErrorInfo, TreeArena},
-        gss::{GssArena, GssNodeId},
+        gss::{CanonicalFrontierCache, GssArena, GssNodeId},
         product::{ProductArena, ProductData, ProductId},
     },
     grammar::{BuildError, Grammar, TerminalId},
 };
 use crate::framework::{
-    lex::TokenPatch,
-    parse::types::{ParserTokenDocument, TokenData, TokenOccurrenceId},
+    lex::{StableDocumentId, TokenOccurrenceId, TokenPatch},
+    parse::types::{
+        ParserBoundaryId, ParserTokenDocument, RecoveryBoundaryId, TokenBoundaryId, TokenData,
+    },
 };
-use crate::utils::{persistent_seq::SeqMeasureWeight, PersistentSeq, SeqMeasure};
+use crate::reactive::store::{Hamt, TrieKey};
+use crate::utils::{PersistentSeq, SeqMeasure, persistent_seq::SeqMeasureWeight};
 
 mod checkpoint;
 mod incremental;
@@ -98,18 +102,88 @@ struct ReductionPath {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReductionKey {
     production: u32,
-    children: Vec<ProductId>,
+    children: SmallVec<[ProductId; 4]>,
     /// Empty reductions are anchored at their lookahead occurrence.
     boundary: Option<TokenOccurrenceId>,
 }
 
+impl TrieKey for ReductionKey {
+    fn trie_hash(&self) -> u64 {
+        let mut hash = lineage::trie_hash_u64(u64::from(self.production));
+        for child in &self.children {
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3) ^ lineage::trie_hash_u64(*child as u64);
+        }
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(self.boundary.is_some());
+        if let Some(boundary) = self.boundary {
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3) ^ lineage::trie_hash_u64(boundary.0);
+        }
+        hash
+    }
+
+    fn trie_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+/// Reduction-origin map key: the product whose reduction is remembered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OriginKey(pub(crate) ProductId);
+
+impl TrieKey for OriginKey {
+    fn trie_hash(&self) -> u64 {
+        lineage::trie_hash_u64(self.0 as u64)
+    }
+
+    fn trie_eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+/// Witness-interval map key: the witnessed token occurrence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OccurrenceKey(pub(crate) u64);
+
+impl TrieKey for OccurrenceKey {
+    fn trie_hash(&self) -> u64 {
+        lineage::trie_hash_u64(self.0)
+    }
+
+    fn trie_eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+/// Recovery-speculation mark for one parser command (Cut D): replay columns
+/// plus command-window journals. Restoring costs O(attempt work), never a
+/// complete session clone.
+#[derive(Clone)]
+pub(crate) struct TxnMark {
+    column_count: usize,
+    last_column: Option<ParseColumn>,
+    diagnostics_len: usize,
+    lineage: lineage::LineageMark,
+    synthetic_log_len: usize,
+    synthetic_ordinal: u64,
+    /// Highest recovery-journal serial at mark time.
+    journal_serial: u64,
+}
+
 #[derive(Debug)]
 pub enum ParseError {
-    MissingGoto { state: usize, non_terminal: u32 },
-    NoActiveStacks { column: Option<TokenOccurrenceId> },
-    MissingGssNode { node: GssNodeId },
+    MissingGoto {
+        state: usize,
+        non_terminal: u32,
+    },
+    NoActiveStacks {
+        column: Option<TokenOccurrenceId>,
+    },
+    MissingGssNode {
+        node: GssNodeId,
+    },
     Build(BuildError),
-    Recovered { product: ProductId },
+    Recovered {
+        product: ProductId,
+    },
     InvalidReachability {
         kind: &'static str,
         key: u64,
@@ -137,7 +211,7 @@ impl fmt::Display for ParseError {
                 )
             }
             Self::NoActiveStacks { column } => match column {
-                Some(column) => write!(f, "no active parse stacks at token column {column}"),
+                Some(column) => write!(f, "no active parse stacks at token column {}", column.0),
                 None => write!(f, "no active parse stacks"),
             },
             Self::MissingGssNode { node } => write!(f, "missing GSS node {node}"),
@@ -155,13 +229,15 @@ impl fmt::Display for ParseError {
         }
     }
 }
-
 /// One parse column: the GSS frontier at one token boundary plus the
 /// products reduced into it. Published liveness is derived exclusively
 /// from accepted-root reach counts; columns remain parser-cache state.
 #[derive(Clone)]
 pub(crate) struct ParseColumn {
+    /// The token shifted to enter this column. This is a transient cursor
+    /// hint; convergence identity is `boundary`, never this predecessor.
     token: Option<TokenOccurrenceId>,
+    boundary: Option<ParserBoundaryId>,
     base_active: IndexSet<GssNodeId>,
     active: IndexSet<GssNodeId>,
     accepted: Vec<ProductId>,
@@ -175,6 +251,7 @@ impl ParseColumn {
     pub(crate) fn new(token: Option<TokenOccurrenceId>, active: IndexSet<GssNodeId>) -> Self {
         Self {
             token,
+            boundary: None,
             base_active: active.clone(),
             active,
             accepted: Vec::new(),
@@ -185,6 +262,7 @@ impl ParseColumn {
         }
     }
 }
+
 /// Immutable metadata for one materialized parser segment. Later range views
 /// share this storage without copying retained columns.
 #[derive(Clone)]
@@ -192,7 +270,11 @@ struct SegmentData {
     columns: PersistentSeq<ParseColumn>,
     frontiers: PersistentSeq<checkpoint::FrontierCheckpoint>,
     token_columns: Arc<HashMap<TokenOccurrenceId, usize>>,
+    boundary_columns: Arc<HashMap<ParserBoundaryId, usize>>,
     token_products: Arc<HashMap<TokenOccurrenceId, ProductId>>,
+    /// Reverse index of `token_products`: seam binding maps a retained
+    /// token product to the current generation through its occurrence.
+    product_occurrences: Arc<HashMap<ProductId, TokenOccurrenceId>>,
     error_suffix_counts: PersistentSeq<usize>,
     first_dirty: Option<usize>,
     products_cache_stable: bool,
@@ -287,12 +369,34 @@ impl SegmentPart {
     }
 }
 
+/// Bounded symbolic references from old-generation products to the current
+/// seam products. Segment columns remain immutable; only this frontier-sized
+/// binding is consulted when a logical root is read.
+#[derive(Clone, Default)]
+pub(crate) struct SeamBinding {
+    products: Arc<HashMap<ProductId, ProductId>>,
+}
+
+impl SeamBinding {
+    pub(crate) fn from_map(map: HashMap<ProductId, ProductId>) -> Self {
+        Self {
+            products: Arc::new(map),
+        }
+    }
+
+    fn resolve(&self, product: ProductId) -> ProductId {
+        self.products.get(&product).copied().unwrap_or(product)
+    }
+
+    fn merge(left: &Self, right: &Self) -> Self {
+        let mut products = (*left.products).clone();
+        products.extend(right.products.iter().map(|(&old, &new)| (old, new)));
+        Self::from_map(products)
+    }
+}
+
 /// Persistent parser suffix storage. Slices and concatenations share the
 /// underlying column arrays and only allocate bounded piece metadata.
-///
-/// A rebased segment keeps its original immutable columns. Only the accepted
-/// products and token-product lookup are overlaid; the parser never needs to
-/// walk or rewrite the retained columns after a bounded seam proof.
 #[derive(Clone, Default)]
 pub(crate) struct ParseSegment {
     // Segment metadata is itself persistent. Concatenating a replay prefix
@@ -302,17 +406,61 @@ pub(crate) struct ParseSegment {
     length: usize,
     raw_accepted: Arc<[ProductId]>,
     accepted: Arc<[ProductId]>,
-    product_map: Arc<HashMap<ProductId, ProductId>>,
+    seam: Arc<SeamBinding>,
 }
 
 impl ParseSegment {
-    pub(crate) fn from_columns(mut columns: Vec<ParseColumn>, gss: &GssArena) -> Arc<Self> {
+    pub(crate) fn from_columns(
+        mut columns: Vec<ParseColumn>,
+        gss: &GssArena,
+        products: &ProductArena,
+        document: StableDocumentId,
+    ) -> Arc<Self> {
         let mut frontiers = Vec::with_capacity(columns.len());
         let mut token_columns = HashMap::new();
+        let mut boundary_columns = HashMap::new();
         let mut token_products = HashMap::new();
+        let mut frontier_cache = CanonicalFrontierCache::default();
         let mut first_dirty = None;
+        let mut next_real = vec![None; columns.len().saturating_add(1)];
+        for index in (0..columns.len()).rev() {
+            next_real[index] = columns[index]
+                .token
+                .filter(|&token| token != TokenOccurrenceId(u64::MAX))
+                .or(next_real[index + 1]);
+        }
+        let mut previous_real = None;
         for (index, column) in columns.iter_mut().enumerate() {
-            frontiers.push(checkpoint::frontier_checkpoint_for_column(column, gss).clone());
+            let inferred_boundary = match (column.token, next_real[index]) {
+                (Some(token), _) if token == TokenOccurrenceId(u64::MAX) => {
+                    // This is the post-EOF acceptance column, not a
+                    // lookahead gap.
+                    None
+                }
+                (_, Some(next)) if index == 0 => Some(ParserBoundaryId::Source(
+                    TokenBoundaryId::before(document, next),
+                )),
+                (Some(_), Some(next)) => Some(ParserBoundaryId::Source(TokenBoundaryId::before(
+                    document, next,
+                ))),
+                (Some(_), None) if previous_real.is_none() => {
+                    Some(ParserBoundaryId::Source(TokenBoundaryId::eof(document)))
+                }
+                (Some(_), None) => Some(ParserBoundaryId::Source(TokenBoundaryId::eof(document))),
+                (None, None) if index == 0 && previous_real.is_none() => {
+                    Some(ParserBoundaryId::Source(TokenBoundaryId::eof(document)))
+                }
+                (_, right) => Some(ParserBoundaryId::Recovery(RecoveryBoundaryId {
+                    left: previous_real,
+                    right,
+                    witness_ordinal: index as u64,
+                })),
+            };
+            let boundary = column.boundary.or(inferred_boundary);
+            column.boundary = boundary;
+            if let Some(boundary) = boundary {
+                boundary_columns.insert(boundary, index);
+            }
             if let Some(token) = column.token {
                 token_columns.insert(token, index);
                 if !column.error_derived
@@ -320,7 +468,19 @@ impl ParseSegment {
                 {
                     token_products.insert(token, product);
                 }
+                if token != TokenOccurrenceId(u64::MAX) {
+                    previous_real = Some(token);
+                }
             }
+            frontiers.push(
+                checkpoint::frontier_checkpoint_for_column(
+                    column,
+                    gss,
+                    products,
+                    &mut frontier_cache,
+                )
+                .clone(),
+            );
             if column.error_derived && first_dirty.is_none() {
                 first_dirty = Some(index);
             }
@@ -336,11 +496,17 @@ impl ParseSegment {
             .unwrap_or_default()
             .into();
         let length = columns.len();
+        let mut product_occurrences = HashMap::with_capacity(token_products.len());
+        for (occurrence, &product) in token_products.iter() {
+            product_occurrences.insert(product, *occurrence);
+        }
         let data = Arc::new(SegmentData {
             columns: PersistentSeq::from_iter(columns),
             frontiers: PersistentSeq::from_iter(frontiers),
             token_columns: Arc::new(token_columns),
+            boundary_columns: Arc::new(boundary_columns),
             token_products: Arc::new(token_products),
+            product_occurrences: Arc::new(product_occurrences),
             error_suffix_counts: PersistentSeq::from_iter(error_suffix_counts),
             first_dirty,
             // Reduction products are keyed by stable token anchors. A
@@ -356,7 +522,7 @@ impl ParseSegment {
             length,
             raw_accepted: raw_accepted.clone(),
             accepted: raw_accepted,
-            product_map: Arc::new(HashMap::new()),
+            seam: Arc::new(SeamBinding::default()),
         })
     }
 
@@ -402,6 +568,28 @@ impl ParseSegment {
         }
         None
     }
+    pub(crate) fn boundary_column(&self, boundary: ParserBoundaryId) -> Option<usize> {
+        let mut base = 0;
+        for part in self.parts.iter() {
+            let len = part.end - part.start;
+            if let Some(&index) = part.data.boundary_columns.get(&boundary)
+                && (part.start..part.end).contains(&index)
+            {
+                return Some(base + index - part.start);
+            }
+            base += len;
+        }
+        None
+    }
+
+    /// The token occurrence a retained segment product shifted, used by
+    /// seam binding to resolve stale token products through the current
+    /// generation.
+    pub(crate) fn product_occurrence(&self, product: ProductId) -> Option<TokenOccurrenceId> {
+        self.parts
+            .iter()
+            .find_map(|part| part.data.product_occurrences.get(&product).copied())
+    }
 
     pub(crate) fn token_product(&self, token: TokenOccurrenceId) -> Option<ProductId> {
         self.parts.iter().find_map(|part| {
@@ -415,16 +603,16 @@ impl ParseSegment {
                         .get(&token)
                         .is_some_and(|index| (part.start..part.end).contains(index))
                 })
-                .map(|product| self.product_map.get(&product).copied().unwrap_or(product))
+                .map(|product| self.seam.resolve(product))
         })
     }
 
-    /// Rebase the logical view of a retained segment without copying or
-    /// rewriting its columns. The raw columns remain the old convergence
-    /// oracle for the next command.
-    pub(crate) fn rebase(
+    /// Attach a bounded seam binding to the retained suffix. Columns and
+    /// their source products remain immutable; the current accepted roots are
+    /// supplied by the transaction's local replay.
+    pub(crate) fn attach_seam(
         &self,
-        product_map: HashMap<ProductId, ProductId>,
+        seam: Arc<SeamBinding>,
         accepted: Arc<[ProductId]>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -432,7 +620,7 @@ impl ParseSegment {
             length: self.length,
             raw_accepted: Arc::clone(&self.raw_accepted),
             accepted,
-            product_map: Arc::new(product_map),
+            seam,
         })
     }
 
@@ -481,7 +669,7 @@ impl ParseSegment {
             accepted: accepts
                 .then(|| Arc::clone(&self.accepted))
                 .unwrap_or_default(),
-            product_map: Arc::clone(&self.product_map),
+            seam: Arc::clone(&self.seam),
         })
     }
     pub(crate) fn concat(left: Arc<Self>, right: Arc<Self>) -> Arc<Self> {
@@ -491,14 +679,13 @@ impl ParseSegment {
         if right.is_empty() {
             return left;
         }
-        let mut product_map = (*left.product_map).clone();
-        product_map.extend(right.product_map.iter().map(|(&old, &new)| (old, new)));
+        let seam = Arc::new(SeamBinding::merge(&left.seam, &right.seam));
         Arc::new(Self {
             parts: left.parts.concat(&right.parts),
             length: left.length + right.length,
             raw_accepted: Arc::clone(&right.raw_accepted),
             accepted: Arc::clone(&right.accepted),
-            product_map: Arc::new(product_map),
+            seam,
         })
     }
 
@@ -560,7 +747,6 @@ impl ParseSegment {
             .collect()
     }
 }
-
 #[derive(Clone, Default)]
 pub struct ParserSessionState {
     pub(crate) columns: Vec<ParseColumn>,
@@ -569,7 +755,11 @@ pub struct ParserSessionState {
     pub(crate) retained_suffix: Option<Arc<ParseSegment>>,
     pub(crate) generation: u32,
     pub(crate) diagnostics: Vec<ParseErrorInfo>,
+    /// Indexed dedup guard over `diagnostics` so recording a recovery fact
+    /// never scans the journal linearly (Cut H).
+    pub(crate) diagnostic_index: std::collections::HashSet<ParseErrorInfo>,
     token_columns: HashMap<TokenOccurrenceId, usize>,
+    boundary_columns: HashMap<ParserBoundaryId, usize>,
     token_products: HashMap<TokenOccurrenceId, ProductId>,
     /// Per-document recovery segment serial (plan §14): monotonically
     /// increasing across commands, so synthetic identities never collide.
@@ -588,13 +778,39 @@ pub struct ParserSessionState {
     /// recovery-segment serials whose repairs touched it. A later structural
     /// patch probes only segments whose intervals intersect the changed
     /// region, never scanning the whole segment table.
-    pub(crate) witness_intervals: std::collections::BTreeMap<TokenOccurrenceId, Vec<u64>>,
-    reduced_products: HashMap<ReductionKey, ProductId>,
+    pub(crate) witness_intervals: Hamt<OccurrenceKey, Arc<Vec<u64>>>,
+    /// Reduction cache over a persistent trie: command clones stay O(1).
+    reduced_products: Hamt<ReductionKey, ProductId>,
     /// Inverse reduction cache used by suffix product rebasing. Keeping this
     /// index avoids rediscovering origins by scanning every cached reduction.
-    reduction_origins: HashMap<ProductId, ReductionKey>,
+    reduction_origins: Hamt<OriginKey, ReductionKey>,
+    /// This command's synthetic identities in insertion order so recovery
+    /// speculation can roll back without cloning session state.
+    pub(crate) synthetic_log: Vec<TokenOccurrenceId>,
+    /// Committed repair plans for reusable recovery regions (plan §14):
+    /// segment serial → journal entry. Clone-cheap persistent trie.
+    pub(crate) recovery_journal: Hamt<OccurrenceKey, Arc<RecoveryJournalEntry>>,
     /// Stable syntax-lineage identities for live records.
     pub(crate) lineage: lineage::LineageState,
+}
+
+/// One committed recovery segment's proven repair plan (plan §14).
+///
+/// The journal is the proof object for recovery-region reuse: a later replay
+/// that re-enters the region at an exactly equal frontier, with every
+/// witnessed token still present under the same occurrence and terminal,
+/// replays the recorded repairs instead of re-running the bounded search.
+/// Any witness that disappeared or changed terminal invalidates the entry.
+#[derive(Clone, Debug)]
+pub(crate) struct RecoveryJournalEntry {
+    /// The error occurrence that triggered the segment.
+    pub(crate) anchor: TokenOccurrenceId,
+    /// Frontier of the column the repairs were applied to.
+    pub(crate) frontier: checkpoint::FrontierCheckpoint,
+    /// Witnessed (occurrence, terminal) pairs this segment consumed.
+    pub(crate) witnesses: Vec<(TokenOccurrenceId, TerminalId)>,
+    /// The chosen repairs with the occurrence each anchored at.
+    pub(crate) repairs: Vec<(crate::framework::parse::recovery::Repair, TokenOccurrenceId)>,
 }
 
 impl ParserSessionState {
@@ -617,6 +833,7 @@ impl ParserSessionState {
         self.next_synthetic_ordinal = self.next_synthetic_ordinal.wrapping_add(1);
         let identity = self.synthetic_bytes(segment, ordinal);
         self.synthetic_tokens.insert(occurrence, identity);
+        self.synthetic_log.push(occurrence);
         identity
     }
 
@@ -631,35 +848,75 @@ impl ParserSessionState {
     /// occurrence to the segments that consumed it, so later structural
     /// patches can probe exactly the affected segments.
     pub(crate) fn record_witness(&mut self, occurrence: TokenOccurrenceId, segment: u64) {
-        let bucket = self.witness_intervals.entry(occurrence).or_default();
+        let key = OccurrenceKey(occurrence.0);
+        let mut bucket = self
+            .witness_intervals
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
         if !bucket.contains(&segment) {
-            bucket.push(segment);
+            Arc::make_mut(&mut bucket).push(segment);
+            self.witness_intervals.insert(key, bucket);
         }
     }
 
-    /// Probes the persistent witness index for the recovery segments whose
-    /// intervals intersect `[start, end]`. Returns segments in ascending
-    /// order; used by recovery-delta generation to keep unaffected segments
-    /// cold (plan §14 locality).
-    pub(crate) fn intersecting_witness_segments(
-        &self,
-        start: TokenOccurrenceId,
-        end: TokenOccurrenceId,
-    ) -> Vec<u64> {
-        let mut segments = std::collections::BTreeSet::new();
-        for &occurrence in self
-            .witness_intervals
-            .range(start..=end)
-            .flat_map(|(k, _)| std::iter::once(k))
-        {
-            if let Some(bucket) = self.witness_intervals.get(&occurrence) {
-                segments.extend(bucket.iter().copied());
-            }
+    /// Cheap recovery-speculation mark (Cut D). The last column is
+    /// snapshotted by value: recovery may mutate it in place, and one column
+    /// is bounded by its frontier, never the document.
+    pub(crate) fn mark(&self) -> TxnMark {
+        TxnMark {
+            column_count: self.columns.len(),
+            last_column: self.columns.last().cloned(),
+            diagnostics_len: self.diagnostics.len(),
+            lineage: self.lineage.mark(),
+            synthetic_log_len: self.synthetic_log.len(),
+            synthetic_ordinal: self.next_synthetic_ordinal,
+            journal_serial: self.next_recovery_segment,
         }
-        segments.into_iter().collect()
+    }
+
+    /// Drops journal entries created after `mark` (failed speculation).
+    pub(crate) fn rollback_journal(&mut self, serial_mark: u64) {
+        let stale: Vec<u64> = self
+            .recovery_journal
+            .iter()
+            .filter(|(key, _)| key.0 >= serial_mark)
+            .map(|(key, _)| key.0)
+            .collect();
+        for key in stale {
+            self.recovery_journal.remove(&OccurrenceKey(key));
+        }
+    }
+
+    /// Restores the exact pre-attempt replay state: appended columns are
+    /// dropped, the mutated frontier column is replaced by its snapshot, and
+    /// window journals (lineage, synthetics, diagnostics) lose the attempt's
+    /// additions. Arenas are append-only, so their records simply orphan.
+    pub(crate) fn rollback_to(&mut self, mark: TxnMark) {
+        self.lineage.rollback(mark.lineage);
+        self.rollback_journal(mark.journal_serial);
+        for occurrence in self.synthetic_log.drain(mark.synthetic_log_len..) {
+            self.synthetic_tokens.remove(&occurrence);
+        }
+        self.next_synthetic_ordinal = mark.synthetic_ordinal;
+        self.diagnostics.truncate(mark.diagnostics_len);
+        self.diagnostic_index = self.diagnostics.iter().cloned().collect();
+        self.retained_suffix = None;
+        debug_assert!(mark.column_count >= 1);
+        self.columns.truncate(mark.column_count);
+        if let Some(column) = mark.last_column
+            && let Some(slot) = self.columns.last_mut()
+        {
+            *slot = column;
+        }
+        self.boundary_columns
+            .retain(|_, &mut column| column < mark.column_count);
+        self.token_columns
+            .retain(|_, &mut column| column < mark.column_count);
+        self.token_products
+            .retain(|token, _| self.token_columns.contains_key(token));
     }
 }
-
 
 /// The direct AST record of one product, if any (plan §9.2). A column's
 /// record segment lists exactly these records for the products it holds,
@@ -684,6 +941,9 @@ pub(crate) struct SessionContext<'a> {
     pub(crate) actions: &'a [ActionSet],
     pub(crate) gotos: &'a [Option<usize>],
     pub(crate) error_recovery: bool,
+    /// Reused active-frontier worklist buffer (Cut H): taken and restored by
+    /// the reduce/shift paths so per-token frontier walks never allocate.
+    pub(crate) active_scratch: Vec<GssNodeId>,
 }
 
 #[derive(Clone)]
@@ -695,7 +955,6 @@ pub(crate) struct ReplayPlan {
     pub(crate) prefix_len: usize,
     pub(crate) suffix_len: usize,
     pub(crate) restart_boundary: usize,
-    pub(crate) old_reuse_start: usize,
     pub(crate) new_reuse_start: usize,
 }
 
@@ -723,30 +982,30 @@ impl ReplayPlan {
                     .before
                     .and_then(|occurrence| {
                         old.as_ref()
-                            .and_then(|document| document.rank_of_occurrence(occurrence.0 as usize))
+                            .and_then(|document| document.rank_of_occurrence(occurrence))
                     })
                     .map_or(0, |rank| rank.saturating_add(1));
                 let old_end = splice
                     .after
                     .and_then(|occurrence| {
                         old.as_ref()
-                            .and_then(|document| document.rank_of_occurrence(occurrence.0 as usize))
+                            .and_then(|document| document.rank_of_occurrence(occurrence))
                     })
                     .unwrap_or(old_extent);
                 let new_start = splice
                     .before
-                    .and_then(|occurrence| new.rank_of_occurrence(occurrence.0 as usize))
+                    .and_then(|occurrence| new.rank_of_occurrence(occurrence))
                     .map_or(0, |rank| rank.saturating_add(1));
                 let new_end = splice
                     .after
-                    .and_then(|occurrence| new.rank_of_occurrence(occurrence.0 as usize))
+                    .and_then(|occurrence| new.rank_of_occurrence(occurrence))
                     .unwrap_or(new_extent);
                 debug_assert!(old_start <= old_end && new_start <= new_end);
                 ranges.push((old_start, old_end, new_start, new_end));
             }
         }
         let prefix_len = ranges.first().map_or(old_extent, |range| range.0);
-        let (old_reuse_start, new_reuse_start) = ranges
+        let (suffix_old_end, new_reuse_start) = ranges
             .last()
             .map_or((old_extent, new_extent), |range| (range.1, range.3));
         Self {
@@ -755,15 +1014,10 @@ impl ReplayPlan {
             old_extent,
             new_extent,
             prefix_len,
-            suffix_len: old_extent.saturating_sub(old_reuse_start),
+            suffix_len: old_extent.saturating_sub(suffix_old_end),
             restart_boundary: prefix_len,
-            old_reuse_start,
             new_reuse_start,
         }
-    }
-
-    pub(crate) fn old_unit(&self, rank: usize) -> Option<TokenData> {
-        self.old.as_ref()?.token_at(rank)
     }
 
     pub(crate) fn new_unit(&self, rank: usize) -> Option<TokenData> {

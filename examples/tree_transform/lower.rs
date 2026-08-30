@@ -1,191 +1,123 @@
-//! A dependency-driven transform from the parser's homogeneous syntax tree
-//! into a separate heterogeneous lowered tree.
+//! Recursive parser-independent lowering for the tree-transform example.
 //!
-//! Each source payload owns one target payload/provenance row. Edge and
-//! child-order components own the corresponding target topology facts, while
-//! the root component owns document root membership. Consequently a source
-//! payload rewrite updates that target payload without rebuilding an unchanged
-//! ancestor or sibling; a child-order rewrite updates only the corresponding
-//! target order/link facts.
+//! The parser publishes `TransformTree` through the same abstract-tree schema
+//! used by the lowered tree.  Each component reads only the fields it needs,
+//! calls child components for semantic children, and returns one owned
+//! `AstBox` render output.  No identity table or raw topology view is needed.
 
-use std::sync::Arc;
-
-use plingo::framework::parse::{
-    ParserTreeEdges, ParserTreeOrders, ParserTreePayloads, ParserTreeRoots, ParserTreeStatuses,
-};
-use plingo::reactive::component::{EachKey, Read, Write};
-use plingo::reactive::kind::{Map, Tree, TreeFact, TreeKey, emit_view};
-use plingo::reactive::prelude::*;
-use plingo::reactive::view::Node;
-use plingo::reactive::{Engine, Result};
-use reactive_macros::view;
-
-use super::syntax::{
-    TransformDeclarationNode, TransformDocument, TransformDocumentNode, TransformExprNode,
-    TransformNode, TransformTree,
-};
-
-/// Payload language deliberately distinct from the parser's generated tree.
-/// The transform erases surface tokens and assigns semantic roles instead.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum LoweredNode {
-    Module,
-    Binding,
-    Sum,
-    Difference,
-    Group,
-    Number,
-    Name,
-    ParseError,
-    Missing,
-}
-
-/// One lowered forest per source URI.
-#[view]
-pub struct LoweredTree(Tree<String, LoweredNode>);
-
-/// Provenance is a separate view so consumers can join a lowered node back to
-/// exactly one syntax-tree node without traversing either tree.
-#[view]
-pub struct LoweredOrigin(Map<Node<LoweredTree>, Node<TransformTree>>);
-
-/// Stable source-to-target node identity join.
-#[view]
-pub struct LoweredNodes(Map<Node<TransformTree>, Node<LoweredTree>>);
-
-/// One source payload owns exactly one target payload and provenance row.
-#[reactive_macros::component]
-pub fn lower_source_node(
-    key: EachKey<ParserTreePayloads<TransformDocument>>,
-    payloads: Read<ParserTreePayloads<TransformDocument>>,
-    nodes: Read<LoweredNodes>,
-    node_writes: Write<LoweredNodes>,
-) -> Result<()> {
-    let Some(payload) = payloads.get(&key)? else {
-        return Ok(());
-    };
-    let target = match nodes.get(&key)? {
-        Some(target) => target.as_ref().clone(),
-        None => emit_view::<LoweredTree>()?.allocate()?,
-    };
-    emit_view::<LoweredTree>()?.put(
-        TreeKey::Payload(target.clone()),
-        Some(TreeFact::Payload(lowered_payload_kind(&payload))),
-    )?;
-    node_writes.insert(key.clone(), target.clone())?;
-    emit_view::<LoweredOrigin>()?.insert(target, key)?;
-    Ok(())
-}
-
-/// One source edge owns one target parent fact and one target link fact.
-#[reactive_macros::component]
-pub fn lower_source_edge(
-    key: EachKey<ParserTreeEdges<TransformDocument>>,
-    edges: Read<ParserTreeEdges<TransformDocument>>,
-    nodes: Read<LoweredNodes>,
-) -> Result<()> {
-    if edges.get(&key)?.is_none() {
-        return Ok(());
-    }
-    let (source_parent, source_child) = key;
-    let Some(parent) = nodes.get(&source_parent)? else {
-        return Ok(());
-    };
-    let Some(child) = nodes.get(&source_child)? else {
-        return Ok(());
-    };
-    let tree = emit_view::<LoweredTree>()?;
-    tree.put(
-        TreeKey::Parent(child.as_ref().clone()),
-        Some(TreeFact::Parent(Some(parent.as_ref().clone()))),
-    )?;
-    tree.put(
-        TreeKey::ChildLink(parent.as_ref().clone(), child.as_ref().clone()),
-        Some(TreeFact::Link(child.as_ref().clone())),
-    )?;
-    Ok(())
-}
-
-/// One source child-order row owns one target child-order fact.
-#[reactive_macros::component]
-pub fn lower_source_order(
-    key: EachKey<ParserTreeOrders<TransformDocument>>,
-    orders: Read<ParserTreeOrders<TransformDocument>>,
-    nodes: Read<LoweredNodes>,
-) -> Result<()> {
-    let Some(order) = orders.get(&key)? else {
-        return Ok(());
-    };
-    let Some(parent) = nodes.get(&key)? else {
-        return Ok(());
-    };
-    let mut children = Vec::with_capacity(order.len());
-    for source_child in order.iter() {
-        let Some(child) = nodes.get(source_child)? else {
-            return Ok(());
-        };
-        children.push(child.as_ref().clone());
-    }
-    emit_view::<LoweredTree>()?.put(
-        TreeKey::ChildOrder(parent.as_ref().clone()),
-        Some(TreeFact::Order(Arc::from(children))),
-    )
-}
-
-/// One source root row owns one target document root list.
-#[reactive_macros::component]
-pub fn lower_source_root(
-    key: EachKey<ParserTreeRoots<TransformDocument>>,
-    roots: Read<ParserTreeRoots<TransformDocument>>,
-    nodes: Read<LoweredNodes>,
-) -> Result<()> {
-    let Some(source_root) = roots.get(&key)? else {
-        return Ok(());
-    };
-    let Some(target_root) = nodes.get(source_root.as_ref())? else {
-        return Ok(());
-    };
-    emit_view::<LoweredTree>()?.replace_roots(&key, &[target_root.as_ref().clone()])
-}
-
-/// Installs the parser-backed lowering components as one transform pass.
-pub fn lower_pass_install(engine: &mut Engine) -> Result<()> {
-    lower_source_node_install(engine)?;
-    lower_source_edge_install(engine)?;
-    lower_source_order_install(engine)?;
-    lower_source_root_install(engine)?;
-    Ok(())
-}
-
-fn lowered_payload_kind(payload: &TransformNode) -> LoweredNode {
-    match payload {
-        TransformNode::Document(TransformDocumentNode::Program { .. }) => LoweredNode::Module,
-        TransformNode::Document(TransformDocumentNode::Error { .. })
-        | TransformNode::Declaration(TransformDeclarationNode::Error { .. })
-        | TransformNode::Expr(TransformExprNode::Error { .. }) => LoweredNode::ParseError,
-        TransformNode::Declaration(TransformDeclarationNode::Binding { .. }) => {
-            LoweredNode::Binding
-        }
-        TransformNode::Expr(TransformExprNode::Add { .. }) => LoweredNode::Sum,
-        TransformNode::Expr(TransformExprNode::Subtract { .. }) => LoweredNode::Difference,
-        TransformNode::Expr(TransformExprNode::Group { .. }) => LoweredNode::Group,
-        TransformNode::Expr(TransformExprNode::Number { .. }) => LoweredNode::Number,
-        TransformNode::Expr(TransformExprNode::Name { .. }) => LoweredNode::Name,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Semantic digest (follow-up plan §4): complete parser-backed family content,
-// ID-erased and canonically ordered.
-// ---------------------------------------------------------------------------
-
+use plingo::framework::parse::{AstSnapshots, ParseStatus};
+use plingo::prelude::*;
+use plingo::reactive::Snapshot;
+use plingo::reactive::abstract_tree::AstBox;
+use plingo::reactive::digest::SemanticDigest;
 use std::collections::HashMap;
 
-use plingo::framework::parse::{AstSnapshot, AstSnapshots, ParseStatus};
-use plingo::framework::source::{SourceSnapshot, source_snapshot};
-use plingo::reactive::digest::SemanticDigest;
+use super::syntax::{
+    TransformDeclaration, TransformDocument, TransformDocumentView, TransformExpr,
+    TransformExprView,
+};
 
-/// The structural path of a child at `index` under `parent` (`""` is the root).
+/// The semantic lowered family.  The target deliberately has its own schema,
+/// even though it preserves the source tree's recursive shape.
+#[abstract_tree(domain = String, tree = LoweredTree, members(LoweredDocument, LoweredDeclaration, LoweredExpr))]
+pub enum LoweredDocument {
+    Module {
+        declarations: Vec<AstBox<LoweredDeclaration>>,
+    },
+    Error {
+        diagnostic: String,
+    },
+}
+
+#[abstract_tree(member_of = LoweredTree)]
+pub enum LoweredDeclaration {
+    Binding { value: AstBox<LoweredExpr> },
+    Error { diagnostic: String },
+}
+
+#[abstract_tree(member_of = LoweredTree)]
+pub enum LoweredExpr {
+    Add {
+        left: AstBox<LoweredExpr>,
+        right: AstBox<LoweredExpr>,
+    },
+    Subtract {
+        left: AstBox<LoweredExpr>,
+        right: AstBox<LoweredExpr>,
+    },
+    Group {
+        expression: AstBox<LoweredExpr>,
+    },
+    Number,
+    Name,
+    Error {
+        diagnostic: String,
+    },
+}
+
+/// Lowers one parser document root.  The generated root mount owns the target
+/// root relation; this body owns only its render slot and child calls.
+#[component]
+pub fn lower_document(source: AstBox<TransformDocument>) -> Result<AstBox<LoweredDocument>> {
+    let value = match source.view()? {
+        TransformDocumentView::Program(program) => LoweredDocument::Module {
+            declarations: program
+                .declarations()?
+                .iter()
+                .map(lower_declaration)
+                .collect::<Result<Vec<_>>>()?,
+        },
+        TransformDocumentView::Error(error) => LoweredDocument::Error {
+            diagnostic: format!("{:?}", error.error()?),
+        },
+    };
+    LoweredDocument::render(value)
+}
+
+#[component]
+pub fn lower_declaration(
+    source: AstBox<TransformDeclaration>,
+) -> Result<AstBox<LoweredDeclaration>> {
+    let value = match source.view()? {
+        super::syntax::TransformDeclarationView::Binding(binding) => LoweredDeclaration::Binding {
+            value: lower_expr(binding.value()?)?,
+        },
+        super::syntax::TransformDeclarationView::Error(error) => LoweredDeclaration::Error {
+            diagnostic: format!("{:?}", error.error()?),
+        },
+    };
+    LoweredDeclaration::render(value)
+}
+
+#[component]
+pub fn lower_expr(source: AstBox<TransformExpr>) -> Result<AstBox<LoweredExpr>> {
+    let value = match source.view()? {
+        TransformExprView::Add(add) => LoweredExpr::Add {
+            left: lower_expr(add.left()?)?,
+            right: lower_expr(add.right()?)?,
+        },
+        TransformExprView::Subtract(subtract) => LoweredExpr::Subtract {
+            left: lower_expr(subtract.left()?)?,
+            right: lower_expr(subtract.right()?)?,
+        },
+        TransformExprView::Group(group) => LoweredExpr::Group {
+            expression: lower_expr(group.expression()?)?,
+        },
+        TransformExprView::Number(_) => LoweredExpr::Number,
+        TransformExprView::Name(_) => LoweredExpr::Name,
+        TransformExprView::Error(error) => LoweredExpr::Error {
+            diagnostic: format!("{:?}", error.error()?),
+        },
+    };
+    LoweredExpr::render(value)
+}
+
+// ---------------------------------------------------------------------------
+// ID-erased semantic digest used by the example's warm/cold and lifecycle
+// oracles.  It intentionally traverses generated snapshot accessors rather
+// than encoded tree fact keys.
+// ---------------------------------------------------------------------------
+
 fn child_path(parent: &str, index: usize) -> String {
     if parent.is_empty() {
         index.to_string()
@@ -194,7 +126,6 @@ fn child_path(parent: &str, index: usize) -> String {
     }
 }
 
-/// Renders one parse status so recovery states appear in digests.
 fn render_status(status: &ParseStatus) -> String {
     match status {
         ParseStatus::Clean => "clean".to_owned(),
@@ -203,135 +134,233 @@ fn render_status(status: &ParseStatus) -> String {
     }
 }
 
-/// The exact source lexeme a Number/Name leaf was built from, resolved by
-/// joining through the origin view into the parser's payload and token
-/// coordinates, then slicing the committed source text.
-fn leaf_lexeme(
+fn source_leaf_lexeme(
     snapshot: &Snapshot,
-    ast: Option<&AstSnapshot>,
+    ast: Option<&plingo::framework::parse::AstSnapshot>,
     source: Option<&SourceSnapshot>,
-    node: Node<LoweredTree>,
+    node: AstBox<TransformExpr>,
 ) -> String {
-    let missing = || "?".to_owned();
-    let Some(origin) = snapshot
-        .observe::<LoweredOrigin>(node.clone())
-        .map(|origin| origin.as_ref().clone())
-    else {
-        return missing();
+    let fallback = || "?".to_owned();
+    let token = match snapshot.tree::<super::syntax::TransformTree>().view(node) {
+        Ok(TransformExprView::Number(number)) => number.token().ok(),
+        Ok(TransformExprView::Name(name)) => name.token().ok(),
+        _ => None,
     };
-    let Some(payload) = snapshot.observe::<ParserTreePayloads<TransformDocument>>(origin) else {
-        return missing();
-    };
-    let token = match payload.as_ref() {
-        TransformNode::Expr(TransformExprNode::Number { f0, .. })
-        | TransformNode::Expr(TransformExprNode::Name { f0, .. }) => *f0,
-        _ => return missing(),
+    let Some(token) = token.as_deref().copied() else {
+        return fallback();
     };
     let Some(entry) = ast.and_then(|ast| ast.token(token)) else {
-        return missing();
+        return fallback();
     };
-    let (start, end): (usize, usize) = entry.span.range.into();
+    let range = entry.span.range;
     source
-        .and_then(|source| source.byte_slice(start..end).ok())
-        .unwrap_or_else(missing)
-}
-fn render_payload(
-    snapshot: &Snapshot,
-    ast: Option<&AstSnapshot>,
-    source: Option<&SourceSnapshot>,
-    node: Node<LoweredTree>,
-) -> String {
-    let kind = snapshot
-        .tree_payload::<LoweredTree>(node.clone())
-        .map(|kind| (*kind).clone())
-        .unwrap_or(LoweredNode::Missing);
-    match kind {
-        LoweredNode::Number | LoweredNode::Name => {
-            format!("{kind:?}({})", leaf_lexeme(snapshot, ast, source, node))
-        }
-        other => format!("{other:?}"),
-    }
+        .and_then(|source| source.byte_slice(range.start()..range.end()).ok())
+        .unwrap_or_else(fallback)
 }
 
-/// Captures every lowered node, provenance link, and parse status of this
-/// family across every document, ID-erased and canonically ordered.
+fn source_expr_at_path(
+    snapshot: &Snapshot,
+    root: AstBox<TransformDocument>,
+    path: &str,
+) -> Option<AstBox<TransformExpr>> {
+    let mut segments = path.split('.');
+    let declaration_index = segments.next()?.parse::<usize>().ok()?;
+    let tree = snapshot.tree::<super::syntax::TransformTree>();
+    let declaration = match tree.view(root).ok()? {
+        TransformDocumentView::Program(program) => {
+            program.declarations().ok()?.get(declaration_index)?
+        }
+        TransformDocumentView::Error(_) => return None,
+    };
+    let value = match tree.view(declaration).ok()? {
+        super::syntax::TransformDeclarationView::Binding(binding) => binding.value().ok()?,
+        super::syntax::TransformDeclarationView::Error(_) => return None,
+    };
+    let rest = segments.collect::<Vec<_>>();
+    if rest.first().copied() != Some("0") {
+        return None;
+    }
+    source_expr_descendant(snapshot, value, &rest[1..])
+}
+
+fn source_expr_descendant(
+    snapshot: &Snapshot,
+    mut node: AstBox<TransformExpr>,
+    segments: &[&str],
+) -> Option<AstBox<TransformExpr>> {
+    let tree = snapshot.tree::<super::syntax::TransformTree>();
+    for segment in segments {
+        let index = segment.parse::<usize>().ok()?;
+        node = match tree.view(node).ok()? {
+            TransformExprView::Add(add) if index == 0 => add.left().ok()?,
+            TransformExprView::Add(add) if index == 1 => add.right().ok()?,
+            TransformExprView::Subtract(subtract) if index == 0 => subtract.left().ok()?,
+            TransformExprView::Subtract(subtract) if index == 1 => subtract.right().ok()?,
+            TransformExprView::Group(group) if index == 0 => group.expression().ok()?,
+            _ => return None,
+        };
+    }
+    Some(node)
+}
+
+fn render_lowered(
+    tree: &SnapshotTree<super::lower::LoweredTree>,
+    node: AstBox<LoweredDocument>,
+    source_root: Option<AstBox<TransformDocument>>,
+    snapshot: &Snapshot,
+    ast: Option<&plingo::framework::parse::AstSnapshot>,
+    source: Option<&SourceSnapshot>,
+    uri: &str,
+    path: &str,
+    digest: &mut SemanticDigest,
+) -> Result<()> {
+    let key = format!("{uri}#{path}");
+    match tree.materialize(node)? {
+        LoweredDocument::Module { declarations } => {
+            digest.insert("lowered", &key, "Module");
+            digest.insert("origin", &key, &key);
+            for (index, declaration) in declarations.into_iter().enumerate() {
+                render_declaration(
+                    tree,
+                    declaration,
+                    source_root.clone(),
+                    snapshot,
+                    ast,
+                    source,
+                    uri,
+                    &child_path(path, index),
+                    digest,
+                )?;
+            }
+        }
+        LoweredDocument::Error { .. } => {
+            digest.insert("lowered", &key, "ParseError");
+            digest.insert("origin", &key, &key);
+        }
+    }
+    Ok(())
+}
+
+fn render_declaration(
+    tree: &SnapshotTree<super::lower::LoweredTree>,
+    node: AstBox<LoweredDeclaration>,
+    source_root: Option<AstBox<TransformDocument>>,
+    snapshot: &Snapshot,
+    ast: Option<&plingo::framework::parse::AstSnapshot>,
+    source: Option<&SourceSnapshot>,
+    uri: &str,
+    path: &str,
+    digest: &mut SemanticDigest,
+) -> Result<()> {
+    let key = format!("{uri}#{path}");
+    match tree.materialize(node)? {
+        LoweredDeclaration::Binding { value } => {
+            digest.insert("lowered", &key, "Binding");
+            digest.insert("origin", &key, &key);
+            render_expr(
+                tree,
+                value,
+                source_root,
+                snapshot,
+                ast,
+                source,
+                uri,
+                &format!("{path}.0"),
+                digest,
+            )?;
+        }
+        LoweredDeclaration::Error { .. } => {
+            digest.insert("lowered", &key, "ParseError");
+            digest.insert("origin", &key, &key);
+        }
+    }
+    Ok(())
+}
+
+fn render_expr(
+    tree: &SnapshotTree<super::lower::LoweredTree>,
+    node: AstBox<LoweredExpr>,
+    source_root: Option<AstBox<TransformDocument>>,
+    snapshot: &Snapshot,
+    ast: Option<&plingo::framework::parse::AstSnapshot>,
+    source: Option<&SourceSnapshot>,
+    uri: &str,
+    path: &str,
+    digest: &mut SemanticDigest,
+) -> Result<()> {
+    let materialized = tree.materialize(node)?;
+    let (kind, children): (&str, Vec<AstBox<LoweredExpr>>) = match materialized {
+        LoweredExpr::Add { left, right } => ("Sum", vec![left, right]),
+        LoweredExpr::Subtract { left, right } => ("Difference", vec![left, right]),
+        LoweredExpr::Group { expression } => ("Group", vec![expression]),
+        LoweredExpr::Number => ("Number", Vec::new()),
+        LoweredExpr::Name => ("Name", Vec::new()),
+        LoweredExpr::Error { .. } => ("ParseError", Vec::new()),
+    };
+    let rendered = if matches!(kind, "Number" | "Name") {
+        // The lowered node's structural path is also the source path because
+        // this example is a shape-preserving transform.
+        let lexeme = source_root
+            .as_ref()
+            .and_then(|root| source_expr_at_path(snapshot, root.clone(), path))
+            .map(|source_node| source_leaf_lexeme(snapshot, ast, source, source_node))
+            .unwrap_or_else(|| "?".to_owned());
+        format!("{kind}({lexeme})")
+    } else {
+        kind.to_owned()
+    };
+    let key = format!("{uri}#{path}");
+    digest.insert("lowered", &key, &rendered);
+    digest.insert("origin", &key, &key);
+    for (index, child) in children.into_iter().enumerate() {
+        render_expr(
+            tree,
+            child,
+            source_root.clone(),
+            snapshot,
+            ast,
+            source,
+            uri,
+            &child_path(path, index),
+            digest,
+        )?;
+    }
+    Ok(())
+}
+
+/// Captures parse status and the generated lowered-tree snapshot for every
+/// open document, with stable structural paths instead of raw identities.
 pub fn semantic_digest(snapshot: &Snapshot) -> SemanticDigest {
     let mut digest = SemanticDigest::new();
-
-    // Document domain: every parser root plus every lowered forest root,
-    // canonically sorted.
-    let mut uris: Vec<String> = snapshot.inputs::<ParserTreeRoots<TransformDocument>>();
-    uris.extend(
-        snapshot
-            .inputs::<LoweredTree>()
-            .into_iter()
-            .filter_map(|input| match input {
-                TreeKey::RootOrder(uri) => Some(uri),
-                _ => None,
-            }),
-    );
+    let source_inputs = snapshot.inputs::<AstSnapshots<TransformDocument>>();
+    let target_tree = snapshot.tree::<LoweredTree>();
+    let source_tree = snapshot.tree::<super::syntax::TransformTree>();
+    let mut uris = source_inputs;
     uris.sort();
     uris.dedup();
 
     for uri in uris {
-        let status = snapshot
-            .observe::<ParserTreeStatuses>(uri.clone())
-            .map(|status| (*status).clone());
-        if let Some(status) = status {
-            digest.insert("parse", &uri, &render_status(&status));
-        }
-        let ast = snapshot
-            .observe::<AstSnapshots<TransformDocument>>(uri.clone())
-            .map(|document| document.arc().clone());
-        let source = source_snapshot(snapshot, &uri);
-
-        // One parser-view DFS builds an id-to-path map so origin rows name
-        // structural positions instead of raw ordinals.
-        let mut source_paths: HashMap<Node<TransformTree>, String> = HashMap::new();
-        if let Some(root) = snapshot
-            .observe::<ParserTreeRoots<TransformDocument>>(uri.clone())
-            .map(|root| root.as_ref().clone())
+        if let Some(status) =
+            snapshot.observe::<plingo::framework::parse::ParserTreeStatuses>(uri.clone())
         {
-            let mut stack = vec![(root, String::new())];
-            while let Some((node, path)) = stack.pop() {
-                source_paths.insert(node.clone(), path.clone());
-                let children = snapshot
-                    .observe::<ParserTreeOrders<TransformDocument>>(node)
-                    .map(|order| order.iter().cloned().collect::<Vec<_>>())
-                    .unwrap_or_default();
-                for (index, child) in children.into_iter().enumerate() {
-                    stack.push((child, child_path(&path, index)));
-                }
-            }
+            digest.insert("parse", &uri, &render_status(status.as_ref()));
         }
-
-        for root in snapshot.tree_roots_of::<LoweredTree>(&uri) {
-            let mut stack = vec![(root, String::new())];
-            while let Some((node, path)) = stack.pop() {
-                digest.insert(
-                    "lowered",
-                    &format!("{uri}#{path}"),
-                    &render_payload(snapshot, ast.as_deref(), source.as_ref(), node.clone()),
-                );
-                let source_path = snapshot
-                    .observe::<LoweredOrigin>(node.clone())
-                    .map(|origin| origin.as_ref().clone())
-                    .and_then(|origin| source_paths.get(&origin).cloned());
-                digest.insert(
-                    "origin",
-                    &format!("{uri}#{path}"),
-                    &match source_path {
-                        Some(source_path) => format!("{uri}#{source_path}"),
-                        None => "detached".to_owned(),
-                    },
-                );
-                for (index, child) in snapshot
-                    .tree_children::<LoweredTree>(node)
-                    .into_iter()
-                    .enumerate()
-                {
-                    stack.push((child, child_path(&path, index)));
-                }
+        let ast = snapshot.observe::<AstSnapshots<TransformDocument>>(uri.clone());
+        let source = source_snapshot(snapshot, &uri);
+        let source_root = source_tree.roots(&uri).next();
+        for root in target_tree.roots(&uri) {
+            if let Err(error) = render_lowered(
+                &target_tree,
+                root,
+                source_root.clone(),
+                snapshot,
+                ast.as_ref().map(|document| document.snapshot()),
+                source.as_ref(),
+                &uri,
+                "",
+                &mut digest,
+            ) {
+                digest.insert("error", &uri, &error.to_string());
             }
         }
     }

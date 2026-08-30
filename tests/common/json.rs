@@ -7,12 +7,11 @@
 
 #![allow(dead_code)]
 
-use plingo_macros::{NonTerminal, PrettyNonTerminal, PrettyTerminal, Terminal};
-
 use plingo::framework::{
     lex::LexErrorInfo,
     parse::{AstToken, ParseErrorInfo, data::AstBox},
 };
+use plingo::prelude::{NonTerminal, PrettyNonTerminal, PrettyTerminal, Terminal};
 
 #[derive(Terminal, PrettyTerminal, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum JsonToken {

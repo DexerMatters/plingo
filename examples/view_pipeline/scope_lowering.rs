@@ -1,24 +1,22 @@
-//! A complete public-view pipeline:
+//! A complete public-view pipeline built only from semantic components.
 //!
-//! `Programs` → `SurfaceTree` → `LoweredTree` → `ScopeGraph` → resolution and
-//! analysis views → `DocumentSummaries`.
-//!
-//! Every derived stage is a set of exact element components (follow-up plan
-//! §24.1, §24.4, §24.5): one automatic node slot per lowered node, one
-//! component instance per surface/lowered node, graph identities from
-//! generated `Output` ports instead of anchors, per-candidate resolution,
-//! independent analysis projections joined by one component, and per-node
-//! summaries that read only exact child summaries.
+//! `Programs` owns a recursive surface tree.  A root component lowers that
+//! tree into a second abstract tree, and node components project scopes,
+//! resolutions, analyses, and summaries through returned effects.  Component
+//! calls and `AstBox` identities own tree lifetime; no application code names
+//! encoded tree facts or constructs a node identity.
 
-use plingo::framework::scope::{Scope, ScopeDomain, ScopeGraph, ScopeNode, observe_node, outgoing};
-use plingo::reactive::component::{EachKey, Output, Read, Write};
-use plingo::reactive::kind::{List, Map, Tree, TreeFact, emit_view, observe_view};
-use plingo::reactive::prelude::*;
-use plingo::reactive::view::Node;
-use reactive_macros::{component, view};
+use plingo::framework::scope::{
+    Scope, ScopeDomain, ScopeGraph, ScopeNode, outgoing, snapshot_node, snapshot_nodes,
+    snapshot_outgoing, snapshot_scope,
+};
+use plingo::prelude::*;
+use plingo::reactive::Snapshot;
+use plingo::reactive::digest::SemanticDigest;
+use std::collections::{BTreeMap, HashMap};
 
 // ---------------------------------------------------------------------------
-// Source model and syntax/lowering trees
+// Semantic input and parser-independent trees
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -27,169 +25,193 @@ pub struct Program {
     pub value: i64,
     pub reference: Option<String>,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum SurfaceNode {
-    Document,
-    Binding(String),
-    Add,
-    Number(i64),
-    Name(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum LoweredNode {
-    Module,
-    Definition(String),
-    ApplyAdd,
-    Integer(i64),
-    Variable(String),
-}
-
 #[view]
 pub struct Programs(Map<String, Program>);
 
-#[view]
-pub struct SurfaceRoots(Map<String, Node<SurfaceTree>>);
-
-#[view]
-pub struct SurfaceTree(Tree<String, SurfaceNode>);
-
-/// One membership entry per live surface node: the per-node driver for the
-/// lowering projection (plan §24.1). The source builder publishes it as it
-/// allocates each node; a removed node retires its lowering instance.
-#[view]
-pub struct SurfaceNodes(Map<Node<SurfaceTree>, ()>);
-
-#[view]
-pub struct LoweredRoots(Map<String, Node<LoweredTree>>);
-
-#[view]
-pub struct LoweredTree(Tree<String, LoweredNode>);
-
-/// One source-to-target projection row per lowered node (plan §24.1).
-#[view]
-pub struct LoweredOrigins(Map<Node<LoweredTree>, Node<SurfaceTree>>);
-
-/// The inverse projection: exact source -> target mapping owned by one
-/// inverse-provenance component (plan §24.4 item 8).
-#[view]
-pub struct LoweredBySource(Map<Node<SurfaceTree>, Node<LoweredTree>>);
-
-/// One keyed source-tree writer per program. It is the source fixture side:
-/// it publishes the surface forest plus its per-node membership, so every
-/// downstream component is driven by exact elements, never an enumeration.
-#[component]
-pub fn build_surface_pass(key: EachKey<Programs>) -> Result<()> {
-    build_surface_document(key)
+/// The source tree is ordinary user data.  `AstBox` is the only child marker;
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[abstract_tree(domain = String, tree = SurfaceTree)]
+pub enum SurfaceNode {
+    Document {
+        declarations: Vec<AstBox<SurfaceNode>>,
+    },
+    Binding {
+        name: String,
+        value: AstBox<SurfaceNode>,
+    },
+    Add {
+        operands: Vec<AstBox<SurfaceNode>>,
+    },
+    Number {
+        value: i64,
+    },
+    Name {
+        value: String,
+    },
+    Error {
+        diagnostic: String,
+    },
 }
 
-fn build_surface_document(uri: String) -> Result<()> {
-    let Some(program) = observe_view::<Programs>()?.get(&uri)? else {
-        return Ok(());
-    };
-    let tree = emit_view::<SurfaceTree>()?;
-    let membership = emit_view::<SurfaceNodes>()?;
-    let root = tree.root(&uri, SurfaceNode::Document)?;
-    membership.insert(root.clone(), ())?;
-    let binding = tree.child(root.clone(), SurfaceNode::Binding(program.binding.clone()))?;
-    membership.insert(binding.clone(), ())?;
-    let add = tree.child(binding.clone(), SurfaceNode::Add)?;
-    membership.insert(add.clone(), ())?;
-    let number = tree.child(add.clone(), SurfaceNode::Number(program.value))?;
-    membership.insert(number, ())?;
-    if let Some(reference) = &program.reference {
-        let name = tree.child(add, SurfaceNode::Name(reference.clone()))?;
-        membership.insert(name, ())?;
-    }
-    emit_view::<SurfaceRoots>()?.insert(uri, root)
-}
-
-/// One lowering instance per surface node. It reads exactly its own payload,
-/// parent, and child order; writes its automatic target node's payload,
-/// parent, order, and links; and publishes the origin projection rows. A
-/// missing endpoint projection writes nothing and its exact absent-key read
-/// wakes the instance when the endpoint publishes (plan §24.1).
-#[component]
-pub fn lower_node(
-    key: EachKey<SurfaceNodes>,
-    origins: Write<LoweredOrigins>,
-    by_source: Read<LoweredBySource>,
-    target: Output<LoweredTree>,
-) -> Result<()> {
-    let source = key;
-    let tree = observe_view::<SurfaceTree>()?;
-    let Some(payload) = tree.payload(source.clone())? else {
-        return Ok(());
-    };
-    let lowered_payload = match payload.as_ref() {
-        SurfaceNode::Document => LoweredNode::Module,
-        SurfaceNode::Binding(name) => LoweredNode::Definition(name.clone()),
-        SurfaceNode::Add => LoweredNode::ApplyAdd,
-        SurfaceNode::Number(value) => LoweredNode::Integer(*value),
-        SurfaceNode::Name(name) => LoweredNode::Variable(name.clone()),
-    };
-
-    let lowered = target.node();
-    // The origin row is unconditional: it is this instance's own output and
-    // the driver for every downstream per-node component.
-    origins.insert(lowered.clone(), source.clone())?;
-
-    // Parent projection: absent endpoint projection -> write nothing; the
-    // absent-key read on LoweredBySource[parent] wakes this instance.
-    let lowered_parent = match tree.parent(source.clone())? {
-        Some(parent) => match by_source.get(&parent)? {
-            Some(parent_target) => Some(parent_target.as_ref().clone()),
-            None => return Ok(()),
-        },
-        None => None,
-    };
-
-    // Children projection: same absent-endpoint protocol per child.
-    let source_children = tree.children(source)?;
-    let mut lowered_children = Vec::with_capacity(source_children.len());
-    for child in source_children {
-        let Some(child_target) = by_source.get(&child)? else {
-            return Ok(());
-        };
-        lowered_children.push(child_target.as_ref().clone());
-    }
-
-    let tree = emit_view::<LoweredTree>()?;
-    tree.put(
-        TreeKey::Payload(lowered.clone()),
-        Some(TreeFact::Payload(lowered_payload)),
-    )?;
-    tree.put(
-        TreeKey::Parent(lowered.clone()),
-        Some(TreeFact::Parent(lowered_parent)),
-    )?;
-    tree.set_children(lowered, lowered_children)?;
-    Ok(())
-}
-
-/// The document root projection: reads the exact root target and publishes
-/// the forest root plus the root map row.
-#[component]
-pub fn lower_root(
-    key: EachKey<SurfaceRoots>,
-    by_source: Read<LoweredBySource>,
-    roots: Write<LoweredRoots>,
-) -> Result<()> {
-    let uri = key;
-    let Some(source_root) = observe_view::<SurfaceRoots>()?.get(&uri)? else {
-        return Ok(());
-    };
-    let Some(target) = by_source.get(source_root.as_ref())? else {
-        return Ok(());
-    };
-    let target = target.as_ref().clone();
-    emit_view::<LoweredTree>()?.replace_roots(&uri, &[target.clone()])?;
-    roots.insert(uri, target)
+/// The lowered tree has an independent schema and is also recursive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[abstract_tree(domain = String, tree = LoweredTree)]
+pub enum LoweredNode {
+    Module {
+        declarations: Vec<AstBox<LoweredNode>>,
+    },
+    Definition {
+        name: String,
+        value: AstBox<LoweredNode>,
+    },
+    ApplyAdd {
+        operands: Vec<AstBox<LoweredNode>>,
+    },
+    Integer {
+        value: i64,
+    },
+    Variable {
+        name: String,
+    },
+    Error {
+        diagnostic: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
-// Scope graph and per-reference resolver
+// Recursive surface construction
+// ---------------------------------------------------------------------------
+
+/// Map membership owns one source-document call per URI.  The entry payload
+/// is intentionally not read here: payload-dependent child components own
+/// their exact reads and retain their output identities across edits.
+#[component]
+pub fn build_surface(entry: Each<Programs>) -> Result<AstBox<SurfaceNode>> {
+    surface_document(entry.key().clone())
+}
+
+#[component]
+fn surface_document(uri: String) -> Result<AstBox<SurfaceNode>> {
+    let declaration = surface_binding(uri)?;
+    SurfaceNode::render(SurfaceNode::Document {
+        declarations: vec![declaration],
+    })
+}
+
+#[component]
+fn surface_binding(uri: String) -> Result<AstBox<SurfaceNode>> {
+    let Some(program) = Programs::get(&uri)? else {
+        return SurfaceNode::render(SurfaceNode::Error {
+            diagnostic: "missing program".to_owned(),
+        });
+    };
+    let value = surface_add(uri)?;
+    SurfaceNode::render(SurfaceNode::Binding {
+        name: program.as_ref().binding.clone(),
+        value,
+    })
+}
+
+#[component]
+fn surface_add(uri: String) -> Result<AstBox<SurfaceNode>> {
+    let Some(program) = Programs::get(&uri)? else {
+        return SurfaceNode::render(SurfaceNode::Error {
+            diagnostic: "missing program".to_owned(),
+        });
+    };
+    let number = surface_number(uri.clone())?;
+    let reference = program
+        .as_ref()
+        .reference
+        .as_ref()
+        .map(|_| surface_name(uri.clone()))
+        .transpose()?;
+    let mut operands = vec![number];
+    if let Some(reference) = reference {
+        operands.push(reference);
+    }
+    SurfaceNode::render(SurfaceNode::Add { operands })
+}
+
+#[component]
+fn surface_number(uri: String) -> Result<AstBox<SurfaceNode>> {
+    let value = Programs::get(&uri)?.map_or(0, |program| program.as_ref().value);
+    SurfaceNode::render(SurfaceNode::Number { value })
+}
+
+#[component]
+fn surface_name(uri: String) -> Result<AstBox<SurfaceNode>> {
+    let value = Programs::get(&uri)?
+        .and_then(|program| program.as_ref().reference.clone())
+        .unwrap_or_default();
+    SurfaceNode::render(SurfaceNode::Name { value })
+}
+
+// ---------------------------------------------------------------------------
+// Recursive lowering
+// ---------------------------------------------------------------------------
+
+/// The only externally rooted lowering computation.  Its child calls create
+/// the declaration and expression outputs; no projection map or raw topology
+/// write is needed.
+#[component]
+pub fn lower_document(source: AstBox<SurfaceNode>) -> Result<AstBox<LoweredNode>> {
+    let value = match source.view()? {
+        SurfaceNodeView::Document(document) => LoweredNode::Module {
+            declarations: document
+                .declarations()?
+                .iter()
+                .map(lower_node)
+                .collect::<Result<Vec<_>>>()?,
+        },
+        SurfaceNodeView::Error(error) => LoweredNode::Error {
+            diagnostic: error.diagnostic()?.as_ref().clone(),
+        },
+        _ => LoweredNode::Error {
+            diagnostic: "surface root is not a document".to_owned(),
+        },
+    };
+    LoweredNode::render(value)
+}
+
+/// One recursive child component per source node.  Each invocation reads the
+/// discriminant and only the fields used by its selected variant.
+#[component]
+pub fn lower_node(source: AstBox<SurfaceNode>) -> Result<AstBox<LoweredNode>> {
+    let value = match source.view()? {
+        SurfaceNodeView::Document(document) => LoweredNode::Module {
+            declarations: document
+                .declarations()?
+                .iter()
+                .map(lower_node)
+                .collect::<Result<Vec<_>>>()?,
+        },
+        SurfaceNodeView::Binding(binding) => LoweredNode::Definition {
+            name: binding.name()?.as_ref().clone(),
+            value: lower_node(binding.value()?)?,
+        },
+        SurfaceNodeView::Add(add) => LoweredNode::ApplyAdd {
+            operands: add
+                .operands()?
+                .iter()
+                .map(lower_node)
+                .collect::<Result<Vec<_>>>()?,
+        },
+        SurfaceNodeView::Number(number) => LoweredNode::Integer {
+            value: *number.value()?.as_ref(),
+        },
+        SurfaceNodeView::Name(name) => LoweredNode::Variable {
+            name: name.value()?.as_ref().clone(),
+        },
+        SurfaceNodeView::Error(error) => LoweredNode::Error {
+            diagnostic: error.diagnostic()?.as_ref().clone(),
+        },
+    };
+    LoweredNode::render(value)
+}
+
+// ---------------------------------------------------------------------------
+// Scope graph and exact semantic joins
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -218,25 +240,18 @@ impl ScopeDomain for PipelineScope {
     type Request = ScopeRequest;
 }
 
-/// The automatic document scope per URI (plan §24.4 item 1). The value is the
-/// generated graph node; consumers read it from this view instead of
-/// reconstructing an anchored identity.
+/// Every key in the derived maps is a typed lowered-tree identity.
 #[view]
-pub struct DocumentScopes(Map<String, Scope<PipelineScope>>);
-
-/// Each lowered node's incoming scope, derived through the tree parent chain
-/// (plan §24.4 item 3). The document root's entry is owned by the document
-/// component; every child copies its parent's exact entry.
-#[view]
-pub struct IncomingScopes(Map<Node<LoweredTree>, Scope<PipelineScope>>);
-
-/// The automatic reference graph node per candidate (plan §24.4 item 2/4).
-/// The resolver links `ResolvesTo` from this exact node.
-#[view]
-pub struct ReferenceScopes(Map<Node<LoweredTree>, Scope<PipelineScope>>);
+pub struct DocumentScopes(Map<AstBox<LoweredNode>, Scope<PipelineScope>>);
 
 #[view]
-pub struct ReferenceCandidates(Map<Node<LoweredTree>, String>);
+pub struct IncomingScopes(Map<AstBox<LoweredNode>, Scope<PipelineScope>>);
+
+#[view]
+pub struct ReferenceScopes(Map<AstBox<LoweredNode>, Scope<PipelineScope>>);
+
+#[view]
+pub struct ReferenceCandidates(Map<AstBox<LoweredNode>, String>);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Resolution {
@@ -245,275 +260,158 @@ pub enum Resolution {
 }
 
 #[view]
-pub struct Resolutions(Map<Node<LoweredTree>, Resolution>);
+pub struct Resolutions(Map<AstBox<LoweredNode>, Resolution>);
 
-/// One document-scope component per lowered root. It owns the automatic
-/// document graph node, the `DocumentScopes[uri]` row, and the root's
-/// incoming-scope entry.
+/// One root component per mounted target-tree node.  Only roots emit a
+/// document scope; non-roots return no desired effects.
 #[component]
 pub fn emit_document_scope(
-    key: EachKey<LoweredRoots>,
-    document_scopes: Write<DocumentScopes>,
-    incoming: Write<IncomingScopes>,
-    document_node: Output<ScopeGraph<PipelineScope>>,
-) -> Result<()> {
-    let uri = key;
-    let Some(root) = observe_view::<LoweredRoots>()?.get(&uri)? else {
-        return Ok(());
-    };
-    let root = root.as_ref().clone();
-    let scope = Scope::from_graph_node(document_node.node());
-    document_node.set_node(ScopeNode::Scope(ScopeData::Document))?;
-    document_scopes.insert(uri, scope.clone())?;
-    incoming.insert(root, scope)
+    root: AstBox<LoweredNode>,
+) -> Result<
+    Option<(
+        Set<DocumentScopes>,
+        Set<IncomingScopes>,
+        GraphRender<ScopeGraph<PipelineScope>>,
+    )>,
+> {
+    if root.parent()?.is_some() {
+        return Ok(None);
+    }
+    let scope = Scope::<PipelineScope>::automatic()?;
+    let graph = scope.clone().render(ScopeNode::Scope(ScopeData::Document));
+    Ok(Some((
+        DocumentScopes::set(root.clone(), scope.clone()),
+        IncomingScopes::set(root, scope),
+        graph,
+    )))
 }
 
-/// One scope component per lowered node. It reads exactly its own payload and
-/// parent (for the incoming scope), publishes the definition/reference graph
-/// node and semantic bucket, and records the reference node for the resolver.
+/// Emits one declaration/reference node and its incoming-scope edge.  A
+/// component may return several independent graph bucket patches; each patch
+/// is still owned by the returned effect and is retracted when omitted.
 #[component]
 pub fn emit_node_scope(
-    key: EachKey<LoweredOrigins>,
-    incoming: Read<IncomingScopes>,
-    reference_scopes: Write<ReferenceScopes>,
-    node_output: Output<ScopeGraph<PipelineScope>>,
-) -> Result<()> {
-    let node = key;
-    let tree = observe_view::<LoweredTree>()?;
-    let Some(payload) = tree.payload(node.clone())? else {
-        return Ok(());
+    node: AstBox<LoweredNode>,
+) -> Result<(
+    Option<Set<IncomingScopes>>,
+    Option<Set<ReferenceScopes>>,
+    Option<GraphRender<ScopeGraph<PipelineScope>>>,
+    Option<GraphRender<ScopeGraph<PipelineScope>>>,
+)> {
+    let parent = node.parent()?;
+    let incoming = match parent.as_ref() {
+        Some(parent) => IncomingScopes::get(parent)?.map(|scope| scope.as_ref().clone()),
+        None => IncomingScopes::get(&node)?.map(|scope| scope.as_ref().clone()),
     };
-    // Incoming scope: the root reads its own entry (owned by the document
-    // component); every child copies its parent's exact entry.
-    let parent = tree.parent(node.clone())?;
-    let incoming_scope = match &parent {
-        Some(parent) => match incoming.get(parent)? {
-            Some(scope) => scope.as_ref().clone(),
-            None => return Ok(()),
-        },
-        None => match incoming.get(&node)? {
-            Some(scope) => scope.as_ref().clone(),
-            None => return Ok(()),
-        },
+    let Some(incoming) = incoming else {
+        return Ok((None, None, None, None));
     };
-    if parent.is_some() {
-        emit_view::<IncomingScopes>()?.insert(node.clone(), incoming_scope.clone())?;
-    }
+    let incoming_output = parent
+        .is_some()
+        .then(|| IncomingScopes::set(node.clone(), incoming.clone()));
 
-    match payload.as_ref() {
-        LoweredNode::Variable(name) => {
-            let graph_node = node_output.node();
-            node_output.set_node(ScopeNode::Reference(ScopeData::Reference(name.clone())))?;
-            emit_view::<ScopeGraph<PipelineScope>>()?.link(
-                incoming_scope.node(),
-                ScopeLabel::Reference(name.clone()),
-                graph_node.clone(),
-            )?;
-            reference_scopes.insert(node, Scope::from_graph_node(graph_node))?;
+    let output = match node.view()? {
+        LoweredNodeView::Definition(definition) => {
+            let name = definition.name()?.as_ref().clone();
+            let scope = Scope::<PipelineScope>::automatic()?;
+            let graph = scope
+                .clone()
+                .render(ScopeNode::Declaration(ScopeData::Definition(name.clone())));
+            let incoming_patch = incoming
+                .clone()
+                .patch()
+                .bucket(ScopeLabel::Declaration(name), vec![scope.clone()]);
+            (incoming_output, None, Some(graph), Some(incoming_patch))
         }
-        LoweredNode::Definition(name) => {
-            let graph_node = node_output.node();
-            node_output.set_node(ScopeNode::Declaration(ScopeData::Definition(name.clone())))?;
-            emit_view::<ScopeGraph<PipelineScope>>()?.link(
-                incoming_scope.node(),
-                ScopeLabel::Declaration(name.clone()),
-                graph_node,
-            )?;
+        LoweredNodeView::Variable(variable) => {
+            let name = variable.name()?.as_ref().clone();
+            let scope = Scope::<PipelineScope>::automatic()?;
+            let graph = scope
+                .clone()
+                .render(ScopeNode::Reference(ScopeData::Reference(name.clone())));
+            let incoming_patch = incoming
+                .clone()
+                .patch()
+                .bucket(ScopeLabel::Reference(name), vec![scope.clone()]);
+            (
+                incoming_output,
+                Some(ReferenceScopes::set(node, scope)),
+                Some(graph),
+                Some(incoming_patch),
+            )
         }
-        LoweredNode::Module | LoweredNode::ApplyAdd | LoweredNode::Integer(_) => {}
-    }
-    Ok(())
+        LoweredNodeView::Module(_)
+        | LoweredNodeView::ApplyAdd(_)
+        | LoweredNodeView::Integer(_)
+        | LoweredNodeView::Error(_) => (incoming_output, None, None, None),
+    };
+    Ok(output)
 }
 
-/// One candidate component per reference node: publishes the exact identifier
-/// element (plan §24.4 item 4).
+/// Publishes only reference candidates.  Omission retracts an old candidate
+/// when a node changes away from the variable variant.
 #[component]
-pub fn publish_candidate(
-    key: EachKey<LoweredOrigins>,
-    candidates: Write<ReferenceCandidates>,
-) -> Result<()> {
-    let node = key;
-    let Some(payload) = observe_view::<LoweredTree>()?.payload(node.clone())? else {
-        return Ok(());
+pub fn publish_candidate(node: AstBox<LoweredNode>) -> Result<Option<Set<ReferenceCandidates>>> {
+    let LoweredNodeView::Variable(variable) = node.view()? else {
+        return Ok(None);
     };
-    match payload.as_ref() {
-        LoweredNode::Variable(name) => candidates.insert(node, name.clone()),
-        _ => Ok(()),
-    }
+    Ok(Some(ReferenceCandidates::set(
+        node,
+        variable.name()?.as_ref().clone(),
+    )))
 }
 
-/// One resolver per candidate (plan §24.4 item 5): reads only the exact
-/// reference node, its incoming scope, and the declaration bucket for its own
-/// name.
+/// Resolves one candidate by reading its exact candidate, incoming scope, and
+/// declaration bucket.  A resolved edge is a bucket patch on the existing
+/// reference scope; an unbound result intentionally returns no graph patch.
 #[component]
 pub fn resolve_pass(
-    key: EachKey<ReferenceCandidates>,
-    reference_scopes: Read<ReferenceScopes>,
-    incoming: Read<IncomingScopes>,
-    resolutions: Write<Resolutions>,
-) -> Result<()> {
-    let node = key;
-    let Some(name) = observe_view::<ReferenceCandidates>()?.get(&node)? else {
-        return Ok(());
+    node: AstBox<LoweredNode>,
+) -> Result<
+    Option<(
+        Set<Resolutions>,
+        Option<GraphRender<ScopeGraph<PipelineScope>>>,
+    )>,
+> {
+    let Some(name) = ReferenceCandidates::get(&node)? else {
+        return Ok(None);
     };
-    let name = (*name).clone();
-    let Some(reference_scope) = reference_scopes.get(&node)? else {
-        return Ok(());
+    let Some(reference_scope) = ReferenceScopes::get(&node)? else {
+        return Ok(None);
     };
+    let Some(incoming_scope) = IncomingScopes::get(&node)? else {
+        return Ok(None);
+    };
+    let name = name.as_ref().clone();
     let reference_scope = reference_scope.as_ref().clone();
-    let Some(incoming_scope) = incoming.get(&node)? else {
-        return Ok(());
-    };
     let incoming_scope = incoming_scope.as_ref().clone();
-    let candidates = outgoing(incoming_scope, &ScopeLabel::Declaration(name.clone()))?;
-    let resolution = match candidates.first().cloned() {
-        Some(declaration) => {
-            emit_view::<ScopeGraph<PipelineScope>>()?.link(
-                reference_scope.node(),
-                ScopeLabel::ResolvesTo,
-                declaration.node(),
-            )?;
-            Resolution::Resolved { declaration }
-        }
-        None => Resolution::Unbound { name },
+    let declaration = outgoing(incoming_scope, &ScopeLabel::Declaration(name.clone()))?
+        .into_iter()
+        .next();
+    let (resolution, edge) = match declaration {
+        Some(declaration) => (
+            Resolution::Resolved {
+                declaration: declaration.clone(),
+            },
+            Some(
+                reference_scope
+                    .patch()
+                    .bucket(ScopeLabel::ResolvesTo, vec![declaration]),
+            ),
+        ),
+        None => (Resolution::Unbound { name }, None),
     };
-    resolutions.insert(node, resolution)
+    Ok(Some((Resolutions::set(node, resolution), edge)))
 }
 
-// ---------------------------------------------------------------------------
-// Independent analysis projections and their join (plan §24.4 items 6-7)
-// ---------------------------------------------------------------------------
-
-/// One label component per node: reads payload plus (for references) the
-/// exact resolution element.
 #[view]
-pub struct AnalysisLabels(Map<Node<LoweredTree>, String>);
+pub struct AnalysisLabels(Map<AstBox<LoweredNode>, String>);
 
-/// One origin-presence component per node.
 #[view]
-pub struct AnalysisOrigins(Map<Node<LoweredTree>, bool>);
+pub struct AnalysisOrigins(Map<AstBox<LoweredNode>, bool>);
 
-/// One incoming-scope-presence component per node.
 #[view]
-pub struct AnalysisScopePresence(Map<Node<LoweredTree>, bool>);
-
-#[component]
-pub fn analysis_label(
-    key: EachKey<LoweredOrigins>,
-    labels: Write<AnalysisLabels>,
-) -> Result<()> {
-    let node = key;
-    let Some(payload) = observe_view::<LoweredTree>()?.payload(node.clone())? else {
-        return Ok(());
-    };
-    let label = match payload.as_ref() {
-        LoweredNode::Module => "module".to_owned(),
-        LoweredNode::Definition(name) => format!("definition {name}"),
-        LoweredNode::ApplyAdd => "apply add".to_owned(),
-        LoweredNode::Integer(value) => format!("integer {value}"),
-        LoweredNode::Variable(name) => {
-            let resolution = observe_view::<Resolutions>()?.get(&node)?;
-            match resolution.as_deref() {
-                Some(Resolution::Resolved { declaration }) => {
-                    let target_name = match observe_node(declaration.clone())?.as_deref() {
-                        Some(ScopeNode::Declaration(ScopeData::Definition(target))) => {
-                            target.clone()
-                        }
-                        _ => "<invalid declaration>".to_owned(),
-                    };
-                    format!("reference {name} -> {target_name}")
-                }
-                Some(Resolution::Unbound { .. }) => {
-                    format!("reference {name} -> <unbound>")
-                }
-                None => format!("reference {name} -> <pending>"),
-            }
-        }
-    };
-    labels.insert(node, label)
-}
-
-#[component]
-pub fn analysis_origin(
-    key: EachKey<LoweredOrigins>,
-    origins: Write<AnalysisOrigins>,
-) -> Result<()> {
-    origins.insert(key, true)
-}
-
-#[component]
-pub fn analysis_scope_presence(
-    key: EachKey<LoweredOrigins>,
-    incoming: Read<IncomingScopes>,
-    presence: Write<AnalysisScopePresence>,
-) -> Result<()> {
-    let node = key;
-    let Some(_) = incoming.get(&node)? else {
-        return Ok(());
-    };
-    presence.insert(node, true)
-}
-
-/// One diagnostics component per resolution: publishes the exact list slot
-/// only for an unbound reference; a resolved instance owns no slots and its
-/// re-evaluation retracts a previously owned slot.
-#[component]
-pub fn analysis_diagnostics(
-    key: EachKey<Resolutions>,
-) -> Result<()> {
-    let node = key;
-    let Some(resolution) = observe_view::<Resolutions>()?.get(&node)? else {
-        return Ok(());
-    };
-    if let Resolution::Unbound { name } = resolution.as_ref() {
-        emit_view::<Diagnostics>()?
-            .replace(&node, vec![format!("unbound reference {name}")])?;
-    }
-    Ok(())
-}
-
-/// One join per node: combines the exact label/origin/scope-presence
-/// projections and the diagnostics list length into `Analyses[node]`.
-#[component]
-pub fn join_analyses(
-    key: EachKey<LoweredOrigins>,
-    labels: Read<AnalysisLabels>,
-    origins: Read<AnalysisOrigins>,
-    presence: Read<AnalysisScopePresence>,
-    analyses: Write<Analyses>,
-) -> Result<()> {
-    let node = key;
-    let Some(label) = labels.get(&node)? else {
-        return Ok(());
-    };
-    let label = (*label).clone();
-    let has_origin = origins.get(&node)?.is_some_and(|value| *value);
-    let has_scope = presence.get(&node)?.is_some_and(|value| *value);
-    let diagnostics = observe_view::<Diagnostics>()?.len(&node)?;
-    analyses.insert(
-        node,
-        NodeAnalysis {
-            label,
-            diagnostics,
-            has_origin,
-            has_scope,
-        },
-    )
-}
-
-/// One inverse-provenance component per node (plan §24.4 item 8): maps
-/// `Origin[target] -> LoweredBySource[source]`.
-#[component]
-pub fn inverse_provenance(
-    key: EachKey<LoweredOrigins>,
-    by_source: Write<LoweredBySource>,
-) -> Result<()> {
-    let node = key;
-    let Some(source) = observe_view::<LoweredOrigins>()?.get(&node)? else {
-        return Ok(());
-    };
-    by_source.insert(source.as_ref().clone(), node)
-}
+pub struct AnalysisScopePresence(Map<AstBox<LoweredNode>, bool>);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeAnalysis {
@@ -524,10 +422,10 @@ pub struct NodeAnalysis {
 }
 
 #[view]
-pub struct Analyses(Map<Node<LoweredTree>, NodeAnalysis>);
+pub struct Analyses(Map<AstBox<LoweredNode>, NodeAnalysis>);
 
 #[view]
-pub struct Diagnostics(List<Node<LoweredTree>, String>);
+pub struct Diagnostics(List<AstBox<LoweredNode>, String>);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DocumentSummary {
@@ -535,106 +433,141 @@ pub struct DocumentSummary {
     pub diagnostics: usize,
 }
 
-/// One per-node summary component (plan §24.5): reads exactly its own
-/// analysis and each exact child summary; a leaf change wakes only actual
-/// ancestors. The example's fields are fixed-degree, so each summary reads
-/// the exact child elements directly.
 #[view]
-pub struct NodeSummaries(Map<Node<LoweredTree>, DocumentSummary>);
+pub struct NodeSummaries(Map<AstBox<LoweredNode>, DocumentSummary>);
 
 #[view]
-pub struct DocumentSummaries(Map<String, DocumentSummary>);
+pub struct DocumentSummaries(Map<AstBox<LoweredNode>, DocumentSummary>);
 
 #[component]
-pub fn node_summary(
-    key: EachKey<LoweredOrigins>,
-    analyses: Read<Analyses>,
-    summaries: Write<NodeSummaries>,
-) -> Result<()> {
-    let node = key;
-    let Some(analysis) = analyses.get(&node)? else {
-        return Ok(());
+pub fn analysis_label(node: AstBox<LoweredNode>) -> Result<Option<Set<AnalysisLabels>>> {
+    let label = match node.view()? {
+        LoweredNodeView::Module(_) => "module".to_owned(),
+        LoweredNodeView::Definition(definition) => {
+            format!("definition {}", definition.name()?.as_ref())
+        }
+        LoweredNodeView::ApplyAdd(_) => "apply add".to_owned(),
+        LoweredNodeView::Integer(integer) => format!("integer {}", integer.value()?.as_ref()),
+        LoweredNodeView::Error(error) => {
+            format!("error {}", error.diagnostic()?.as_ref())
+        }
+        LoweredNodeView::Variable(variable) => {
+            let name = variable.name()?.as_ref().clone();
+            match Resolutions::get(&node)?.as_deref() {
+                Some(Resolution::Resolved { declaration }) => {
+                    let target_name = match snapshot_node_from_effect(declaration.clone())? {
+                        Some(ScopeNode::Declaration(ScopeData::Definition(target))) => target,
+                        _ => "<invalid declaration>".to_owned(),
+                    };
+                    format!("reference {name} -> {target_name}")
+                }
+                Some(Resolution::Unbound { .. }) => format!("reference {name} -> <unbound>"),
+                None => format!("reference {name} -> <pending>"),
+            }
+        }
+    };
+    Ok(Some(AnalysisLabels::set(node, label)))
+}
+
+/// Reads a graph node through the semantic scope API while remaining usable
+/// inside an active effect context.
+fn snapshot_node_from_effect(
+    scope: Scope<PipelineScope>,
+) -> Result<Option<ScopeNode<PipelineScope>>> {
+    plingo::framework::scope::observe_node(scope).map(|node| node.map(|node| node.as_ref().clone()))
+}
+
+#[component]
+pub fn analysis_origin(node: AstBox<LoweredNode>) -> Result<Set<AnalysisOrigins>> {
+    Ok(AnalysisOrigins::set(node, true))
+}
+
+#[component]
+pub fn analysis_scope_presence(
+    node: AstBox<LoweredNode>,
+) -> Result<Option<Set<AnalysisScopePresence>>> {
+    if IncomingScopes::get(&node)?.is_some() {
+        Ok(Some(AnalysisScopePresence::set(node, true)))
+    } else {
+        Ok(None)
+    }
+}
+
+#[component]
+pub fn analysis_diagnostics(node: AstBox<LoweredNode>) -> Result<Option<Replace<Diagnostics>>> {
+    let resolution = Resolutions::get(&node)?;
+    let Some(Resolution::Unbound { name }) = resolution.as_deref() else {
+        return Ok(None);
+    };
+    Ok(Some(Diagnostics::replace(
+        node,
+        vec![format!("unbound reference {name}")],
+    )))
+}
+
+#[component]
+pub fn join_analyses(node: AstBox<LoweredNode>) -> Result<Option<Set<Analyses>>> {
+    let Some(label) = AnalysisLabels::get(&node)? else {
+        return Ok(None);
+    };
+    let has_origin = AnalysisOrigins::get(&node)?.is_some_and(|value| *value);
+    let has_scope = AnalysisScopePresence::get(&node)?.is_some_and(|value| *value);
+    let diagnostics = Diagnostics::len(&node)?;
+    Ok(Some(Analyses::set(
+        node,
+        NodeAnalysis {
+            label: label.as_ref().clone(),
+            diagnostics,
+            has_origin,
+            has_scope,
+        },
+    )))
+}
+
+fn lowered_children(node: &AstBox<LoweredNode>) -> Result<Vec<AstBox<LoweredNode>>> {
+    match node.view()? {
+        LoweredNodeView::Module(module) => Ok(module.declarations()?.to_vec()),
+        LoweredNodeView::Definition(definition) => Ok(vec![definition.value()?]),
+        LoweredNodeView::ApplyAdd(add) => Ok(add.operands()?.to_vec()),
+        LoweredNodeView::Integer(_) | LoweredNodeView::Variable(_) | LoweredNodeView::Error(_) => {
+            Ok(Vec::new())
+        }
+    }
+}
+
+#[component]
+pub fn node_summary(node: AstBox<LoweredNode>) -> Result<Option<Set<NodeSummaries>>> {
+    let Some(analysis) = Analyses::get(&node)? else {
+        return Ok(None);
     };
     let mut summary = DocumentSummary {
         nodes: 1,
-        diagnostics: analysis.diagnostics,
+        diagnostics: analysis.as_ref().diagnostics,
     };
-    let tree = observe_view::<LoweredTree>()?;
-    for child in tree.children(node.clone())? {
-        let Some(child_summary) = observe_view::<NodeSummaries>()?.get(&child)? else {
-            return Ok(());
+    for child in lowered_children(&node)? {
+        let Some(child_summary) = NodeSummaries::get(&child)? else {
+            return Ok(None);
         };
-        summary.nodes += child_summary.nodes;
-        summary.diagnostics += child_summary.diagnostics;
+        summary.nodes += child_summary.as_ref().nodes;
+        summary.diagnostics += child_summary.as_ref().diagnostics;
     }
-    summaries.insert(node, summary)
+    Ok(Some(NodeSummaries::set(node, summary)))
 }
 
-/// The document summary mirrors the exact root summary (plan §24.5).
 #[component]
-pub fn document_summary(
-    key: EachKey<LoweredRoots>,
-    summaries: Read<NodeSummaries>,
-    documents: Write<DocumentSummaries>,
-) -> Result<()> {
-    let uri = key;
-    let Some(root) = observe_view::<LoweredRoots>()?.get(&uri)? else {
-        return Ok(());
+pub fn document_summary(node: AstBox<LoweredNode>) -> Result<Option<Set<DocumentSummaries>>> {
+    if node.parent()?.is_some() {
+        return Ok(None);
+    }
+    let Some(summary) = NodeSummaries::get(&node)? else {
+        return Ok(None);
     };
-    let Some(summary) = summaries.get(root.as_ref())? else {
-        return Ok(());
-    };
-    documents.insert(uri, (*summary).clone())
+    Ok(Some(DocumentSummaries::set(node, summary.as_ref().clone())))
 }
 
 // ---------------------------------------------------------------------------
-// Installers
+// Snapshot digest: generated tree readers, typed map/list readers, scopes
 // ---------------------------------------------------------------------------
-
-/// Installs the per-node lowering projection and the root projection.
-pub fn lower_pass_install(engine: &mut plingo::reactive::Engine) -> plingo::Result<()> {
-    lower_node_install(engine)?;
-    lower_root_install(engine)?;
-    inverse_provenance_install(engine)?;
-    Ok(())
-}
-
-/// Installs the document/scope-node emission plus candidate publication.
-pub fn emit_scopes_pass_install(engine: &mut plingo::reactive::Engine) -> plingo::Result<()> {
-    emit_document_scope_install(engine)?;
-    emit_node_scope_install(engine)?;
-    publish_candidate_install(engine)?;
-    Ok(())
-}
-
-/// Installs the independent analysis projections, their join, and the
-/// diagnostics component.
-pub fn analyze_pass_install(engine: &mut plingo::reactive::Engine) -> plingo::Result<()> {
-    analysis_label_install(engine)?;
-    analysis_origin_install(engine)?;
-    analysis_scope_presence_install(engine)?;
-    analysis_diagnostics_install(engine)?;
-    join_analyses_install(engine)?;
-    Ok(())
-}
-
-/// Installs the per-node summaries and the document summary.
-pub fn summarize_pass_install(engine: &mut plingo::reactive::Engine) -> plingo::Result<()> {
-    node_summary_install(engine)?;
-    document_summary_install(engine)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Semantic digest (follow-up plan §24.4 / Phase 0): complete public-view
-// content of this family, ID-erased and canonically ordered.
-// ---------------------------------------------------------------------------
-
-use std::collections::{BTreeMap, HashMap};
-
-use plingo::framework::scope::{snapshot_nodes, snapshot_outgoing, snapshot_scope};
-use plingo::reactive::digest::SemanticDigest;
-use plingo::reactive::kind::{ListKey, TreeKey, TreeView};
 
 fn render_program(program: &Program) -> String {
     let reference = match &program.reference {
@@ -649,21 +582,23 @@ fn render_program(program: &Program) -> String {
 
 fn render_surface(payload: &SurfaceNode) -> String {
     match payload {
-        SurfaceNode::Document => "Document".to_owned(),
-        SurfaceNode::Binding(name) => format!("Binding({name:?})"),
-        SurfaceNode::Add => "Add".to_owned(),
-        SurfaceNode::Number(value) => format!("Number({value})"),
-        SurfaceNode::Name(name) => format!("Name({name:?})"),
+        SurfaceNode::Document { .. } => "Document".to_owned(),
+        SurfaceNode::Binding { name, .. } => format!("Binding({name:?})"),
+        SurfaceNode::Add { .. } => "Add".to_owned(),
+        SurfaceNode::Number { value } => format!("Number({value})"),
+        SurfaceNode::Name { value } => format!("Name({value:?})"),
+        SurfaceNode::Error { diagnostic } => format!("Error({diagnostic:?})"),
     }
 }
 
 fn render_lowered(payload: &LoweredNode) -> String {
     match payload {
-        LoweredNode::Module => "Module".to_owned(),
-        LoweredNode::Definition(name) => format!("Definition({name:?})"),
-        LoweredNode::ApplyAdd => "ApplyAdd".to_owned(),
-        LoweredNode::Integer(value) => format!("Integer({value})"),
-        LoweredNode::Variable(name) => format!("Variable({name:?})"),
+        LoweredNode::Module { .. } => "Module".to_owned(),
+        LoweredNode::Definition { name, .. } => format!("Definition({name:?})"),
+        LoweredNode::ApplyAdd { .. } => "ApplyAdd".to_owned(),
+        LoweredNode::Integer { value } => format!("Integer({value})"),
+        LoweredNode::Variable { name } => format!("Variable({name:?})"),
+        LoweredNode::Error { diagnostic } => format!("Error({diagnostic:?})"),
     }
 }
 
@@ -691,11 +626,10 @@ fn render_scope_label(label: &ScopeLabel) -> String {
     }
 }
 
-fn render_resolution(snapshot: &plingo::reactive::Snapshot, resolution: &Resolution) -> String {
+fn render_resolution(snapshot: &Snapshot, resolution: &Resolution) -> String {
     match resolution {
         Resolution::Resolved { declaration } => {
-            let target = snapshot
-                .graph_node::<ScopeGraph<PipelineScope>>(declaration.node())
+            let target = snapshot_node(snapshot, declaration.clone())
                 .as_deref()
                 .map(render_scope_node)
                 .unwrap_or_else(|| "<unknown>".to_owned());
@@ -719,216 +653,190 @@ fn render_summary(summary: &DocumentSummary) -> String {
     )
 }
 
-/// Depth-first walk of one rooted forest: records one
-/// `{key}#{root}.{child...} = payload` row per reachable node and indexes
-/// every reached node by its structural path.
-fn walk_tree<V: TreeView>(
-    snapshot: &plingo::reactive::Snapshot,
-    view: &str,
-    render: &dyn Fn(&V::Payload) -> String,
-    paths: &mut HashMap<Node<V>, String>,
-    digest: &mut SemanticDigest,
-    node: Node<V>,
+fn walk_surface(
+    tree: &SnapshotTree<SurfaceTree>,
+    node: AstBox<SurfaceNode>,
+    uri: &str,
     path: &str,
-) {
-    if let Some(payload) = snapshot.tree_payload::<V>(node.clone()) {
-        digest.insert(view, path, &render(&payload));
-    }
-    paths.insert(node.clone(), path.to_owned());
-    for (index, child) in snapshot.tree_children::<V>(node.clone()).into_iter().enumerate() {
-        walk_tree(
-            snapshot,
-            view,
-            render,
-            paths,
-            digest,
-            child,
-            &format!("{path}.{index}"),
-        );
-    }
-}
-
-/// Enumerates one tree-kind view through its committed inputs: every domain
-/// key with a root order, DFS per root; payload facts unreachable from any
-/// root are recorded as sorted orphan rows so a leaked subtree cannot hide.
-/// Returns the node -> structural-path index.
-fn index_tree<V>(
-    snapshot: &plingo::reactive::Snapshot,
-    view: &str,
-    render: impl Fn(&V::Payload) -> String,
+    paths: &mut HashMap<AstBox<SurfaceNode>, String>,
     digest: &mut SemanticDigest,
-) -> HashMap<Node<V>, String>
-where
-    V: TreeView,
-    V::Key: Ord + Clone + std::fmt::Display,
-{
-    let mut paths: HashMap<Node<V>, String> = HashMap::new();
-    let mut keys: Vec<V::Key> = snapshot
-        .inputs::<V>()
-        .into_iter()
-        .filter_map(|input| match input {
-            TreeKey::RootOrder(key) => Some(key),
-            _ => None,
-        })
-        .collect();
-    keys.sort();
-    keys.dedup();
-    for key in keys {
-        for (root_index, root) in snapshot.tree_roots_of::<V>(&key).into_iter().enumerate() {
-            walk_tree(
-                snapshot,
-                view,
-                &render,
-                &mut paths,
-                digest,
-                root,
-                &format!("{key}#{root_index}"),
-            );
+) {
+    let Ok(value) = tree.materialize(node.clone()) else {
+        return;
+    };
+    digest.insert(
+        "surface_tree",
+        &format!("{uri}#{path}"),
+        &render_surface(&value),
+    );
+    paths.insert(node, path.to_owned());
+    let children: Vec<AstBox<SurfaceNode>> = match value {
+        SurfaceNode::Document { declarations } => declarations,
+        SurfaceNode::Binding { value, .. } => vec![value],
+        SurfaceNode::Add { operands } => operands,
+        SurfaceNode::Number { .. } | SurfaceNode::Name { .. } | SurfaceNode::Error { .. } => {
+            Vec::new()
         }
+    };
+    for (index, child) in children.into_iter().enumerate() {
+        walk_surface(tree, child, uri, &format!("{path}{index}"), paths, digest);
     }
-    let mut orphans: Vec<String> = snapshot
-        .inputs::<V>()
-        .into_iter()
-        .filter_map(|input| match input {
-            TreeKey::Payload(node) if !paths.contains_key(&node) => {
-                snapshot.tree_payload::<V>(node).as_deref().map(&render)
-            }
-            _ => None,
-        })
-        .collect();
-    orphans.sort();
-    orphans.dedup();
-    for (ordinal, text) in orphans.iter().enumerate() {
-        digest.insert_domain(view, ordinal, &format!("orphan {text}"));
-    }
-    paths
 }
 
-/// Resolves a lowered node to its structural path; an unreachable node falls
-/// back to a payload-rendered key so the row stays ID-erased.
+fn walk_lowered(
+    tree: &SnapshotTree<LoweredTree>,
+    node: AstBox<LoweredNode>,
+    uri: &str,
+    path: &str,
+    paths: &mut HashMap<AstBox<LoweredNode>, String>,
+    digest: &mut SemanticDigest,
+) {
+    let Ok(value) = tree.materialize(node.clone()) else {
+        return;
+    };
+    digest.insert(
+        "lowered_tree",
+        &format!("{uri}#{path}"),
+        &render_lowered(&value),
+    );
+    paths.insert(node, path.to_owned());
+    let children: Vec<AstBox<LoweredNode>> = match value {
+        LoweredNode::Module { declarations } => declarations,
+        LoweredNode::Definition { value, .. } => vec![value],
+        LoweredNode::ApplyAdd { operands } => operands,
+        LoweredNode::Integer { .. } | LoweredNode::Variable { .. } | LoweredNode::Error { .. } => {
+            Vec::new()
+        }
+    };
+    for (index, child) in children.into_iter().enumerate() {
+        walk_lowered(tree, child, uri, &format!("{path}{index}"), paths, digest);
+    }
+}
+
 fn lowered_path(
-    snapshot: &plingo::reactive::Snapshot,
-    paths: &HashMap<Node<LoweredTree>, String>,
-    node: Node<LoweredTree>,
+    paths: &HashMap<AstBox<LoweredNode>, String>,
+    node: &AstBox<LoweredNode>,
 ) -> String {
     paths
-        .get(&node)
+        .get(node)
         .cloned()
-        .unwrap_or_else(|| match snapshot.tree_payload::<LoweredTree>(node) {
-            Some(payload) => format!("orphan {}", render_lowered(&payload)),
-            None => "orphan <unknown>".to_owned(),
-        })
+        .unwrap_or_else(|| "orphan".to_owned())
 }
 
-/// Same fallback resolution for surface nodes.
-fn surface_path(
-    snapshot: &plingo::reactive::Snapshot,
-    paths: &HashMap<Node<SurfaceTree>, String>,
-    node: Node<SurfaceTree>,
-) -> String {
-    paths
-        .get(&node)
-        .cloned()
-        .unwrap_or_else(|| match snapshot.tree_payload::<SurfaceTree>(node) {
-            Some(payload) => format!("orphan {}", render_surface(&payload)),
-            None => "orphan <unknown>".to_owned(),
-        })
-}
-
-/// Collects `(structural path, node)` pairs for one lowered-node-keyed view,
-/// ordered canonically by path.
-fn rows_by_lowered_path(
-    snapshot: &plingo::reactive::Snapshot,
-    paths: &HashMap<Node<LoweredTree>, String>,
-    nodes: impl IntoIterator<Item = Node<LoweredTree>>,
-) -> Vec<(String, Node<LoweredTree>)> {
-    let mut rows: Vec<(String, Node<LoweredTree>)> = nodes
+fn lowered_rows(
+    paths: &HashMap<AstBox<LoweredNode>, String>,
+    nodes: impl IntoIterator<Item = AstBox<LoweredNode>>,
+) -> Vec<(String, AstBox<LoweredNode>)> {
+    let mut rows: Vec<_> = nodes
         .into_iter()
-        .map(|node| (lowered_path(snapshot, paths, node.clone()), node))
+        .map(|node| (lowered_path(paths, &node), node))
         .collect();
     rows.sort_by(|left, right| left.0.cmp(&right.0));
     rows.dedup_by(|left, right| left.0 == right.0);
     rows
 }
 
-/// Captures every present entry of every public view of this family.
-pub fn semantic_digest(snapshot: &plingo::reactive::Snapshot) -> SemanticDigest {
+/// Captures every present semantic view using generated tree readers and
+/// typed scope snapshot helpers.  Materialization is used only by this
+/// tooling digest, never by the granularity-sensitive components above.
+pub fn semantic_digest(snapshot: &Snapshot) -> SemanticDigest {
     let mut digest = SemanticDigest::new();
-
-    // Programs map.
     let mut uris = snapshot.inputs::<Programs>();
     uris.sort();
-    for uri in uris {
-        let row = snapshot
-            .observe::<Programs>(uri.clone())
-            .as_deref()
-            .map(render_program)
-            .unwrap_or_else(|| "absent".to_owned());
-        digest.insert("programs", &uri, &row);
+
+    for uri in &uris {
+        if let Some(program) = snapshot.observe::<Programs>(uri.clone()) {
+            digest.insert("programs", uri, &render_program(program.as_ref()));
+        }
     }
 
-    // Surface and lowered forests.
-    let surface_paths =
-        index_tree::<SurfaceTree>(snapshot, "surface_tree", render_surface, &mut digest);
-    let lowered_paths =
-        index_tree::<LoweredTree>(snapshot, "lowered_tree", render_lowered, &mut digest);
-
-    // Root maps: document URI -> resolved structural root path.
-    let mut roots = snapshot.inputs::<SurfaceRoots>();
-    roots.sort();
-    for uri in roots {
-        let row = match snapshot.observe::<SurfaceRoots>(uri.clone()) {
-            Some(root) => surface_path(snapshot, &surface_paths, root.as_ref().clone()),
-            None => "absent".to_owned(),
-        };
-        digest.insert("surface_roots", &uri, &row);
-    }
-    let mut roots = snapshot.inputs::<LoweredRoots>();
-    roots.sort();
-    for uri in roots {
-        let row = match snapshot.observe::<LoweredRoots>(uri.clone()) {
-            Some(root) => lowered_path(snapshot, &lowered_paths, root.as_ref().clone()),
-            None => "absent".to_owned(),
-        };
-        digest.insert("lowered_roots", &uri, &row);
-    }
-
-    // Provenance edge pairs resolved to both endpoints' structural paths.
-    let origins = rows_by_lowered_path(
-        snapshot,
-        &lowered_paths,
-        snapshot.inputs::<LoweredOrigins>(),
-    );
-    for (key, node) in origins {
-        let row = match snapshot.observe::<LoweredOrigins>(node) {
-            Some(source) => surface_path(snapshot, &surface_paths, source.as_ref().clone()),
-            None => "absent".to_owned(),
-        };
-        digest.insert("lowered_origins", &key, &row);
-    }
-    let mut inverses: Vec<(String, Node<SurfaceTree>)> = snapshot
-        .inputs::<LoweredBySource>()
-        .into_iter()
-        .map(|source| (surface_path(snapshot, &surface_paths, source.clone()), source))
-        .collect();
-    inverses.sort_by(|left, right| left.0.cmp(&right.0));
-    inverses.dedup_by(|left, right| left.0 == right.0);
-    for (key, source) in inverses {
-        let row = match snapshot.observe::<LoweredBySource>(source) {
-            Some(target) => lowered_path(snapshot, &lowered_paths, target.as_ref().clone()),
-            None => "absent".to_owned(),
-        };
-        digest.insert("lowered_by_source", &key, &row);
+    let surface_tree = snapshot.tree::<SurfaceTree>();
+    let lowered_tree = snapshot.tree::<LoweredTree>();
+    let mut surface_paths = HashMap::new();
+    let mut lowered_paths = HashMap::new();
+    for uri in &uris {
+        for (index, root) in surface_tree.roots(uri).enumerate() {
+            walk_surface(
+                &surface_tree,
+                root,
+                uri,
+                &format!("{index}"),
+                &mut surface_paths,
+                &mut digest,
+            );
+        }
+        let roots: Vec<_> = lowered_tree.roots(uri).collect();
+        for (index, root) in roots.into_iter().enumerate() {
+            let path = format!("{index}");
+            digest.insert("lowered_roots", uri, &format!("{uri}#{path}"));
+            walk_lowered(
+                &lowered_tree,
+                root,
+                uri,
+                &path,
+                &mut lowered_paths,
+                &mut digest,
+            );
+        }
     }
 
-    // Scope graph: node payload multiset plus edge triples rendered from
-    // both endpoints' payloads and the label, as sorted domain rows.
+    let lowered_nodes: Vec<_> = lowered_paths.keys().cloned().collect();
+    let lowered_rows = lowered_rows(&lowered_paths, lowered_nodes.clone());
+
+    for (path, node) in &lowered_rows {
+        if let Some(value) = snapshot.observe::<DocumentScopes>(node.clone()) {
+            let row = snapshot_scope(snapshot, value.as_ref().clone())
+                .as_deref()
+                .map(render_scope_data)
+                .unwrap_or_else(|| "absent".to_owned());
+            digest.insert("document_scopes", path, &row);
+        }
+        if let Some(value) = snapshot.observe::<IncomingScopes>(node.clone()) {
+            let row = snapshot_scope(snapshot, value.as_ref().clone())
+                .as_deref()
+                .map(render_scope_data)
+                .unwrap_or_else(|| "absent".to_owned());
+            digest.insert("incoming_scopes", path, &row);
+        }
+        if let Some(value) = snapshot.observe::<ReferenceScopes>(node.clone()) {
+            let row = snapshot_node(snapshot, value.as_ref().clone())
+                .as_deref()
+                .map(render_scope_node)
+                .unwrap_or_else(|| "absent".to_owned());
+            digest.insert("reference_scopes", path, &row);
+        }
+        if let Some(value) = snapshot.observe::<ReferenceCandidates>(node.clone()) {
+            digest.insert("reference_candidates", path, value.as_ref());
+        }
+        if let Some(value) = snapshot.observe::<Resolutions>(node.clone()) {
+            digest.insert(
+                "resolutions",
+                path,
+                &render_resolution(snapshot, value.as_ref()),
+            );
+        }
+        if let Some(value) = snapshot.observe::<Analyses>(node.clone()) {
+            digest.insert("analyses", path, &render_analysis(value.as_ref()));
+        }
+        let diagnostics = snapshot.list::<Diagnostics>(node);
+        if !diagnostics.is_empty() {
+            let rendered: Vec<String> =
+                diagnostics.iter().map(|item| format!("{item:?}")).collect();
+            digest.insert("diagnostics", path, &format!("[{}]", rendered.join(",")));
+        }
+        if let Some(value) = snapshot.observe::<NodeSummaries>(node.clone()) {
+            digest.insert("node_summaries", path, &render_summary(value.as_ref()));
+        }
+        if let Some(value) = snapshot.observe::<DocumentSummaries>(node.clone()) {
+            digest.insert("document_summaries", path, &render_summary(value.as_ref()));
+        }
+    }
+
     let scopes = snapshot_nodes::<PipelineScope>(snapshot);
     let mut node_texts: Vec<String> = scopes
         .iter()
         .filter_map(|scope| {
-            snapshot
-                .graph_node::<ScopeGraph<PipelineScope>>(scope.node())
+            snapshot_node(snapshot, scope.clone())
                 .as_deref()
                 .map(render_scope_node)
         })
@@ -940,161 +848,43 @@ pub fn semantic_digest(snapshot: &plingo::reactive::Snapshot) -> SemanticDigest 
 
     let mut labels: BTreeMap<String, ScopeLabel> = BTreeMap::new();
     labels.insert("ResolvesTo".to_owned(), ScopeLabel::ResolvesTo);
-    for node in lowered_paths.keys() {
-        let Some(payload) = snapshot.tree_payload::<LoweredTree>(node.clone()) else {
+    for node in &lowered_nodes {
+        let Ok(value) = lowered_tree.materialize(node.clone()) else {
             continue;
         };
-        match payload.as_ref() {
-            LoweredNode::Definition(name) => {
-                let label = ScopeLabel::Declaration(name.clone());
+        match value {
+            LoweredNode::Definition { name, .. } => {
+                let label = ScopeLabel::Declaration(name);
                 labels.insert(render_scope_label(&label), label);
             }
-            LoweredNode::Variable(name) => {
-                let label = ScopeLabel::Reference(name.clone());
+            LoweredNode::Variable { name } => {
+                let label = ScopeLabel::Reference(name);
                 labels.insert(render_scope_label(&label), label);
             }
-            LoweredNode::Module | LoweredNode::ApplyAdd | LoweredNode::Integer(_) => {}
+            _ => {}
         }
     }
-    let mut triples: Vec<String> = Vec::new();
+    let mut triples = Vec::new();
     for scope in &scopes {
-        let source_text = snapshot
-            .graph_node::<ScopeGraph<PipelineScope>>(scope.node())
-            .as_deref()
-            .map(render_scope_node)
-            .unwrap_or_else(|| "<unknown>".to_owned());
+        let Some(source) = snapshot_node(snapshot, scope.clone()) else {
+            continue;
+        };
+        let source_text = render_scope_node(source.as_ref());
         for (label_text, label) in &labels {
             for target in snapshot_outgoing(snapshot, scope.clone(), label) {
-                let target_text = snapshot
-                    .graph_node::<ScopeGraph<PipelineScope>>(target.node())
-                    .as_deref()
-                    .map(render_scope_node)
-                    .unwrap_or_else(|| "<unknown>".to_owned());
-                triples.push(format!("({source_text},{label_text})->{target_text}"));
+                let Some(target_node) = snapshot_node(snapshot, target) else {
+                    continue;
+                };
+                triples.push(format!(
+                    "({source_text},{label_text})->{}",
+                    render_scope_node(target_node.as_ref())
+                ));
             }
         }
     }
     triples.sort();
     for (ordinal, triple) in triples.iter().enumerate() {
         digest.insert_domain("scope_edges", ordinal, triple);
-    }
-
-    // Document and per-node automatic scope joins.
-    let mut document_scopes = snapshot.inputs::<DocumentScopes>();
-    document_scopes.sort();
-    for uri in document_scopes {
-        let row = match snapshot.observe::<DocumentScopes>(uri.clone()) {
-            Some(scope) => snapshot_scope(snapshot, scope.as_ref().clone())
-                .as_deref()
-                .map(render_scope_data)
-                .unwrap_or_else(|| "absent".to_owned()),
-            None => "absent".to_owned(),
-        };
-        digest.insert("document_scopes", &uri, &row);
-    }
-
-    let incoming =
-        rows_by_lowered_path(snapshot, &lowered_paths, snapshot.inputs::<IncomingScopes>());
-    for (key, node) in incoming {
-        let row = match snapshot.observe::<IncomingScopes>(node) {
-            Some(scope) => snapshot_scope(snapshot, scope.as_ref().clone())
-                .as_deref()
-                .map(render_scope_data)
-                .unwrap_or_else(|| "absent".to_owned()),
-            None => "absent".to_owned(),
-        };
-        digest.insert("incoming_scopes", &key, &row);
-    }
-
-    let reference_scopes =
-        rows_by_lowered_path(snapshot, &lowered_paths, snapshot.inputs::<ReferenceScopes>());
-    for (key, node) in reference_scopes {
-        let row = match snapshot.observe::<ReferenceScopes>(node) {
-            Some(scope) => snapshot
-                .graph_node::<ScopeGraph<PipelineScope>>(scope.as_ref().node())
-                .as_deref()
-                .map(render_scope_node)
-                .unwrap_or_else(|| "absent".to_owned()),
-            None => "absent".to_owned(),
-        };
-        digest.insert("reference_scopes", &key, &row);
-    }
-
-    let candidates = rows_by_lowered_path(
-        snapshot,
-        &lowered_paths,
-        snapshot.inputs::<ReferenceCandidates>(),
-    );
-    for (key, node) in candidates {
-        let row = snapshot
-            .observe::<ReferenceCandidates>(node)
-            .as_deref()
-            .map(|name| name.clone())
-            .unwrap_or_else(|| "absent".to_owned());
-        digest.insert("reference_candidates", &key, &row);
-    }
-
-    let resolutions =
-        rows_by_lowered_path(snapshot, &lowered_paths, snapshot.inputs::<Resolutions>());
-    for (key, node) in resolutions {
-        let row = match snapshot.observe::<Resolutions>(node) {
-            Some(resolution) => render_resolution(snapshot, &resolution),
-            None => "absent".to_owned(),
-        };
-        digest.insert("resolutions", &key, &row);
-    }
-
-    let analyses = rows_by_lowered_path(snapshot, &lowered_paths, snapshot.inputs::<Analyses>());
-    for (key, node) in analyses {
-        let row = snapshot
-            .observe::<Analyses>(node)
-            .as_deref()
-            .map(render_analysis)
-            .unwrap_or_else(|| "absent".to_owned());
-        digest.insert("analyses", &key, &row);
-    }
-
-    let diagnostics: Vec<(String, Node<LoweredTree>)> = {
-        let mut rows = rows_by_lowered_path(
-            snapshot,
-            &lowered_paths,
-            snapshot
-                .inputs::<Diagnostics>()
-                .into_iter()
-                .filter_map(|input| match input {
-                    ListKey::Slot(key, _) | ListKey::Len(key) => Some(key),
-                }),
-        );
-        rows.dedup_by(|left, right| left.0 == right.0);
-        rows
-    };
-    for (key, node) in diagnostics {
-        let items = snapshot.list::<Diagnostics>(&node);
-        let rendered: Vec<String> = items.iter().map(|item| format!("{item:?}")).collect();
-        digest.insert("diagnostics", &key, &format!("[{}]", rendered.join(",")));
-    }
-
-    // Per-node and document aggregates.
-    let summaries =
-        rows_by_lowered_path(snapshot, &lowered_paths, snapshot.inputs::<NodeSummaries>());
-    for (key, node) in summaries {
-        let row = snapshot
-            .observe::<NodeSummaries>(node)
-            .as_deref()
-            .map(render_summary)
-            .unwrap_or_else(|| "absent".to_owned());
-        digest.insert("node_summaries", &key, &row);
-    }
-
-    let mut summary_keys = snapshot.inputs::<DocumentSummaries>();
-    summary_keys.sort();
-    for uri in summary_keys {
-        let row = snapshot
-            .observe::<DocumentSummaries>(uri.clone())
-            .as_deref()
-            .map(render_summary)
-            .unwrap_or_else(|| "absent".to_owned());
-        digest.insert("document_summaries", &uri, &row);
     }
 
     digest

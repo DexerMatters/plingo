@@ -1,600 +1,493 @@
-//! STLC semantic snapshot digest (follow-up plan §4 items 1–2, 8, 13).
-//!
-//! `stlc_digest` enumerates the COMPLETE public-view domain of one
-//! committed workspace state — tokens, parse status, structural tree,
-//! diagnostics in explicit slot order, scope-graph payloads and labelled
-//! edge buckets, resolutions, and the five structural products — as
-//! ID-erased canonical rows. Raw node ordinals never appear: every
-//! syntax-keyed view joins to a deterministic DFS path of the parsed tree
-//! (`doc#0.2.1` style), so a warm workspace and a fresh cold build of the
-//! same text are directly comparable.
-//!
-//! Edge triples render endpoint PAYLOADS, so equal-cardinality graph
-//! buckets with different sources/targets produce different digests.
-use std::collections::BTreeMap;
+//! Canonical, identity-erased digest for the STLC public semantic views.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
-use plingo::framework::lex::{TokenVec, Tokens};
-use plingo::framework::parse::{
-    AstSnapshot, AstSnapshots, AstToken, ParseDiagnostics, ParseStatus, TreeParseUnits,
-};
+use plingo::framework::lex::{Tokens, observe_token};
+use plingo::framework::parse::{AstToken, ParseDiagnostics, ParseStatus, ParserTreeStatuses};
 use plingo::framework::scope::{ScopeGraph, ScopeNode};
+use plingo::reactive::abstract_tree::{AstBox, SnapshotTree};
 use plingo::reactive::digest::SemanticDigest;
-use plingo::reactive::kind::{GraphKey, ListKey};
-use plingo::reactive::view::Node;
 use plingo::reactive::{Snapshot, View};
 
-use super::check::{StlcTypeDiagnostic, StlcTypeDiagnostics, StlcTypeValue};
+use super::check::{
+    StlcDefinitionTypes, StlcExpectedTypes, StlcSynthesizedTypes, StlcTypeDiagnostics,
+};
 use super::name_resolve::{
-    StlcIncomingScopes, StlcReferenceCandidates, StlcResolution, StlcResolvedReferences, StlcScope,
-    StlcScopeData, StlcScopeLabel,
+    StlcContinuationScopes, StlcDeclarationScopes, StlcIncomingScopes, StlcReferenceCandidates,
+    StlcResolution, StlcResolvedReferences, StlcRootScopes, StlcScope, StlcScopeData,
+    StlcScopeLabel,
 };
 use super::structural::{
     StlcLowered, StlcLoweredOrigin, StlcLoweredSummary, StlcLoweringDiagnostics, StlcNodeIndex,
-    StlcNodeKind,
 };
 use super::syntax::{
-    StlcCase, StlcDeclarationCase, StlcDocument, StlcDocumentCase, StlcExprCase, StlcParamCase,
-    StlcPathCase, StlcToken, StlcTree, StlcTypeAtomCase, StlcTypeCase,
+    StlcDeclaration, StlcDeclarationView, StlcDocument, StlcDocumentView, StlcExpr, StlcExprView,
+    StlcParam, StlcParamView, StlcPath, StlcToken, StlcTree, StlcType, StlcTypeAtom,
+    StlcTypeAtomView, StlcTypeView,
 };
 
-// ---------------------------------------------------------------------------
-// Typed value renderers (semantic content only; no identities)
-// ---------------------------------------------------------------------------
+fn add_path(
+    paths: &mut HashMap<AstBox<()>, String>,
+    kinds: &mut BTreeMap<String, String>,
+    node: AstBox<()>,
+    path: String,
+    kind: &str,
+) {
+    paths.insert(node, path.clone());
+    kinds.insert(path, kind.to_owned());
+}
 
-/// Renders an STLC type the way the surface writes it.
-pub fn render_type(ty: &StlcTypeValue) -> String {
-    match ty {
-        StlcTypeValue::Nat => "Nat".into(),
-        StlcTypeValue::Bool => "Bool".into(),
-        StlcTypeValue::Unit => "Unit".into(),
-StlcTypeValue::Function(function) => {
-            let parameters = function
-                .parameters()
-                .iter()
-                .map(render_type)
-                .collect::<Vec<_>>()
-                .join(" -> ");
-            if parameters.is_empty() {
-                render_type(function.result())
-            } else {
-                format!("({parameters} -> {})", render_type(function.result()))
-            }
+fn visit_document(
+    tree: &SnapshotTree<StlcTree>,
+    node: AstBox<StlcDocument>,
+    path: String,
+    paths: &mut HashMap<AstBox<()>, String>,
+    kinds: &mut BTreeMap<String, String>,
+) -> plingo::Result<()> {
+    add_path(paths, kinds, node.erased(), path.clone(), "document");
+    if let StlcDocumentView::Lines(lines) = tree.view(node.clone())? {
+        for (index, child) in lines.declarations()?.iter().enumerate() {
+            visit_declaration(
+                tree,
+                child,
+                format!("{path}.declaration[{index}]"),
+                paths,
+                kinds,
+            )?;
         }
     }
+    Ok(())
 }
 
-fn render_scope_data(data: &StlcScopeData) -> String {
-    match data {
-        StlcScopeData::Document => "document".into(),
-        StlcScopeData::Lexical => "lexical".into(),
-        // The `definition` field carries a raw syntax identity; the semantic
-        // content of a declaration bucket is its name.
-        StlcScopeData::Declaration { name, .. } => format!("decl({name})"),
-        StlcScopeData::CaseSuccessor => "case-successor".into(),
-        StlcScopeData::External { path } => format!("external({path})"),
-    }
-}
-
-fn render_scope_node(node: &ScopeNode<StlcScope>) -> String {
-    match node {
-        ScopeNode::Scope(data) => format!("scope:{}", render_scope_data(data)),
-        ScopeNode::Declaration(data) => format!("declaration:{}", render_scope_data(data)),
-        ScopeNode::Reference(data) => format!("reference:{}", render_scope_data(data)),
-    }
-}
-
-fn render_label(label: &StlcScopeLabel) -> String {
-    match label {
-        StlcScopeLabel::Lexical => "Lexical".into(),
-        StlcScopeLabel::Declaration(name) => format!("Declaration({name})"),
-        StlcScopeLabel::Import(path) => format!("Import({path})"),
-    }
-}
-
-fn render_node_kind(kind: &StlcNodeKind) -> &'static str {
-    match kind {
-        StlcNodeKind::Document => "document",
-        StlcNodeKind::Declaration => "declaration",
-        StlcNodeKind::Expression => "expression",
-        StlcNodeKind::Type => "type",
-        StlcNodeKind::Other => "other",
-    }
-}
-
-fn render_status(status: &ParseStatus) -> String {
-    match status {
-        ParseStatus::Clean => "clean".into(),
-        ParseStatus::Recovered { diagnostics } => format!("recovered({diagnostics})"),
-        ParseStatus::Unrecoverable { diagnostics } => format!("unrecoverable({diagnostics})"),
-        other => format!("{other:?}"),
-    }
-}
-
-/// Span-keyed lexeme table built once per document from the committed
-/// token publication; `source_text` is crate-private, so lexemes join
-/// through coordinates instead.
-#[derive(Default)]
-pub struct LexemeJoin {
-    by_span: BTreeMap<(usize, usize), String>,
-}
-
-impl LexemeJoin {
-    pub fn build(snapshot: &Snapshot, uri: &str) -> Option<Self> {
-        let tokens = snapshot.observe::<Tokens<StlcToken>>(uri.to_string())?;
-        let mut join = LexemeJoin::default();
-        for token in tokens.tokens.iter() {
-            join.by_span.insert(
-                (token.start, token.start + token.length),
-                render_token_value(&token.value),
-            );
+fn visit_declaration(
+    tree: &SnapshotTree<StlcTree>,
+    node: AstBox<StlcDeclaration>,
+    path: String,
+    paths: &mut HashMap<AstBox<()>, String>,
+    kinds: &mut BTreeMap<String, String>,
+) -> plingo::Result<()> {
+    add_path(paths, kinds, node.erased(), path.clone(), "declaration");
+    if let StlcDeclarationView::Value(value) = tree.view(node.clone())? {
+        if let Some(annotation) = value.annotation()? {
+            visit_type(tree, annotation, format!("{path}.annotation"), paths, kinds)?;
         }
-        Some(join)
+        for (index, parameter) in value.parameters()?.iter().enumerate() {
+            visit_param(
+                tree,
+                parameter,
+                format!("{path}.parameter[{index}]"),
+                paths,
+                kinds,
+            )?;
+        }
+        visit_expr(tree, value.body()?, format!("{path}.body"), paths, kinds)?;
+    } else if let StlcDeclarationView::Import(import) = tree.view(node.clone())? {
+        visit_path(tree, import.path()?, format!("{path}.path"), paths, kinds)?;
+    } else if let StlcDeclarationView::Export(export) = tree.view(node.clone())? {
+        visit_path(tree, export.path()?, format!("{path}.path"), paths, kinds)?;
     }
-
-    fn text(&self, span: &plingo::utils::Span) -> String {
-        self.by_span
-            .get(&(span.range.start(), span.range.end()))
-            .cloned()
-            .unwrap_or_else(|| "?".into())
-    }
+    Ok(())
 }
 
-/// The semantic lexeme of one token value (identifier or number text).
-fn render_token_value(value: &StlcToken) -> String {
-    match value {
-        StlcToken::Ident(text) => text.clone(),
-        StlcToken::Number(text) => text.clone(),
-        other => format!("{other:?}"),
-    }
+fn visit_path(
+    tree: &SnapshotTree<StlcTree>,
+    node: AstBox<StlcPath>,
+    path: String,
+    paths: &mut HashMap<AstBox<()>, String>,
+    kinds: &mut BTreeMap<String, String>,
+) -> plingo::Result<()> {
+    add_path(paths, kinds, node.erased(), path, "path");
+    let _ = tree.view(node)?;
+    Ok(())
 }
 
-fn resolve_lexeme<T: Send + Sync + 'static>(
-    join: Option<&LexemeJoin>,
-    ast: Option<&AstSnapshot>,
-    token: AstToken<T>,
-) -> String {
-    let (Some(join), Some(ast)) = (join, ast) else {
-        return "?".into();
+fn visit_param(
+    tree: &SnapshotTree<StlcTree>,
+    node: AstBox<StlcParam>,
+    path: String,
+    paths: &mut HashMap<AstBox<()>, String>,
+    kinds: &mut BTreeMap<String, String>,
+) -> plingo::Result<()> {
+    add_path(paths, kinds, node.erased(), path.clone(), "parameter");
+    let annotation = match tree.view(node.clone())? {
+        StlcParamView::Bare(param) => param.annotation()?,
+        StlcParamView::Parenthesized(param) => param.annotation()?,
     };
-    match ast.token(token) {
-        Some(entry) => join.text(&entry.span),
-        None => "?".into(),
+    if let Some(annotation) = annotation {
+        visit_type(tree, annotation, format!("{path}.annotation"), paths, kinds)?;
+    }
+    Ok(())
+}
+
+fn visit_type(
+    tree: &SnapshotTree<StlcTree>,
+    node: AstBox<StlcType>,
+    path: String,
+    paths: &mut HashMap<AstBox<()>, String>,
+    kinds: &mut BTreeMap<String, String>,
+) -> plingo::Result<()> {
+    add_path(paths, kinds, node.erased(), path.clone(), "type");
+    match tree.view(node)? {
+        StlcTypeView::Arrow(arrow) => {
+            visit_type_atom(tree, arrow.left()?, format!("{path}.left"), paths, kinds)?;
+            visit_type(tree, arrow.right()?, format!("{path}.right"), paths, kinds)?;
+        }
+        StlcTypeView::Atom(atom) => {
+            visit_type_atom(tree, atom.atom()?, format!("{path}.atom"), paths, kinds)?;
+        }
+        StlcTypeView::Error(_) => {}
+    }
+    Ok(())
+}
+
+fn visit_type_atom(
+    tree: &SnapshotTree<StlcTree>,
+    node: AstBox<StlcTypeAtom>,
+    path: String,
+    paths: &mut HashMap<AstBox<()>, String>,
+    kinds: &mut BTreeMap<String, String>,
+) -> plingo::Result<()> {
+    add_path(paths, kinds, node.erased(), path.clone(), "type-atom");
+    if let StlcTypeAtomView::Parenthesized(parenthesized) = tree.view(node)? {
+        visit_type(
+            tree,
+            parenthesized.ty()?,
+            format!("{path}.type"),
+            paths,
+            kinds,
+        )?;
+    }
+    Ok(())
+}
+
+fn visit_expr(
+    tree: &SnapshotTree<StlcTree>,
+    node: AstBox<StlcExpr>,
+    path: String,
+    paths: &mut HashMap<AstBox<()>, String>,
+    kinds: &mut BTreeMap<String, String>,
+) -> plingo::Result<()> {
+    add_path(paths, kinds, node.erased(), path.clone(), "expression");
+    match tree.view(node)? {
+        StlcExprView::If(if_) => {
+            visit_expr(
+                tree,
+                if_.condition()?,
+                format!("{path}.condition"),
+                paths,
+                kinds,
+            )?;
+            visit_expr(tree, if_.when_true()?, format!("{path}.then"), paths, kinds)?;
+            visit_expr(
+                tree,
+                if_.when_false()?,
+                format!("{path}.else"),
+                paths,
+                kinds,
+            )?;
+        }
+        StlcExprView::Case(case) => {
+            visit_expr(
+                tree,
+                case.scrutinee()?,
+                format!("{path}.scrutinee"),
+                paths,
+                kinds,
+            )?;
+            visit_expr(
+                tree,
+                case.zero_branch()?,
+                format!("{path}.zero"),
+                paths,
+                kinds,
+            )?;
+            visit_expr(
+                tree,
+                case.successor_branch()?,
+                format!("{path}.successor"),
+                paths,
+                kinds,
+            )?;
+        }
+        StlcExprView::Let(let_) => {
+            visit_expr(tree, let_.value()?, format!("{path}.value"), paths, kinds)?;
+            visit_expr(tree, let_.body()?, format!("{path}.body"), paths, kinds)?;
+        }
+        StlcExprView::Lambda(lambda) => {
+            visit_param(
+                tree,
+                lambda.parameter()?,
+                format!("{path}.parameter"),
+                paths,
+                kinds,
+            )?;
+            visit_expr(tree, lambda.body()?, format!("{path}.body"), paths, kinds)?;
+        }
+        StlcExprView::Add(add) => {
+            visit_expr(tree, add.left()?, format!("{path}.left"), paths, kinds)?;
+            visit_expr(tree, add.right()?, format!("{path}.right"), paths, kinds)?;
+        }
+        StlcExprView::Apply(apply) => {
+            visit_expr(
+                tree,
+                apply.function()?,
+                format!("{path}.function"),
+                paths,
+                kinds,
+            )?;
+            visit_expr(
+                tree,
+                apply.argument()?,
+                format!("{path}.argument"),
+                paths,
+                kinds,
+            )?;
+        }
+        StlcExprView::Succ(succ) => {
+            visit_expr(tree, succ.value()?, format!("{path}.value"), paths, kinds)?;
+        }
+        StlcExprView::Group(group) => {
+            visit_expr(
+                tree,
+                group.expression()?,
+                format!("{path}.expression"),
+                paths,
+                kinds,
+            )?;
+        }
+        StlcExprView::True(_)
+        | StlcExprView::False(_)
+        | StlcExprView::Number(_)
+        | StlcExprView::Variable(_)
+        | StlcExprView::Unit(_)
+        | StlcExprView::Error(_) => {}
+    }
+    Ok(())
+}
+
+fn tree_paths(
+    snapshot: &Snapshot,
+) -> plingo::Result<(HashMap<AstBox<()>, String>, BTreeMap<String, String>)> {
+    let tree = snapshot.tree::<StlcTree>();
+    let mut paths = HashMap::new();
+    let mut kinds = BTreeMap::new();
+    for domain in tree.domains() {
+        for (index, root) in tree.roots(&domain).enumerate() {
+            visit_document(
+                &tree,
+                root,
+                format!("{domain}#{index}"),
+                &mut paths,
+                &mut kinds,
+            )?;
+        }
+    }
+    Ok((paths, kinds))
+}
+
+fn node_path(paths: &HashMap<AstBox<()>, String>, node: &AstBox<()>) -> String {
+    paths
+        .get(node)
+        .cloned()
+        .unwrap_or_else(|| "orphan".to_owned())
+}
+
+fn insert_ast_map<V>(
+    digest: &mut SemanticDigest,
+    snapshot: &Snapshot,
+    paths: &HashMap<AstBox<()>, String>,
+    name: &str,
+) where
+    V: View<Input = AstBox<()>>,
+    V::Output: std::fmt::Debug,
+{
+    for key in snapshot.inputs::<V>() {
+        if let Some(value) = snapshot.observe::<V>(key.clone()) {
+            digest.insert(name, &node_path(paths, &key), &format!("{value:?}"));
+        }
     }
 }
 
-/// Renders one node's case variant with resolved identifier lexemes.
-fn render_case(join: Option<&LexemeJoin>, ast: Option<&AstSnapshot>, case: &StlcCase) -> String {
-    match case {
-        StlcCase::Document(StlcDocumentCase::Lines { .. }) => "Document::Lines".into(),
-        StlcCase::Document(StlcDocumentCase::Error { .. }) => "Document::Error".into(),
-        StlcCase::Declaration(StlcDeclarationCase::Value { f0, .. }) => {
-            format!("Declaration::Value({})", resolve_lexeme(join, ast, *f0))
+fn insert_definitions(digest: &mut SemanticDigest, snapshot: &Snapshot) {
+    for key in snapshot.inputs::<StlcDefinitionTypes>() {
+        if let Some(value) = snapshot.observe::<StlcDefinitionTypes>(key.clone()) {
+            digest.insert("definitions", &format!("{key:?}"), &format!("{value:?}"));
         }
-        StlcCase::Declaration(StlcDeclarationCase::Import { .. }) => "Declaration::Import".into(),
-        StlcCase::Declaration(StlcDeclarationCase::Export { .. }) => "Declaration::Export".into(),
-        StlcCase::Declaration(StlcDeclarationCase::Error { .. }) => "Declaration::Error".into(),
-        StlcCase::Path(StlcPathCase::Segments { .. }) => "Path::Segments".into(),
-        StlcCase::Param(StlcParamCase::Bare { f0, .. }) => {
-            format!("Param::Bare({})", resolve_lexeme(join, ast, *f0))
-        }
-        StlcCase::Param(StlcParamCase::Parenthesized { f0, .. }) => {
-            format!("Param::Parenthesized({})", resolve_lexeme(join, ast, *f0))
-        }
-        StlcCase::Type(StlcTypeCase::Arrow { .. }) => "Type::Arrow".into(),
-        StlcCase::Type(StlcTypeCase::Atom { .. }) => "Type::Atom".into(),
-        StlcCase::Type(StlcTypeCase::Error { .. }) => "Type::Error".into(),
-        StlcCase::TypeAtom(StlcTypeAtomCase::Nat { .. }) => "Atom::Nat".into(),
-        StlcCase::TypeAtom(StlcTypeAtomCase::Unit { .. }) => "Atom::Unit".into(),
-        StlcCase::TypeAtom(StlcTypeAtomCase::Bool { .. }) => "Atom::Bool".into(),
-        StlcCase::TypeAtom(StlcTypeAtomCase::Parenthesized { .. }) => "Atom::Group".into(),
-        StlcCase::Expr(expr) => render_expr_case(join, ast, expr),
-        _ => "unknown-case".into(),
     }
 }
 
-fn render_expr_case(
-    join: Option<&LexemeJoin>,
-    ast: Option<&AstSnapshot>,
-    expr: &StlcExprCase,
-) -> String {
-    match expr {
-        StlcExprCase::If { .. } => "Expr::If".into(),
-        StlcExprCase::Case { f2, .. } => {
-            format!("Expr::Case(successor={})", resolve_lexeme(join, ast, *f2))
-        }
-        StlcExprCase::True { .. } => "Expr::True".into(),
-        StlcExprCase::False { .. } => "Expr::False".into(),
-        StlcExprCase::Let { f0, .. } => format!("Expr::Let({})", resolve_lexeme(join, ast, *f0)),
-        StlcExprCase::Lambda { .. } => "Expr::Lambda".into(),
-        StlcExprCase::Add { .. } => "Expr::Add".into(),
-        StlcExprCase::Apply { .. } => "Expr::Apply".into(),
-        StlcExprCase::Succ { .. } => "Expr::Succ".into(),
-        StlcExprCase::Group { .. } => "Expr::Group".into(),
-        StlcExprCase::Number { f0 } => format!("Expr::Number({})", resolve_lexeme(join, ast, *f0)),
-        StlcExprCase::Variable { f0 } => {
-            format!("Expr::Variable({})", resolve_lexeme(join, ast, *f0))
-        }
-        StlcExprCase::Unit { .. } => "Expr::Unit".into(),
-        StlcExprCase::Error { .. } => "Expr::Error".into(),
-        _ => "unknown-expr".into(),
-    }
-}
-
-fn render_error(error: &super::check::StlcTypeError) -> String {
-    use super::check::StlcTypeError;
-    match error {
-        StlcTypeError::Mismatch { expected, found } => format!(
-            "mismatch{{expected:{},found:{}}}",
-            render_type(expected),
-            render_type(found)
-        ),
-        StlcTypeError::NonFunctionApplication { found } => {
-            format!("non-function-application{{found:{}}}", render_type(found))
-        }
-        StlcTypeError::BranchMismatch { then_ty, else_ty } => format!(
-            "branch-mismatch{{then:{},else:{}}}",
-            render_type(then_ty),
-            render_type(else_ty)
-        ),
-        StlcTypeError::UnboundVariable { name } => format!("unbound-variable{{{name}}}"),
-        StlcTypeError::UnboundVariable { name } => format!("unbound-variable{{{name}}}"),
-        StlcTypeError::MissingParameterAnnotation => "missing-parameter-annotation".into(),
-    }
-}
-
-fn render_type_diagnostic(diagnostic: &StlcTypeDiagnostic) -> String {
-    render_error(&diagnostic.error)
-}
-
-// ---------------------------------------------------------------------------
-// Tree projection: stable DFS paths joined to every node-keyed view
-// ---------------------------------------------------------------------------
-
-/// One document's tree projection.
-///
-/// Paths are local: a root renders `{doc}#{root-ordinal}` and a child
-/// appends `.position-among-siblings`, so an inserted subtree renumbers
-/// nothing outside its own branch.
-struct TreeProjection {
-    /// Join key (deterministic per engine capture) → canonical path.
-    paths: BTreeMap<u64, String>,
-    /// Canonical path → rendered case row.
-    cases: BTreeMap<String, String>,
-    /// Roots in publication order.
-    roots: Vec<String>,
-}
-
-impl TreeProjection {
-    fn build(
-        snapshot: &Snapshot,
-        join: Option<&LexemeJoin>,
-        ast: Option<&AstSnapshot>,
-        uri: &str,
-    ) -> Self {
-        let mut projection = Self {
-            paths: BTreeMap::new(),
-            cases: BTreeMap::new(),
-            roots: Vec::new(),
-        };
-        let doc = doc_prefix(uri);
-        let key = uri.to_string();
-        // Root-order facts exist only after an explicit root splice; the
-        // initial document root handle rides in TreeParseUnits (plan
-        // §19.6 removes this companion lifecycle in Phase 1).
-        let mut roots: Vec<Node<StlcTree>> = StlcTree::snapshot_roots_of(snapshot, &key);
-        if roots.is_empty() {
-            if let Some(unit) = snapshot.observe::<TreeParseUnits<StlcDocument>>(uri.to_string())
-                && let Some(root) = unit.root.clone()
-            {
-                roots.push(root);
-            }
-        }
-        for root in roots {
-            let root_path = format!("{doc}#{}", projection.roots.len());
-            projection.roots.push(root_path.clone());
-            projection.visit(snapshot, join, ast, root, &root_path);
-        }
-        projection
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn visit(
-        &mut self,
-        snapshot: &Snapshot,
-        join: Option<&LexemeJoin>,
-        ast: Option<&AstSnapshot>,
-        id: Node<StlcTree>,
-        path: &str,
-    ) {
-        let key = join_key(id.clone());
-        if self.paths.contains_key(&key) {
-            return;
-        }
-        self.paths.insert(key, path.to_owned());
-        if let Some(case) = StlcTree::snapshot_case(snapshot, id.clone()) {
-            let rendered = render_case(join, ast, &case);
-            self.cases.insert(path.to_owned(), rendered);
-        }
-        for (position, child) in StlcTree::snapshot_children(snapshot, id.clone())
-            .iter()
-            .enumerate()
+fn insert_expected(
+    digest: &mut SemanticDigest,
+    snapshot: &Snapshot,
+    paths: &HashMap<AstBox<()>, String>,
+) {
+    for (parent, child) in snapshot.inputs::<StlcExpectedTypes>() {
+        if let Some(value) = snapshot.observe::<StlcExpectedTypes>((parent.clone(), child.clone()))
         {
-            let child_path = format!("{path}.{position}");
-            self.visit(snapshot, join, ast, child.clone(), &child_path);
-        }
-    }
-
-    fn path_of(&self, id: Node<StlcTree>) -> Option<&str> {
-        self.paths.get(&join_key(id)).map(|path| path.as_str())
-    }
-
-    fn len(&self) -> usize {
-        self.paths.len()
-    }
-}
-
-/// Internal per-capture join key; never rendered.
-fn join_key(id: Node<StlcTree>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    id.hash(&mut hasher);
-    std::hash::Hasher::finish(&hasher)
-}
-
-fn doc_prefix(uri: &str) -> String {
-    uri.trim_start_matches("test://").to_owned()
-}
-
-// ---------------------------------------------------------------------------
-// The digest
-// ---------------------------------------------------------------------------
-
-/// Captures every public view's complete committed content.
-pub fn stlc_digest(snapshot: &Snapshot) -> SemanticDigest {
-    let mut digest = SemanticDigest::new();
-
-    // Document universe: union of token publications and parse units.
-    let mut uris: Vec<String> = snapshot.inputs::<Tokens<StlcToken>>();
-    uris.extend(snapshot.inputs::<TreeParseUnits<StlcDocument>>());
-    uris.sort();
-    uris.dedup();
-
-    for uri in &uris {
-        let prefix = doc_prefix(uri);
-
-        // Ordered semantic tokens: source-stable coordinate rows.
-        if let Some(tokens) = snapshot.observe::<Tokens<StlcToken>>(uri.clone()) {
-            let TokenVec {
-                tokens: list,
-                errors,
-            } = &*tokens;
-            for (ordinal, token) in list.iter().enumerate() {
-                digest.insert_domain(
-                    &format!("{prefix}:tokens"),
-                    ordinal,
-                    &format!(
-                        "{}..{}:{:?}",
-                        token.start,
-                        token.start + token.length,
-                        token.value
-                    ),
-                );
-            }
             digest.insert(
-                &format!("{prefix}:lex"),
-                "errors",
-                &errors.len().to_string(),
+                "expected",
+                &format!("{}>{}", node_path(paths, &parent), node_path(paths, &child)),
+                &format!("{value:?}"),
             );
         }
+    }
+}
 
-        // Parse unit: status + full structural projection.
-        let unit = snapshot.observe::<TreeParseUnits<StlcDocument>>(uri.clone());
-        let ast = snapshot
-            .observe::<AstSnapshots<StlcDocument>>(uri.clone())
-            .map(|document| Arc::clone(document.arc()));
-        let ast = ast.as_deref();
-        let Some(unit) = unit else {
+fn insert_list<V>(
+    digest: &mut SemanticDigest,
+    snapshot: &Snapshot,
+    paths: &HashMap<AstBox<()>, String>,
+    name: &str,
+) where
+    V: plingo::reactive::kind::ListView<Key = AstBox<()>>,
+    V::Item: std::fmt::Debug,
+{
+    for domain in snapshot.list_domains::<V>() {
+        let items = snapshot.list::<V>(&domain);
+        let base = node_path(paths, &domain);
+        digest.insert(
+            name,
+            &format!("{base}.len"),
+            &format!("Len({})", items.len()),
+        );
+        for (index, value) in items.iter().enumerate() {
+            digest.insert(
+                name,
+                &format!("{base}.slot[{index}]"),
+                &format!("Item({value:?})"),
+            );
+        }
+    }
+}
+fn scope_data(data: &StlcScopeData, _paths: &HashMap<AstBox<()>, String>) -> String {
+    match data {
+        StlcScopeData::Document => "document".to_owned(),
+        StlcScopeData::Lexical => "lexical".to_owned(),
+        StlcScopeData::CaseSuccessor => "case-successor".to_owned(),
+        StlcScopeData::External { path } => format!("external({path})"),
+        StlcScopeData::Declaration { name } => format!("declaration({name})"),
+    }
+}
+
+fn scope_label(label: &StlcScopeLabel) -> String {
+    match label {
+        StlcScopeLabel::Lexical => "lexical".to_owned(),
+        StlcScopeLabel::Declaration(name) => format!("declaration({name})"),
+        StlcScopeLabel::Import(path) => format!("import({path})"),
+    }
+}
+
+fn insert_graph(
+    digest: &mut SemanticDigest,
+    snapshot: &Snapshot,
+    _paths: &HashMap<AstBox<()>, String>,
+) {
+    let mut rows = Vec::new();
+    for node in snapshot.graph_nodes::<ScopeGraph<StlcScope>>() {
+        let Some(payload) = snapshot.graph_node::<ScopeGraph<StlcScope>>(node) else {
             continue;
         };
-        digest.insert(
-            &format!("{prefix}:parse"),
-            "status",
-            &render_status(&unit.status),
-        );
+        let row = match payload.as_ref() {
+            ScopeNode::Scope(data) => format!("node scope {}", scope_data(data, _paths)),
+            ScopeNode::Declaration(data) => {
+                format!("node declaration {}", scope_data(data, _paths))
+            }
+            ScopeNode::Reference(data) => {
+                format!("node reference {}", scope_data(data, _paths))
+            }
+        };
+        rows.push(row);
+    }
+    for (_node, label, targets) in snapshot.graph_buckets::<ScopeGraph<StlcScope>>() {
+        let target_rows = targets
+            .iter()
+            .filter_map(|target| snapshot.graph_node::<ScopeGraph<StlcScope>>(target.clone()))
+            .map(|payload| match payload.as_ref() {
+                ScopeNode::Scope(data) => scope_data(data, _paths),
+                ScopeNode::Declaration(data) => scope_data(data, _paths),
+                ScopeNode::Reference(data) => scope_data(data, _paths),
+            })
+            .collect::<Vec<_>>();
+        rows.push(format!(
+            "bucket {} -> {:?}",
+            scope_label(&label),
+            target_rows
+        ));
+    }
+    rows.sort();
+    for (index, row) in rows.iter().enumerate() {
+        digest.insert("graph", &format!("#{index:06}"), row);
+    }
+}
 
-        let join = LexemeJoin::build(snapshot, uri);
-        let projection = TreeProjection::build(snapshot, join.as_ref(), ast, uri);
-        digest.insert(
-            &format!("{prefix}:tree"),
-            "nodes",
-            &projection.len().to_string(),
-        );
-        for (index, root) in projection.roots.iter().enumerate() {
-            digest.insert(&format!("{prefix}:roots"), &index.to_string(), root);
-        }
-        for (path, case_row) in &projection.cases {
-            digest.insert(&format!("{prefix}:cases"), path, case_row);
-        }
+/// Captures every committed public semantic view without exposing raw node or
+/// graph ordinals.  Tree paths are derived from the generated child readers.
+pub fn stlc_digest(snapshot: &Snapshot) -> SemanticDigest {
+    let (paths, kinds) = tree_paths(snapshot).unwrap_or_default();
+    let mut digest = SemanticDigest::new();
 
-        // Node-keyed semantic views joined to stable paths.
-        for input in snapshot.inputs::<StlcIncomingScopes>() {
-            let Some(path) = projection.path_of(input.clone()).map(|path| path.to_owned()) else {
-                continue;
-            };
-            digest.insert(&format!("{prefix}:enclosing"), &path, "present");
-        }
-        for input in snapshot.inputs::<StlcReferenceCandidates>() {
-            let Some(path) = projection.path_of(input.clone()).map(|path| path.to_owned()) else {
-                continue;
-            };
-            digest.insert(&format!("{prefix}:reference-candidates"), &path, "present");
-        }
-        for input in snapshot.inputs::<StlcResolvedReferences>() {
-            let Some(path) = projection.path_of(input.clone()).map(|path| path.to_owned()) else {
-                continue;
-            };
-            let resolution = snapshot.observe::<StlcResolvedReferences>(input.clone());
-            let row = match resolution.as_deref() {
-                Some(StlcResolution::Resolved { declaration }) => snapshot
-                    .graph_node::<ScopeGraph<StlcScope>>(declaration.node())
-                    .as_deref()
-                    .map(|payload| format!("resolved({})", render_scope_node(payload)))
-                    .unwrap_or_else(|| "resolved(<absent>)".into()),
-                Some(StlcResolution::Unbound { name }) => format!("unbound({name})"),
-                None => continue,
-            };
-            digest.insert(&format!("{prefix}:resolutions"), &path, &row);
-        }
-
-        // Structural products.
-        for input in snapshot.inputs::<StlcNodeIndex>() {
-            let Some(path) = projection.path_of(input.clone()).map(|path| path.to_owned()) else {
-                continue;
-            };
-            if let Some(kind) = snapshot.observe::<StlcNodeIndex>(input.clone()) {
-                digest.insert(
-                    &format!("{prefix}:node-index"),
-                    &path,
-                    render_node_kind(&kind),
+    for (path, kind) in kinds {
+        digest.insert("tree", &path, &kind);
+    }
+    for key in snapshot.inputs::<Tokens<StlcToken>>() {
+        if let Some(tokens) = snapshot.observe::<Tokens<StlcToken>>(key.clone()) {
+            let mut values = String::new();
+            for token in &tokens.tokens[..] {
+                if !values.is_empty() {
+                    values.push('|');
+                }
+                let _ = write!(
+                    &mut values,
+                    "{}..{}:{:?}",
+                    token.start,
+                    token.start + token.length,
+                    token.value
                 );
             }
+            digest.insert("tokens", &key, &values);
         }
-        for input in snapshot.inputs::<StlcLowered>() {
-            let Some(path) = projection.path_of(input.clone()).map(|path| path.to_owned()) else {
-                continue;
-            };
-            if let Some(lowered) = snapshot.observe::<StlcLowered>(input.clone()) {
-                digest.insert(&format!("{prefix}:lowered"), &path, lowered.as_str());
-            }
+    }
+    for key in snapshot.inputs::<ParserTreeStatuses>() {
+        if let Some(status) = snapshot.observe::<ParserTreeStatuses>(key.clone()) {
+            digest.insert("parse", &key, &format!("{status:?}"));
         }
-        for input in snapshot.inputs::<StlcLoweredOrigin>() {
-            let Some(path) = projection.path_of(input.clone()).map(|path| path.to_owned()) else {
-                continue;
-            };
-            if let Some(origin) = snapshot.observe::<StlcLoweredOrigin>(input.clone()) {
-                let row = projection
-                    .path_of(origin.as_ref().clone())
-                    .unwrap_or("<orphan>")
-                    .to_owned();
-                digest.insert(&format!("{prefix}:lowered-origin"), &path, &row);
-            }
-        }
-        for input in snapshot.inputs::<StlcLoweredSummary>() {
-            let Some(path) = projection.path_of(input.clone()).map(|path| path.to_owned()) else {
-                continue;
-            };
-            if let Some(summary) = snapshot.observe::<StlcLoweredSummary>(input.clone()) {
-                digest.insert(
-                    &format!("{prefix}:lowered-summary"),
-                    &path,
-                    summary.as_str(),
-                );
-            }
-        }
-
-        // List-keyed diagnostics in explicit slot order.
-        for input in snapshot.inputs::<ParseDiagnostics>() {
-            let ListKey::Slot(domain, slot) = &input else {
-                continue;
-            };
-            if domain != uri {
-                continue;
-            }
-            if let Some(item) = snapshot.observe::<ParseDiagnostics>(input.clone()) {
-                digest.insert(
-                    &format!("{prefix}:parse-diagnostics"),
-                    &slot.to_string(),
-                    &format!("{item:?}"),
-                );
-            }
-        }
-        for input in snapshot.inputs::<StlcTypeDiagnostics>() {
-            let ListKey::Slot(node, _slot) = &input else {
-                continue;
-            };
-            let Some(path) = projection.path_of(node.clone()).map(|path| path.to_owned()) else {
-                continue;
-            };
-            let ListKey::Slot(_, slot) = &input else {
-                unreachable!()
-            };
-            let item = snapshot.observe::<StlcTypeDiagnostics>(input.clone());
-            let Some(plingo::reactive::kind::ListFact::Item(diagnostic)) = item.as_deref() else {
-                continue;
-            };
+    }
+    for key in snapshot.inputs::<ParseDiagnostics>() {
+        if let Some(value) = snapshot.observe::<ParseDiagnostics>(key.clone()) {
             digest.insert(
-                &format!("{prefix}:type-diagnostics"),
-                &format!("{path}[{slot}]"),
-                &render_type_diagnostic(diagnostic),
-            );
-        }
-        for input in snapshot.inputs::<StlcLoweringDiagnostics>() {
-            let ListKey::Slot(node, slot) = &input else {
-                continue;
-            };
-            let Some(path) = projection.path_of(node.clone()).map(|path| path.to_owned()) else {
-                continue;
-            };
-            let item = snapshot.observe::<StlcLoweringDiagnostics>(input.clone());
-            let Some(plingo::reactive::kind::ListFact::Item(text)) = item.as_deref() else {
-                continue;
-            };
-            digest.insert(
-                &format!("{prefix}:lowering-diagnostics"),
-                &format!("{path}[{slot}]"),
-                text,
+                "parse-diagnostics",
+                &format!("{key:?}"),
+                &format!("{value:?}"),
             );
         }
     }
 
-    emit_scope_graph_rows(snapshot, &mut digest);
+    insert_ast_map::<StlcIncomingScopes>(&mut digest, snapshot, &paths, "incoming");
+    insert_ast_map::<StlcRootScopes>(&mut digest, snapshot, &paths, "roots");
+    insert_ast_map::<StlcContinuationScopes>(&mut digest, snapshot, &paths, "continuations");
+    insert_definitions(&mut digest, snapshot);
+    insert_ast_map::<StlcReferenceCandidates>(&mut digest, snapshot, &paths, "candidates");
+    insert_ast_map::<StlcResolvedReferences>(&mut digest, snapshot, &paths, "resolved");
+    insert_ast_map::<StlcSynthesizedTypes>(&mut digest, snapshot, &paths, "synthesized");
+    insert_expected(&mut digest, snapshot, &paths);
+    insert_list::<StlcTypeDiagnostics>(&mut digest, snapshot, &paths, "type-diagnostics");
+    insert_ast_map::<StlcNodeIndex>(&mut digest, snapshot, &paths, "node-index");
+    insert_ast_map::<StlcLowered>(&mut digest, snapshot, &paths, "lowered");
+    insert_ast_map::<StlcLoweredOrigin>(&mut digest, snapshot, &paths, "lowered-origin");
+    insert_ast_map::<StlcLoweredSummary>(&mut digest, snapshot, &paths, "lowered-summary");
+    insert_graph(&mut digest, snapshot, &paths);
+
     digest
 }
 
-/// Scope graph: payload multiset plus exact edge triples.
-///
-/// Endpoints render by payload content, so equal-cardinality buckets whose
-/// sources/targets differ produce different digests (plan §4 exit gate).
-fn emit_scope_graph_rows(snapshot: &Snapshot, digest: &mut SemanticDigest) {
-    let mut nodes: Vec<String> = Vec::new();
-    let mut edges: Vec<String> = Vec::new();
-    for input in snapshot.inputs::<ScopeGraph<StlcScope>>() {
-        match input {
-            GraphKey::Node(node) => {
-                if let Some(payload) =
-                    snapshot.graph_node::<ScopeGraph<StlcScope>>(node.clone())
-                {
-                    nodes.push(render_scope_node(&payload));
-                }
-            }
-            GraphKey::Bucket(source, label) => {
-                let label_row = render_label(&label);
-                let source_payload = snapshot
-                    .graph_node::<ScopeGraph<StlcScope>>(source.clone())
-                    .map(|payload| render_scope_node(&payload))
-                    .unwrap_or_else(|| "<absent>".into());
-                for target in
-                    snapshot.outgoing::<ScopeGraph<StlcScope>>(source.clone(), &label)
-                {
-                    let target_payload = snapshot
-                        .graph_node::<ScopeGraph<StlcScope>>(target)
-                        .map(|payload| render_scope_node(&payload))
-                        .unwrap_or_else(|| "<absent>".into());
-                    edges.push(format!(
-                        "({source_payload})--{label_row}->({target_payload})"
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-    nodes.sort();
-    edges.sort();
-    for (ordinal, row) in nodes.iter().enumerate() {
-        digest.insert_domain("graph:nodes", ordinal, row);
-    }
-    for (ordinal, row) in edges.iter().enumerate() {
-        digest.insert_domain("graph:edges", ordinal, row);
-    }
+#[allow(dead_code)]
+fn token_value(token: AstToken<StlcToken>) -> plingo::Result<Option<Arc<StlcToken>>> {
+    observe_token(token)
+}
+
+#[allow(dead_code)]
+fn _status_is_clean(status: &ParseStatus) -> bool {
+    matches!(status, ParseStatus::Clean)
 }

@@ -20,6 +20,14 @@ use crate::reactive::plain::{EffectContext, Temporal};
 use crate::reactive::view::{Node, View};
 use crate::reactive::{Error, Result};
 
+/// Opaque node identity for generic tree views.
+///
+/// This name keeps the generic tree API distinct from abstract-tree schema
+/// nodes while retaining one identity representation internally.
+pub type TreeNode<V> = Node<V>;
+
+/// Opaque node identity for generic graph views.
+pub type GraphNode<V> = Node<V>;
 /// Bounds every encoded fact key.
 pub trait KeyBounds:
     Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static
@@ -354,15 +362,17 @@ impl<V: TreeView> TreePatch<V> {
     /// retained root or parent receives a rebuilt child list.
     #[doc(hidden)]
     pub fn set_children(&self, id: Node<V>, children: Vec<Node<V>>) -> Result<()> {
-        let before: Arc<[Node<V>]> =
-            match self.context.peek::<V>(TreeKey::ChildOrder(id.clone()))?.as_deref() {
-                Some(TreeFact::Order(order)) => order.clone(),
-                _ => Arc::from([]),
-            };
+        let before: Arc<[Node<V>]> = match self
+            .context
+            .peek::<V>(TreeKey::ChildOrder(id.clone()))?
+            .as_deref()
+        {
+            Some(TreeFact::Order(order)) => order.clone(),
+            _ => Arc::from([]),
+        };
         let after: Arc<[Node<V>]> = children.clone().into();
         if before.as_ref() != after.as_ref() {
-            let retained: std::collections::HashSet<Node<V>> =
-                after.iter().cloned().collect();
+            let retained: std::collections::HashSet<Node<V>> = after.iter().cloned().collect();
             for link in before.iter().filter(|link| !retained.contains(*link)) {
                 self.remove(TreeKey::ChildLink(id.clone(), link.clone()))?;
             }
@@ -389,20 +399,25 @@ impl<V: TreeView> TreePatch<V> {
     ) -> Result<()> {
         let removed_ids: Vec<Node<V>> = removed.to_vec();
         let inserted_ids: Vec<Node<V>> = inserted.to_vec();
-        let old: Arc<[Node<V>]> =
-            match self.context.peek::<V>(TreeKey::ChildOrder(id.clone()))?.as_deref() {
-                Some(TreeFact::Order(order)) => order.clone(),
-                _ => Arc::from([]),
-            };
+        let old: Arc<[Node<V>]> = match self
+            .context
+            .peek::<V>(TreeKey::ChildOrder(id.clone()))?
+            .as_deref()
+        {
+            Some(TreeFact::Order(order)) => order.clone(),
+            _ => Arc::from([]),
+        };
         let start = match before.as_ref() {
-            Some(before) => old.iter().position(|link| link == before).ok_or_else(|| {
-                crate::reactive::Error::TopologyViolation {
-                    view: V::name().to_string(),
-                    message: format!(
-                        "splice before-anchor {before:?} absent from child order of {id:?}"
-                    ),
-                }
-            })? + 1,
+            Some(before) => {
+                old.iter().position(|link| link == before).ok_or_else(|| {
+                    crate::reactive::Error::TopologyViolation {
+                        view: V::name().to_string(),
+                        message: format!(
+                            "splice before-anchor {before:?} absent from child order of {id:?}"
+                        ),
+                    }
+                })? + 1
+            }
             None => 0,
         };
         let end = match after.as_ref() {
@@ -885,8 +900,7 @@ impl<V: TreeView> TreeEmit<V> {
         };
         let after: Arc<[Node<V>]> = children.clone().into();
         if before.as_ref() != after.as_ref() {
-            let retained: std::collections::HashSet<Node<V>> =
-                after.iter().cloned().collect();
+            let retained: std::collections::HashSet<Node<V>> = after.iter().cloned().collect();
             for link in before.iter().filter(|link| !retained.contains(*link)) {
                 self.1
                     .write(&self.0, TreeKey::ChildLink(id.clone(), link.clone()), None)?;
@@ -923,14 +937,16 @@ impl<V: TreeView> TreeEmit<V> {
             _ => Arc::from([]),
         };
         let start = match before.as_ref() {
-            Some(before) => old.iter().position(|link| link == before).ok_or_else(|| {
-                crate::reactive::Error::TopologyViolation {
-                    view: V::name().to_string(),
-                    message: format!(
-                        "splice before-anchor {before:?} absent from child order of {id:?}"
-                    ),
-                }
-            })? + 1,
+            Some(before) => {
+                old.iter().position(|link| link == before).ok_or_else(|| {
+                    crate::reactive::Error::TopologyViolation {
+                        view: V::name().to_string(),
+                        message: format!(
+                            "splice before-anchor {before:?} absent from child order of {id:?}"
+                        ),
+                    }
+                })? + 1
+            }
             None => 0,
         };
         let end = match after.as_ref() {
@@ -964,8 +980,11 @@ impl<V: TreeView> TreeEmit<V> {
             }
         }
         for removed in &removed_ids {
-            self.1
-                .write(&self.0, TreeKey::ChildLink(id.clone(), removed.clone()), None)?;
+            self.1.write(
+                &self.0,
+                TreeKey::ChildLink(id.clone(), removed.clone()),
+                None,
+            )?;
         }
         let order: Arc<[Node<V>]> = old[..start]
             .iter()
@@ -1028,21 +1047,16 @@ impl<V: TreeView> TreeEmit<V> {
     /// every call — equal values stay cold while ownership (T5) survives
     /// re-running builders.
     pub fn replace_roots(&self, key: &V::Key, roots: &[Node<V>]) -> Result<()> {
-        let before: Arc<[Node<V>]> =
-            match self.1.read(&self.0, &TreeKey::RootOrder(key.clone()))? {
-                Some(TreeFact::RootOrder(order)) => order,
-                _ => Arc::from([]),
-            };
+        let before: Arc<[Node<V>]> = match self.1.read(&self.0, &TreeKey::RootOrder(key.clone()))? {
+            Some(TreeFact::RootOrder(order)) => order,
+            _ => Arc::from([]),
+        };
         let after: Arc<[Node<V>]> = roots.iter().cloned().collect();
         if before.as_ref() != after.as_ref() {
-            let retained: std::collections::HashSet<Node<V>> =
-                after.iter().cloned().collect();
+            let retained: std::collections::HashSet<Node<V>> = after.iter().cloned().collect();
             for link in before.iter().filter(|link| !retained.contains(*link)) {
-                self.1.write(
-                    &self.0,
-                    TreeKey::RootLink(key.clone(), link.clone()),
-                    None,
-                )?;
+                self.1
+                    .write(&self.0, TreeKey::RootLink(key.clone(), link.clone()), None)?;
             }
         }
         self.1.write(
@@ -1075,9 +1089,7 @@ impl<V: TreeView> TreeEmit<V> {
     }
 
     fn read_fact(&self, id: &Node<V>) -> Result<Option<TreeFact<Node<V>, V::Payload>>> {
-        let fact = self
-            .1
-            .read(&self.0, &TreeKey::ChildOrder(id.clone()))?;
+        let fact = self.1.read(&self.0, &TreeKey::ChildOrder(id.clone()))?;
         Ok(fact)
     }
     fn read_parent(&self, id: &Node<V>) -> Result<Option<Node<V>>> {
@@ -1175,9 +1187,7 @@ impl<V: TreeView> TreeObserve<V> {
     /// Reads one node's ordered children (the order fact plus each link
     /// encountered; each read is a separate dependency).
     pub fn children(&self, id: Node<V>) -> Result<Vec<Node<V>>> {
-        let Some(order) =
-            self.fact_of(TreeKey::ChildOrder(id.clone()), Temporal::Current)?
-        else {
+        let Some(order) = self.fact_of(TreeKey::ChildOrder(id.clone()), Temporal::Current)? else {
             return Ok(Vec::new());
         };
         let TreeFact::Order(order) = order else {
@@ -1239,9 +1249,7 @@ impl<V: TreeView> TreeObserve<V> {
 
     /// Reads one node's previous-epoch children.
     pub fn children_previous(&self, id: Node<V>) -> Result<Vec<Node<V>>> {
-        let Some(order) =
-            self.fact_of(TreeKey::ChildOrder(id.clone()), Temporal::Previous)?
-        else {
+        let Some(order) = self.fact_of(TreeKey::ChildOrder(id.clone()), Temporal::Previous)? else {
             return Ok(Vec::new());
         };
         let TreeFact::Order(order) = order else {
@@ -1341,6 +1349,11 @@ impl<V: GraphView> GraphEmit<V> {
             GraphKey::Bucket(from.clone(), label.clone()),
             Some(GraphFact::Targets(targets)),
         )
+    }
+
+    /// Replaces one labelled edge bucket with the supplied target order.
+    pub fn set_bucket(&self, from: Node<V>, label: V::Label, targets: Vec<Node<V>>) -> Result<()> {
+        self.write_bucket(&from, &label, targets)
     }
 
     /// Allocates a fresh node identity and publishes its payload.

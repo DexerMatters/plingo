@@ -19,9 +19,9 @@ use reactive_macros::view;
 use crate::{
     framework::{
         lex::{
-            LexErrorInfo, LexToken, Lexer, LexerCreationError, LexerRoot, LexicalDocument,
-            SemanticTokenDocument, SemanticTokenDocuments, TokenFact, TokenFactId, TokenFactKey,
-            TokenFacts, TokenLayoutDocument, TokenLayoutDocuments, TokenOccurrenceId, LexInterrupt,
+            LexErrorInfo, LexInterrupt, LexToken, Lexer, LexerCreationError, LexerRoot,
+            LexicalDocument, SemanticTokenDocument, SemanticTokenDocuments, TokenFact, TokenFactId,
+            TokenFactKey, TokenFacts, TokenLayoutDocument, TokenLayoutDocuments,
         },
         source::SourceRevisions,
     },
@@ -281,9 +281,9 @@ where
         .lexer
         .derive_document(Arc::clone(&revision))
         .map_err(|error| match error {
-            LexInterrupt::StaleSourceRevision { uri } => Error::Internal(
-                format!("stale source revision: {uri}").into(),
-            ),
+            LexInterrupt::StaleSourceRevision { uri } => {
+                Error::Internal(format!("stale source revision: {uri}").into())
+            }
             error => Error::Internal(error.to_string().into()),
         })?;
     let document = derived.document;

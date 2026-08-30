@@ -116,8 +116,7 @@ where
     let keep = pairs
         .iter()
         .map(|(parent, child)| {
-            Arc::new((parent.clone(), child.clone()))
-                as Arc<dyn crate::reactive::value::KeyValue>
+            Arc::new((parent.clone(), child.clone())) as Arc<dyn crate::reactive::value::KeyValue>
         })
         .collect::<Vec<_>>();
     crate::reactive::plain::reconcile_keyed_children(group, &keep)?;
@@ -155,8 +154,7 @@ where
     let keep = children
         .iter()
         .map(|child| {
-            Arc::new((parent.clone(), child.clone()))
-                as Arc<dyn crate::reactive::value::KeyValue>
+            Arc::new((parent.clone(), child.clone())) as Arc<dyn crate::reactive::value::KeyValue>
         })
         .collect::<Vec<_>>();
     crate::reactive::plain::reconcile_keyed_children(group, &keep)?;

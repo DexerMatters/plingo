@@ -1,6 +1,7 @@
 //! T5 — concrete facts have one writer.
 
-use crate::reactive::kind::Map;
+use crate::reactive::api::{run, run_each_child, run_each_child_of, run_each_key};
+use crate::reactive::kind::{Map, emit_view, observe_view};
 use crate::reactive::prelude::*;
 use crate::view;
 

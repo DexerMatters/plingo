@@ -84,47 +84,6 @@ pub struct ChildSplice {
     pub inserted_children: Arc<[(SyntaxNodeId, u64)]>,
 }
 
-impl ChildSplice {
-    /// Validates anchor membership against the old order (debug).
-    pub(crate) fn assert_anchored(&self, order_before: &[SyntaxNodeId]) {
-        let start = self
-            .delta
-            .before
-            .as_ref()
-            .map(|before| {
-                order_before
-                    .iter()
-                    .position(|id| id == before)
-                    .expect("splice before-anchor missing from old order")
-                    + 1
-            })
-            .unwrap_or(0);
-        let end = self
-            .delta
-            .after
-            .as_ref()
-            .map(|after| {
-                order_before
-                    .iter()
-                    .position(|id| id == after)
-                    .expect("splice after-anchor missing from old order")
-            })
-            .unwrap_or(order_before.len());
-        debug_assert!(start <= end, "splice anchors cross in old order");
-        debug_assert_eq!(
-            order_before.get(start..end).unwrap_or_default(),
-            self.delta.removed.as_ref(),
-            "splice removed run differs from old order"
-        );
-        for id in &*self.delta.inserted {
-            debug_assert!(
-                !order_before[..start].contains(id) && !order_before[end..].contains(id),
-                "splice inserts a link that survives outside the replaced run"
-            );
-        }
-    }
-}
-
 /// A stable syntax identity observed by downstream components (plan §8.7).
 /// Allocated per document from a checked serial; proofs may inherit an
 /// older node's identity when correspondence is provable. Equality across
@@ -150,7 +109,6 @@ pub struct RemovedRecord {
     pub child_records: Arc<[u64]>,
 }
 
-
 /// A synthesized (recovery) token identity (plan §14): deterministic
 /// `(document, recovery segment, action ordinal)`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -170,10 +128,9 @@ pub struct ParseDelta {
     pub parents: KeyDelta<SyntaxNodeId>,
     /// One ordered splice per changed parent.
     pub child_splices: Arc<[ChildSplice]>,
-    /// Cut E: the post-publication stable child orders for every parent
-    /// touched this command, consumed by the caller to seed the next
-    /// command's splice oracle. Not a public wire field.
-    pub(crate) child_orders_next: Arc<std::collections::HashMap<u64, Vec<u64>>>,
+    /// Cut F: the post-publication stable child orders for every parent
+    /// touched this command. The order root is persistent and path-copied.
+    pub(crate) child_orders_next: Arc<crate::reactive::store::RadixMap<Vec<u64>>>,
     /// Root-list splice.
     pub roots: OrderedDelta<SyntaxNodeId>,
     /// Synthesized recovery tokens.

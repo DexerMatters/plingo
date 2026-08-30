@@ -19,4 +19,4 @@ pub use scope::{
     snapshot_declarations, snapshot_node, snapshot_nodes, snapshot_outgoing, snapshot_scope,
 };
 pub use source::{SourceEdit, SourceEdits, SourceRevisions, SourceSnapshot, source_snapshot};
-pub use workspace::{Workspace, WorkspaceReport};
+pub use workspace::{Workspace, WorkspaceBuilder, WorkspaceReport};

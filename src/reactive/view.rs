@@ -66,10 +66,9 @@ pub(crate) struct SyntaxNodeIdentity {
     pub(crate) view: std::any::TypeId,
     pub(crate) uri: Arc<str>,
     pub(crate) lineage: u64,
-    pub(crate) member: u8,
+    pub(crate) member: &'static str,
     pub(crate) root: bool,
 }
-
 
 impl<V: 'static> Clone for Node<V> {
     fn clone(&self) -> Self {
@@ -100,21 +99,19 @@ impl<V: 'static> std::hash::Hash for Node<V> {
 
 impl<V: 'static> Node<V> {
     /// Constructs a generated syntax identity from its complete logical key.
+    ///
+    /// Only the scope facade still uses this legacy constructor; parser
+    /// publication mints identities through `__published_syntax_box`, which
+    /// carries the collision-safe member descriptor (Cut B item 6).
     #[doc(hidden)]
-    pub(crate) fn from_syntax(
-        raw: u64,
-        uri: &str,
-        lineage: u64,
-        member: u8,
-        root: bool,
-    ) -> Self {
+    pub(crate) fn from_syntax(raw: u64, uri: &str, lineage: u64, root: bool) -> Self {
         Self {
             raw,
             identity: Some(Arc::new(SyntaxNodeIdentity {
                 view: std::any::TypeId::of::<V>(),
                 uri: Arc::from(uri),
                 lineage,
-                member,
+                member: "",
                 root,
             })),
             marker: PhantomData,
@@ -161,9 +158,20 @@ impl<V: 'static> Node<V> {
         }
     }
 
-    /// The stable cached hash, used only by legacy fact encodings.
+    /// Converts an automatically allocated node into the public abstract-tree
+    /// identity without copying its complete erased key.
+    pub(crate) fn into_ast_box<T>(self) -> crate::reactive::abstract_tree::AstBox<T> {
+        let identity = self
+            .identity
+            .expect("automatic node identity must retain its complete key");
+        crate::reactive::abstract_tree::AstBox::from_parts(self.raw, identity)
+    }
+
+    /// The stable cached hash, used only by framework-internal fact
+    /// encodings and the crate's own test fixtures. Never part of the
+    /// authoring surface (plan §7).
     #[doc(hidden)]
-    pub fn raw_id(&self) -> u64 {
+    pub(crate) fn raw_id(&self) -> u64 {
         self.raw
     }
 }

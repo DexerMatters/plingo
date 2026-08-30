@@ -6,17 +6,17 @@ use std::{
 };
 
 use super::{
-    ParseColumn, ParseError, ParseToken, ParserSessionState, ReplayPlan, SessionContext, TokenTail,
-    checkpoint,
+    OccurrenceKey, OriginKey, ParseColumn, ParseError, ParseToken, ParserSessionState,
+    RecoveryJournalEntry, ReplayPlan, SeamBinding, SessionContext, TokenTail, checkpoint,
 };
 use crate::framework::{
-    lex::LexerRoot,
+    lex::{LexerRoot, TokenOccurrenceId},
     parse::{
-        IncrementalParseStats, Parser, ParserSnapshotState,
+        IncrementalParseStats, Parser,
         data::{
             ast::{AnchoredSpan, AstArena},
-            green::{ParseErrorInfo, TreeArena},
-            gss::GssArena,
+            green::ParseErrorInfo,
+            gss::CanonicalFrontierCache,
             product::{ProductArena, ProductData, ProductId},
         },
         delta::{
@@ -25,7 +25,8 @@ use crate::framework::{
         },
         diagnostics::collect_parse_diagnostics,
         types::{
-            ParserTreeFacts, ProductReachKey, RecordReachKey, RecordTransition, SessionArenas,
+            ParserBoundaryId, ParserDocumentRoot, ParserTreeFacts, ProductReachKey, RecordReachKey,
+            RecordTransition,
         },
     },
 };
@@ -59,21 +60,23 @@ impl ReusableSuffix {
 
 /// Phase accounting for exact parser convergence. These durations are emitted
 /// with each replay so a logical suffix reuse can be distinguished from its
-/// physical mapping/rebase cost.
+/// bounded seam-binding cost.
 #[derive(Default)]
 struct ReuseTiming {
     checkpoint: Duration,
     frontier_match: Duration,
     tail_validation: Duration,
-    product_remap: Duration,
-    rebase: Duration,
+    seam_binding: Duration,
 }
 
-
-fn remap_product(
+/// Materialize only the bounded product closure needed to bind a retained
+/// segment's logical root to the current replay generation. The source
+/// columns and their products stay immutable; this map is the seam overlay.
+fn bind_product(
     old: ProductId,
     mapping: &mut HashMap<ProductId, ProductId>,
     session_ctx: &mut SessionContext<'_>,
+    token_remap: &dyn Fn(ProductId) -> Option<TokenOccurrenceId>,
 ) -> Result<Option<ProductId>, ParseError> {
     if let Some(product) = mapping.get(&old).copied() {
         return Ok(Some(product));
@@ -86,23 +89,127 @@ fn remap_product(
         return Ok(None);
     };
     if matches!(data, ProductData::Token { .. }) {
+        // A retained token product resolves through its occurrence: an
+        // unchanged occurrence keeps the cache-stable product; the edited
+        // occurrence maps to the current replay's replacement product.
+        let target = token_remap(old).and_then(|occ| session_ctx.state.token_product(occ));
+        let target = target.unwrap_or(old);
+        mapping.insert(old, target);
+        return Ok(Some(target));
+    }
+    if matches!(data, ProductData::Error { .. }) {
+        // Recovery products carry no reduction origin. The seam only lands
+        // after every edited occurrence, so a retained error region is
+        // validated-unchanged and keeps its products verbatim.
         mapping.insert(old, old);
         return Ok(Some(old));
     }
-    let Some(origin) = session_ctx.state.reduction_origins.get(&old).cloned() else {
+    let Some(origin) = session_ctx
+        .state
+        .reduction_origins
+        .get(&OriginKey(old))
+        .cloned()
+    else {
         return Ok(None);
     };
     let mut children = Vec::with_capacity(origin.children.len());
     for &child in &origin.children {
-        let Some(child) = remap_product(child, mapping, session_ctx)? else {
+        let Some(child) = bind_product(child, mapping, session_ctx, token_remap)? else {
             return Ok(None);
         };
         children.push(child);
     }
-    let product =
-        session_ctx.reduce_cached(origin.production, &children, origin.boundary.unwrap_or(0))?;
+    let product = session_ctx.reduce_cached(
+        origin.production,
+        &children,
+        origin.boundary.unwrap_or(TokenOccurrenceId(u64::MAX)),
+    )?;
     mapping.insert(old, product);
     Ok(Some(product))
+}
+
+/// Tries to replay a journaled recovery region instead of re-running the
+/// bounded search (plan §14). The proof is exact: the triggering occurrence,
+/// per-witness token identity (existence plus terminal), and exact frontier
+/// equality at the error column. A dirty witness invalidates the entry.
+fn try_reuse_recovery_journal(
+    plan: &ReplayPlan,
+    session_ctx: &mut SessionContext<'_>,
+    trigger: TokenOccurrenceId,
+    tail: &mut TokenTail,
+    _stats: &mut IncrementalParseStats,
+    frontier_cache: &mut CanonicalFrontierCache,
+) -> Result<Option<usize>, ParseError> {
+    use crate::framework::parse::recovery::Repair;
+    let candidates: Vec<(u64, Arc<RecoveryJournalEntry>)> = session_ctx
+        .state
+        .recovery_journal
+        .iter()
+        .filter(|(_, entry)| entry.anchor == trigger)
+        .map(|(key, entry)| (key.0, Arc::clone(entry)))
+        .collect();
+    for (serial, entry) in candidates {
+        // Witness identity: every consumed token must still exist under the
+        // same occurrence with the same terminal; otherwise the region is
+        // dirty and the journal entry is invalidated.
+        let mut dirty = false;
+        for (occurrence, terminal) in &entry.witnesses {
+            let matches = plan
+                .new
+                .rank_of_occurrence(*occurrence)
+                .and_then(|r| plan.new.token_at(r))
+                .is_some_and(|data| data.terminal == Some(*terminal));
+            if !matches {
+                dirty = true;
+                break;
+            }
+        }
+        if dirty {
+            session_ctx
+                .state
+                .recovery_journal
+                .remove(&OccurrenceKey(serial));
+            crate::framework::workspace::record_parser_work(&session_ctx.uri.to_string(), |work| {
+                work.recovery_segments_invalidated += 1;
+            });
+            continue;
+        }
+        // Anchor alignment: each repair must land on exactly the token the
+        // proven plan named, in order.
+        let mut aligned = true;
+        let mut probe = 0usize;
+        for (repair, anchor) in &entry.repairs {
+            match tail.get(probe) {
+                Some(token) if token.column == *anchor => {
+                    if !matches!(repair, Repair::Insert(_)) {
+                        probe += 1;
+                    }
+                }
+                _ => {
+                    aligned = false;
+                    break;
+                }
+            }
+        }
+        if !aligned {
+            continue;
+        }
+        // Exact frontier equality at the re-entered error column.
+        let frontier = {
+            let column_index = session_ctx.state.current_column();
+            checkpoint::frontier_checkpoint_for_column(
+                &mut session_ctx.state.columns[column_index],
+                session_ctx.gss,
+                session_ctx.products,
+                frontier_cache,
+            )
+        };
+        if !frontier.exact_match(&entry.frontier) {
+            continue;
+        }
+        return session_ctx.replay_recovery_journal(serial, &entry, 0, tail);
+    }
+    Ok(None)
 }
 
 pub(super) fn decode_data(
@@ -133,93 +240,233 @@ fn maybe_reuse_suffix(
     current: (usize, usize),
     stats: &mut IncrementalParseStats,
     timing: &mut ReuseTiming,
+    frontier_cache: &mut CanonicalFrontierCache,
 ) -> Result<bool, ParseError> {
-    let (current_boundary, current_token_boundary) = current;
-    // Only the final-coordinate suffix can correspond to the base revision's
-    // unchanged suffix, so reuse is never considered inside a changed range.
-    if current_token_boundary < plan.new_reuse_start {
+    let (current_column, current_rank) = current;
+    if current_rank < plan.new_reuse_start {
         return Ok(false);
     }
     stats.convergence_checks += 1;
-    let old_token_boundary = plan.old_reuse_start + (current_token_boundary - plan.new_reuse_start);
-    let old_index = plan
-        .old_unit(old_token_boundary)
-        .and_then(|token| old.segment.token_column(token.column))
-        .or_else(|| (old_token_boundary == plan.old_reuse_start).then_some(0));
-    let Some(old_index) =
-        old_index.filter(|&index| index < old.len() && old.is_clean_from(index + 1))
-    else {
+    crate::framework::workspace::record_parser_work(&session_ctx.uri.to_string(), |work| {
+        work.convergence_candidates += 1;
+    });
+
+    let current_occurrence = (current_rank < plan.new.semantic_len())
+        .then(|| plan.new_unit(current_rank).map(|token| token.column))
+        .flatten();
+    let boundary = ParserBoundaryId::Source(plan.new.boundary_at_rank(current_rank));
+    session_ctx.state.columns[current_column].set_boundary(Some(boundary));
+    let old_index = old.segment.boundary_column(boundary);
+    let old_occurrence = old_index
+        .and_then(|index| old.column(index))
+        .and_then(|column| column.token);
+    let selected_old_column_anchor = old_occurrence.map(|occurrence| occurrence.0);
+    let current_column_anchor = session_ctx.state.columns[current_column]
+        .token
+        .map(|occurrence| occurrence.0);
+    stats.boundary_trace = Some(crate::framework::parse::BoundaryTrace {
+        current_lookahead_occurrence: current_occurrence.map(|occurrence| occurrence.0),
+        current_column_anchor,
+        selected_old_occurrence: old_occurrence.map(|occurrence| occurrence.0),
+        selected_old_column_anchor,
+    });
+    // Retained recovery columns no longer block reuse: the state-frontier
+    // proof below establishes an equal LR configuration, and the parser is
+    // deterministic over identical inputs, so the frozen recovery regions
+    // are exactly what a fresh replay would produce (plan §14 reuse).
+    let Some(old_index) = old_index.filter(|&index| index < old.len()) else {
         return Ok(false);
     };
 
     let checkpoint_start = Instant::now();
     let current_frontier = {
-        let current_column = &mut session_ctx.state.columns[current_boundary];
-        checkpoint::frontier_checkpoint_for_column(current_column, session_ctx.gss).clone()
+        let current_column = &mut session_ctx.state.columns[current_column];
+        checkpoint::frontier_checkpoint_for_column(
+            current_column,
+            session_ctx.gss,
+            session_ctx.products,
+            frontier_cache,
+        )
+        .clone()
     };
     let Some(old_frontier) = old.frontier(old_index).cloned() else {
         return Ok(false);
     };
-    if current_frontier != old_frontier {
+    crate::framework::workspace::record_parser_work(&session_ctx.uri.to_string(), |work| {
+        work.checkpoint_exact_comparisons += 1;
+        work.checkpoint_comparisons += 1;
+    });
+    let exact_checkpoint = current_frontier.exact_match(&old_frontier);
+    if !exact_checkpoint {
+        // State-level convergence (plan §5.6): the exact product key differs
+        // (or is absent across cyclic frontiers), but an equal post-reduction
+        // LR configuration parses the retained suffix identically — the
+        // parser is deterministic over identical states and inputs. The
+        // paired traversal maps the differing token products by position;
+        // the reduction cache and the token remap resolve the rest during
+        // attachment.
+        if current_frontier.anchor != old_frontier.anchor
+            || current_frontier.error_derived != old_frontier.error_derived
+        {
+            timing.checkpoint += checkpoint_start.elapsed();
+            return Ok(false);
+        }
+        let Some(old_column) = old.column(old_index) else {
+            timing.checkpoint += checkpoint_start.elapsed();
+            return Ok(false);
+        };
+        let current_parse_column = &session_ctx.state.columns[current_column];
+        let old_active = old_column.active_nodes().collect::<Vec<_>>();
+        let new_active = current_parse_column.active_nodes().collect::<Vec<_>>();
+        let Some(seeded) = session_ctx.gss.match_state_frontiers(
+            &old_active,
+            &new_active,
+            session_ctx.products,
+            session_ctx.trees,
+            frontier_cache,
+        ) else {
+            timing.checkpoint += checkpoint_start.elapsed();
+            return Ok(false);
+        };
         timing.checkpoint += checkpoint_start.elapsed();
-        return Ok(false);
+        stats.checkpoint_matches += 1;
+        stats.frontier_matches += 1;
+        crate::framework::workspace::record_parser_work(&session_ctx.uri.to_string(), |work| {
+            work.checkpoint_matches += 1;
+            work.frontier_matches += 1;
+        });
+        let seam_start = Instant::now();
+        let tail = old.segment.slice(old_index + 1..old.len());
+        let mut products = seeded;
+        let mut accepted = Vec::with_capacity(tail.raw_accepted().len());
+        for &product in tail.raw_accepted() {
+            // A bind failure — including a rebuild whose mapped child no
+            // longer satisfies the old production's token kinds — rejects
+            // the seam; the replay continues conservatively.
+            let mapped = match bind_product(product, &mut products, session_ctx, &|id| {
+                old.segment.product_occurrence(id)
+            }) {
+                Ok(Some(mapped)) => mapped,
+                Ok(None) | Err(ParseError::Build(_)) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            accepted.push(mapped);
+        }
+        let seam = Arc::new(SeamBinding::from_map(products));
+        let attached = tail.attach_seam(seam, accepted.into());
+        timing.seam_binding += seam_start.elapsed();
+        stats.reconverged_new_boundary = Some(current_column);
+        stats.reconverged_old_boundary = Some(old.column_base + old_index);
+        session_ctx.state.append_reused_segment(attached);
+        return Ok(true);
     }
     timing.checkpoint += checkpoint_start.elapsed();
     stats.checkpoint_matches += 1;
+    crate::framework::workspace::record_parser_work(&session_ctx.uri.to_string(), |work| {
+        work.checkpoint_matches += 1;
+    });
 
     let frontier_start = Instant::now();
     let Some(old_column) = old.column(old_index) else {
         return Ok(false);
     };
-    let current_column = &session_ctx.state.columns[current_boundary];
+    let current_parse_column = &session_ctx.state.columns[current_column];
     let old_base = old_column.base_active_nodes().collect::<Vec<_>>();
     let old_active = old_column.active_nodes().collect::<Vec<_>>();
-    let new_base = current_column.base_active_nodes().collect::<Vec<_>>();
-    let new_active = current_column.active_nodes().collect::<Vec<_>>();
-    let Some((frontier_nodes, frontier_products, shared_prefix)) = session_ctx
-        .gss
-        .match_frontiers((&old_base, &old_active), (&new_base, &new_active))
+    let new_base = current_parse_column.base_active_nodes().collect::<Vec<_>>();
+    let new_active = current_parse_column.active_nodes().collect::<Vec<_>>();
+    let Some((frontier_nodes, frontier_products, shared_prefix)) =
+        session_ctx.gss.match_canonical_frontiers_cached(
+            (&old_base, &old_active),
+            (&new_base, &new_active),
+            session_ctx.products,
+            frontier_cache,
+        )
     else {
+        // State-level convergence (plan §5.6): the exact product key differs
+        // because the edited value produced different products below the
+        // seam, but the paired LR configuration is equal, so the retained
+        // suffix parses identically. The paired traversal maps the differing
+        // token products by position; the reduction cache plus the token
+        // remap resolve the rest during attachment.
+        let Some(seeded) = session_ctx.gss.match_state_frontiers(
+            &old_active,
+            &new_active,
+            session_ctx.products,
+            session_ctx.trees,
+            frontier_cache,
+        ) else {
+            timing.frontier_match += frontier_start.elapsed();
+            return Ok(false);
+        };
         timing.frontier_match += frontier_start.elapsed();
-        return Ok(false);
+        stats.frontier_matches += 1;
+        let seam_start = Instant::now();
+        let tail = old.segment.slice(old_index + 1..old.len());
+        let mut products = seeded;
+        let mut accepted = Vec::with_capacity(tail.raw_accepted().len());
+        for &product in tail.raw_accepted() {
+            // A bind failure — including a rebuild whose mapped child no
+            // longer satisfies the old production's token kinds — rejects
+            // the seam; the replay continues conservatively.
+            let mapped = match bind_product(product, &mut products, session_ctx, &|id| {
+                old.segment.product_occurrence(id)
+            }) {
+                Ok(Some(mapped)) => mapped,
+                Ok(None) | Err(ParseError::Build(_)) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            accepted.push(mapped);
+        }
+        let seam = Arc::new(SeamBinding::from_map(products));
+        let attached = tail.attach_seam(seam, accepted.into());
+        timing.seam_binding += seam_start.elapsed();
+        stats.reconverged_new_boundary = Some(current_column);
+        stats.reconverged_old_boundary = Some(old.column_base + old_index);
+        session_ctx.state.append_reused_segment(attached);
+        return Ok(true);
     };
     timing.frontier_match += frontier_start.elapsed();
     stats.frontier_matches += 1;
-
-    // A fully identity frontier is the proof that the immutable tail's
-    // existing GSS edges remain valid. No retained column needs to be read.
+    crate::framework::workspace::record_parser_work(&session_ctx.uri.to_string(), |work| {
+        work.frontier_matches += 1;
+    });
     let identity_frontier = shared_prefix
         && frontier_nodes.iter().all(|(old, new)| old == new)
         && frontier_products.iter().all(|(old, new)| old == new);
+    // An identity frontier proves that the immutable tail's existing GSS
+    // edges remain valid. No retained column needs to be read.
     if identity_frontier && old.products_cache_stable() {
         let tail = old.segment.slice(old_index + 1..old.len());
-        timing.rebase += Duration::default();
-        stats.reconverged_new_boundary = Some(current_boundary);
+        stats.reconverged_new_boundary = Some(current_column);
         stats.reconverged_old_boundary = Some(old.column_base + old_index);
         session_ctx.state.append_reused_segment(tail);
         return Ok(true);
     }
 
-    // Rebase only the bounded accepted-root/product closure. The retained
-    // columns remain immutable source data; their raw GSS frontier is the
-    // convergence oracle for the next command.
-    let rebase_start = Instant::now();
+    // Attach a bounded seam overlay to the immutable tail. The source
+    // columns are never rewritten; only the accepted roots' product closure
+    // is materialized in the current generation.
+    let seam_start = Instant::now();
     let tail = old.segment.slice(old_index + 1..old.len());
     let mut products = frontier_products;
     let mut accepted = Vec::with_capacity(tail.raw_accepted().len());
     for &product in tail.raw_accepted() {
-        let Some(mapped) = remap_product(product, &mut products, session_ctx)? else {
+        let Some(mapped) = bind_product(product, &mut products, session_ctx, &|id| {
+            old.segment.product_occurrence(id)
+        })?
+        else {
             return Ok(false);
         };
         accepted.push(mapped);
     }
-    let rebased = tail.rebase(products, accepted.into());
-    timing.product_remap += rebase_start.elapsed();
-    timing.rebase += Duration::default();
+    let seam = Arc::new(SeamBinding::from_map(products));
+    let attached = tail.attach_seam(seam, accepted.into());
+    timing.seam_binding += seam_start.elapsed();
 
-    stats.reconverged_new_boundary = Some(current_boundary);
+    stats.reconverged_new_boundary = Some(current_column);
     stats.reconverged_old_boundary = Some(old.column_base + old_index);
-    session_ctx.state.append_reused_segment(rebased);
+    session_ctx.state.append_reused_segment(attached);
     Ok(true)
 }
 /// The accepted-root reachability update for one parser command.
@@ -329,10 +576,7 @@ fn apply_accepted_root_delta(
         if crossed_into_live || crossed_dead {
             if let Some(record) = super::product_direct_record(products, product) {
                 let record_key = RecordReachKey(record);
-                let record_before = record_reach_counts
-                    .get(&record_key)
-                    .copied()
-                    .unwrap_or(0);
+                let record_before = record_reach_counts.get(&record_key).copied().unwrap_or(0);
                 let record_delta = if crossed_into_live { 1 } else { -1 };
                 let record_after =
                     checked_reach_count("record", record, record_before, record_delta)?;
@@ -371,11 +615,7 @@ fn apply_accepted_root_delta(
                         delta: child as i64,
                     });
                 }
-                add_pending_product(
-                    &mut pending,
-                    child,
-                    if crossed_into_live { 1 } else { -1 },
-                )?;
+                add_pending_product(&mut pending, child, if crossed_into_live { 1 } else { -1 })?;
             }
         }
     }
@@ -420,12 +660,14 @@ fn apply_accepted_root_delta(
             "accepted-root record reach counts diverged from slow oracle"
         );
         debug_assert_eq!(
-            live_records.iter().map(|(record, ())| record).collect::<Vec<_>>(),
+            live_records
+                .iter()
+                .map(|(record, ())| record)
+                .collect::<Vec<_>>(),
             expected_records.keys().copied().collect::<Vec<_>>(),
             "persistent live-record map diverged from accepted-root oracle"
         );
     }
-
 
     Ok(ReachabilityUpdate {
         live_records,
@@ -495,16 +737,14 @@ fn slow_accepted_root_reach(
     Ok((product_counts, record_counts))
 }
 
-
-
 /// Freezes one command into the canonical [`ParseDelta`] (plan §9).
 ///
 /// Membership is authoritative from the accepted roots: the union of the
 /// accepted products' transitive AST records IS the live tree, so a
 /// transiently live recovery region can never reach the published
-/// domains. Journal-derived classification refines this where proven
-/// (currently: none — record-granular republication relies on fact
-/// equality downstream); lineage-keyed updates arrive with Phase 9.
+/// domains. Journal-derived classification refines this where proven:
+/// lineage-keyed payload/order classification is live, and the frozen delta
+/// carries only genuinely inserted, updated, or removed keys.
 #[allow(clippy::too_many_arguments)]
 fn freeze_parse_delta(
     state: &mut ParserSessionState,
@@ -520,7 +760,7 @@ fn freeze_parse_delta(
     current_status: ParsedStatus,
     tree_member_kind: Option<fn(&AstArena, u64) -> Option<u8>>,
     tree_child_records_fn: Option<fn(&AstArena, u64) -> Vec<u64>>,
-)-> Result<(Arc<ParseDelta>, ReachabilityUpdate), ParseError> {
+) -> Result<(Arc<ParseDelta>, ReachabilityUpdate), ParseError> {
     let reachability =
         apply_accepted_root_delta(previous, previous_roots, current_roots, products)?;
     if std::env::var_os("PLINGO_TRACE_PARSER").is_some() {
@@ -560,9 +800,9 @@ fn freeze_parse_delta(
 
     let mut computed_child_splices: Vec<ChildSplice> = Vec::new();
     // Retained-record splice oracle (Cut E): last published order per
-    // parent lineage. Interim O(parents) clone on first mutation; the
-    // persistent-root migration (Cut G) replaces this with structural
-    // sharing.
+    // parent lineage, held in a persistent path-copying radix root. A
+    // command clones the root handle (O(1)) and path-copies only the
+    // touched parents' entries.
     let tree_child_records = |record: usize| {
         let raw = tree_child_records_fn
             .map(|children| children(ast, record as u64))
@@ -582,8 +822,7 @@ fn freeze_parse_delta(
             })
             .collect::<Vec<_>>()
     };
-    let mut next_child_orders: std::collections::HashMap<u64, Vec<u64>> =
-        (*previous.child_orders).clone();
+    let mut next_child_orders = (*previous.child_orders).clone();
     // Dropped-lineage record resolution: prefer a LIVE record bearing the
     // lineage (a child that moved), else the command's death journal.
     let reverse_died: std::collections::HashMap<u64, u64> = state
@@ -599,9 +838,6 @@ fn freeze_parse_delta(
     let mut updated_records: Vec<(SyntaxNodeId, u64)> = Vec::new();
     let mut silent: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     {
-        let dead_lookup =
-            |record: u64| -> Option<u64> { state.lineage.lineage_of(record as usize) };
-        let _ = dead_lookup;
         for &record in &inserted {
             let rec = record as usize;
             let Some(old_record) = state.lineage.inherited_from(rec) else {
@@ -626,7 +862,6 @@ fn freeze_parse_delta(
             updated_records.push((SyntaxNodeId(lineage), record));
         }
     }
-
 
     let mut syntax_inserted: Vec<SyntaxNodeId> = Vec::new();
     let mut inserted_pairs: Vec<(SyntaxNodeId, u64)> = Vec::new();
@@ -676,7 +911,7 @@ fn freeze_parse_delta(
         // for the exact removed key.
         let Some(lineage) = previous
             .record_lineages
-            .get(record)
+            .get(*record)
             .copied()
             .or_else(|| state.lineage.died_lineage_of(*record))
         else {
@@ -694,7 +929,7 @@ fn freeze_parse_delta(
         let parent_lineage = parent_record.and_then(|parent| {
             previous
                 .record_lineages
-                .get(&parent)
+                .get(parent)
                 .copied()
                 .or_else(|| state.lineage.died_lineage_of(parent))
                 .or_else(|| state.lineage.lineage_of(parent as usize))
@@ -741,15 +976,13 @@ fn freeze_parse_delta(
             let old_pairs: Vec<(SyntaxNodeId, u64)> = old_child_records
                 .iter()
                 .filter_map(|&child| {
-                    resolve_lineage(child as usize)
-                        .map(|lin| (SyntaxNodeId(lin), child as u64))
+                    resolve_lineage(child as usize).map(|lin| (SyntaxNodeId(lin), child as u64))
                 })
                 .collect();
             let new_pairs: Vec<(SyntaxNodeId, u64)> = new_child_records_all
                 .iter()
                 .filter_map(|&child| {
-                    resolve_lineage(child as usize)
-                        .map(|lin| (SyntaxNodeId(lin), child as u64))
+                    resolve_lineage(child as usize).map(|lin| (SyntaxNodeId(lin), child as u64))
                 })
                 .collect();
             let old_children: Vec<SyntaxNodeId> =
@@ -806,13 +1039,19 @@ fn freeze_parse_delta(
                 candidate_parents.push((parent_lineage, parent_bearer));
             };
             for &record in inserted.iter() {
-                note(ast.parent_of(record as usize), &|parent| resolve_lineage(parent));
+                note(ast.parent_of(record as usize), &|parent| {
+                    resolve_lineage(parent)
+                });
             }
             for &record in removed.iter() {
-                note(ast.parent_of(record as usize), &|parent| resolve_lineage(parent));
+                note(ast.parent_of(record as usize), &|parent| {
+                    resolve_lineage(parent)
+                });
             }
             for &(_lineage, record) in updated_records.iter() {
-                note(ast.parent_of(record as usize), &|parent| resolve_lineage(parent));
+                note(ast.parent_of(record as usize), &|parent| {
+                    resolve_lineage(parent)
+                });
             }
             // A newly reached record can itself own a generated child field.
             // Seed its current order directly; relying only on a touched
@@ -857,8 +1096,7 @@ fn freeze_parse_delta(
             let new_pairs: Vec<(SyntaxNodeId, u64)> = new_list
                 .iter()
                 .filter_map(|&child| {
-                    resolve_lineage(child as usize)
-                        .map(|lin| (SyntaxNodeId(lin), child as u64))
+                    resolve_lineage(child as usize).map(|lin| (SyntaxNodeId(lin), child as u64))
                 })
                 .collect();
             let new_children: Vec<SyntaxNodeId> =
@@ -870,7 +1108,7 @@ fn freeze_parse_delta(
             if spliced_already.contains(&parent_lin) {
                 continue;
             }
-            if let Some(old_order) = previous.child_orders.get(&parent_lin) {
+            if let Some(old_order) = previous.child_orders.get(parent_lin) {
                 let old_children: Vec<SyntaxNodeId> =
                     old_order.iter().map(|&lin| SyntaxNodeId(lin)).collect();
                 if old_children != new_children {
@@ -918,9 +1156,8 @@ fn freeze_parse_delta(
         }
 
         for removed in &removed_pairs {
-            next_child_orders.remove(&removed.lineage.0);
+            next_child_orders.remove(removed.lineage.0);
         }
-
     }
 
     sort_dedup(&mut inserted);
@@ -931,7 +1168,7 @@ fn freeze_parse_delta(
     // not produce a root splice.
     let previous_root_lineage = previous
         .root
-        .and_then(|record| previous.record_lineages.get(&record).copied())
+        .and_then(|record| previous.record_lineages.get(record).copied())
         .map(SyntaxNodeId);
     let current_root_lineage = tree_root
         .and_then(|record| {
@@ -1146,11 +1383,11 @@ fn fnv64(bytes: &[u8]) -> u64 {
 
 impl<Root: LexerRoot + Clone> Parser<Root> {
     pub(crate) fn parse_delta_batch(
-        &mut self,
-        working: &mut ParserSnapshotState,
+        &self,
+        previous_root: Option<Arc<ParserDocumentRoot>>,
         uri: fluent_uri::Uri<String>,
         plan: ReplayPlan,
-    ) -> Result<(), ParseError> {
+    ) -> Result<Arc<ParserDocumentRoot>, ParseError> {
         let total_start = Instant::now();
         if std::env::var_os("PLINGO_TRACE_PARSER").is_some() {
             eprintln!(
@@ -1166,29 +1403,28 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
         let plan_elapsed = Duration::default();
 
         let session_setup_start = Instant::now();
-        let previous_tree_facts = working
-            .tree_facts
-            .get(&uri)
+        let previous_tree_facts = previous_root.as_ref().map_or_else(
+            || Arc::new(ParserTreeFacts::default()),
+            |root| Arc::clone(&root.tree_facts),
+        );
+        let previous_roots = previous_root
+            .as_ref()
+            .map_or_else(|| Arc::new(Vec::new()), |root| Arc::clone(&root.roots));
+        let mut root = previous_root
+            .as_deref()
             .cloned()
-            .unwrap_or_else(|| Arc::new(ParserTreeFacts::default()));
-        let previous_roots = working
-            .roots
-            .get(&uri)
-            .map(|roots| roots.as_slice())
-            .unwrap_or(&[]);
-        let arenas = self
-            .session_arenas
-            .entry(uri.clone())
-            .or_insert_with(|| SessionArenas {
-                trees: TreeArena::new(),
-                products: ProductArena::new(),
-                ast: Arc::new(AstArena::new(uri.clone())),
-                gss: GssArena::new(),
-            });
-        let state = Arc::make_mut(working.sessions.entry(uri.clone()).or_default());
+            .unwrap_or_else(|| ParserDocumentRoot::with_document(&uri, plan.new.document));
+        let state = Arc::make_mut(&mut root.session);
+        let arenas = Arc::make_mut(&mut root.arenas);
         if state.columns.is_empty() && state.retained_suffix.is_none() {
             let start = arenas.gss.node(0, 0, 0);
-            state.columns = vec![ParseColumn::new(None, IndexSet::from([start]))];
+            let mut initial = ParseColumn::new(None, IndexSet::from([start]));
+            let boundary = plan.new.boundary_at_rank(0);
+            initial.set_boundary(Some(ParserBoundaryId::Source(boundary)));
+            state.columns = vec![initial];
+            state
+                .boundary_columns
+                .insert(ParserBoundaryId::Source(boundary), 0);
         }
         let mut session_ctx = SessionContext {
             uri: uri.clone(),
@@ -1201,35 +1437,33 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             actions: &self.actions,
             gotos: &self.gotos,
             error_recovery: self.config.error_recovery,
+            active_scratch: Vec::new(),
         };
         session_ctx.state.lineage.begin_command();
         // Deterministic synthetic-token identity (plan §14): the document
         // serial is the stable URI hash; this command's synthetic tokens
         // restart empty.
-        session_ctx.state.document_serial = crate::framework::parse::data::ast::document_key(&uri);
+        session_ctx.state.document_serial = plan.new.document.0;
         session_ctx.state.synthetic_tokens.clear();
+        session_ctx.state.synthetic_log.clear();
         session_ctx.state.active_recovery_segment = None;
         let gss_before = session_ctx.gss.node_count();
-        let products_before = session_ctx.products.products.len();
+        let gss_edges_before = session_ctx.gss.edge_count();
+        let products_before = session_ctx.products.len();
         let ast_before = session_ctx.ast.len();
         let session_setup_elapsed = session_setup_start.elapsed();
-
-        // Recovery may add physical columns without consuming a token. Find
-        // the nearest existing checkpoint by probing only the bounded replay
-        // prefix; the unchanged suffix is indexed by its segment metadata.
-        let restart_token_boundary = (0..=plan.restart_boundary.min(plan.old_extent))
-            .rev()
-            .find(|&rank| {
-                plan.old_unit(rank)
-                    .and_then(|token| session_ctx.state.column_for_token(token.column))
-                    .is_some()
+        let restart_token_boundary = plan.restart_boundary.min(plan.old_extent);
+        let restart_column = plan
+            .old
+            .as_ref()
+            .and_then(|old| {
+                (0..=restart_token_boundary).rev().find_map(|rank| {
+                    let boundary = ParserBoundaryId::Source(old.boundary_at_rank(rank));
+                    session_ctx.state.column_for_boundary(boundary)
+                })
             })
             .unwrap_or(0);
-        let restart_column = plan
-            .old_unit(restart_token_boundary)
-            .and_then(|token| session_ctx.state.column_for_token(token.column))
-            .unwrap_or(0);
-        let restart_boundary = (0..=restart_column.saturating_sub(1))
+        let restart_boundary = (0..=restart_column)
             .rev()
             .find(|&column| {
                 session_ctx
@@ -1242,15 +1476,31 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
         // segment. Materialize only the checkpoint prefix needed by this
         // replay before detaching the old suffix.
         session_ctx.state.ensure_prefix(restart_boundary);
-        let old_column_base = plan
-            .old_unit(plan.old_reuse_start)
-            .and_then(|token| session_ctx.state.column_for_token(token.column))
-            .unwrap_or_else(|| session_ctx.state.column_count());
+        let old_column_base = if plan.suffix_len > 0 {
+            let reuse_boundary =
+                ParserBoundaryId::Source(plan.new.boundary_at_rank(plan.new_reuse_start));
+            session_ctx
+                .state
+                .column_for_boundary(reuse_boundary)
+                .unwrap_or_else(|| session_ctx.state.column_count())
+        } else {
+            session_ctx.state.column_count()
+        };
         let checkpoint_start = Instant::now();
-        let detached = session_ctx
-            .state
-            .detach_suffix(old_column_base, session_ctx.gss);
-        let empty_segment = || super::ParseSegment::from_columns(Vec::new(), session_ctx.gss);
+        let detached = session_ctx.state.detach_suffix(
+            old_column_base,
+            session_ctx.gss,
+            session_ctx.products,
+            plan.new.document,
+        );
+        let empty_segment = || {
+            super::ParseSegment::from_columns(
+                Vec::new(),
+                session_ctx.gss,
+                session_ctx.products,
+                plan.new.document,
+            )
+        };
         let detached = detached.unwrap_or_else(empty_segment);
         // If the restart checkpoint lies inside the detached range, keep only
         // that bounded overlap mutable for replay. The retained segment stays
@@ -1281,9 +1531,10 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
         let replay_start = Instant::now();
         let mut reduce_elapsed = Duration::default();
         let mut shift_elapsed = Duration::default();
+        let mut reuse_timing = ReuseTiming::default();
         let mut recover_elapsed = Duration::default();
         let mut converge_elapsed = Duration::default();
-        let mut reuse_timing = ReuseTiming::default();
+        let mut frontier_cache = CanonicalFrontierCache::default();
         let replay_len = plan.new_extent.saturating_sub(restart_token_boundary);
         let mut cursor = plan.new.cursor_at(restart_token_boundary);
         let mut decoded = 0usize;
@@ -1299,6 +1550,10 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             );
             decoded = decoded.saturating_add(1);
             let column = session_ctx.state.current_column();
+            let boundary = ParserBoundaryId::Source(plan.new.boundary_at_rank(rank));
+            session_ctx
+                .state
+                .set_column_boundary(column, Some(boundary));
             let reduce_start = Instant::now();
             session_ctx.reduce_until_stable(column, token.terminal, token.column)?;
             reduce_elapsed += reduce_start.elapsed();
@@ -1313,6 +1568,7 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
                 (column, rank),
                 &mut stats,
                 &mut reuse_timing,
+                &mut frontier_cache,
             )? {
                 converge_elapsed += converge_start.elapsed();
                 break;
@@ -1325,14 +1581,24 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
 
             if token.terminal == session_ctx.grammar.error_terminal {
                 let recover_start = Instant::now();
-                let recovery_state = session_ctx.state.clone();
+                let recovery_mark = session_ctx.state.mark();
                 let mut tail = TokenTail::new(&plan.new, rank, session_ctx.grammar);
-                let recovery = session_ctx.recover_tokens(0, &mut tail);
+                let recovery = match try_reuse_recovery_journal(
+                    &plan,
+                    &mut session_ctx,
+                    token.column,
+                    &mut tail,
+                    &mut stats,
+                    &mut frontier_cache,
+                )? {
+                    Some(consumed) => Ok(Some(consumed)),
+                    None => session_ctx.recover_tokens(0, &mut tail, token.column),
+                };
                 recovery_decoded = recovery_decoded.saturating_add(tail.decoded());
                 let recovery = match recovery {
                     Ok(value) => value,
                     Err(ParseError::NoActiveStacks { .. }) => {
-                        *session_ctx.state = recovery_state;
+                        session_ctx.state.rollback_to(recovery_mark);
                         None
                     }
                     Err(error) => return Err(error),
@@ -1357,14 +1623,24 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             {
                 shift_elapsed += shift_start.elapsed();
                 let recover_start = Instant::now();
-                let recovery_state = session_ctx.state.clone();
+                let recovery_mark = session_ctx.state.mark();
                 let mut tail = TokenTail::new(&plan.new, rank, session_ctx.grammar);
-                let recovery = session_ctx.recover_tokens(0, &mut tail);
+                let recovery = match try_reuse_recovery_journal(
+                    &plan,
+                    &mut session_ctx,
+                    token.column,
+                    &mut tail,
+                    &mut stats,
+                    &mut frontier_cache,
+                )? {
+                    Some(consumed) => Ok(Some(consumed)),
+                    None => session_ctx.recover_tokens(0, &mut tail, token.column),
+                };
                 recovery_decoded = recovery_decoded.saturating_add(tail.decoded());
                 let recovery = match recovery {
                     Ok(value) => value,
                     Err(ParseError::NoActiveStacks { .. }) => {
-                        *session_ctx.state = recovery_state;
+                        session_ctx.state.rollback_to(recovery_mark);
                         None
                     }
                     Err(error) => return Err(error),
@@ -1435,15 +1711,48 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
         } else {
             "replayed-to-eof"
         };
-        working.incremental_stats.insert(uri.clone(), stats);
+        let full_replay_reason = (!stats.reconverged_old_boundary.is_some()).then(|| {
+            if plan.old.is_none() {
+                crate::framework::parse::FullReplayReason::ExplicitColdParse
+            } else if recovery_columns > 0 {
+                crate::framework::parse::FullReplayReason::RecoveryProofFailed
+            } else if plan.suffix_len == 0 {
+                crate::framework::parse::FullReplayReason::NoRetainedRightBoundary
+            } else {
+                crate::framework::parse::FullReplayReason::NoEqualFrontierBeforeEof
+            }
+        });
+        let gss_nodes_created = session_ctx.gss.node_count().saturating_sub(gss_before);
+        let gss_edges_created = session_ctx
+            .gss
+            .edge_count()
+            .saturating_sub(gss_edges_before);
+        let products_created = session_ctx.products.len().saturating_sub(products_before);
+        let ast_records_created = session_ctx.ast.len().saturating_sub(ast_before);
         crate::framework::workspace::record_parser_work(&uri.to_string(), |work| {
             work.restart_columns += restart_boundary as u64;
+            work.restart_boundary_lookups += 1;
+            work.restart_lookup_depth += restart_token_boundary as u64;
+            work.restart_occurrences += u64::from(plan.old.is_some());
             work.tokens_decoded += (decoded + recovery_decoded) as u64;
-            work.tokens_replayed += decoded as u64;
+            work.tokens_replayed += (decoded + recovery_decoded) as u64;
+            work.semantic_tokens_decoded += decoded as u64;
+            work.source_boundaries_replayed += reparsed as u64;
+            work.recovery_boundaries_replayed += recovery_decoded as u64;
             work.columns_replayed += reparsed as u64;
             work.columns_reused += reused as u64;
+            work.segments_split += u64::from(old_suffix_len > 0);
             work.segments_attached += u64::from(stats.reconverged_old_boundary.is_some());
             work.suffix_columns_physically_visited += stats.suffix_rewritten as u64;
+            work.gss_nodes_created += gss_nodes_created as u64;
+            work.gss_records_created += gss_nodes_created as u64;
+            work.gss_edges_created += gss_edges_created as u64;
+            work.products_created += products_created as u64;
+            work.product_records_created += products_created as u64;
+            work.ast_records_created += ast_records_created as u64;
+            if let Some(reason) = full_replay_reason {
+                work.record_full_replay(reason);
+            }
         });
         let mut tree_root = None;
         for (index, root) in roots_after.iter().copied().enumerate() {
@@ -1461,12 +1770,12 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
                 };
             }
         }
-        let previous_infos = working
-            .published_diagnostics
-            .get(&uri)
-            .map(|infos| infos.as_ref().clone())
-            .unwrap_or_default();
-        let previous_status = working.published_status.get(&uri).cloned();
+        let previous_infos = previous_root
+            .as_ref()
+            .map_or_else(Vec::new, |root| root.published_diagnostics.as_ref().clone());
+        let previous_status = previous_root
+            .as_ref()
+            .and_then(|root| root.published_status);
         let current_infos = collect_parse_diagnostics(
             session_ctx.state,
             Some(crate::framework::parse::diagnostics::DiagnosticArenas {
@@ -1481,7 +1790,7 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             session_ctx.products,
             session_ctx.ast,
             &previous_tree_facts,
-            previous_roots,
+            previous_roots.as_slice(),
             &roots_after,
             tree_root,
             &previous_infos,
@@ -1491,21 +1800,32 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             self.tree_member_kind,
             self.tree_child_records,
         )?;
-        if !tree_delta.is_empty() {
-            let next = working.semantic_revisions.entry(uri.clone()).or_insert(0);
-            *next = next.saturating_add(1);
-        }
+        let semantic_revision_changed = !tree_delta.is_empty();
         crate::framework::workspace::record_parser_work(&uri.to_string(), |work| {
-            work.parser_records_inserted = tree_delta.ast_records.inserted.len() as u64;
-            work.parser_records_removed = tree_delta.ast_records.removed.len() as u64;
+            let payload_ops = tree_delta.syntax_payloads.len() as u64;
+            let parent_ops = tree_delta.parents.len() as u64;
+            let field_ops = tree_delta.child_splices.len() as u64;
+            let order_ops = tree_delta.child_splices.len() as u64;
+            let journal_entries = tree_delta.ast_records.len() as u64
+                + payload_ops
+                + parent_ops
+                + field_ops
+                + tree_delta.roots.removed.len() as u64
+                + tree_delta.roots.inserted.len() as u64
+                + tree_delta.diagnostics.len() as u64;
+            work.parser_records_inserted += tree_delta.ast_records.inserted.len() as u64;
+            work.parser_records_removed += tree_delta.ast_records.removed.len() as u64;
+            work.parser_records_updated += tree_delta.ast_records.updated.len() as u64;
+            work.syntax_journal_entries += journal_entries;
+            work.syntax_payload_ops += payload_ops;
+            work.syntax_parent_ops += parent_ops;
+            work.syntax_field_ops += field_ops;
+            work.syntax_order_splices += order_ops;
+            work.record_journal_touches += journal_entries;
         });
-        working.published_status.insert(uri.clone(), current_status);
-        working
-            .published_diagnostics
-            .insert(uri.clone(), Arc::new(current_infos));
         let mut current_record_lineages = (*previous_tree_facts.record_lineages).clone();
         for &record in &*tree_delta.ast_records.removed {
-            current_record_lineages.remove(&record);
+            current_record_lineages.remove(record);
         }
         for &record in &*tree_delta.ast_records.inserted {
             if let Some(lineage) = session_ctx.state.lineage.lineage_of(record as usize) {
@@ -1521,20 +1841,26 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             published_child_orders: Arc::clone(&previous_tree_facts.published_child_orders),
             child_orders: Arc::clone(&tree_delta.child_orders_next),
         });
-        // Commit the parser session as a persistent root. Future edits
-        // materialize only their restart prefix; successful suffix
-        // attachments keep the retained Arc untouched.
-        session_ctx.state.seal(session_ctx.gss);
-        working.tree_facts.insert(uri.clone(), current_tree_facts);
-        working.tree_deltas.insert(uri.clone(), tree_delta);
+        session_ctx
+            .state
+            .seal(session_ctx.gss, session_ctx.products, plan.new.document);
+        drop(session_ctx);
+        arenas.seal_generations();
+        root.incremental_stats = stats;
+        root.published_status = Some(current_status);
+        root.published_diagnostics = Arc::new(current_infos);
+        root.tree_facts = current_tree_facts;
+        root.tree_delta = tree_delta;
+        root.roots = Arc::new(roots_after);
+        root.token = Some(Arc::clone(&plan.new));
+        if semantic_revision_changed {
+            root.semantic_revision = root.semantic_revision.saturating_add(1);
+        }
         let stats_elapsed = stats_start.elapsed();
-
-        working.roots.insert(uri.clone(), Arc::new(roots_after));
-        working.tokens.insert(uri.clone(), Arc::clone(&plan.new));
 
         let total_elapsed = total_start.elapsed();
         log::debug!(
-            "[parse-replay] uri={} total={:?} plan={:?} session={:?} checkpoints={:?} truncate={:?} tokens={:?} replay={:?} reduce={:?} shift={:?} recover={:?} converge={:?} reuse_checkpoint={:?} frontier_match={:?} tail_validate={:?} product_remap={:?} suffix_rebase={:?} replay_misc={:?} stats={:?} status={} restart={} reparsed={} reused={} recovery_columns={} checks={} checkpoint_matches={} frontier_matches={} old_suffix={} replay_tokens={} suffix_rebased={} old_tokens={} new_tokens={} prefix={} suffix={}",
+            "[parse-replay] uri={} total={:?} plan={:?} session={:?} checkpoints={:?} truncate={:?} tokens={:?} replay={:?} reduce={:?} shift={:?} recover={:?} converge={:?} reuse_checkpoint={:?} frontier_match={:?} tail_validate={:?} seam_binding={:?} replay_misc={:?} stats={:?} status={} restart={} reparsed={} reused={} recovery_columns={} checks={} checkpoint_matches={} frontier_matches={} old_suffix={} replay_tokens={} suffix_rebased={} old_tokens={} new_tokens={} prefix={} suffix={}",
             uri,
             total_elapsed,
             plan_elapsed,
@@ -1550,8 +1876,7 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             reuse_timing.checkpoint,
             reuse_timing.frontier_match,
             reuse_timing.tail_validation,
-            reuse_timing.product_remap,
-            reuse_timing.rebase,
+            reuse_timing.seam_binding,
             replay_misc_elapsed,
             stats_elapsed,
             replay_status,
@@ -1571,10 +1896,9 @@ impl<Root: LexerRoot + Clone> Parser<Root> {
             plan.suffix_len,
         );
 
-        Ok(())
+        Ok(Arc::new(root))
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1637,18 +1961,19 @@ mod tests {
             product_counts(&update),
             BTreeMap::from([(child, 2), (parent, 1)])
         );
-        assert_eq!(
-            record_counts(&update),
-            BTreeMap::from([(0, 1), (1, 1)])
-        );
+        assert_eq!(record_counts(&update), BTreeMap::from([(0, 1), (1, 1)]));
         assert_eq!(
             slow_accepted_root_reach(&[parent], &products).unwrap(),
             (product_counts(&update), record_counts(&update))
         );
 
-        let duplicate_roots =
-            apply_accepted_root_delta(&ParserTreeFacts::default(), &[], &[parent, parent], &products)
-                .unwrap();
+        let duplicate_roots = apply_accepted_root_delta(
+            &ParserTreeFacts::default(),
+            &[],
+            &[parent, parent],
+            &products,
+        )
+        .unwrap();
         assert_eq!(
             product_counts(&duplicate_roots),
             BTreeMap::from([(child, 2), (parent, 2)])
@@ -1678,13 +2003,8 @@ mod tests {
             BTreeMap::from([(0, 1), (1, 1), (2, 1)])
         );
 
-        let reverted = apply_accepted_root_delta(
-            &facts(&update),
-            &[left, right],
-            &[],
-            &products,
-        )
-        .unwrap();
+        let reverted =
+            apply_accepted_root_delta(&facts(&update), &[left, right], &[], &products).unwrap();
         assert!(product_counts(&reverted).is_empty());
         assert!(record_counts(&reverted).is_empty());
         assert!(reverted.live_records.is_empty());
@@ -1709,22 +2029,25 @@ mod tests {
         assert_eq!(product_counts(&update), BTreeMap::from([(root, 1)]));
         assert_eq!(record_counts(&update), BTreeMap::from([(1, 1)]));
         assert!(!product_counts(&update).contains_key(&orphan));
-        assert_eq!(update.live_records.iter().map(|(key, _)| key).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            update
+                .live_records
+                .iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     #[test]
     fn accepted_root_reachability_rejects_underflow_and_non_topological_edges() {
         let (_ast, mut products) = arenas();
         products.insert(Product::error(0));
-        let underflow = match apply_accepted_root_delta(
-            &ParserTreeFacts::default(),
-            &[0],
-            &[],
-            &products,
-        ) {
-            Ok(_) => panic!("root removal at zero must fail"),
-            Err(error) => error,
-        };
+        let underflow =
+            match apply_accepted_root_delta(&ParserTreeFacts::default(), &[0], &[], &products) {
+                Ok(_) => panic!("root removal at zero must fail"),
+                Err(error) => error,
+            };
         assert!(matches!(
             underflow,
             ParseError::InvalidReachability {
@@ -1737,15 +2060,11 @@ mod tests {
 
         let (_ast, mut products) = arenas();
         products.insert(Product::error_with_children(0, vec![0]));
-        let non_topological = match apply_accepted_root_delta(
-            &ParserTreeFacts::default(),
-            &[],
-            &[0],
-            &products,
-        ) {
-            Ok(_) => panic!("self-referential product edge must fail"),
-            Err(error) => error,
-        };
+        let non_topological =
+            match apply_accepted_root_delta(&ParserTreeFacts::default(), &[], &[0], &products) {
+                Ok(_) => panic!("self-referential product edge must fail"),
+                Err(error) => error,
+            };
         assert!(matches!(
             non_topological,
             ParseError::InvalidReachability {

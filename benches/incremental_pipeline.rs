@@ -23,10 +23,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use plingo::framework::Workspace;
 use plingo::framework::lex::install_lexer;
-use plingo::framework::parse::install_parser_tree;
-use plingo::framework::source::{SourceEdit, SourceRevisions};
+use plingo::framework::parse::install_parser;
+use plingo::framework::{SourceEdit, SourceRevisions, Workspace};
 use plingo::utils::Span;
 
 #[path = "../examples/stlc/check.rs"]
@@ -38,9 +37,6 @@ mod structural;
 #[path = "../examples/stlc/syntax.rs"]
 mod syntax;
 
-use check::check_pass_install;
-use name_resolve::{name_pass_install, resolve_pass_install};
-use structural::structural_pass_install;
 use syntax::{StlcDocument, StlcToken};
 // ---------------------------------------------------------------------------
 
@@ -105,26 +101,42 @@ fn uri() -> fluent_uri::Uri<String> {
 fn build() -> Workspace {
     Workspace::build(|engine| {
         install_lexer::<JsonToken>(engine)?;
-        plingo::framework::parse::install_parser::<JsonToken, JsonDocument>(engine)?;
+        install_parser::<JsonToken, JsonDocument>(engine)?;
         Ok(())
     })
     .expect("workspace builds")
 }
 
 fn build_stlc() -> Workspace {
-    Workspace::build(|engine| {
-        install_lexer::<StlcToken>(engine)?;
-        install_parser_tree::<StlcToken, StlcDocument>(engine)?;
-        // Cut C: passes install as first-class components.
-        name_pass_install(engine)?;
-        resolve_pass_install(engine)?;
-        check_pass_install(engine)?;
-        structural_pass_install(engine)?;
-        Ok(())
-    })
-    .expect("STLC workspace builds")
+    Workspace::builder()
+        .lexer::<StlcToken>()
+        .parser::<StlcDocument>()
+        .mount::<name_resolve::name_document::Component, _>(StlcDocument::nodes())
+        .mount::<name_resolve::name_declaration::Component, _>(syntax::StlcDeclaration::nodes())
+        .mount::<name_resolve::name_path::Component, _>(syntax::StlcPath::nodes())
+        .mount::<name_resolve::name_param::Component, _>(syntax::StlcParam::nodes())
+        .mount::<name_resolve::name_type::Component, _>(syntax::StlcType::nodes())
+        .mount::<name_resolve::name_type_atom::Component, _>(syntax::StlcTypeAtom::nodes())
+        .mount::<name_resolve::name_expr::Component, _>(syntax::StlcExpr::nodes())
+        .mount::<name_resolve::resolve_expr::Component, _>(syntax::StlcExpr::nodes())
+        .mount::<check::synthesize_expr::Component, _>(syntax::StlcExpr::nodes())
+        .mount::<check::synthesize_type::Component, _>(syntax::StlcType::nodes())
+        .mount::<check::synthesize_type_atom::Component, _>(syntax::StlcTypeAtom::nodes())
+        .mount::<check::synthesize_param::Component, _>(syntax::StlcParam::nodes())
+        .mount::<check::synthesize_declaration::Component, _>(syntax::StlcDeclaration::nodes())
+        .mount::<check::publish_expr::Component, _>(syntax::StlcExpr::nodes())
+        .mount::<check::publish_param::Component, _>(syntax::StlcParam::nodes())
+        .mount::<check::publish_declaration::Component, _>(syntax::StlcDeclaration::nodes())
+        .mount::<structural::structural_document::Component, _>(StlcDocument::nodes())
+        .mount::<structural::structural_declaration::Component, _>(syntax::StlcDeclaration::nodes())
+        .mount::<structural::structural_expression::Component, _>(syntax::StlcExpr::nodes())
+        .mount::<structural::structural_path::Component, _>(syntax::StlcPath::nodes())
+        .mount::<structural::structural_parameter::Component, _>(syntax::StlcParam::nodes())
+        .mount::<structural::structural_type::Component, _>(syntax::StlcType::nodes())
+        .mount::<structural::structural_type_atom::Component, _>(syntax::StlcTypeAtom::nodes())
+        .build()
+        .expect("STLC workspace builds")
 }
-
 // ---------------------------------------------------------------------------
 // Measurement
 // ---------------------------------------------------------------------------
@@ -494,10 +506,7 @@ fn work_counters_for(report: &plingo::framework::WorkspaceReport, doc_uri: Optio
         format!("\"invocation_scans\":{}", engine.invocation_scans),
         format!("\"state_diffs\":{}", engine.state_diffs),
         format!("\"diff_scan_steps\":{}", engine.diff_scan_steps),
-        format!(
-            "\"path_work\":{{{}}}",
-            plingo::reactive::pathwork::pathwork_path_work_json(&engine.path_work)
-        ),
+        format!("\"path_work\":{{{}}}", engine.path_work_json()),
     ];
     let uri_string = match doc_uri {
         Some(explicit) => explicit.to_string(),
@@ -513,7 +522,10 @@ fn work_counters_for(report: &plingo::framework::WorkspaceReport, doc_uri: Optio
             source.effective_splices
         ));
         parts.push(format!("\"source_bytes_removed\":{}", source.bytes_removed));
-        parts.push(format!("\"source_bytes_inserted\":{}", source.bytes_inserted));
+        parts.push(format!(
+            "\"source_bytes_inserted\":{}",
+            source.bytes_inserted
+        ));
         parts.push(format!(
             "\"source_coordinate_islands_built\":{}",
             source.coordinate_islands_built

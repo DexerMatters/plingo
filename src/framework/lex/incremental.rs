@@ -7,7 +7,6 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    ops::Range,
     sync::Arc,
 };
 
@@ -15,9 +14,9 @@ use fluent_uri::Uri;
 
 use crate::framework::{
     lex::{
-        CanonicalLexerState, IncrementalLexStats, LexInterrupt, Lexer, LexerRoot, LexicalDocument,
-        LexicalOccurrence, ParseTokenRef, ScannedToken, TapeSplice, TokenLayoutEntry,
-        TokenOccurrenceId, TokenPatch, cursor::RopeCursor,
+        CanonicalLexerState, LexInterrupt, Lexer, LexerRoot, LexicalDocument, LexicalOccurrence,
+        ParseTokenRef, TapeSplice, TokenLayoutEntry, TokenOccurrenceId, TokenPatch,
+        cursor::RopeCursor,
     },
     source::SourceSplice,
     tape::StableTape,
@@ -127,7 +126,7 @@ where
     ) -> Result<LocalPatch, LexInterrupt> {
         let old_source = Arc::clone(&document.source);
         let old_lexical_len = document.lexical.len();
-        let old_semantic_len = document.semantic.len();
+        let _old_semantic_len = document.semantic.len();
         let (restart_rank, restart_lookup_depth) = document
             .lexical
             .lexical_rank_at_byte_detailed(splice.old_range.start as u64);

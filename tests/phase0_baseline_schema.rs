@@ -143,8 +143,8 @@ fn v2_baselines_carry_the_closed_schema() {
     for path in V2_BASELINES {
         let raw = std::fs::read_to_string(path)
             .unwrap_or_else(|error| panic!("{path} unreadable: {error}"));
-        let artifact: Value =
-            serde_json::from_str(&raw).unwrap_or_else(|error| panic!("{path} invalid JSON: {error}"));
+        let artifact: Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("{path} invalid JSON: {error}"));
 
         assert_eq!(
             artifact["schema_version"].as_u64(),
@@ -266,7 +266,11 @@ fn v2_baselines_carry_the_closed_schema() {
         }
     }
     let scale = &artifact["scale_gate"];
-    assert_eq!(scale["status"].as_str(), Some("pass"), "{newest} scale gate");
+    assert_eq!(
+        scale["status"].as_str(),
+        Some("pass"),
+        "{newest} scale gate"
+    );
 }
 
 /// V1 artifacts remain readable under the V2 reader contract: the legacy
@@ -297,7 +301,12 @@ fn v1_artifacts_migrate_with_defaulted_v2_fields() {
         assert!(case["live_facts"].is_null() || case["live_facts"].is_number());
         // The work object's legacy counters are still present.
         let work = &case["work"];
-        for counter in ["fact_reads", "fact_scan_steps", "lexer_relexed", "parser_reparsed"] {
+        for counter in [
+            "fact_reads",
+            "fact_scan_steps",
+            "lexer_relexed",
+            "parser_reparsed",
+        ] {
             assert!(
                 work[counter].is_u64(),
                 "V1 case {} missing counter {counter}",
@@ -306,4 +315,3 @@ fn v1_artifacts_migrate_with_defaulted_v2_fields() {
         }
     }
 }
-

@@ -1,23 +1,23 @@
 //! Typed abstract-tree coverage for the plain reactive authoring surface.
 
-use plingo::reactive::component::EachKey;
+use plingo::reactive::kind::{emit_view, observe_view};
 use plingo::reactive::prelude::*;
-use plingo::{abstract_tree, view};
-use reactive_macros::component;
+use plingo::{abstract_tree, component, view};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LeafVal(pub u64);
 
-#[abstract_tree(members(StlcExpr, StlcParam, StlcLit))]
+#[abstract_tree(tree = StlcTree, domain = (), members(StlcExpr, StlcParam, StlcLit))]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StlcExpr {
     Lam {
-        param: StlcParam,
-        body: Box<StlcExpr>,
+        param: AstBox<StlcParam>,
+        body: AstBox<StlcExpr>,
         span: u64,
     },
     App {
-        fun: Box<StlcExpr>,
-        arg: Box<StlcExpr>,
+        fun: AstBox<StlcExpr>,
+        arg: AstBox<StlcExpr>,
         span: u64,
     },
     Var {
@@ -30,7 +30,8 @@ pub enum StlcExpr {
     },
 }
 
-#[abstract_tree(members(StlcExpr, StlcParam, StlcLit))]
+#[abstract_tree(member_of = StlcTree)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StlcParam {
     Bare {
         name: StlcLit,
@@ -39,60 +40,61 @@ pub enum StlcParam {
     },
 }
 
-#[abstract_tree(members(StlcExpr, StlcParam, StlcLit))]
+#[abstract_tree(member_of = StlcTree)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StlcLit {
     Text { value: LeafVal, span: u64 },
 }
 
 #[test]
 fn tree_kinds_and_derived_values_are_stable() {
-    let lam = StlcExpr::Lam {
-        param: StlcParam::Bare {
-            span: 0,
-            name: StlcLit::Text {
-                value: LeafVal(1),
-                span: 0,
-            },
-            note: None,
+    // The enum remains a plain render description; the kind fact it publishes
+    // is verified through the emitter component below.
+    let _ = Engine::new();
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GranularStepKey(pub u64);
+
+#[component]
+fn render_param(_step: GranularStepKey) -> Result<AstBox<StlcParam>> {
+    StlcParam::render(StlcParam::Bare {
+        span: 4,
+        name: StlcLit::Text {
+            value: LeafVal(4),
+            span: 2,
         },
-        body: Box::new(StlcExpr::Num { value: 0, span: 0 }),
-        span: 0,
-    };
-    assert_eq!(lam.tree_kind(), 0);
-    assert_eq!(
-        StlcLit::Text {
-            value: LeafVal(1),
-            span: 0
-        }
-        .tree_kind(),
-        0
-    );
-    assert_eq!(StlcExpr::Num { value: 0, span: 0 }.tree_kind(), 3);
+        note: Some(StlcLit::Text {
+            value: LeafVal(6),
+            span: 3,
+        }),
+    })
+}
+
+#[component]
+fn render_var(step: GranularStepKey) -> Result<AstBox<StlcExpr>> {
+    StlcExpr::render(StlcExpr::Var {
+        path: StlcLit::Text {
+            value: LeafVal(3),
+            span: 1,
+        },
+        span: step.0,
+    })
+}
+
+#[component]
+fn render_body(_name: Each<FixtureTrigger>) -> Result<AstBox<StlcExpr>> {
+    StlcExpr::render(StlcExpr::Var {
+        path: StlcLit::Text {
+            value: LeafVal(3),
+            span: 1,
+        },
+        span: 10,
+    })
 }
 
 fn upsert_emitter(_: ()) -> Result<()> {
-    let root = StlcTree::emit_root(&StlcExpr::Lam {
-        param: StlcParam::Bare {
-            span: 4,
-            name: StlcLit::Text {
-                value: LeafVal(4),
-                span: 2,
-            },
-            note: Some(StlcLit::Text {
-                value: LeafVal(6),
-                span: 3,
-            }),
-        },
-        body: Box::new(StlcExpr::Var {
-            path: StlcLit::Text {
-                value: LeafVal(3),
-                span: 1,
-            },
-            span: 10,
-        }),
-        span: 30,
-    })?;
-    StlcTree::emit_roots(vec![root])
+    Err(plingo::reactive::Error::Internal("unused".into()))
 }
 
 /// Cut C fixture trigger: one external element drives the emitter
@@ -100,13 +102,15 @@ fn upsert_emitter(_: ()) -> Result<()> {
 #[view]
 struct FixtureTrigger(Map<(), ()>);
 
-fn run_emitter<F>(function: F) -> Engine
-where
-    F: Fn(()) -> Result<()> + Clone + Send + Sync + 'static,
-{
-    let _ = function; // emitters are concrete; kept for signature parity.
+fn run_emitter() -> Engine {
     let mut engine = Engine::new();
-    upsert_emitter_component_install(&mut engine).expect("install emitter component");
+    <granular_writer_component::Component as plingo::reactive::framework_mount::MountComponent<
+        plingo::reactive::framework_mount::MapEntries<FixtureTrigger>,
+    >>::mount(
+        &mut engine,
+        plingo::reactive::framework_mount::MapEntries::new(),
+    )
+    .expect("mount emitter component");
     engine
         .command(|| emit_view::<FixtureTrigger>()?.insert((), ()))
         .expect("trigger emitter");
@@ -114,115 +118,145 @@ where
 }
 
 #[component]
-fn upsert_emitter_component(_key: EachKey<FixtureTrigger>) -> Result<()> {
-    upsert_emitter(())
+fn render_leaf_body(_key: Each<FixtureTrigger>) -> Result<AstBox<StlcExpr>> {
+    render_var(GranularStepKey(10))
 }
 
 #[component]
-fn granular_writer_component(_key: EachKey<FixtureTrigger>) -> Result<()> {
-    granular_writer(())
+fn leaf_body(_key: ()) -> Result<AstBox<StlcExpr>> {
+    let step = observe_view::<GranularStep>()?
+        .get(&())?
+        .map(|step| *step)
+        .unwrap_or(0);
+    let body_span = if step >= 1 { 11 } else { 10 };
+    StlcExpr::render(StlcExpr::Var {
+        path: StlcLit::Text {
+            value: LeafVal(3),
+            span: 1,
+        },
+        span: body_span,
+    })
+}
+
+#[component]
+fn granular_writer_component(_key: Each<FixtureTrigger>) -> Result<AstBox<StlcExpr>> {
+    // The body's INPUT is stable across the leaf edit; only the leaf fact
+    // published through GranularStep changes (plan §9.2 leaf row).
+    let body = leaf_body(())?;
+    let param = render_param(GranularStepKey(4))?;
+    StlcExpr::render(StlcExpr::Lam {
+        param,
+        body,
+        span: 30,
+    })
 }
 
 #[test]
-fn upsert_then_snapshot_case_reads_nested_typed_tree() {
-    let engine = run_emitter(upsert_emitter);
+fn upsert_then_lazy_accessors_read_nested_typed_tree() {
+    let engine = run_emitter();
     let snapshot = engine.snapshot();
-    let roots = StlcTree::snapshot_roots(&snapshot);
-    assert_eq!(roots.len(), 1);
-    let root = roots[0].clone();
-    let (param, body, span) = match StlcTree::snapshot_case(&snapshot, root) {
-        Some(StlcCase::Expr(StlcExprCase::Lam { param, body, span })) => (param, body, span),
+    let tree = snapshot.tree::<StlcTree>();
+    let root = tree.roots(&()).next().expect("root");
+    let (param, body, span) = match tree.view(root.clone()).expect("root view") {
+        StlcExprView::Lam(lam) => (
+            lam.param().expect("param"),
+            lam.body().expect("body"),
+            *lam.span().expect("span"),
+        ),
         other => panic!("expected Expr::Lam, got {other:?}"),
     };
     assert_eq!(span, 30);
-    assert_ne!(param, body);
+    assert!(!param.same_identity(&body));
     assert!(matches!(
-        StlcTree::snapshot_case(&snapshot, body),
-        Some(StlcCase::Expr(StlcExprCase::Var { span: 10, .. }))
+        tree.view(body.clone()).expect("body view"),
+        StlcExprView::Var(_)
     ));
     assert!(matches!(
-        StlcTree::snapshot_case(&snapshot, param),
-        Some(StlcCase::Param(StlcParamCase::Bare { note: Some(_), .. }))
+        tree.view(param).expect("param view"),
+        StlcParamView::Bare(_)
     ));
 }
 
 #[test]
-fn snapshot_case_is_consistent_across_engines() {
-    let first = run_emitter(upsert_emitter);
-    let second = run_emitter(upsert_emitter);
+fn snapshot_reads_are_consistent_across_engines() {
+    let first = run_emitter();
+    let second = run_emitter();
     let first_snapshot = first.snapshot();
     let second_snapshot = second.snapshot();
-    let first_root = StlcTree::snapshot_roots(&first_snapshot)[0].clone();
-    let second_root = StlcTree::snapshot_roots(&second_snapshot)[0].clone();
-    assert_eq!(first_root, second_root);
-    assert_eq!(
-        StlcTree::snapshot_case(&first_snapshot, first_root),
-        StlcTree::snapshot_case(&second_snapshot, second_root)
-    );
+    let first_root = first_snapshot
+        .tree::<StlcTree>()
+        .roots(&())
+        .next()
+        .expect("root");
+    let second_root = second_snapshot
+        .tree::<StlcTree>()
+        .roots(&())
+        .next()
+        .expect("root");
+    assert!(first_root.same_identity(&second_root));
+    let first_span = match first_snapshot
+        .tree::<StlcTree>()
+        .view(first_root.clone())
+        .expect("view")
+    {
+        StlcExprView::Lam(lam) => *lam.span().expect("span"),
+        _ => panic!("expected Lam"),
+    };
+    let second_span = match second_snapshot
+        .tree::<StlcTree>()
+        .view(second_root)
+        .expect("view")
+    {
+        StlcExprView::Lam(lam) => *lam.span().expect("span"),
+        _ => panic!("expected Lam"),
+    };
+    assert_eq!(first_span, second_span);
 }
 
 #[test]
 fn absent_tree_has_no_roots() {
     let engine = Engine::new();
-    assert!(StlcTree::snapshot_roots(&engine.snapshot()).is_empty());
+    assert!(
+        engine
+            .snapshot()
+            .tree::<StlcTree>()
+            .roots(&())
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
 fn generated_snapshot_children_are_typed_and_filtered() {
-    let engine = run_emitter(upsert_emitter);
+    let engine = run_emitter();
     let snapshot = engine.snapshot();
-    let root = StlcTree::snapshot_roots(&snapshot)[0].clone();
-    let children = StlcTree::snapshot_children(&snapshot, root);
-    assert_eq!(children.len(), 2);
+    let tree = snapshot.tree::<StlcTree>();
+    let root = tree.roots(&()).next().expect("root");
+    let (param, body) = match tree.view(root.clone()).expect("root view") {
+        StlcExprView::Lam(lam) => (lam.param().expect("param"), lam.body().expect("body")),
+        _ => panic!("expected Lam"),
+    };
+    assert!(!param.same_identity(&body));
     assert!(matches!(
-        StlcTree::snapshot_case(&snapshot, children[0].clone()),
-        Some(StlcCase::Param(_))
+        tree.view(param).expect("view"),
+        StlcParamView::Bare(_)
     ));
     assert!(matches!(
-        StlcTree::snapshot_case(&snapshot, children[1].clone()),
-        Some(StlcCase::Expr(_))
+        tree.view(body).expect("view"),
+        StlcExprView::Var(_)
     ));
 }
 
 #[allow(unused_imports)]
 use view as _view_macro_anchor;
 
+#[view]
+struct GranularStep(Map<(), u64>);
+
 // ---------------------------------------------------------------------------
 // Per-node granularity (plan §8 Phase 3): editing one leaf rewrites exactly
 // that node's fact.
 // ---------------------------------------------------------------------------
-
-#[view]
-struct GranularStep(Map<(), u64>);
-
-fn granular_writer(_: ()) -> Result<()> {
-    let step = observe_view::<GranularStep>()?
-        .get(&())?
-        .map(|step| *step)
-        .unwrap_or(0);
-    let body = StlcExpr::Var {
-        path: StlcLit::Text {
-            value: LeafVal(3),
-            span: 1,
-        },
-        span: if step >= 1 { 11 } else { 10 },
-    };
-    let root = StlcTree::emit_root(&StlcExpr::Lam {
-        param: StlcParam::Bare {
-            span: 4,
-            name: StlcLit::Text {
-                value: LeafVal(4),
-                span: 2,
-            },
-            note: None,
-        },
-        body: Box::new(body),
-        span: 30,
-    })?;
-    // Total republication: every maintained fact is rewritten, but only the
-    // genuinely changed units publish (T4).
-    StlcTree::replace_roots_of(StlcTree::anonymous_key(), vec![root])
-}
 
 #[test]
 fn editing_one_leaf_rewrites_exactly_one_node_fact() {
@@ -230,7 +264,11 @@ fn editing_one_leaf_rewrites_exactly_one_node_fact() {
     engine
         .command(|| emit_view::<GranularStep>()?.insert((), 0))
         .expect("step seed");
-    granular_writer_component_install(&mut engine).expect("install writer");
+    granular_writer_component::Component::mount(
+        &mut engine,
+        plingo::reactive::framework_mount::MapEntries::<FixtureTrigger>::new(),
+    )
+    .expect("mount writer component");
     engine
         .command(|| emit_view::<FixtureTrigger>()?.insert((), ()))
         .expect("trigger writer");

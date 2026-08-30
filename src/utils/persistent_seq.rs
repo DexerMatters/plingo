@@ -213,10 +213,7 @@ impl<T: Clone, M: SeqMeasure<T>> PersistentSeq<T, M> {
     }
     /// Returns the item containing a logical offset and that item's local
     /// offset.  The weighted descent follows only the metadata spine.
-    pub(crate) fn weighted_get(
-        &self,
-        offset: usize,
-    ) -> Option<(usize, usize, &T)>
+    pub(crate) fn weighted_get(&self, offset: usize) -> Option<(usize, usize, &T)>
     where
         M: SeqMeasureWeight,
     {
@@ -288,10 +285,7 @@ impl<T: Clone, M: SeqMeasure<T>> PersistentSeq<T, M> {
     /// copies one bounded leaf and one node per path ancestor.
     pub(crate) fn replace(&self, index: usize, value: T) -> Self {
         assert!(index < self.len(), "sequence replace index out of bounds");
-        let root = self
-            .root
-            .as_ref()
-            .expect("non-empty sequence has a root");
+        let root = self.root.as_ref().expect("non-empty sequence has a root");
         Self {
             root: Some(replace_node(root, index, value)),
         }
@@ -305,8 +299,14 @@ impl<T: Clone, M: SeqMeasure<T>> PersistentSeq<T, M> {
     where
         I: IntoIterator<Item = T>,
     {
-        assert!(range.start <= range.end, "sequence splice range is inverted");
-        assert!(range.end <= self.len(), "sequence splice range out of bounds");
+        assert!(
+            range.start <= range.end,
+            "sequence splice range is inverted"
+        );
+        assert!(
+            range.end <= self.len(),
+            "sequence splice range out of bounds"
+        );
         let (prefix, tail) = self.split_at(range.start);
         let (_, suffix) = tail.split_at(range.end - range.start);
         let replacement = Self::from_iter(replacement);
@@ -365,10 +365,7 @@ pub struct Iter<'a, T: Clone, M: SeqMeasure<T>> {
 
 enum Frame<'a, T: Clone, M: SeqMeasure<T>> {
     Node(&'a Node<T, M>),
-    Leaf {
-        values: &'a [T],
-        next: usize,
-    },
+    Leaf { values: &'a [T], next: usize },
 }
 
 impl<'a, T: Clone, M: SeqMeasure<T>> Iterator for Iter<'a, T, M> {
@@ -428,10 +425,7 @@ fn weighted_get_node<'a, T: Clone, M: SeqMeasure<T> + SeqMeasureWeight>(
     }
 }
 
-fn measure_after_node<T: Clone, M: SeqMeasure<T>>(
-    node: &Node<T, M>,
-    index: usize,
-) -> M {
+fn measure_after_node<T: Clone, M: SeqMeasure<T>>(node: &Node<T, M>, index: usize) -> M {
     if index == 0 {
         return node.measure().clone();
     }

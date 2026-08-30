@@ -170,6 +170,14 @@ pub struct EngineWork {
     pub path_work: crate::reactive::pathwork::PathWorkReport,
 }
 
+impl EngineWork {
+    /// Serializes the per-structure work counters for benchmark/reporting
+    /// consumers without exposing the internal path-work module.
+    pub fn path_work_json(&self) -> String {
+        crate::reactive::pathwork::pathwork_path_work_json(&self.path_work)
+    }
+}
+
 type Subscription = Arc<dyn Fn(Snapshot, usize) + Send + Sync>;
 
 /// A validated handle to one installed keyed component family (plan §5.4).
@@ -388,7 +396,7 @@ impl Engine {
                 let deltas = with_txn_pub(|txn| txn.journal.commit_deltas());
                 runtime.committed.apply(&deltas);
             }
-            let txn = take_txn_pub();
+            let _txn = take_txn_pub();
             drop(_txn_frame);
             runtime.epoch = runtime.epoch.saturating_add(1);
             runtime.last_changed = downstream.clone();
@@ -458,7 +466,7 @@ impl Engine {
     /// generated marker-registered installer
     /// ([`Self::install_component_each_key`]); this ordinal path remains
     /// only for framework-internal and transaction-test use.
-    pub(crate) fn install_keyed<V, F>(&mut self, mut function: F) -> Result<KeyedFamily<V>>
+    pub(crate) fn install_keyed<V, F>(&mut self, function: F) -> Result<KeyedFamily<V>>
     where
         V: MapView,
         F: Fn(V::Input) -> Result<()> + Clone + Send + Sync + 'static,
@@ -504,6 +512,8 @@ impl Engine {
                     view,
                     view_name: V::name(),
                     install_ordinal,
+                    selector: plain::FamilySelector::MapEntry,
+                    accept_key: Arc::new(|_| true),
                     build_call,
                     definition: None,
                 },
@@ -561,13 +571,16 @@ impl Engine {
         }
     }
 
-    /// Installs one first-class `#[component]` with an `EachKey<V>` driver
-    /// (follow-up plan §6.1 / Cut C).
+    /// Installs one keyed component family over one map view. Framework
+    /// seam: application components mount through the generated
+    /// `Component::mount` (plan §7 — raw installers are not the authoring
+    /// path).
     ///
     /// The definition marker rejects a second installer for the same
     /// component before anything mutates; children take the marker as their
     /// identity type so scheduling, retirement, and reaction attribution
     /// derive from the authored definition and the exact driving element.
+    #[doc(hidden)]
     pub fn install_component_each_key<D, V, F>(&mut self, body: F) -> Result<KeyedFamily<V>>
     where
         D: crate::reactive::component::ComponentDefinition + 'static,
@@ -621,6 +634,8 @@ impl Engine {
                     view,
                     view_name: descriptor,
                     install_ordinal,
+                    selector: plain::FamilySelector::MapEntry,
+                    accept_key: Arc::new(|_| true),
                     build_call,
                     definition: Some((descriptor, definition)),
                 },
@@ -667,6 +682,476 @@ impl Engine {
                     plain::update_sinks(&runtime);
                 }
                 Ok(family)
+            }
+            Err(error) => {
+                let txn = take_txn_pub();
+                drop(_txn_frame);
+                rollback_txn_pub(txn, &runtime.state.clone(), &mut runtime.roots);
+                Err(error)
+            }
+        }
+    }
+    /// Installs a keyed component whose returned value is a desired ordinary
+    /// effect. The effect is applied inside the component invocation, so the
+    /// invocation owns exactly the outputs returned by its latest evaluation.
+    #[doc(hidden)]
+    pub fn install_component_each_key_effect<D, V, B, F>(
+        &mut self,
+        body: F,
+    ) -> Result<KeyedFamily<V>>
+    where
+        D: crate::reactive::component::ComponentDefinition + 'static,
+        V: MapView,
+        B: crate::reactive::component::Effects
+            + Clone
+            + PartialEq
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + 'static,
+        F: Fn(V::Input) -> Result<B> + Clone + Send + Sync + 'static,
+    {
+        let effective = move |input: V::Input| {
+            let output = body(input)?;
+            output.__apply()
+        };
+        self.install_component_each_key::<D, V, _>(effective)
+    }
+
+    /// Installs one first-class component for every committed root link in a
+    /// generated abstract-tree family.
+    pub fn install_component_tree_roots<D, F, N, B, Body>(
+        &mut self,
+        _selector: crate::reactive::abstract_tree::RootSelector<F, N>,
+        body: Body,
+    ) -> Result<()>
+    where
+        D: crate::reactive::component::ComponentDefinition + 'static,
+        F: crate::reactive::abstract_tree::AbstractTreeFamily,
+        N: crate::reactive::abstract_tree::AbstractTreeNode<Family = F>,
+        B: Clone + PartialEq + std::fmt::Debug + Send + Sync + 'static,
+        Body: Fn(F::Domain, crate::reactive::abstract_tree::AstBox<N>) -> Result<B>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        use crate::reactive::plain::ErasedCall;
+        use crate::reactive::plain::{
+            PlainStatePub as PlainState, erased_call_with_definition, push_txn_pub,
+            rollback_txn_pub, take_txn_pub, with_txn_pub,
+        };
+        let definition = TypeId::of::<D>();
+        let descriptor = D::__descriptor();
+        {
+            let mut runtime = self.plain.lock();
+            runtime
+                .components
+                .register(definition, descriptor, "tree_root")?;
+        }
+        let mut runtime = self.plain.lock();
+        let _txn_frame = push_txn_pub();
+        let result = (|| -> Result<()> {
+            let root = plain::fresh_token();
+            let graph = Arc::new(Mutex::new(plain::PlainGraph::new(
+                PlainState::default(),
+                plain::erased_noop_pub(),
+                root,
+            )));
+            graph.lock().state = Arc::clone(&runtime.state);
+            let view = TypeId::of::<F>();
+            let build_call: Arc<dyn Fn(Arc<dyn KeyValue>) -> Arc<dyn ErasedCall> + Send + Sync> = {
+                let body = body.clone();
+                Arc::new(move |key| {
+                    let input = key
+                        .as_any()
+                        .downcast_ref::<crate::reactive::abstract_tree::TreeKey<F::Domain>>()
+                        .and_then(|key| match key {
+                            crate::reactive::abstract_tree::TreeKey::RootLink(domain, node) => {
+                                Some((
+                                    domain.clone(),
+                                    crate::reactive::abstract_tree::AstBox::<N>::from_erased(
+                                        node.clone(),
+                                    ),
+                                ))
+                            }
+                            _ => None,
+                        })
+                        .expect("tree component received a non-root key");
+                    let invoke = {
+                        let body = body.clone();
+                        move |(domain, node): (
+                            F::Domain,
+                            crate::reactive::abstract_tree::AstBox<N>,
+                        )| { body(domain, node) }
+                    };
+                    erased_call_with_definition(definition, invoke, input)
+                })
+            };
+            let install_ordinal = runtime.next_install_ordinal;
+            runtime.next_install_ordinal += 1;
+            let family_id = root;
+            runtime.families.insert(
+                family_id,
+                plain::FamilyRuntime {
+                    graph: Arc::clone(&graph),
+                    view,
+                    view_name: descriptor,
+                    install_ordinal,
+                    selector: plain::FamilySelector::TreeRoot,
+                    accept_key: Arc::new(|key| {
+                        key.as_any()
+                            .downcast_ref::<crate::reactive::abstract_tree::TreeKey<F::Domain>>()
+                            .is_some_and(|key| {
+                                matches!(
+                                    key,
+                                    crate::reactive::abstract_tree::TreeKey::RootLink(_, _)
+                                )
+                            })
+                    }),
+                    build_call,
+                    definition: Some((descriptor, definition)),
+                },
+            );
+            runtime.family_by_root.insert(family_id, family_id);
+            with_txn_pub(|txn| txn.push_undo(plain::Undo::RootInserted { root }));
+            let initial_keys: Vec<Arc<dyn KeyValue>> = runtime
+                .committed
+                .view(view)
+                .map(|snapshot| {
+                    snapshot
+                        .entries()
+                        .filter_map(|entry| {
+                            entry
+                                .key
+                                .as_any()
+                                .downcast_ref::<crate::reactive::abstract_tree::TreeKey<F::Domain>>(
+                                )
+                                .and_then(|key| {
+                                    matches!(
+                                        key,
+                                        crate::reactive::abstract_tree::TreeKey::RootLink(_, _)
+                                    )
+                                    .then(|| Arc::clone(&entry.key))
+                                })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for key in initial_keys {
+                plain::queue_family_child(&mut runtime, family_id, key)?;
+            }
+            plain::quiesce(&mut runtime)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                let deltas = with_txn_pub(|txn| txn.journal.commit_deltas());
+                let changes = with_txn_pub(|txn| txn.journal.commit_changes());
+                drop(_txn_frame);
+                if !deltas.is_empty() {
+                    runtime.committed.apply(&deltas);
+                    runtime.epoch += 1;
+                    runtime.last_changed = changes;
+                    plain::update_sinks(&runtime);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let txn = take_txn_pub();
+                drop(_txn_frame);
+                rollback_txn_pub(txn, &runtime.state.clone(), &mut runtime.roots);
+                Err(error)
+            }
+        }
+    }
+
+    /// Installs one heterogeneous component at each selected root. The
+    /// component's normalized family key is stable; `props` are copied into
+    /// each root invocation and remain replaceable call values rather than
+    /// lifecycle identity.
+    #[doc(hidden)]
+    pub fn install_component_tree_family_roots<D, F, N, P, B, Body>(
+        &mut self,
+        _selector: crate::reactive::abstract_tree::RootSelector<F, N>,
+        props: P,
+        body: Body,
+    ) -> Result<()>
+    where
+        D: crate::reactive::component::ComponentDefinition + 'static,
+        F: crate::reactive::abstract_tree::AbstractTreeFamily,
+        N: crate::reactive::abstract_tree::AbstractTreeNode<Family = F>,
+        P: Clone + PartialEq + std::fmt::Debug + Send + Sync + 'static,
+        B: Clone + PartialEq + std::fmt::Debug + Send + Sync + 'static,
+        Body: Fn(crate::reactive::component::FamilyNode<F>, P) -> Result<B>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        use crate::reactive::plain::ErasedCall;
+        use crate::reactive::plain::{
+            PlainStatePub as PlainState, erased_component_call_with_definition, push_txn_pub,
+            rollback_txn_pub, take_txn_pub, with_txn_pub,
+        };
+        let definition = TypeId::of::<D>();
+        let descriptor = D::__descriptor();
+        {
+            let mut runtime = self.plain.lock();
+            runtime
+                .components
+                .register(definition, descriptor, "tree_family_root")?;
+        }
+        let mut runtime = self.plain.lock();
+        let _txn_frame = push_txn_pub();
+        let result = (|| -> Result<()> {
+            let root = plain::fresh_token();
+            let graph = Arc::new(Mutex::new(plain::PlainGraph::new(
+                PlainState::default(),
+                plain::erased_noop_pub(),
+                root,
+            )));
+            graph.lock().state = Arc::clone(&runtime.state);
+            let view = TypeId::of::<F>();
+            let build_call: Arc<dyn Fn(Arc<dyn KeyValue>) -> Arc<dyn ErasedCall> + Send + Sync> = {
+                let body = body.clone();
+                let props = props.clone();
+                Arc::new(move |key| {
+                    let node = key
+                        .as_any()
+                        .downcast_ref::<crate::reactive::abstract_tree::TreeKey<F::Domain>>()
+                        .and_then(|key| match key {
+                            crate::reactive::abstract_tree::TreeKey::RootLink(_, node) => {
+                                Some(crate::reactive::abstract_tree::AstBox::<N>::from_erased(
+                                    node.clone(),
+                                ))
+                            }
+                            _ => None,
+                        })
+                        .expect("heterogeneous component received a non-root key");
+                    let family_node = crate::reactive::component::FamilyNode::<F>::from_typed(node);
+                    erased_component_call_with_definition(
+                        definition,
+                        descriptor,
+                        Some(N::__member()),
+                        body.clone(),
+                        family_node,
+                        props.clone(),
+                    )
+                })
+            };
+            let install_ordinal = runtime.next_install_ordinal;
+            runtime.next_install_ordinal += 1;
+            let family_id = root;
+            runtime.families.insert(
+                family_id,
+                plain::FamilyRuntime {
+                    graph: Arc::clone(&graph),
+                    view,
+                    view_name: descriptor,
+                    install_ordinal,
+                    selector: plain::FamilySelector::TreeRoot,
+                    accept_key: Arc::new(|key| {
+                        key.as_any()
+                            .downcast_ref::<crate::reactive::abstract_tree::TreeKey<F::Domain>>()
+                            .is_some_and(|key| {
+                                matches!(
+                                    key,
+                                    crate::reactive::abstract_tree::TreeKey::RootLink(_, _)
+                                )
+                            })
+                    }),
+                    build_call,
+                    definition: Some((descriptor, definition)),
+                },
+            );
+            runtime.family_by_root.insert(family_id, family_id);
+            with_txn_pub(|txn| txn.push_undo(plain::Undo::RootInserted { root }));
+            let initial_keys: Vec<Arc<dyn KeyValue>> = runtime
+                .committed
+                .view(view)
+                .map(|snapshot| {
+                    snapshot
+                        .entries()
+                        .filter_map(|entry| {
+                            entry
+                                .key
+                                .as_any()
+                                .downcast_ref::<crate::reactive::abstract_tree::TreeKey<F::Domain>>()
+                                .is_some_and(|key| {
+                                    matches!(
+                                        key,
+                                        crate::reactive::abstract_tree::TreeKey::RootLink(_, _)
+                                    )
+                                })
+                                .then(|| Arc::clone(&entry.key))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for key in initial_keys {
+                plain::queue_family_child(&mut runtime, family_id, key)?;
+            }
+            plain::quiesce(&mut runtime)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                let deltas = with_txn_pub(|txn| txn.journal.commit_deltas());
+                let changes = with_txn_pub(|txn| txn.journal.commit_changes());
+                drop(_txn_frame);
+                if !deltas.is_empty() {
+                    runtime.committed.apply(&deltas);
+                    runtime.epoch += 1;
+                    runtime.last_changed = changes;
+                    plain::update_sinks(&runtime);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let txn = take_txn_pub();
+                drop(_txn_frame);
+                rollback_txn_pub(txn, &runtime.state.clone(), &mut runtime.roots);
+                Err(error)
+            }
+        }
+    }
+
+    /// Installs one first-class component for every committed node of the
+    /// selected member in a generated abstract-tree family.
+    pub fn install_component_tree_nodes<D, F, N, B, Body>(
+        &mut self,
+        _selector: crate::reactive::abstract_tree::NodeSelector<F, N>,
+        body: Body,
+    ) -> Result<()>
+    where
+        D: crate::reactive::component::ComponentDefinition + 'static,
+        F: crate::reactive::abstract_tree::AbstractTreeFamily,
+        N: crate::reactive::abstract_tree::AbstractTreeNode<Family = F>,
+        B: Clone + PartialEq + std::fmt::Debug + Send + Sync + 'static,
+        Body: Fn(crate::reactive::abstract_tree::AstBox<N>) -> Result<B>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        use crate::reactive::plain::ErasedCall;
+        use crate::reactive::plain::{
+            PlainStatePub as PlainState, erased_call_with_definition, push_txn_pub,
+            rollback_txn_pub, take_txn_pub, with_txn_pub,
+        };
+        let definition = TypeId::of::<D>();
+        let descriptor = D::__descriptor();
+        {
+            let mut runtime = self.plain.lock();
+            runtime
+                .components
+                .register(definition, descriptor, "tree_node")?;
+        }
+        let mut runtime = self.plain.lock();
+        let _txn_frame = push_txn_pub();
+        let result = (|| -> Result<()> {
+            let root = plain::fresh_token();
+            let graph = Arc::new(Mutex::new(plain::PlainGraph::new(
+                PlainState::default(),
+                plain::erased_noop_pub(),
+                root,
+            )));
+            graph.lock().state = Arc::clone(&runtime.state);
+            let view = TypeId::of::<F>();
+            let member = N::__member();
+            let build_call: Arc<dyn Fn(Arc<dyn KeyValue>) -> Arc<dyn ErasedCall> + Send + Sync> = {
+                let body = body.clone();
+                Arc::new(move |key| {
+                    let input = key
+                        .as_any()
+                        .downcast_ref::<crate::reactive::abstract_tree::TreeKey<F::Domain>>()
+                        .and_then(|key| match key {
+                            crate::reactive::abstract_tree::TreeKey::Member(node, actual)
+                                if *actual == member =>
+                            {
+                                Some(crate::reactive::abstract_tree::AstBox::<N>::from_erased(
+                                    node.clone(),
+                                ))
+                            }
+                            _ => None,
+                        })
+                        .expect("tree component received a non-selected member key");
+                    erased_call_with_definition(definition, body.clone(), input)
+                })
+            };
+            let install_ordinal = runtime.next_install_ordinal;
+            runtime.next_install_ordinal += 1;
+            let family_id = root;
+            runtime.families.insert(
+                family_id,
+                plain::FamilyRuntime {
+                    graph: Arc::clone(&graph),
+                    view,
+                    view_name: descriptor,
+                    install_ordinal,
+                    selector: plain::FamilySelector::TreeNode(member),
+                    accept_key: Arc::new(move |key| {
+                        key.as_any()
+                            .downcast_ref::<crate::reactive::abstract_tree::TreeKey<F::Domain>>()
+                            .is_some_and(|key| {
+                                matches!(
+                                    key,
+                                    crate::reactive::abstract_tree::TreeKey::Member(_, actual)
+                                        if *actual == member
+                                )
+                            })
+                    }),
+                    build_call,
+                    definition: Some((descriptor, definition)),
+                },
+            );
+            runtime.family_by_root.insert(family_id, family_id);
+            with_txn_pub(|txn| txn.push_undo(plain::Undo::RootInserted { root }));
+            let initial_keys: Vec<Arc<dyn KeyValue>> = runtime
+                .committed
+                .view(view)
+                .map(|snapshot| {
+                    snapshot
+                        .entries()
+                        .filter_map(|entry| {
+                            entry
+                                .key
+                                .as_any()
+                                .downcast_ref::<crate::reactive::abstract_tree::TreeKey<F::Domain>>(
+                                )
+                                .and_then(|key| {
+                                    matches!(
+                                        key,
+                                        crate::reactive::abstract_tree::TreeKey::Member(
+                                            _,
+                                            actual
+                                        ) if *actual == member
+                                    )
+                                    .then(|| Arc::clone(&entry.key))
+                                })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for key in initial_keys {
+                plain::queue_family_child(&mut runtime, family_id, key)?;
+            }
+            plain::quiesce(&mut runtime)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                let deltas = with_txn_pub(|txn| txn.journal.commit_deltas());
+                let changes = with_txn_pub(|txn| txn.journal.commit_changes());
+                drop(_txn_frame);
+                if !deltas.is_empty() {
+                    runtime.committed.apply(&deltas);
+                    runtime.epoch += 1;
+                    runtime.last_changed = changes;
+                    plain::update_sinks(&runtime);
+                }
+                Ok(())
             }
             Err(error) => {
                 let txn = take_txn_pub();
@@ -754,7 +1239,6 @@ impl Engine {
     pub fn __liveness_audit(&self) -> Vec<String> {
         plain::liveness_audit(&self.plain.lock())
     }
-
 }
 
 /// A read-only view of committed typed facts.
@@ -808,7 +1292,7 @@ impl Snapshot {
         }
     }
 
-    /// Reads a list-kind view's committed items under one domain key.
+    /// Reads all present list slots under one semantic domain key.
     pub fn list<V: ListView>(&self, key: &V::Key) -> Vec<Arc<V::Item>> {
         let len = self.list_len::<V>(key);
         let mut items = Vec::with_capacity(len);
@@ -823,6 +1307,20 @@ impl Snapshot {
         items
     }
 
+    /// Enumerates list domains without exposing the encoded list-key ABI.
+    pub fn list_domains<V: ListView>(&self) -> Vec<V::Key> {
+        let mut domains = Vec::new();
+        for input in self.__plain_inputs::<V>() {
+            let key = match input {
+                ListKey::Slot(key, _) | ListKey::Len(key) => key,
+            };
+            if !domains.iter().any(|existing| existing == &key) {
+                domains.push(key);
+            }
+        }
+        domains
+    }
+
     /// Reads a tree-kind view's committed roots across all domain keys.
     pub fn tree_roots<V: TreeView>(&self) -> Vec<Node<V>> {
         let mut roots = Vec::new();
@@ -832,8 +1330,8 @@ impl Snapshot {
             {
                 if let TreeFact::RootOrder(order) = observed.as_ref() {
                     for link in order.iter() {
-                        if let Some(observed) = self
-                            .__plain_observe::<V>(TreeKey::RootLink(key.clone(), link.clone()))
+                        if let Some(observed) =
+                            self.__plain_observe::<V>(TreeKey::RootLink(key.clone(), link.clone()))
                             && let TreeFact::RootLink(root) = observed.as_ref()
                         {
                             roots.push(root.clone());
@@ -920,6 +1418,39 @@ impl Snapshot {
             Some(GraphFact::Targets(targets)) => targets.clone(),
             _ => Vec::new(),
         }
+    }
+    /// Enumerates committed graph nodes without exposing encoded graph keys.
+    pub fn graph_nodes<V: GraphView>(&self) -> Vec<Node<V>> {
+        self.__plain_inputs::<V>()
+            .into_iter()
+            .filter_map(|input| match input {
+                GraphKey::Node(node) => Some(node),
+                GraphKey::Bucket(_, _) => None,
+            })
+            .collect()
+    }
+
+    /// Enumerates committed labelled graph buckets as semantic entries.
+    ///
+    /// Each entry owns the bucket's target vector because snapshot inspection
+    /// is intentionally detached from the reactive read context.
+    pub fn graph_buckets<V: GraphView>(&self) -> Vec<(Node<V>, V::Label, Vec<Node<V>>)> {
+        self.__plain_inputs::<V>()
+            .into_iter()
+            .filter_map(|input| {
+                let GraphKey::Bucket(node, label) = input else {
+                    return None;
+                };
+                let targets = match self
+                    .__plain_observe::<V>(GraphKey::Bucket(node.clone(), label.clone()))
+                    .as_deref()
+                {
+                    Some(GraphFact::Targets(targets)) => targets.clone(),
+                    _ => Vec::new(),
+                };
+                Some((node, label, targets))
+            })
+            .collect()
     }
 
     /// Reads a box-kind view's committed cell.

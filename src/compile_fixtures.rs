@@ -120,7 +120,92 @@
 //!     },
 //! }
 //! ```
-
+//! `#[abstract_tree]` rejects an unsupported wrapper around `AstBox`.
+//!
+//! ```compile_fail
+//! use plingo::abstract_tree;
+//! use plingo::reactive::abstract_tree::AstBox;
+//! use std::rc::Rc;
+//!
+//! #[abstract_tree]
+//! pub enum Bad {
+//!     Item {
+//!         child: Rc<AstBox<Bad>>,
+//!     },
+//! }
+//! ```
+//!
+//! `#[abstract_tree]` rejects a duplicate family member.
+//!
+//! ```compile_fail
+//! use plingo::abstract_tree;
+//! use plingo::reactive::abstract_tree::AstBox;
+//!
+//! #[abstract_tree(members(Left, Left))]
+//! pub enum Left {
+//!     Leaf,
+//! }
+//! ```
+//!
+//! `#[abstract_tree]` rejects `member_of` together with `tree`.
+//!
+//! ```compile_fail
+//! use plingo::abstract_tree;
+//! use plingo::reactive::abstract_tree::AstBox;
+//!
+//! #[abstract_tree(tree = MyTree, member_of = MyTree)]
+//! pub enum Left {
+//!     Leaf,
+//! }
+//! ```
+//!
+//! `#[abstract_tree]` rejects a cross-family child.
+//!
+//! ```compile_fail
+//! use plingo::abstract_tree;
+//! use plingo::reactive::abstract_tree::AstBox;
+//!
+//! #[abstract_tree(tree = AlphaTree, members(Alpha, Beta))]
+//! pub enum Alpha {
+//!     Wrap { child: AstBox<Beta> },
+//! }
+//!
+//! #[abstract_tree(tree = GammaTree)]
+//! pub enum Beta {
+//!     Leaf,
+//! }
+//! ```
+//!
+//! `AstBox<T>` render output is owned by exactly one component evaluation:
+//! `T::render` requires an active component frame and rejects a second
+//! render of the same output slot ("abstract-tree output slot rendered
+//! more than once"). Calling it outside any component run fails at the
+//! effect boundary with `EffectOutsideRun { effect: "tree_render", .. }`.
+//!
+//! ```compile_fail
+//! use plingo::abstract_tree;
+//! use plingo::reactive::abstract_tree::{AstBox, TreeRender};
+//!
+//! #[abstract_tree]
+//! pub enum Leaf {
+//!     Bare,
+//! }
+//!
+//! impl TreeRender for Leaf {
+//!     fn __materialize(node: AstBox<Self>) -> plingo::reactive::Result<Self> {
+//!         unreachable!()
+//!     }
+//!     fn __snapshot_materialize(
+//!         snapshot: &plingo::reactive::Snapshot,
+//!         node: AstBox<Self>,
+//!     ) -> plingo::reactive::Result<Self> {
+//!         unreachable!()
+//!     }
+//!     fn __render(value: Self) -> plingo::reactive::Result<AstBox<Self>> {
+//!         unreachable!()
+//!     }
+//! }
+//! ```
 /// The compile-time rejection gates live in this module's documentation.
 #[doc(hidden)]
 pub struct CompileFixtures;

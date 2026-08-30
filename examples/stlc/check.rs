@@ -1,36 +1,16 @@
-//! Component-separated STLC checker (Cut J, plan §23).
-//!
-//! Three independent EachKey components — synthesis, diagnostics, and
-//! definition publication — split the single-node bidirectional pass.
-//! Expectation writing is part of the parent's synthesis component (each
-//! parent node writes `StlcExpectedTypes` for its children based on grammar
-//! rules and the parent's own expectation). No `run` recursion, no
-//! `StlcTypeMode`, no graph `Type` nodes, no `StlcTypeScopes`, no `Arrow`.
-//!
-//! Synthesis reads child `StlcSynthesizedTypes` and parent `StlcExpectedTypes`,
-//! writes own `StlcSynthesizedTypes` and child `StlcExpectedTypes`.
-//! Diagnostics read both for the same node. Definition publication reads
-//! `StlcDeclarationScopes` and `StlcSynthesizedTypes`.
+//! Incremental STLC type checking authored against generated abstract-tree views.
 
 use std::sync::Arc;
 
-use plingo::framework::parse::{ParserTreePayloads, TreeParseUnits};
-use plingo::reactive::component::EachKey;
-use plingo::reactive::prelude::*;
-use plingo::reactive::view::Node;
-use reactive_macros::view;
+use plingo::prelude::*;
 
 use super::name_resolve::{
     Scope, StlcDeclarationScopes, StlcResolution, StlcResolvedReferences, StlcScope,
 };
 use super::syntax::{
-    StlcCase, StlcDeclarationCase, StlcDocument, StlcExprCase, StlcParamCase, StlcTree,
-    StlcTypeAtomCase, StlcTypeCase,
+    StlcDeclaration, StlcDeclarationView, StlcDocument, StlcExpr, StlcExprView, StlcParam,
+    StlcParamView, StlcPath, StlcType, StlcTypeAtom, StlcTypeAtomView, StlcTypeView,
 };
-
-// ---------------------------------------------------------------------------
-// Type value — canonical curried function spine replaces boxed Arrow
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FunctionType {
@@ -57,293 +37,584 @@ pub enum StlcTypeValue {
 
 impl StlcTypeValue {
     pub fn function<I>(parameters: I, result: StlcTypeValue) -> StlcTypeValue
-    where I: IntoIterator<Item = StlcTypeValue> {
-        let mut params: Vec<StlcTypeValue> = parameters.into_iter().collect();
-        let terminal = match result {
-            StlcTypeValue::Function(f) => { params.extend(f.parameters.iter().cloned()); f.result.clone() }
-            other => other,
+    where
+        I: IntoIterator<Item = StlcTypeValue>,
+    {
+        let mut parameters: Vec<_> = parameters.into_iter().collect();
+        let result = match result {
+            StlcTypeValue::Function(function) => {
+                parameters.extend(function.parameters.iter().cloned());
+                function.result.clone()
+            }
+            result => result,
         };
-        if params.is_empty() { terminal }
-        else { StlcTypeValue::Function(Arc::new(FunctionType { parameters: Arc::from(params), result: terminal })) }
+        if parameters.is_empty() {
+            result
+        } else {
+            StlcTypeValue::Function(Arc::new(FunctionType {
+                parameters: Arc::from(parameters),
+                result,
+            }))
+        }
     }
+
     pub fn apply_one(&self) -> Option<StlcTypeValue> {
+        let StlcTypeValue::Function(function) = self else {
+            return None;
+        };
+        if function.parameters.len() == 1 {
+            Some(function.result.clone())
+        } else {
+            Some(StlcTypeValue::Function(Arc::new(FunctionType {
+                parameters: Arc::from(&function.parameters[1..]),
+                result: function.result.clone(),
+            })))
+        }
+    }
+
+    pub fn function_parts(&self) -> Option<(Vec<StlcTypeValue>, StlcTypeValue)> {
         match self {
-            StlcTypeValue::Function(f) => {
-                if f.parameters.len() == 1 { Some(f.result.clone()) }
-                else { Some(StlcTypeValue::Function(Arc::new(FunctionType { parameters: Arc::from(&f.parameters[1..]), result: f.result.clone() }))) }
+            StlcTypeValue::Function(function) => {
+                Some((function.parameters.to_vec(), function.result.clone()))
             }
             _ => None,
         }
-    }
-    pub fn function_parts(&self) -> Option<(Vec<StlcTypeValue>, StlcTypeValue)> {
-        match self { StlcTypeValue::Function(f) => Some((f.parameters.to_vec(), f.result.clone())), _ => None }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StlcTypeError {
-    Mismatch { expected: StlcTypeValue, found: StlcTypeValue },
-    NonFunctionApplication { found: StlcTypeValue },
-    BranchMismatch { then_ty: StlcTypeValue, else_ty: StlcTypeValue },
-    UnboundVariable { name: Arc<str> },
+    Mismatch {
+        expected: StlcTypeValue,
+        found: StlcTypeValue,
+    },
+    NonFunctionApplication {
+        found: StlcTypeValue,
+    },
+    BranchMismatch {
+        then_ty: StlcTypeValue,
+        else_ty: StlcTypeValue,
+    },
+    UnboundVariable {
+        name: Arc<str>,
+    },
     MissingParameterAnnotation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum StlcTypeResult { Known(StlcTypeValue), Unknown }
+pub enum StlcTypeResult {
+    Known(StlcTypeValue),
+    Unknown,
+}
+
 impl From<Option<StlcTypeValue>> for StlcTypeResult {
-    fn from(v: Option<StlcTypeValue>) -> Self { match v { Some(v) => Self::Known(v), None => Self::Unknown } }
+    fn from(value: Option<StlcTypeValue>) -> Self {
+        value.map_or(Self::Unknown, Self::Known)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct StlcTypeDiagnostic { pub expression: Node<StlcTree>, pub error: StlcTypeError }
+pub struct StlcTypeDiagnostic {
+    pub expression: AstBox<()>,
+    pub error: StlcTypeError,
+}
 
 #[view]
-pub struct StlcSynthesizedTypes(Map<Node<StlcTree>, StlcTypeResult>);
+pub struct StlcSynthesizedTypes(Map<AstBox<()>, StlcTypeResult>);
 
-/// Expected type per edge `(parent, child)` (plan §23.5). Each parent's
-/// synthesis writes entries for its children; the child reads its own
-/// expectation by looking up `(tree_parent, self)`.
 #[view]
-pub struct StlcExpectedTypes(Map<(Node<StlcTree>, Node<StlcTree>), StlcTypeValue>);
+pub struct StlcExpectedTypes(Map<(AstBox<()>, AstBox<()>), StlcTypeValue>);
 
 #[view]
 pub struct StlcDefinitionTypes(Map<Scope<StlcScope>, StlcTypeResult>);
 
 #[view]
-pub struct StlcTypeDiagnostics(List<Node<StlcTree>, StlcTypeDiagnostic>);
+pub struct StlcTypeDiagnostics(List<AstBox<()>, StlcTypeDiagnostic>);
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn child_type(id: &Node<StlcTree>) -> Option<StlcTypeValue> {
-    observe_view::<StlcSynthesizedTypes>().ok()
-        .and_then(|v| v.get(id).ok()).flatten()
-        .and_then(|r| match &*r { StlcTypeResult::Known(ty) => Some(ty.clone()), _ => None })
+#[derive(Clone, Debug, PartialEq, Effects)]
+struct SynthesisEffects {
+    synthesized: Set<StlcSynthesizedTypes>,
+    expected: Vec<Set<StlcExpectedTypes>>,
+    expected_removed: Vec<Remove<StlcExpectedTypes>>,
+    diagnostics: Replace<StlcTypeDiagnostics>,
 }
 
-fn node_expected(id: &Node<StlcTree>) -> Option<StlcTypeValue> {
-    // Find the parent via the tree parent fact, then read the edge-keyed expectation.
-    let parent = StlcTree::observe_parent(id.clone()).ok()??;
-    observe_view::<StlcExpectedTypes>().ok()
-        .and_then(|v| v.get(&(parent, id.clone())).ok()).flatten()
-        .map(|a| (*a).clone())
+fn child_type(id: &AstBox<()>) -> Result<Option<StlcTypeValue>> {
+    Ok(
+        StlcSynthesizedTypes::get(id)?.and_then(|result| match result.as_ref() {
+            StlcTypeResult::Known(value) => Some(value.clone()),
+            StlcTypeResult::Unknown => None,
+        }),
+    )
 }
 
-// ---------------------------------------------------------------------------
-// Synthesis + expectation: per-node (plan §23.4/§23.5)
-// ---------------------------------------------------------------------------
-
-#[reactive_macros::component]
-pub fn synthesize_node(key: EachKey<ParserTreePayloads<StlcDocument>>) -> Result<()> {
-    let id: Node<StlcTree> = key;
-    let case_opt = StlcTree::observe_case(id.clone())?;
-    let mut errs = Vec::<StlcTypeDiagnostic>::new();
-    let syn = match &case_opt {
-        Some(case) => synthesize_and_expect(&id, case, &mut errs),
-        None => StlcTypeResult::Unknown,
+fn expected<T: AbstractTreeNode>(node: &AstBox<T>) -> Result<Option<StlcTypeValue>> {
+    let Some(parent) = node.parent()? else {
+        return Ok(None);
     };
-    emit_view::<StlcSynthesizedTypes>()?.insert(id.clone(), syn)?;
-    write_diagnostics(&id, errs);
-    Ok(())
+    Ok(StlcExpectedTypes::get(&(parent.erased(), node.erased()))?
+        .map(|value| value.as_ref().clone()))
+}
+fn expectation(
+    effects: &mut SynthesisEffects,
+    parent: AstBox<()>,
+    child: AstBox<()>,
+    value: Option<StlcTypeValue>,
+) {
+    match value {
+        Some(value) => effects
+            .expected
+            .push(StlcExpectedTypes::set((parent, child), value)),
+        None => effects
+            .expected_removed
+            .push(StlcExpectedTypes::remove((parent, child))),
+    }
 }
 
-/// Computes the synthesized type for `id` AND writes expectations for its
-/// children (plan §23.4 rules, §23.5 table). Returns the synthesized result.
-fn synthesize_and_expect(id: &Node<StlcTree>, case: &StlcCase, errs: &mut Vec<StlcTypeDiagnostic>) -> StlcTypeResult {
-    let exp = |child, ty| expect_child_typed(id, child, ty);
-    let parent_exp = node_expected(id);
-    let result = match case {
-        StlcCase::Document(_) | StlcCase::Path(_) => StlcTypeResult::Unknown,
-        StlcCase::Type(StlcTypeCase::Arrow { f0, f1 }) => {
-            exp(f0, None);
-            exp(f1, None);
-            match (child_type(f0), child_type(f1)) {
-                (Some(p), Some(r)) => StlcTypeResult::Known(StlcTypeValue::function([p], r)),
-                _ => StlcTypeResult::Unknown,
+fn result(
+    id: AstBox<()>,
+    value: Option<StlcTypeValue>,
+    diagnostics: Vec<StlcTypeDiagnostic>,
+) -> SynthesisEffects {
+    SynthesisEffects {
+        synthesized: StlcSynthesizedTypes::set(id.clone(), value.clone().into()),
+        expected: Vec::new(),
+        expected_removed: Vec::new(),
+        diagnostics: StlcTypeDiagnostics::replace(id, diagnostics),
+    }
+}
+
+fn finish(
+    node: AstBox<()>,
+    value: Option<StlcTypeValue>,
+    expected_value: Option<StlcTypeValue>,
+    diagnostics: &mut Vec<StlcTypeDiagnostic>,
+    mut effects: SynthesisEffects,
+) -> SynthesisEffects {
+    if let (Some(expected), Some(found)) = (expected_value, value.as_ref()) {
+        if expected != *found {
+            diagnostics.push(StlcTypeDiagnostic {
+                expression: node.clone(),
+                error: StlcTypeError::Mismatch {
+                    expected,
+                    found: found.clone(),
+                },
+            });
+        }
+    }
+    effects.synthesized = StlcSynthesizedTypes::set(node.clone(), value.into());
+    effects.diagnostics = StlcTypeDiagnostics::replace(node, diagnostics.clone());
+    effects
+}
+
+fn synth_type_atom(node: AstBox<StlcTypeAtom>) -> Result<SynthesisEffects> {
+    let id = node.erased();
+    let value = match node.view()? {
+        StlcTypeAtomView::Nat(_) => Some(StlcTypeValue::Nat),
+        StlcTypeAtomView::Bool(_) => Some(StlcTypeValue::Bool),
+        StlcTypeAtomView::Unit(_) => Some(StlcTypeValue::Unit),
+        StlcTypeAtomView::Parenthesized(parenthesized) => {
+            let child = parenthesized.ty()?;
+            child_type(&child.erased())?
+        }
+    };
+    Ok(finish(
+        id.clone(),
+        value.clone(),
+        expected(&node)?,
+        &mut Vec::new(),
+        result(id, value, Vec::new()),
+    ))
+}
+
+fn synth_type(node: AstBox<StlcType>) -> Result<SynthesisEffects> {
+    let id = node.erased();
+    let mut effects = result(id.clone(), None, Vec::new());
+    let mut value = None;
+    match node.view()? {
+        StlcTypeView::Arrow(arrow) => {
+            let left = arrow.left()?;
+            let right = arrow.right()?;
+            expectation(&mut effects, id.clone(), left.erased(), None);
+            expectation(&mut effects, id.clone(), right.erased(), None);
+            value = match (child_type(&left.erased())?, child_type(&right.erased())?) {
+                (Some(left), Some(right)) => Some(StlcTypeValue::function([left], right)),
+                _ => None,
+            };
+        }
+        StlcTypeView::Atom(atom) => {
+            let child = atom.atom()?;
+            expectation(&mut effects, id.clone(), child.erased(), None);
+            value = child_type(&child.erased())?;
+        }
+        StlcTypeView::Error(_) => {}
+    }
+    let expected_value = expected(&node)?;
+    let mut diagnostics = Vec::new();
+    Ok(finish(id, value, expected_value, &mut diagnostics, effects))
+}
+
+fn synth_param(node: AstBox<StlcParam>) -> Result<SynthesisEffects> {
+    let id = node.erased();
+    let mut effects = result(id.clone(), None, Vec::new());
+    let annotation = match node.view()? {
+        StlcParamView::Bare(param) => param.annotation()?,
+        StlcParamView::Parenthesized(param) => param.annotation()?,
+    };
+    let value = if let Some(annotation) = annotation.as_ref() {
+        expectation(&mut effects, id.clone(), annotation.erased(), None);
+        child_type(&annotation.erased())?
+    } else {
+        None
+    };
+    let mut diagnostics = Vec::new();
+    if value.is_none() && annotation.is_none() {
+        diagnostics.push(StlcTypeDiagnostic {
+            expression: id.clone(),
+            error: StlcTypeError::MissingParameterAnnotation,
+        });
+    }
+    Ok(finish(
+        id,
+        value,
+        expected(&node)?,
+        &mut diagnostics,
+        effects,
+    ))
+}
+
+fn synth_expr(node: AstBox<StlcExpr>) -> Result<SynthesisEffects> {
+    let id = node.erased();
+    let mut effects = result(id.clone(), None, Vec::new());
+    let mut diagnostics = Vec::new();
+    let mut value = None;
+    match node.view()? {
+        StlcExprView::True(_) | StlcExprView::False(_) => value = Some(StlcTypeValue::Bool),
+        StlcExprView::Number(_) => value = Some(StlcTypeValue::Nat),
+        StlcExprView::Unit(_) => value = Some(StlcTypeValue::Unit),
+        StlcExprView::Group(group) => {
+            let child = group.expression()?;
+            let expected_value = expected(&node)?;
+            expectation(&mut effects, id.clone(), child.erased(), expected_value);
+            value = child_type(&child.erased())?;
+        }
+        StlcExprView::Succ(succ) => {
+            let child = succ.value()?;
+            expectation(
+                &mut effects,
+                id.clone(),
+                child.erased(),
+                Some(StlcTypeValue::Nat),
+            );
+            value = Some(StlcTypeValue::Nat);
+        }
+        StlcExprView::Add(add) => {
+            let left = add.left()?;
+            let right = add.right()?;
+            expectation(
+                &mut effects,
+                id.clone(),
+                left.erased(),
+                Some(StlcTypeValue::Nat),
+            );
+            expectation(
+                &mut effects,
+                id.clone(),
+                right.erased(),
+                Some(StlcTypeValue::Nat),
+            );
+            value = Some(StlcTypeValue::Nat);
+        }
+        StlcExprView::If(if_) => {
+            let condition = if_.condition()?;
+            let when_true = if_.when_true()?;
+            let when_false = if_.when_false()?;
+            expectation(
+                &mut effects,
+                id.clone(),
+                condition.erased(),
+                Some(StlcTypeValue::Bool),
+            );
+            let parent_expected = expected(&node)?;
+            expectation(
+                &mut effects,
+                id.clone(),
+                when_true.erased(),
+                parent_expected.clone(),
+            );
+            expectation(
+                &mut effects,
+                id.clone(),
+                when_false.erased(),
+                parent_expected,
+            );
+            match (
+                child_type(&when_true.erased())?,
+                child_type(&when_false.erased())?,
+            ) {
+                (Some(left), Some(right)) if left == right => value = Some(left),
+                (Some(left), Some(right)) => diagnostics.push(StlcTypeDiagnostic {
+                    expression: id.clone(),
+                    error: StlcTypeError::BranchMismatch {
+                        then_ty: left,
+                        else_ty: right,
+                    },
+                }),
+                _ => {}
             }
         }
-        StlcCase::Type(StlcTypeCase::Atom { f0 }) => {
-            exp(f0, None);
-            child_type(f0).into()
-        }
-        StlcCase::TypeAtom(StlcTypeAtomCase::Nat { .. }) => StlcTypeResult::Known(StlcTypeValue::Nat),
-        StlcCase::TypeAtom(StlcTypeAtomCase::Bool { .. }) => StlcTypeResult::Known(StlcTypeValue::Bool),
-        StlcCase::TypeAtom(StlcTypeAtomCase::Unit { .. }) => StlcTypeResult::Known(StlcTypeValue::Unit),
-        StlcCase::TypeAtom(StlcTypeAtomCase::Parenthesized { f0 }) => {
-            exp(f0, None);
-            child_type(f0).into()
-        }
-        StlcCase::Expr(StlcExprCase::True { .. }) | StlcCase::Expr(StlcExprCase::False { .. }) => StlcTypeResult::Known(StlcTypeValue::Bool),
-        StlcCase::Expr(StlcExprCase::Number { .. }) => StlcTypeResult::Known(StlcTypeValue::Nat),
-        StlcCase::Expr(StlcExprCase::Unit { .. }) => StlcTypeResult::Known(StlcTypeValue::Unit),
-        StlcCase::Expr(StlcExprCase::Group { f0 }) => { exp(f0, parent_exp.clone()); child_type(f0).into() }
-        StlcCase::Expr(StlcExprCase::Succ { f0 }) => { exp(f0, Some(StlcTypeValue::Nat)); StlcTypeResult::Known(StlcTypeValue::Nat) }
-        StlcCase::Expr(StlcExprCase::Add { f0, f1 }) => {
-            exp(f0, Some(StlcTypeValue::Nat));
-            exp(f1, Some(StlcTypeValue::Nat));
-            StlcTypeResult::Known(StlcTypeValue::Nat)
-        }
-        StlcCase::Expr(StlcExprCase::If { f0: cond, f1: then_branch, f2: else_branch, .. }) => {
-            exp(cond, Some(StlcTypeValue::Bool));
-            exp(then_branch, parent_exp.clone());
-            exp(else_branch, parent_exp.clone());
-            match (child_type(then_branch), child_type(else_branch)) {
-                (Some(a), Some(b)) if a == b => StlcTypeResult::Known(a),
-                _ => StlcTypeResult::Unknown,
+        StlcExprView::Case(case) => {
+            let scrutinee = case.scrutinee()?;
+            let zero = case.zero_branch()?;
+            let successor = case.successor_branch()?;
+            expectation(
+                &mut effects,
+                id.clone(),
+                scrutinee.erased(),
+                Some(StlcTypeValue::Nat),
+            );
+            let parent_expected = expected(&node)?;
+            expectation(
+                &mut effects,
+                id.clone(),
+                zero.erased(),
+                parent_expected.clone(),
+            );
+            expectation(
+                &mut effects,
+                id.clone(),
+                successor.erased(),
+                parent_expected,
+            );
+            match (
+                child_type(&zero.erased())?,
+                child_type(&successor.erased())?,
+            ) {
+                (Some(left), Some(right)) if left == right => value = Some(left),
+                (Some(left), Some(right)) => diagnostics.push(StlcTypeDiagnostic {
+                    expression: id.clone(),
+                    error: StlcTypeError::BranchMismatch {
+                        then_ty: left,
+                        else_ty: right,
+                    },
+                }),
+                _ => {}
             }
         }
-        StlcCase::Expr(StlcExprCase::Lambda { f0: parameter, f1: body }) => {
-            let pe = parent_exp.as_ref().and_then(|pe| pe.function_parts());
-            let param_exp = pe.as_ref().and_then(|(ps, _)| ps.first().cloned());
-            let body_exp = pe.map(|(mut ps, r)| { if ps.len() <= 1 { r } else { ps.remove(0); StlcTypeValue::function(ps, r) } });
-            exp(parameter, param_exp);
-            exp(body, body_exp);
-            match (child_type(parameter), child_type(body)) {
-                (Some(p), Some(r)) => StlcTypeResult::Known(StlcTypeValue::function([p], r)),
-                _ => StlcTypeResult::Unknown,
-            }
-        }
-        StlcCase::Expr(StlcExprCase::Apply { f0, f1 }) => {
-            exp(f0, None);
-            let fn_ty = child_type(f0);
-            let arg_exp = fn_ty.as_ref().and_then(|fn_ty| fn_ty.function_parts().and_then(|(ps, _)| ps.into_iter().next()));
-            exp(f1, arg_exp);
-            if let Some(fn_ty) = fn_ty.as_ref() {
-                if fn_ty.function_parts().is_none() {
-                    errs.push(StlcTypeDiagnostic { expression: id.clone(), error: StlcTypeError::NonFunctionApplication { found: fn_ty.clone() } });
-                }
-            }
-            match fn_ty { Some(fn_ty) => fn_ty.apply_one().into(), None => StlcTypeResult::Unknown }
-        }
-        StlcCase::Expr(StlcExprCase::Let { f1: value, f2: body, .. }) => {
-            exp(value, None);
-            exp(body, parent_exp);
-            let _ = child_type(value);
-            child_type(body).into()
-        }
-        StlcCase::Expr(StlcExprCase::Case { f0: scrutinee, f1: zero_branch, f3: successor_branch, .. }) => {
-            exp(scrutinee, Some(StlcTypeValue::Nat));
-            exp(zero_branch, parent_exp.clone());
-            exp(successor_branch, parent_exp);
-            match (child_type(zero_branch), child_type(successor_branch)) {
-                (Some(a), Some(b)) if a == b => StlcTypeResult::Known(a),
-                _ => StlcTypeResult::Unknown,
-            }
-        }
-        StlcCase::Expr(StlcExprCase::Variable { .. }) => {
-            match observe_view::<StlcResolvedReferences>().ok()
-                .and_then(|v| v.get(id).ok()).flatten().map(|a| a.as_ref().clone())
-            {
-                Some(StlcResolution::Resolved { declaration }) => {
-                    observe_view::<StlcDefinitionTypes>().ok()
-                        .and_then(|v| v.get(&declaration).ok()).flatten()
-                        .map(|r| (&*r).clone())
-                        .unwrap_or(StlcTypeResult::Unknown)
-                }
-                Some(StlcResolution::Unbound { name }) => {
-                    errs.push(StlcTypeDiagnostic { expression: id.clone(), error: StlcTypeError::UnboundVariable { name } });
-                    StlcTypeResult::Unknown
-                }
-                None => StlcTypeResult::Unknown,
-            }
-        }
-        StlcCase::Declaration(StlcDeclarationCase::Value { f1: annotation, f2: body, f3: parameters, .. }) => {
-            if let Some(annotation) = annotation { exp(annotation, None); }
-            for p in parameters { exp(p, None); }
-            let body_exp = annotation.as_ref().and_then(child_type);
-            exp(body, body_exp);
-            let result = child_type(body);
-            let mut result = result;
-            for p in parameters.iter().rev() {
-                let p_ty = child_type(p);
-                result = match (p_ty, result) {
-                    (Some(p), Some(r)) => Some(StlcTypeValue::function([p], r)),
-                    _ => None,
-                };
-            }
-            if let Some(annotation) = annotation {
-                if let Some(expected) = child_type(annotation) {
-                    if let Some(ref found) = result {
-                        if expected != *found {
-                            errs.push(StlcTypeDiagnostic { expression: id.clone(), error: StlcTypeError::Mismatch { expected, found: found.clone() } });
-                            result = None;
-                        } else { result = Some(expected); }
+        StlcExprView::Lambda(lambda) => {
+            let parameter = lambda.parameter()?;
+            let body = lambda.body()?;
+            let parameter_expectation = expected(&node)?.and_then(|value| {
+                value
+                    .function_parts()
+                    .and_then(|(parameters, _)| parameters.first().cloned())
+            });
+            let body_expectation = expected(&node)?.and_then(|value| {
+                value.function_parts().map(|(mut parameters, result)| {
+                    if parameters.len() <= 1 {
+                        result
+                    } else {
+                        parameters.remove(0);
+                        StlcTypeValue::function(parameters, result)
                     }
+                })
+            });
+            expectation(
+                &mut effects,
+                id.clone(),
+                parameter.erased(),
+                parameter_expectation,
+            );
+            expectation(&mut effects, id.clone(), body.erased(), body_expectation);
+            if let (Some(parameter), Some(body)) = (
+                child_type(&parameter.erased())?,
+                child_type(&body.erased())?,
+            ) {
+                value = Some(StlcTypeValue::function([parameter], body));
+            }
+        }
+        StlcExprView::Apply(apply) => {
+            let function = apply.function()?;
+            let argument = apply.argument()?;
+            expectation(&mut effects, id.clone(), function.erased(), None);
+            let function_type = child_type(&function.erased())?;
+            let argument_expected = function_type
+                .as_ref()
+                .and_then(StlcTypeValue::function_parts)
+                .and_then(|(parameters, _)| parameters.into_iter().next());
+            expectation(
+                &mut effects,
+                id.clone(),
+                argument.erased(),
+                argument_expected,
+            );
+            if let Some(function_type) = function_type {
+                if function_type.function_parts().is_none() {
+                    diagnostics.push(StlcTypeDiagnostic {
+                        expression: id.clone(),
+                        error: StlcTypeError::NonFunctionApplication {
+                            found: function_type,
+                        },
+                    });
+                } else {
+                    value = function_type.apply_one();
                 }
             }
-            result.into()
         }
-        StlcCase::Param(StlcParamCase::Bare { f1: Some(annotation), .. })
-        | StlcCase::Param(StlcParamCase::Parenthesized { f1: Some(annotation), .. }) => {
-            exp(annotation, None);
-            child_type(annotation).into()
+        StlcExprView::Let(let_) => {
+            let bound = let_.value()?;
+            let body = let_.body()?;
+            expectation(&mut effects, id.clone(), bound.erased(), None);
+            expectation(&mut effects, id.clone(), body.erased(), expected(&node)?);
+            value = child_type(&body.erased())?;
         }
-        StlcCase::Param(StlcParamCase::Bare { f1: None, .. })
-        | StlcCase::Param(StlcParamCase::Parenthesized { f1: None, .. }) => {
-            errs.push(StlcTypeDiagnostic { expression: id.clone(), error: StlcTypeError::MissingParameterAnnotation });
-            StlcTypeResult::Unknown
+        StlcExprView::Variable(_) => {
+            if let Some(reference) = StlcResolvedReferences::get(&id)? {
+                match reference.as_ref() {
+                    StlcResolution::Resolved { declaration } => {
+                        value =
+                            StlcDefinitionTypes::get(declaration)?.and_then(|value| {
+                                match value.as_ref() {
+                                    StlcTypeResult::Known(value) => Some(value.clone()),
+                                    StlcTypeResult::Unknown => None,
+                                }
+                            });
+                    }
+                    StlcResolution::Unbound { name } => diagnostics.push(StlcTypeDiagnostic {
+                        expression: id.clone(),
+                        error: StlcTypeError::UnboundVariable { name: name.clone() },
+                    }),
+                }
+            }
         }
-        _ => StlcTypeResult::Unknown,
-    };
+        StlcExprView::Error(_) => {}
+    }
+    Ok(finish(
+        id,
+        value,
+        expected(&node)?,
+        &mut diagnostics,
+        effects,
+    ))
+}
 
-    // Type mismatch: expected vs found
-    if let Some(expected) = node_expected(id) {
-        if let StlcTypeResult::Known(ref found) = result {
-            if expected != *found {
-                errs.push(StlcTypeDiagnostic { expression: id.clone(), error: StlcTypeError::Mismatch { expected, found: found.clone() } });
+fn synth_declaration(node: AstBox<StlcDeclaration>) -> Result<SynthesisEffects> {
+    let id = node.erased();
+    let mut effects = result(id.clone(), None, Vec::new());
+    let mut value = None;
+    let diagnostics = Vec::new();
+    if let StlcDeclarationView::Value(declaration) = node.view()? {
+        let annotation = declaration.annotation()?;
+        if let Some(annotation) = &annotation {
+            expectation(&mut effects, id.clone(), annotation.erased(), None);
+        }
+        let parameters = declaration.parameters()?;
+        for parameter in parameters.iter() {
+            expectation(&mut effects, id.clone(), parameter.erased(), None);
+        }
+        let body = declaration.body()?;
+        let body_expected = annotation
+            .as_ref()
+            .and_then(|annotation| child_type(&annotation.erased()).ok().flatten());
+        expectation(&mut effects, id.clone(), body.erased(), body_expected);
+        value = child_type(&body.erased())?;
+        let parameters = parameters.to_vec();
+        for parameter in parameters.iter().rev() {
+            value = match (child_type(&parameter.erased())?, value) {
+                (Some(parameter), Some(value)) => Some(StlcTypeValue::function([parameter], value)),
+                _ => None,
+            };
+        }
+        if let (Some(annotation), Some(found)) = (
+            annotation.and_then(|annotation| child_type(&annotation.erased()).ok().flatten()),
+            value.as_ref(),
+        ) {
+            if annotation != *found {
+                // The declaration itself is the most stable diagnostic anchor.
+                let mut diagnostics = diagnostics;
+                diagnostics.push(StlcTypeDiagnostic {
+                    expression: id.clone(),
+                    error: StlcTypeError::Mismatch {
+                        expected: annotation,
+                        found: found.clone(),
+                    },
+                });
+                return Ok(finish(
+                    id,
+                    None,
+                    expected(&node)?,
+                    &mut diagnostics,
+                    effects,
+                ));
             }
         }
     }
-    // Use a separate insert for diagnostics to avoid `id` borrow conflict.
-    result
+    Ok(finish(
+        id,
+        value,
+        expected(&node)?,
+        &mut diagnostics.clone(),
+        effects,
+    ))
 }
 
-fn write_diagnostics(id: &Node<StlcTree>, errs: Vec<StlcTypeDiagnostic>) {
-    if let Ok(view) = emit_view::<StlcTypeDiagnostics>() {
-        let _ = view.replace(id, errs);
+fn publish_definition<T: AbstractTreeNode>(
+    node: AstBox<T>,
+    binder: bool,
+) -> Result<Option<Set<StlcDefinitionTypes>>> {
+    if !binder {
+        return Ok(None);
     }
+    let Some(scope) = StlcDeclarationScopes::get(&node.erased())? else {
+        return Ok(None);
+    };
+    let value = child_type(&node.erased())?.into();
+    Ok(Some(StlcDefinitionTypes::set(
+        scope.as_ref().clone(),
+        value,
+    )))
 }
 
-/// Writes an expected type for a child node (plan §23.5). `None` removes
-/// the expectation (child is inferred). Uses `observe_view` to check if the
-/// child exists; writes via `emit_view`.
-fn expect_child_typed(parent: &Node<StlcTree>, child: &Node<StlcTree>, expected: Option<StlcTypeValue>) {
-    let Ok(view) = emit_view::<StlcExpectedTypes>() else { return };
-    match expected {
-        Some(ty) => { let _ = view.insert((parent.clone(), child.clone()), ty); }
-        None => { let _ = view.remove((parent.clone(), child.clone())); }
-    }
+#[component]
+pub fn synthesize_expr(node: AstBox<StlcExpr>) -> Result<SynthesisEffects> {
+    synth_expr(node)
 }
 
-// ---------------------------------------------------------------------------
-// Definition publication: binder types (plan §23.6)
-// ---------------------------------------------------------------------------
-
-#[reactive_macros::component]
-pub fn publish_definition(key: EachKey<ParserTreePayloads<StlcDocument>>) -> Result<()> {
-    let id: Node<StlcTree> = key;
-    let Some(case) = StlcTree::observe_case(id.clone())? else { return Ok(()) };
-    let is_binder = matches!(&case,
-        StlcCase::Declaration(StlcDeclarationCase::Value { .. })
-        | StlcCase::Param(_)
-        | StlcCase::Expr(StlcExprCase::Let { .. })
-    );
-    if !is_binder { return Ok(()) }
-    let Some(scope) = observe_view::<StlcDeclarationScopes>()?.get(&id)? else { return Ok(()) };
-    let scope_val = (*scope).clone();
-    let syn = child_type(&id);
-    emit_view::<StlcDefinitionTypes>()?.insert(scope_val, syn.into())?;
-    Ok(())
+#[component]
+pub fn synthesize_type(node: AstBox<StlcType>) -> Result<SynthesisEffects> {
+    synth_type(node)
 }
 
-// ---------------------------------------------------------------------------
-// Installer
-// ---------------------------------------------------------------------------
+#[component]
+pub fn synthesize_type_atom(node: AstBox<StlcTypeAtom>) -> Result<SynthesisEffects> {
+    synth_type_atom(node)
+}
 
-pub fn check_pass_install(engine: &mut plingo::reactive::Engine) -> Result<()> {
-    synthesize_node_install(engine)?;
-    publish_definition_install(engine)?;
-    Ok(())
+#[component]
+pub fn synthesize_param(node: AstBox<StlcParam>) -> Result<SynthesisEffects> {
+    synth_param(node)
+}
+
+#[component]
+pub fn synthesize_declaration(node: AstBox<StlcDeclaration>) -> Result<SynthesisEffects> {
+    synth_declaration(node)
+}
+
+#[component]
+pub fn publish_expr(node: AstBox<StlcExpr>) -> Result<Option<Set<StlcDefinitionTypes>>> {
+    let binder = matches!(node.view()?, StlcExprView::Let(_));
+    publish_definition(node, binder)
+}
+
+#[component]
+pub fn publish_param(node: AstBox<StlcParam>) -> Result<Option<Set<StlcDefinitionTypes>>> {
+    publish_definition(node, true)
+}
+
+#[component]
+pub fn publish_declaration(
+    node: AstBox<StlcDeclaration>,
+) -> Result<Option<Set<StlcDefinitionTypes>>> {
+    let binder = matches!(node.view()?, StlcDeclarationView::Value(_));
+    publish_definition(node, binder)
 }

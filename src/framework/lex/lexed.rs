@@ -184,10 +184,14 @@ impl crate::reactive::store::TrieKey for UriMapKey {
 
 impl<V: Clone> Default for PersistentUriMap<V> {
     fn default() -> Self {
+        Self::with_kind(crate::reactive::pathwork::StructureKind::LexerDocumentIndex)
+    }
+}
+
+impl<V: Clone> PersistentUriMap<V> {
+    pub(crate) fn with_kind(kind: crate::reactive::pathwork::StructureKind) -> Self {
         Self {
-            entries: crate::reactive::store::Hamt::with_kind(
-                crate::reactive::pathwork::StructureKind::LexerDocumentIndex,
-            ),
+            entries: crate::reactive::store::Hamt::with_kind(kind),
         }
     }
 }
@@ -217,7 +221,6 @@ impl<V: Clone> PersistentUriMap<V> {
         self.entries.iter().map(|(_, value)| value)
     }
 }
-
 
 /// One local immutable lexical occurrence.  The occurrence never carries a
 /// global byte offset; its span is the prefix-source-byte metric at its rank.
@@ -564,7 +567,7 @@ impl<R: LexerRoot> LexicalDocument<R> {
             terminal: token.terminal,
             start: self.lexical_start(layout_rank),
             length: layout.byte_len as usize,
-            column: usize::try_from(token.occurrence.0).ok()?,
+            column: token.occurrence,
             fingerprint: layout.fingerprint.0,
         })
     }
@@ -583,7 +586,7 @@ impl<R: LexerRoot> LexicalDocument<R> {
             terminal: None,
             start: self.source.len_bytes(),
             length: 0,
-            column: crate::framework::lex::token::SYNTHETIC_EOF_ID,
+            column: TokenOccurrenceId(u64::MAX),
             fingerprint: crate::framework::parse::identity::eof_fingerprint(),
         });
         data
@@ -751,10 +754,10 @@ pub struct TokenLayoutDocuments<R: LexerRoot + std::fmt::Debug>(
 );
 
 /// Compatibility name for one parser-facing semantic root publication.
-pub type LexedDocument<R: LexerRoot + std::fmt::Debug> = SemanticTokenDocument<R>;
+pub type LexedDocument<R> = SemanticTokenDocument<R>;
 /// Compatibility name retained for consumers that imported the previous
 /// semantic-document view. It no longer denotes a whole token vector.
-pub type LexedDocuments<R: LexerRoot + std::fmt::Debug> = SemanticTokenDocuments<R>;
+pub type LexedDocuments<R> = SemanticTokenDocuments<R>;
 
 /// Stable document identity derived only from the document URI.  The FNV-1a
 /// seed is explicit rather than process-random.

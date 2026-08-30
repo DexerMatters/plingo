@@ -90,7 +90,7 @@ impl SemanticDigest {
 
     /// Stable fingerprint across processes.
     pub fn fingerprint(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
+        use std::hash::Hash;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.render().hash(&mut hasher);
         std::hash::Hasher::finish(&hasher)

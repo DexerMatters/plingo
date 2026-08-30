@@ -1,20 +1,17 @@
 use crate::utils::Span;
 use fluent_uri::Uri;
 use ropey::Rope;
-use std::{
-    any::TypeId,
-    collections::{BTreeSet, HashMap},
-    fmt,
-    ops::Deref,
-    sync::Arc,
-};
+use std::{any::TypeId, fmt, ops::Deref, sync::Arc};
 
 use super::data::ast::AstArena;
 use crate::framework::{
-    lex::{LayoutRevisionId, LexerRoot, LexicalDocument, ParseTokenRef, TokenLayoutEntry},
+    lex::{
+        LayoutRevisionId, LexerRoot, LexicalDocument, ParseTokenRef, PersistentUriMap,
+        StableDocumentId, TokenLayoutEntry, TokenOccurrenceId,
+    },
     parse::{
         data::{
-            ast::{AnchoredSpan, AstBox, AstId, AstToken, TokenEntryId, document_key},
+            ast::{AnchoredSpan, AstBox, AstToken, TokenEntryId},
             green::TreeArena,
             gss::GssArena,
             product::{ProductArena, ProductId},
@@ -42,14 +39,6 @@ impl Default for ParserConfig {
 }
 
 pub(crate) type ParseSnapshotId = u64;
-
-/// Metadata and source span for one AST value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AstSnapshotEntry {
-    pub(crate) product: ProductId,
-    pub(crate) type_id: TypeId,
-    pub(crate) span: Span,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstTokenSnapshotEntry {
@@ -202,7 +191,7 @@ impl AstSnapshot {
     where
         T: Send + Sync + 'static,
     {
-        if node.document_id() != document_key(&self.uri) {
+        if node.document_id() != self.arena.document_id() {
             return Err(AstLookupError::WrongDocument);
         }
         let id = node.raw_id();
@@ -239,7 +228,7 @@ impl AstSnapshot {
         let occurrence = token.occurrence();
         let data = self
             .token_document
-            .rank_of_occurrence(occurrence)
+            .rank_of_occurrence(TokenOccurrenceId(occurrence as u64))
             .and_then(|rank| self.token_document.token_at(rank))?;
         let end = data
             .start
@@ -254,7 +243,7 @@ impl AstSnapshot {
 
     fn coordinate_at(&self, occurrence: usize) -> usize {
         self.token_document
-            .rank_of_occurrence(occurrence)
+            .rank_of_occurrence(TokenOccurrenceId(occurrence as u64))
             .and_then(|rank| self.token_document.token_at(rank))
             .map_or(self.source.len_bytes(), |token| token.start)
     }
@@ -263,7 +252,7 @@ impl AstSnapshot {
         let start = self.coordinate_at(extent.start);
         let end = self
             .token_document
-            .rank_of_occurrence(extent.end)
+            .rank_of_occurrence(TokenOccurrenceId(extent.end as u64))
             .and_then(|rank| self.token_document.token_at(rank))
             .map_or(self.source.len_bytes(), |token| {
                 if extent.end_at_token_end {
@@ -312,7 +301,89 @@ pub enum ParseStatus {
     Unrecoverable { diagnostics: usize },
 }
 
-pub(crate) type TokenOccurrenceId = usize;
+/// The reason a parser replay reached EOF without attaching a retained
+/// suffix.  This is part of deterministic work attribution: a valid full
+/// replay is never reported as an unclassified rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FullReplayReason {
+    ExplicitColdParse,
+    GrammarOrPolicyVersionChanged,
+    NoRetainedRightBoundary,
+    NoCleanRestartCheckpoint,
+    RecoveryProofFailed,
+    FrontierProofInconclusive,
+    NoEqualFrontierBeforeEof,
+}
+
+impl FullReplayReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitColdParse => "ExplicitColdParse",
+            Self::GrammarOrPolicyVersionChanged => "GrammarOrPolicyVersionChanged",
+            Self::NoRetainedRightBoundary => "NoRetainedRightBoundary",
+            Self::NoCleanRestartCheckpoint => "NoCleanRestartCheckpoint",
+            Self::RecoveryProofFailed => "RecoveryProofFailed",
+            Self::FrontierProofInconclusive => "FrontierProofInconclusive",
+            Self::NoEqualFrontierBeforeEof => "NoEqualFrontierBeforeEof",
+        }
+    }
+}
+/// Stable parser boundary at the gap before the next semantic token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct TokenBoundaryId {
+    pub(crate) document: StableDocumentId,
+    pub(crate) kind: TokenBoundaryKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum TokenBoundaryKind {
+    Before(TokenOccurrenceId),
+    Eof,
+}
+
+impl TokenBoundaryId {
+    pub(crate) const fn before(document: StableDocumentId, occurrence: TokenOccurrenceId) -> Self {
+        Self {
+            document,
+            kind: TokenBoundaryKind::Before(occurrence),
+        }
+    }
+
+    pub(crate) const fn eof(document: StableDocumentId) -> Self {
+        Self {
+            document,
+            kind: TokenBoundaryKind::Eof,
+        }
+    }
+}
+
+/// Identity of a parser column. Source gaps and recovery-created gaps occupy
+/// separate namespaces so a synthetic column can never be mistaken for a
+/// source boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum ParserBoundaryId {
+    Source(TokenBoundaryId),
+    Recovery(RecoveryBoundaryId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct RecoveryBoundaryId {
+    pub(crate) left: Option<TokenOccurrenceId>,
+    pub(crate) right: Option<TokenOccurrenceId>,
+    pub(crate) witness_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BoundaryTrace {
+    /// Lookahead occurrence at the current replay gap.
+    pub current_lookahead_occurrence: Option<u64>,
+    /// Anchor stored on the current parser column.
+    pub current_column_anchor: Option<u64>,
+    /// Occurrence selected from the old token root for comparison.
+    pub selected_old_occurrence: Option<u64>,
+    /// Anchor stored on the selected old parser column.
+    pub selected_old_column_anchor: Option<u64>,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IncrementalParseStats {
@@ -328,111 +399,195 @@ pub struct IncrementalParseStats {
     /// columns are attached verbatim — plan §8.6 fast path).
     pub suffix_rewritten: usize,
     pub recovery_columns: usize,
+    /// Test-only characterization of the old adjacent-boundary mismatch.
+    pub boundary_trace: Option<BoundaryTrace>,
 }
 
 /// Deterministic parser work counters for one document command (plan §10.1).
-/// Counters roll back with their command and never enter reactive facts.
+/// Every field is an always-on integer attribution; timing and allocation
+/// probes stay outside this structure so parser decisions never depend on
+/// instrumentation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ParserWork {
-    /// Parser component invocations for this document.
+    /// Total parser component invocations. Kept as the sum of the two
+    /// explicit scheduling domains for existing report consumers.
     pub component_runs: u64,
+    /// Semantic parser invocations.
+    pub semantic_runs: u64,
+    /// Layout-only snapshot projection invocations.
+    pub layout_projection_runs: u64,
     /// Restart occurrence anchors chosen for replay.
     pub restart_occurrences: u64,
-    /// Restart boundary anchors chosen for replay.
+    /// Restart-boundary lookups and their persistent-map descent work.
+    pub restart_boundary_lookups: u64,
+    pub restart_lookup_depth: u64,
+    /// Legacy report spelling for restart lookup work.
     pub restart_columns: u64,
     /// Parse tokens decoded by the lazy cursor.
+    pub semantic_tokens_decoded: u64,
     pub tokens_decoded: u64,
-    /// Legacy alias counter retained for report compatibility.
+    /// Historical report name retained while benchmark artifacts migrate.
     pub tokens_replayed: u64,
     /// Prefix tokens reused without decoding.
     pub tokens_reused: u64,
-    /// Columns rebuilt inside the replay window.
+    /// Source/parser boundaries rebuilt inside the replay window.
+    pub source_boundaries_replayed: u64,
+    pub recovery_boundaries_replayed: u64,
+    /// Legacy report spelling for replayed parser columns.
     pub columns_replayed: u64,
     /// Suffix columns transferred unchanged.
     pub columns_reused: u64,
-    /// Retained suffix columns physically visited after convergence.
     pub suffix_columns_physically_visited: u64,
-    /// Immutable parse segments attached by pointer.
-    pub segments_attached: u64,
-    /// Checkpoint equality comparisons.
+    /// Candidate and exact checkpoint/frontier proof work.
+    pub convergence_candidates: u64,
+    pub checkpoint_fingerprint_rejects: u64,
+    pub checkpoint_exact_comparisons: u64,
+    pub checkpoint_matches: u64,
+    pub frontier_exact_comparisons: u64,
+    pub frontier_matches: u64,
+    /// Historical aggregate names retained for schema readers.
     pub checkpoint_comparisons: u64,
-    /// Frontier equality comparisons.
     pub frontier_comparisons: u64,
-    /// GSS nodes created.
-    pub gss_records_created: u64,
-    /// GSS nodes reused by identity.
-    pub gss_records_reused: u64,
-    /// Products created.
-    pub product_records_created: u64,
-    /// Products reused through reduction caches.
-    pub product_records_reused: u64,
-    /// AST records created.
+    pub frontier_proof_nodes_refined: u64,
+    pub frontier_proof_edges_refined: u64,
+    pub frontier_sccs: u64,
+    pub frontier_inconclusive_symmetry: u64,
+    /// Persistent segment and seam operations.
+    pub segments_split: u64,
+    pub segments_attached: u64,
+    pub seam_bindings_created: u64,
+    pub seam_bindings_flattened: u64,
+    pub seam_binding_slots: u64,
+    /// GSS, product, and AST record construction/reuse.
+    pub gss_nodes_created: u64,
+    pub gss_nodes_reused: u64,
+    pub gss_edges_created: u64,
+    pub gss_edges_reused: u64,
+    pub products_created: u64,
+    pub products_reused: u64,
     pub ast_records_created: u64,
-    /// AST records reused by identity.
     pub ast_records_reused: u64,
-    /// Exact parser record mutations journaled.
+    /// Reachability, lineage, and syntax journal work.
+    pub reachability_keys_read: u64,
+    pub reachability_keys_written: u64,
+    pub reachability_queue_pops: u64,
+    pub lineage_candidates: u64,
+    pub lineage_proofs: u64,
+    pub lineage_transfers: u64,
+    pub lineage_fresh_identities: u64,
+    /// Historical aggregate names retained for schema readers.
+    pub gss_records_created: u64,
+    pub gss_records_reused: u64,
+    pub product_records_created: u64,
+    pub product_records_reused: u64,
+    pub syntax_journal_entries: u64,
+    pub syntax_payload_ops: u64,
+    pub syntax_parent_ops: u64,
+    pub syntax_field_ops: u64,
+    pub syntax_order_splices: u64,
+    /// Existing parser publication counters.
     pub record_journal_touches: u64,
-    /// Parser records entering reachability.
     pub parser_records_inserted: u64,
-    /// Retained parser records with changed payloads.
     pub parser_records_updated: u64,
-    /// Parser records leaving reachability.
     pub parser_records_removed: u64,
-    /// Snapshot entries changed by publication.
     pub snapshot_entries_changed: u64,
-    /// Snapshot entries eagerly materialized by a command.
     pub snapshot_entries_materialized: u64,
-    /// Synthesized token facts published.
     pub synthesized_token_facts: u64,
-    /// Syntax node/root facts patched.
     pub syntax_facts_patched: u64,
-    /// Tree-publisher node scans.
     pub tree_publisher_node_scans: u64,
-    /// Full parser-token vector clones.
+    /// Forbidden full-domain work, retained as explicit zero/non-zero gates.
     pub full_token_vector_clones: u64,
-    /// Full parser-store or tree scans.
     pub full_store_scans: u64,
-    /// Defensive full rebuilds; valid local edits must leave this zero.
+    pub full_maps_cloned: u64,
     pub full_rebuild_fallbacks: u64,
-    /// Replays that ran to EOF instead of converging.
     pub eof_replays: u64,
-    /// Recovery searches started.
+    /// Enumerated classification for the one EOF fallback in this command.
+    pub full_replay_reason: Option<FullReplayReason>,
+    pub full_replay_reason_count: u64,
+    /// Recovery and transaction marks.
     pub recovery_searches: u64,
-    /// Recovery segments reused without search.
     pub recovery_segments_reused: u64,
-    /// Recovery segments invalidated by intersecting edits.
     pub recovery_segments_invalidated: u64,
-    /// Recovery-derived columns in the final session.
     pub recovery_columns: u64,
-    /// Configurations expanded by canonical recovery search.
     pub recovery_configurations_expanded: u64,
-    /// Witness tokens/gaps recorded for recovery reuse proofs.
     pub recovery_witness_tokens: u64,
-    /// Recovery interval-index probes.
     pub recovery_interval_probes: u64,
+    pub rollback_marks_restored: u64,
+    /// Committed immutable root/snapshot allocations.
+    pub document_roots_allocated: u64,
+    pub snapshot_roots_allocated: u64,
 }
 
 impl ParserWork {
+    /// Records one classified EOF replay. A command can never expose two
+    /// fallback causes, which makes the reason a deterministic proof result.
+    pub fn record_full_replay(&mut self, reason: FullReplayReason) {
+        self.eof_replays += 1;
+        if self.full_replay_reason.is_none() {
+            self.full_replay_reason = Some(reason);
+            self.full_replay_reason_count += 1;
+        }
+    }
+
     /// Merges another counter set into this one (checked addition).
     pub fn merge(&mut self, other: &Self) {
         self.component_runs += other.component_runs;
+        self.semantic_runs += other.semantic_runs;
+        self.layout_projection_runs += other.layout_projection_runs;
         self.restart_occurrences += other.restart_occurrences;
+        self.restart_boundary_lookups += other.restart_boundary_lookups;
+        self.restart_lookup_depth += other.restart_lookup_depth;
         self.restart_columns += other.restart_columns;
+        self.semantic_tokens_decoded += other.semantic_tokens_decoded;
         self.tokens_decoded += other.tokens_decoded;
         self.tokens_replayed += other.tokens_replayed;
         self.tokens_reused += other.tokens_reused;
+        self.source_boundaries_replayed += other.source_boundaries_replayed;
+        self.recovery_boundaries_replayed += other.recovery_boundaries_replayed;
         self.columns_replayed += other.columns_replayed;
         self.columns_reused += other.columns_reused;
         self.suffix_columns_physically_visited += other.suffix_columns_physically_visited;
-        self.segments_attached += other.segments_attached;
+        self.convergence_candidates += other.convergence_candidates;
+        self.checkpoint_fingerprint_rejects += other.checkpoint_fingerprint_rejects;
+        self.checkpoint_exact_comparisons += other.checkpoint_exact_comparisons;
+        self.checkpoint_matches += other.checkpoint_matches;
+        self.frontier_exact_comparisons += other.frontier_exact_comparisons;
+        self.frontier_matches += other.frontier_matches;
         self.checkpoint_comparisons += other.checkpoint_comparisons;
         self.frontier_comparisons += other.frontier_comparisons;
+        self.frontier_proof_nodes_refined += other.frontier_proof_nodes_refined;
+        self.frontier_proof_edges_refined += other.frontier_proof_edges_refined;
+        self.frontier_sccs += other.frontier_sccs;
+        self.frontier_inconclusive_symmetry += other.frontier_inconclusive_symmetry;
+        self.segments_split += other.segments_split;
+        self.segments_attached += other.segments_attached;
+        self.seam_bindings_created += other.seam_bindings_created;
+        self.seam_bindings_flattened += other.seam_bindings_flattened;
+        self.seam_binding_slots += other.seam_binding_slots;
+        self.gss_nodes_created += other.gss_nodes_created;
+        self.gss_nodes_reused += other.gss_nodes_reused;
+        self.gss_edges_created += other.gss_edges_created;
+        self.gss_edges_reused += other.gss_edges_reused;
+        self.products_created += other.products_created;
+        self.products_reused += other.products_reused;
+        self.ast_records_created += other.ast_records_created;
+        self.ast_records_reused += other.ast_records_reused;
         self.gss_records_created += other.gss_records_created;
         self.gss_records_reused += other.gss_records_reused;
         self.product_records_created += other.product_records_created;
         self.product_records_reused += other.product_records_reused;
-        self.ast_records_created += other.ast_records_created;
-        self.ast_records_reused += other.ast_records_reused;
+        self.reachability_keys_read += other.reachability_keys_read;
+        self.reachability_keys_written += other.reachability_keys_written;
+        self.reachability_queue_pops += other.reachability_queue_pops;
+        self.lineage_candidates += other.lineage_candidates;
+        self.lineage_proofs += other.lineage_proofs;
+        self.lineage_transfers += other.lineage_transfers;
+        self.lineage_fresh_identities += other.lineage_fresh_identities;
+        self.syntax_journal_entries += other.syntax_journal_entries;
+        self.syntax_payload_ops += other.syntax_payload_ops;
+        self.syntax_parent_ops += other.syntax_parent_ops;
+        self.syntax_field_ops += other.syntax_field_ops;
+        self.syntax_order_splices += other.syntax_order_splices;
         self.record_journal_touches += other.record_journal_touches;
         self.parser_records_inserted += other.parser_records_inserted;
         self.parser_records_updated += other.parser_records_updated;
@@ -444,8 +599,13 @@ impl ParserWork {
         self.tree_publisher_node_scans += other.tree_publisher_node_scans;
         self.full_token_vector_clones += other.full_token_vector_clones;
         self.full_store_scans += other.full_store_scans;
+        self.full_maps_cloned += other.full_maps_cloned;
         self.full_rebuild_fallbacks += other.full_rebuild_fallbacks;
         self.eof_replays += other.eof_replays;
+        if self.full_replay_reason.is_none() {
+            self.full_replay_reason = other.full_replay_reason;
+        }
+        self.full_replay_reason_count += other.full_replay_reason_count;
         self.recovery_searches += other.recovery_searches;
         self.recovery_segments_reused += other.recovery_segments_reused;
         self.recovery_segments_invalidated += other.recovery_segments_invalidated;
@@ -453,6 +613,9 @@ impl ParserWork {
         self.recovery_configurations_expanded += other.recovery_configurations_expanded;
         self.recovery_witness_tokens += other.recovery_witness_tokens;
         self.recovery_interval_probes += other.recovery_interval_probes;
+        self.rollback_marks_restored += other.rollback_marks_restored;
+        self.document_roots_allocated += other.document_roots_allocated;
+        self.snapshot_roots_allocated += other.snapshot_roots_allocated;
     }
 }
 
@@ -470,8 +633,8 @@ pub(crate) struct TokenData {
 /// parser-relevant persistent projections; typed lexical payloads remain in
 /// the lexer arena. Token decoding is rank-addressed and never requires a
 /// document-wide `Vec<TokenData>`.
-#[derive(Clone)]
 pub(crate) struct ParserTokenDocument {
+    pub(crate) document: StableDocumentId,
     source_len: usize,
     /// Layout revision of the lexical root this projection was built from.
     /// The semantic parser keying is structural; this field lets the layout
@@ -487,12 +650,27 @@ pub(crate) struct ParserTokenDocument {
 impl ParserTokenDocument {
     pub(crate) fn from_lexical<R: LexerRoot>(document: &LexicalDocument<R>) -> Self {
         Self {
+            document: document.document,
             source_len: document.source.len_bytes(),
             layout_revision: document.layout_revision,
             semantic: document.semantic.clone(),
             semantic_index: document.semantic_index.clone(),
             layout: document.layout.clone(),
             layout_index: document.layout_index.clone(),
+        }
+    }
+
+    pub(crate) fn boundary_at_rank(&self, rank: usize) -> TokenBoundaryId {
+        if rank < self.semantic.len() {
+            TokenBoundaryId::before(
+                self.document,
+                self.semantic
+                    .get(rank)
+                    .expect("rank is inside semantic token tape")
+                    .occurrence,
+            )
+        } else {
+            TokenBoundaryId::eof(self.document)
         }
     }
 
@@ -504,15 +682,8 @@ impl ParserTokenDocument {
         self.semantic.len()
     }
 
-    pub(crate) fn occurrence_at(&self, rank: usize) -> Option<TokenOccurrenceId> {
-        self.semantic
-            .get(rank)
-            .and_then(|token| usize::try_from(token.occurrence.0).ok())
-    }
-
     pub(crate) fn rank_of_occurrence(&self, occurrence: TokenOccurrenceId) -> Option<usize> {
-        self.semantic
-            .rank_of_id(occurrence as u64, &self.semantic_index)
+        self.semantic.rank_of_id(occurrence.0, &self.semantic_index)
     }
 
     pub(crate) fn token_at(&self, rank: usize) -> Option<TokenData> {
@@ -522,7 +693,7 @@ impl ParserTokenDocument {
                 terminal: None,
                 start: self.source_len,
                 length: 0,
-                column: usize::MAX,
+                column: TokenOccurrenceId(u64::MAX),
                 fingerprint: crate::framework::parse::identity::eof_fingerprint(),
             });
         }
@@ -536,13 +707,9 @@ impl ParserTokenDocument {
             terminal: token.terminal,
             start: usize::try_from(self.layout.metric_before(layout_rank).source_bytes).ok()?,
             length: layout.byte_len as usize,
-            column: usize::try_from(token.occurrence.0).ok()?,
+            column: token.occurrence,
             fingerprint: layout.fingerprint.0,
         })
-    }
-
-    pub(crate) fn structure_ptr_eq(&self, other: &Self) -> bool {
-        self.semantic.root_ptr_eq(&other.semantic)
     }
 }
 
@@ -589,7 +756,7 @@ impl ParserTokenCursor {
             start: usize::try_from(self.document.layout.metric_before(layout_rank).source_bytes)
                 .ok()?,
             length: layout.byte_len as usize,
-            column: usize::try_from(semantic.occurrence.0).ok()?,
+            column: semantic.occurrence,
             fingerprint: layout.fingerprint.0,
         })
     }
@@ -653,20 +820,18 @@ pub(crate) struct ParserTreeFacts {
     pub(crate) root: Option<u64>,
     /// Product reach counts in the accepted-root DAG. Parser-column/cache
     /// retention never updates this domain.
-    pub(crate) product_reach_counts:
-        Arc<crate::reactive::store::Hamt<ProductReachKey, u32>>,
+    pub(crate) product_reach_counts: Arc<crate::reactive::store::Hamt<ProductReachKey, u32>>,
     /// Direct AST-record reach counts induced by accepted products.
-    pub(crate) record_reach_counts:
-        Arc<crate::reactive::store::Hamt<RecordReachKey, u32>>,
+    pub(crate) record_reach_counts: Arc<crate::reactive::store::Hamt<RecordReachKey, u32>>,
     /// Stable lineage for every record in `records` at the last commit.
     /// This preserves exact removal keys when the mutable parser arena
     /// reuses a cached product across commands.
-    pub(crate) record_lineages: Arc<std::collections::HashMap<u64, u64>>,
-    /// Last lineage-to-node order committed by the tree publisher.
-    pub(crate) published_child_orders: Arc<std::collections::HashMap<u64, PublishedChildOrder>>,
+    pub(crate) record_lineages: Arc<crate::reactive::store::RadixMap<u64>>,
     /// Last published child order per parent lineage, expressed as
-    /// lineage identities for the parser splice oracle.
-    pub(crate) child_orders: Arc<std::collections::HashMap<u64, Vec<u64>>>,
+    /// lineage identities for the parser splice oracle. This is a persistent
+    /// path-copying radix root: local parent changes never clone all orders.
+    pub(crate) published_child_orders: Arc<crate::reactive::store::RadixMap<PublishedChildOrder>>,
+    pub(crate) child_orders: Arc<crate::reactive::store::RadixMap<Vec<u64>>>,
 }
 
 /// One successfully published parent/child order. The parser freeze keeps
@@ -690,18 +855,7 @@ pub(crate) struct PublishedNodeIdentity {
     pub(crate) identity: crate::reactive::view::SyntaxNodeIdentity,
 }
 
-
-impl ParserTreeFacts {
-    pub(crate) fn contains(&self, record: u64) -> bool {
-        self.records.get(record).is_some()
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.records.len()
-    }
-}
-
-/// Per-document mutable parser arenas and working session state.
+/// Mutable generation arenas owned by one document root.
 #[derive(Clone)]
 pub(crate) struct SessionArenas {
     pub trees: TreeArena,
@@ -709,23 +863,79 @@ pub(crate) struct SessionArenas {
     pub ast: Arc<AstArena>,
     pub gss: GssArena,
 }
+impl SessionArenas {
+    pub(crate) fn seal_generations(&mut self) {
+        self.trees.seal_generation();
+        self.products.seal_generation();
+        self.gss.seal_generation();
+        Arc::make_mut(&mut self.ast).seal_generation();
+    }
+}
 
-#[derive(Clone, Default)]
-pub(crate) struct ParserSnapshotState {
-    pub(crate) sessions: HashMap<Uri<String>, Arc<ParserSessionState>>,
-    pub(crate) roots: HashMap<Uri<String>, Arc<Vec<ProductId>>>,
-    pub(crate) tokens: HashMap<Uri<String>, Arc<ParserTokenDocument>>,
-    pub(crate) incremental_stats: HashMap<Uri<String>, IncrementalParseStats>,
-    pub(crate) tree_facts: HashMap<Uri<String>, Arc<ParserTreeFacts>>,
-    /// The canonical adjacent-revision output consumed by the tree
-    /// publisher (plan §9, §12).
-    pub(crate) tree_deltas: HashMap<Uri<String>, Arc<crate::framework::parse::delta::ParseDelta>>,
-    /// Per-document semantic-revision ordinals: bumped once per non-empty
-    /// ParseDelta so tree consumers get an O(1) equality handle (§12.7).
-    pub(crate) semantic_revisions: HashMap<Uri<String>, u64>,
-    /// The last published status fact, for exact status deltas.
-    pub(crate) published_status: HashMap<Uri<String>, crate::framework::parse::delta::ParsedStatus>,
-    /// The last published diagnostics, for exact diagnostic key deltas.
+/// Immutable per-document parser root. A command path-copies this small
+/// handle and stages mutable session/arena generations behind its `Arc`s;
+/// snapshots retain the prior root without retaining a mutable global map.
+#[derive(Clone)]
+pub(crate) struct ParserDocumentRoot {
+    pub(crate) session: Arc<ParserSessionState>,
+    pub(crate) arenas: Arc<SessionArenas>,
+    pub(crate) token: Option<Arc<ParserTokenDocument>>,
+    pub(crate) roots: Arc<Vec<ProductId>>,
+    pub(crate) incremental_stats: IncrementalParseStats,
+    pub(crate) tree_facts: Arc<ParserTreeFacts>,
+    pub(crate) tree_delta: Arc<crate::framework::parse::delta::ParseDelta>,
+    pub(crate) semantic_revision: u64,
+    pub(crate) published_status: Option<crate::framework::parse::delta::ParsedStatus>,
     pub(crate) published_diagnostics:
-        HashMap<Uri<String>, Arc<Vec<crate::framework::parse::data::green::ParseErrorInfo>>>,
+        Arc<Vec<crate::framework::parse::data::green::ParseErrorInfo>>,
+}
+
+impl ParserDocumentRoot {
+    pub(crate) fn with_document(_uri: &Uri<String>, document: StableDocumentId) -> Self {
+        Self {
+            session: Arc::new(ParserSessionState::default()),
+            arenas: Arc::new(SessionArenas {
+                trees: TreeArena::new(),
+                products: ProductArena::new(),
+                ast: Arc::new(AstArena::with_document(document.0)),
+                gss: GssArena::new(),
+            }),
+            token: None,
+            roots: Arc::new(Vec::new()),
+            incremental_stats: IncrementalParseStats::default(),
+            tree_facts: Arc::new(ParserTreeFacts::default()),
+            tree_delta: Arc::new(crate::framework::parse::delta::ParseDelta::default()),
+            semantic_revision: 0,
+            published_status: None,
+            published_diagnostics: Arc::new(Vec::new()),
+        }
+    }
+}
+
+/// Immutable parser snapshot root. The URI map is a persistent HAMT: updating
+/// one document path-copies only the affected lookup path while every
+/// unrelated document root remains pointer-shared.
+#[derive(Clone)]
+pub(crate) struct ParserSnapshotState {
+    pub(crate) documents: PersistentUriMap<Arc<ParserDocumentRoot>>,
+}
+
+impl Default for ParserSnapshotState {
+    fn default() -> Self {
+        Self {
+            documents: PersistentUriMap::with_kind(
+                crate::reactive::pathwork::StructureKind::ParserIndex,
+            ),
+        }
+    }
+}
+
+impl ParserSnapshotState {
+    pub(crate) fn replace_document(&mut self, uri: Uri<String>, root: Arc<ParserDocumentRoot>) {
+        self.documents.insert(uri, root);
+    }
+
+    pub(crate) fn remove_document(&mut self, uri: &Uri<String>) {
+        self.documents.remove(uri);
+    }
 }

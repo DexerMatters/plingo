@@ -1,3 +1,5 @@
+use std::{collections::HashMap, sync::Arc};
+
 use crate::framework::parse::grammar::{NonTerminalId, Symbol, TerminalId};
 
 pub type GreenId = usize;
@@ -134,10 +136,18 @@ pub struct ParseErrorInfo {
     pub recovered: bool,
     pub location: Option<usize>,
 }
-
 #[derive(Clone)]
 pub struct TreeArena {
-    pub trees: indexmap::IndexSet<GreenTree>,
+    /// Immutable green-record generations. Green IDs are offsets in this
+    /// append-only sequence, so retaining an old root retains its records
+    /// without copying them into the next command's arena.
+    chunks: Arc<Vec<Arc<[GreenTree]>>>,
+    chunk_starts: Arc<Vec<usize>>,
+    /// Hash-consing directory for frozen generations.
+    indexes: Arc<Vec<Arc<HashMap<GreenTree, GreenId>>>>,
+    tail: Vec<GreenTree>,
+    tail_index: HashMap<GreenTree, GreenId>,
+    total_len: usize,
 }
 
 impl Default for TreeArena {
@@ -149,16 +159,61 @@ impl Default for TreeArena {
 impl TreeArena {
     pub fn new() -> TreeArena {
         TreeArena {
-            trees: indexmap::IndexSet::new(),
+            chunks: Arc::new(Vec::new()),
+            chunk_starts: Arc::new(Vec::new()),
+            indexes: Arc::new(Vec::new()),
+            tail: Vec::new(),
+            tail_index: HashMap::new(),
+            total_len: 0,
         }
     }
 
     pub fn insert(&mut self, tree: GreenTree) -> GreenId {
-        self.trees.insert_full(tree).0
+        if let Some(&id) = self.tail_index.get(&tree) {
+            return id;
+        }
+        for index in self.indexes.iter().rev() {
+            if let Some(&id) = index.get(&tree) {
+                return id;
+            }
+        }
+        let id = self.total_len;
+        self.tail_index.insert(tree.clone(), id);
+        self.tail.push(tree);
+        self.total_len = self.total_len.saturating_add(1);
+        id
     }
 
     pub fn get(&self, id: GreenId) -> Option<&GreenTree> {
-        self.trees.get_index(id)
+        let sealed_len = self.total_len.saturating_sub(self.tail.len());
+        if id >= sealed_len {
+            return self.tail.get(id - sealed_len);
+        }
+        let index = self
+            .chunk_starts
+            .partition_point(|&start| start <= id)
+            .checked_sub(1)?;
+        let start = self.chunk_starts[index];
+        self.chunks[index].get(id - start)
+    }
+
+    /// Publishes the current append-only green generation and its lookup
+    /// directory. The directory vectors are the only metadata copied.
+    pub(crate) fn seal_generation(&mut self) {
+        if self.tail.is_empty() {
+            return;
+        }
+        let start = self.total_len - self.tail.len();
+        let trees: Arc<[GreenTree]> = std::mem::take(&mut self.tail).into();
+        let index = std::mem::take(&mut self.tail_index);
+        let mut chunks = self.chunks.as_ref().clone();
+        chunks.push(trees);
+        self.chunks = Arc::new(chunks);
+        let mut starts = self.chunk_starts.as_ref().clone();
+        starts.push(start);
+        self.chunk_starts = Arc::new(starts);
+        let mut indexes = self.indexes.as_ref().clone();
+        indexes.push(Arc::new(index));
     }
 
     pub fn node(&mut self, id: NonTerminalId, children: Vec<GreenId>) -> GreenId {

@@ -42,5 +42,9 @@ color-print = "0.3.7"
 name = "incremental_pipeline"
 harness = false
 
+[[bench]]
+name = "expansion_size"
+harness = false
+
 [dev-dependencies]
 serde_json = "1"

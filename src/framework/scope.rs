@@ -42,7 +42,6 @@ pub trait ScopeDomain: Clone + Eq + Hash + Debug + Send + Sync + 'static {
 #[derive(PartialEq, Eq, Hash)]
 pub struct Scope<D: ScopeDomain>(Node<ScopeGraph<D>>);
 
-
 impl<D: ScopeDomain> Clone for Scope<D> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
@@ -57,8 +56,36 @@ impl<D: ScopeDomain> fmt::Debug for Scope<D> {
 
 impl<D: ScopeDomain> Scope<D> {
     #[doc(hidden)]
-    pub fn from_graph_node(node: Node<ScopeGraph<D>>) -> Self {
+    pub(crate) fn from_graph_node(node: Node<ScopeGraph<D>>) -> Self {
         Self(node)
+    }
+
+    /// Allocates the graph identity owned by the active component instance.
+    ///
+    /// This is the semantic graph counterpart of `AstBox::render`: the
+    /// definition and exact component input determine the identity.
+    pub fn automatic() -> Result<Self> {
+        let node = crate::reactive::plain::automatic_graph_node_id::<ScopeGraph<D>>()?;
+        Ok(Self::from_graph_node(node))
+    }
+
+    /// Returns a complete graph-node publication for this scope.
+    pub fn render(
+        self,
+        payload: ScopeNode<D>,
+    ) -> crate::reactive::component::GraphRender<ScopeGraph<D>> {
+        crate::reactive::component::GraphRender::from_node(self.node(), Some(payload))
+    }
+
+    /// Returns a bucket-only publication for this scope.
+    pub fn patch(self) -> crate::reactive::component::GraphRender<ScopeGraph<D>> {
+        crate::reactive::component::GraphRender::patch_node(self.node())
+    }
+}
+
+impl<D: ScopeDomain> From<Scope<D>> for Node<ScopeGraph<D>> {
+    fn from(scope: Scope<D>) -> Self {
+        scope.0
     }
 }
 
@@ -75,13 +102,7 @@ impl<D: ScopeDomain> Scope<D> {
         std::any::TypeId::of::<ScopeGraph<D>>().hash(&mut hasher);
         seed.hash(&mut hasher);
         let identity = hasher.finish();
-        Self(Node::from_syntax(
-            identity,
-            "<scope>",
-            identity,
-            0,
-            false,
-        ))
+        Self(Node::from_syntax(identity, "<scope>", identity, false))
     }
 }
 

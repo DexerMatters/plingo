@@ -1,6 +1,6 @@
 pub mod persistent_seq;
-pub use persistent_seq::{CountMeasure, PersistentSeq, SeqMeasure};
 use core::fmt;
+pub use persistent_seq::{CountMeasure, PersistentSeq, SeqMeasure};
 use std::{error::Error, fmt::Debug, sync::Arc};
 
 use color_print::cwrite;

@@ -21,14 +21,11 @@ thread_local! {
 }
 
 #[component]
-fn owner(_key: EachKey<Trigger>) -> Result<()> {
+fn owner(_key: Each<Trigger>) -> Result<()> {
     // Read the driver FIRST so every evaluation records an exact dependency
     // on the trigger element (membership alone schedules; payload changes
     // must wake through this row).
-    let step = observe_view::<Trigger>()?
-        .get(&())?
-        .map(|value| *value)
-        .unwrap_or(0);
+    let step = _key.value()?.map(|value| *value).unwrap_or(0);
     if !SEEDED.with(|flag| flag.get()) {
         let patch = emit_patch::<BigOwned>()?;
         for index in 0..DOMAIN {
@@ -52,6 +49,13 @@ fn owner(_key: EachKey<Trigger>) -> Result<()> {
 
 fn fact_writes_of(report: &crate::reactive::CommandReport) -> u64 {
     report.engine_work().fact_writes
+}
+
+fn owner_install(engine: &mut Engine) -> Result<crate::reactive::KeyedFamily<Trigger>> {
+    owner::Component::mount(
+        engine,
+        crate::reactive::framework_mount::MapEntries::<Trigger>::new(),
+    )
 }
 
 #[test]

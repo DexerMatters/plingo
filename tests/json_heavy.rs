@@ -573,7 +573,10 @@ mod recovery_determinism {
         ws.open(u.clone(), &malformed).unwrap();
         let before = common::oracle::project(&ws.snapshot(), &u.to_string());
         assert!(
-            before.parse_status.as_deref().is_some_and(|s| s.starts_with("recovered")),
+            before
+                .parse_status
+                .as_deref()
+                .is_some_and(|s| s.starts_with("recovered")),
             "fixture must start recovered: {:?}",
             before.parse_status
         );
@@ -602,7 +605,9 @@ mod recovery_determinism {
             "value edit woke the parser: {work:?}"
         );
         assert_eq!(
-            work.parser_records_inserted + work.parser_records_updated + work.parser_records_removed,
+            work.parser_records_inserted
+                + work.parser_records_updated
+                + work.parser_records_removed,
             0,
             "value edit journaled parser records: {work:?}"
         );

@@ -30,21 +30,23 @@ fn text_of(ws: &Workspace, u: &fluent_uri::Uri<String>) -> Option<String> {
 #[view]
 pub struct TextLog(Map<String, String>);
 
-#[reactive_macros::component]
-fn text_logger_component(key: EachKey<SourceRevisions>) -> Result<()> {
+#[plingo::component]
+fn text_logger_component(key: Each<SourceRevisions>) -> Result<()> {
     // Cut C: one instance per document writes exactly its own entry
     // (previous-epoch value when the current revision is absent, i.e. the
     // close-tombstone case).
-    let text = observe_view::<SourceRevisions>()?;
-    let value = text
-        .get_previous(&key)?
+    let value = key
+        .value_previous()?
         .map(|revision| revision.text().to_string())
         .unwrap_or_default();
-    emit_view::<TextLog>()?.insert(key, value)
+    TextLog::set(key.into_key(), value).__apply()
 }
 
 fn install_logger(engine: &mut Engine) -> Result<()> {
-    text_logger_component_install(engine)?;
+    text_logger_component::Component::mount(
+        engine,
+        plingo::reactive::framework_mount::MapEntries::<SourceRevisions>::new(),
+    )?;
     Ok(())
 }
 

@@ -57,54 +57,49 @@ fn collect_ast_parse_diagnostics(
     seen_diagnostics: &mut HashSet<ParseErrorInfo>,
     diagnostics: &mut Vec<ParseErrorInfo>,
 ) {
-    if !seen_products.insert(product_id) {
-        return;
-    }
-    let Some(product) = arenas.products.get(product_id) else {
-        return;
-    };
+    let mut pending = vec![product_id];
+    while let Some(product_id) = pending.pop() {
+        if !seen_products.insert(product_id) {
+            continue;
+        }
+        let Some(product) = arenas.products.get(product_id) else {
+            continue;
+        };
 
-    match &product.data {
-        ProductData::Error { .. } => {
-            let Some(tree) = arenas.trees.get(product.green) else {
-                return;
-            };
-            let TreeData::Error {
-                kind,
-                node,
-                unexpected,
-                expected,
-                recovered,
-                location,
-                ..
-            } = &tree.data
-            else {
-                return;
-            };
-            let info = ParseErrorInfo {
-                kind: kind.clone(),
-                node: *node,
-                length: tree.length,
-                unexpected: *unexpected,
-                expected: *expected,
-                recovered: *recovered,
-                location: *location,
-            };
-            if seen_diagnostics.insert(info.clone()) {
-                diagnostics.push(info);
+        match &product.data {
+            ProductData::Error { .. } => {
+                let Some(tree) = arenas.trees.get(product.green) else {
+                    continue;
+                };
+                let TreeData::Error {
+                    kind,
+                    node,
+                    unexpected,
+                    expected,
+                    recovered,
+                    location,
+                    ..
+                } = &tree.data
+                else {
+                    continue;
+                };
+                let info = ParseErrorInfo {
+                    kind: kind.clone(),
+                    node: *node,
+                    length: tree.length,
+                    unexpected: *unexpected,
+                    expected: *expected,
+                    recovered: *recovered,
+                    location: *location,
+                };
+                if seen_diagnostics.insert(info.clone()) {
+                    diagnostics.push(info);
+                }
             }
-        }
-        ProductData::Node { children, .. } => {
-            for child in children.iter().copied() {
-                collect_ast_parse_diagnostics(
-                    child,
-                    arenas,
-                    seen_products,
-                    seen_diagnostics,
-                    diagnostics,
-                );
+            ProductData::Node { children, .. } => {
+                pending.extend(children.iter().rev().copied());
             }
+            ProductData::Token { .. } => {}
         }
-        ProductData::Token { .. } => {}
     }
 }

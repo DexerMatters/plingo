@@ -10,7 +10,7 @@ use std::{
 use crate::framework::parse::{
     build::{Action, ActionSet},
     grammar::{Grammar, TerminalId},
-    parsing::{ParseToken, SessionContext},
+    parsing::SessionContext,
 };
 
 const MIN_REAL_SHIFTS: usize = 1;

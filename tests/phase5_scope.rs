@@ -7,9 +7,9 @@ use plingo::framework::scope::{
     declare, edge, partition_visible, scope, snapshot_declarations, snapshot_node, snapshot_nodes,
     snapshot_outgoing, snapshot_scope,
 };
-use plingo::reactive::component::EachKey;
+use plingo::reactive::kind::emit_view;
 use plingo::reactive::prelude::*;
-use reactive_macros::{component, view};
+use plingo::{component, view};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LabelKind {
@@ -42,17 +42,29 @@ impl ScopeDomain for Domain {
 struct FixtureTrigger(Map<(), ()>);
 
 fn install_emitter(engine: &mut Engine) {
-    emitter_component_install(engine).expect("install emitter");
+    emitter_component::Component::mount(
+        engine,
+        plingo::reactive::framework_mount::MapEntries::<FixtureTrigger>::new(),
+    )
+    .expect("install emitter");
     trigger(engine);
 }
 
 fn install_resolver(engine: &mut Engine) {
-    resolver_component_install(engine).expect("install resolver");
+    resolver_component::Component::mount(
+        engine,
+        plingo::reactive::framework_mount::MapEntries::<FixtureTrigger>::new(),
+    )
+    .expect("install resolver");
     trigger(engine);
 }
 
 fn install_req_emitter(engine: &mut Engine) {
-    req_emitter_component_install(engine).expect("install req emitter");
+    req_emitter_component::Component::mount(
+        engine,
+        plingo::reactive::framework_mount::MapEntries::<FixtureTrigger>::new(),
+    )
+    .expect("install req emitter");
     trigger(engine);
 }
 
@@ -63,22 +75,22 @@ fn trigger(engine: &mut Engine) {
 }
 
 #[component]
-fn emitter_component(_key: EachKey<FixtureTrigger>) -> Result<()> {
+fn emitter_component(_key: Each<FixtureTrigger>) -> Result<()> {
     emitter(())
 }
 
 #[component]
-fn resolver_component(_key: EachKey<FixtureTrigger>) -> Result<()> {
+fn resolver_component(_key: Each<FixtureTrigger>) -> Result<()> {
     resolver(())
 }
 
 #[component]
-fn req_emitter_component(_key: EachKey<FixtureTrigger>) -> Result<()> {
+fn req_emitter_component(_key: Each<FixtureTrigger>) -> Result<()> {
     req_emitter(())
 }
 
 #[component]
-fn emitter_second_component(_key: EachKey<FixtureTrigger>) -> Result<()> {
+fn emitter_second_component(_key: Each<FixtureTrigger>) -> Result<()> {
     emitter(())
 }
 
@@ -109,8 +121,16 @@ fn identical_scope_construction_is_shared_across_roots() {
     // Cut C identity: each definition owns its own node copies (the
     // definition participates in automatic ids), so both owners coexist
     // and removal retracts exactly that owner's set.
-    let first = emitter_component_install(&mut engine).expect("first install");
-    let second = emitter_second_component_install(&mut engine).expect("second install");
+    let first = emitter_component::Component::mount(
+        &mut engine,
+        plingo::reactive::framework_mount::MapEntries::<FixtureTrigger>::new(),
+    )
+    .expect("first install");
+    let second = emitter_second_component::Component::mount(
+        &mut engine,
+        plingo::reactive::framework_mount::MapEntries::<FixtureTrigger>::new(),
+    )
+    .expect("second install");
     trigger(&mut engine);
 
     let snapshot = engine.snapshot();
